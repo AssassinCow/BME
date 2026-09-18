@@ -1,0 +1,21 @@
+extends: base.yaml
+
+features:
+  window_seconds: 15
+  include_dyadic: false
+  motion_bucket_seconds: [3, 6, 12, 24, 48, 96, 192]
+  ppg_bucket_seconds: [15, 30, 60, 120, 240]
+  workers: 8
+
+xgboost:
+  device: cuda
+  objective: binary:logistic
+  eval_metric: aucpr
+  n_estimators: 3000
+  early_stopping_rounds: 80
+  trials: 30
+  near_event_minutes: 30
+  far_negative_to_positive_ratio: 5
+  hard_negative_to_positive_ratio: 2
+  random_seed: 2026
+

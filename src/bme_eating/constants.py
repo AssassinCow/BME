@@ -1,0 +1,14 @@
+from __future__ import annotations
+
+ACC_COLUMNS = ("ACC_X", "ACC_Y", "ACC_Z")
+GYRO_COLUMNS = ("GYRO_X", "GYRO_Y", "GYRO_Z")
+TIME_COLUMNS = ("ACC_TIME", "PPG_TIME", "GYRO_TIME")
+PPG_PREFIX = "PPG"
+
+MOTION_CHANNELS = (*ACC_COLUMNS, *GYRO_COLUMNS)
+MOTION_FEATURE_CHANNELS = 12
+PPG_FEATURE_CHANNELS = 2
+
+DEFAULT_INVALID_SUBJECTS = frozenset({"HNU21007", "HNU21026J", "HNU21030"})
+EVENT_COLUMNS = ("subject_key", "start_ms", "end_ms", "score")
+

@@ -1,0 +1,42 @@
+project:
+  seed: 2026
+  data_root_env: BME_DATA_ROOT
+  output_root_env: BME_OUTPUT_ROOT
+
+data:
+  invalid_subjects: [HNU21007, HNU21026J, HNU21030]
+  formal_subject_pattern: '^HNU\d{5}$'
+  packet_timestamp_anchor: start
+  ppg_samples_per_row: 20
+  ppg_available_columns: 44
+  gap_factor: 5.0
+  minimum_gap_ms: 2000
+  maximum_interpolation_gap_ms: 250
+  motion_target_hz: 100
+  ppg_target_hz: 50
+  minimum_segment_seconds: 30
+  output_step_seconds: 3
+  subject_folds: 5
+  split_seed: 2026
+
+preprocess:
+  compression: true
+  workers: 8
+  overwrite: false
+
+postprocess:
+  ema_half_life_seconds: 12
+  high_threshold: 0.6
+  low_threshold: 0.3
+  minimum_event_seconds: 30
+  merge_gap_seconds: 60
+  boundary_lookback_seconds: 30
+  iou_threshold: 0.25
+
+postprocess_search:
+  ema_half_life_seconds: [6, 12, 24]
+  high_threshold: [0.5, 0.6, 0.7]
+  low_threshold: [0.2, 0.3, 0.4]
+  minimum_event_seconds: [15, 30, 60]
+  merge_gap_seconds: [30, 60, 120]
+  boundary_lookback_seconds: [15, 30, 60]

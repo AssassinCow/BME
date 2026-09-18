@@ -1,0 +1,42 @@
+extends: base.yaml
+
+model:
+  motion_block_seconds: 3
+  ppg_block_seconds: 15
+  motion_bucket_counts: [1, 2, 4, 8, 16, 32, 64]
+  ppg_bucket_counts: [1, 2, 4, 8, 16]
+  embedding_dim: 128
+  token_dim: 192
+  transformer_layers: 2
+  attention_heads: 4
+  feedforward_dim: 384
+  dropout: 0.1
+  future_context_seconds: 0
+
+training:
+  device: cuda
+  amp_dtype: bfloat16
+  batch_size: 4
+  gradient_accumulation: 8
+  steps_per_epoch: 5000
+  inference_batch_size: 16
+  validation_every_epochs: 2
+  validation_background_segments_per_subject: 1
+  num_workers: 8
+  max_epochs: 80
+  early_stopping_epochs: 12
+  learning_rate: 0.0003
+  encoder_learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_fraction: 0.05
+  gradient_clip_norm: 1.0
+  positive_sampling_fraction: 0.5
+  ppg_augmentation_probability: 0.35
+  boundary_positive_weight: 20.0
+  random_seed: 2026
+
+loss:
+  focal_gamma: 2.0
+  dice_weight: 0.3
+  boundary_weight: 0.5
+  sqi_weight: 0.1

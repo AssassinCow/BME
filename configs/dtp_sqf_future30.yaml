@@ -1,0 +1,5 @@
+extends: dtp_sqf.yaml
+
+model:
+  future_context_seconds: 30
+
