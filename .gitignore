@@ -6,8 +6,9 @@ __pycache__/
 .venv/
 env/
 *.egg-info/
+/.vscode/
 
-data/
+/data/
 outputs/
 artifacts/
 checkpoints/
