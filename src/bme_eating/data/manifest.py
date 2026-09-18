@@ -25,6 +25,26 @@ def _load_download_state(data_root: Path) -> dict[str, Any]:
         return json.load(handle)
 
 
+def _resolve_attachment_path(data_root: Path, relative_path: str | Path) -> Path:
+    candidate = data_root / Path(relative_path)
+    if candidate.exists():
+        return candidate
+    attachment_root = data_root / "raw" / "sensor_attachments"
+    filename = Path(relative_path).name
+    matches = list(attachment_root.rglob(filename)) if attachment_root.exists() else []
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise FileNotFoundError(
+            f"Downloaded attachment is missing: {candidate}; "
+            f"no fallback match for {filename} under {attachment_root}"
+        )
+    raise RuntimeError(
+        f"Downloaded attachment is ambiguous: {filename}; "
+        f"found {len(matches)} matches under {attachment_root}"
+    )
+
+
 def build_secure_indices(
     data_root: Path,
     output_root: Path,
@@ -56,9 +76,7 @@ def build_secure_indices(
         if item.get("status") != "downloaded" or item.get("invalid_externalid"):
             continue
         relative_path = Path(item["relative_path"])
-        absolute_path = data_root / relative_path
-        if not absolute_path.exists():
-            raise FileNotFoundError(f"Downloaded attachment is missing: {absolute_path}")
+        absolute_path = _resolve_attachment_path(data_root, relative_path)
         attachment_rows.append(
             {
                 "subject_key": subject_key(normalized, salt),
