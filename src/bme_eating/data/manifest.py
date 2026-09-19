@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Any
 
 import pandas as pd
@@ -29,11 +30,12 @@ def _load_download_state(data_root: Path) -> dict[str, Any]:
 
 
 def _resolve_attachment_path(data_root: Path, relative_path: str | Path) -> Path:
-    candidate = data_root / Path(relative_path)
+    normalized_relative = str(relative_path).replace("\\", "/")
+    candidate = data_root / PurePosixPath(normalized_relative)
     if candidate.exists():
         return candidate
     attachment_root = data_root / "raw" / "sensor_attachments"
-    filename = Path(relative_path).name
+    filename = PurePosixPath(normalized_relative).name
     matches = list(attachment_root.rglob(filename)) if attachment_root.exists() else []
     if len(matches) == 1:
         return matches[0]
@@ -141,4 +143,3 @@ def build_secure_indices(
     records.to_parquet(secure_dir / "records.parquet", index=False)
     events.to_parquet(secure_dir / "events.parquet", index=False)
     return records, events
-
