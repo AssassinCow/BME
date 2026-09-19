@@ -39,6 +39,43 @@ class Normalization:
         )
 
 
+def _load_segment_archive(path: str | Path) -> dict[str, np.ndarray]:
+    path = Path(path)
+    try:
+        with np.load(path) as archive:
+            payload = {name: archive[name] for name in archive.files}
+        required = {
+            "motion_timestamp_ms",
+            "motion_values",
+            "motion_mask",
+            "ppg_timestamp_ms",
+            "ppg_values",
+            "ppg_mask",
+        }
+        missing = required - set(payload)
+        if missing:
+            raise ValueError(f"Segment cache is missing fields: {sorted(missing)}")
+        if len(payload["motion_timestamp_ms"]) != len(payload["motion_values"]):
+            raise ValueError("Motion timestamps and values have different lengths")
+        if len(payload["motion_timestamp_ms"]) != len(payload["motion_mask"]):
+            raise ValueError("Motion timestamps and mask have different lengths")
+        if len(payload["ppg_timestamp_ms"]) != len(payload["ppg_values"]):
+            raise ValueError("PPG timestamps and values have different lengths")
+        if len(payload["ppg_timestamp_ms"]) != len(payload["ppg_mask"]):
+            raise ValueError("PPG timestamps and mask have different lengths")
+        if payload["motion_values"].ndim != 2 or payload["motion_values"].shape[1] != 6:
+            raise ValueError("Motion values must have shape (n, 6)")
+        if np.any(np.diff(payload["motion_timestamp_ms"]) <= 0) or np.any(
+            np.diff(payload["ppg_timestamp_ms"]) <= 0
+        ):
+            raise ValueError("Segment cache timestamps must be strictly increasing")
+        return payload
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to load segment cache {path}: {type(error).__name__}: {error}"
+        ) from error
+
+
 def compute_normalization(
     segments: pd.DataFrame,
     subject_keys: set[str],
@@ -48,11 +85,11 @@ def compute_normalization(
     ppg_samples: list[np.ndarray] = []
     selected = segments[segments["subject_key"].isin(subject_keys)]
     for segment in selected.itertuples(index=False):
-        with np.load(segment.segment_path) as payload:
-            motion = payload["motion_values"]
-            motion_mask = payload["motion_mask"].astype(bool)
-            ppg = payload["ppg_values"].reshape(-1)
-            ppg_mask = payload["ppg_mask"].astype(bool).reshape(-1)
+        payload = _load_segment_archive(segment.segment_path)
+        motion = payload["motion_values"]
+        motion_mask = payload["motion_mask"].astype(bool)
+        ppg = payload["ppg_values"].reshape(-1)
+        ppg_mask = payload["ppg_mask"].astype(bool).reshape(-1)
         motion_stride = max(1, len(motion) // maximum_samples_per_segment)
         motion_subset = motion[::motion_stride].copy()
         motion_subset[~motion_mask[::motion_stride]] = np.nan
@@ -64,7 +101,10 @@ def compute_normalization(
         raise ValueError("No valid training samples available for normalization")
     motion_all = np.concatenate(motion_samples, axis=0)
     ppg_all = np.concatenate(ppg_samples)
+    if not np.isfinite(motion_all).any() or len(ppg_all) == 0 or not np.isfinite(ppg_all).any():
+        raise ValueError("No finite training sensor samples available for normalization")
     motion_median = np.nanmedian(motion_all, axis=0)
+    motion_median = np.nan_to_num(motion_median, nan=0.0, posinf=0.0, neginf=0.0)
     motion_iqr = np.nanpercentile(motion_all, 75, axis=0) - np.nanpercentile(
         motion_all, 25, axis=0
     )
@@ -178,8 +218,7 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             payload = self._cache.pop(path)
             self._cache[path] = payload
             return payload
-        with np.load(path) as archive:
-            payload = {name: archive[name] for name in archive.files}
+        payload = _load_segment_archive(path)
         self._cache[path] = payload
         while len(self._cache) > self._cache_size:
             self._cache.popitem(last=False)
@@ -322,6 +361,10 @@ class SegmentBalancedBatchSampler(Sampler[list[int]]):
         positive_fraction: float,
         seed: int,
     ) -> None:
+        if batch_size <= 0 or steps_per_epoch <= 0:
+            raise ValueError("batch_size and steps_per_epoch must be positive")
+        if not 0 < positive_fraction <= 1:
+            raise ValueError("positive_fraction must be in (0, 1]")
         self.batch_size = int(batch_size)
         self.steps_per_epoch = int(steps_per_epoch)
         self.positive_fraction = float(positive_fraction)
@@ -347,6 +390,10 @@ class SegmentBalancedBatchSampler(Sampler[list[int]]):
             [len(self.negative_by_segment[str(key)]) for key in self.negative_segments],
             dtype=np.float64,
         )
+        if len(self.positive_segments) == 0 or len(self.negative_segments) == 0:
+            raise ValueError(
+                "Training anchors must contain both positive and negative segments"
+            )
         self.positive_weights /= self.positive_weights.sum()
         self.negative_weights /= self.negative_weights.sum()
 

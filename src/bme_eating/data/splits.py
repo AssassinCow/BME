@@ -12,7 +12,23 @@ def create_subject_folds(
     number_of_folds: int,
     seed: int,
     output_path: Path,
+    subject_keys: set[str] | None = None,
 ) -> dict[str, int]:
+    if number_of_folds <= 0:
+        raise ValueError("number_of_folds must be positive")
+    required = {"subject_key", "event_id", "valid_duration", "hand_relation"}
+    missing = required - set(events.columns)
+    if missing and len(events):
+        raise ValueError(f"Events are missing columns: {sorted(missing)}")
+    all_subjects = {
+        str(value) for value in (subject_keys or set(events.get("subject_key", [])))
+    }
+    if events.empty and not all_subjects:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text("{}", encoding="utf-8")
+        return {}
+    if missing:
+        raise ValueError(f"Events are missing columns: {sorted(missing)}")
     valid = events[(events["valid_duration"]) & (events.get("coverage", "full") == "full")]
     summary = (
         valid.assign(
@@ -22,6 +38,11 @@ def create_subject_folds(
         .groupby("subject_key", as_index=False)
         .agg(events=("event_id", "count"), same=("same", "sum"), different=("different", "sum"))
     )
+    summary = pd.DataFrame({"subject_key": sorted(all_subjects)}).merge(
+        summary, on="subject_key", how="left"
+    )
+    for column in ("events", "same", "different"):
+        summary[column] = summary[column].fillna(0).astype(int)
     rng = np.random.default_rng(seed)
     summary["tie_breaker"] = rng.random(len(summary))
     summary = summary.sort_values(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import statistics
 import zipfile
@@ -20,6 +21,19 @@ class ParsedAttachment:
     ppg: SensorSeries
     source_name: str
     info: dict[str, object]
+
+
+class UnsupportedSensorFormatError(ValueError):
+    """Raised when a sensor member is not the documented tab-separated text format."""
+
+    def __init__(self, zip_path: Path, member_name: str, reason: str) -> None:
+        self.zip_path = zip_path
+        self.member_name = member_name
+        self.reason = reason
+        super().__init__(f"Unsupported sensor format in {zip_path}!{member_name}: {reason}")
+
+    def __reduce__(self):
+        return type(self), (self.zip_path, self.member_name, self.reason)
 
 
 class _PacketExpander:
@@ -101,6 +115,33 @@ def _int_or_zero(value: str) -> int:
         return 0
 
 
+def _assert_text_sensor_member(
+    archive: zipfile.ZipFile,
+    zip_path: Path,
+    member_name: str,
+    required_columns: set[str],
+) -> None:
+    with archive.open(member_name) as handle:
+        prefix = handle.read(4096)
+    try:
+        decoded = prefix.decode("utf-8-sig")
+    except UnicodeDecodeError as error:
+        raise UnsupportedSensorFormatError(
+            zip_path,
+            member_name,
+            f"member is not UTF-8 text (prefix={prefix[:32].hex()})",
+        ) from error
+    first_line = decoded.splitlines()[0] if decoded.splitlines() else ""
+    columns = {value.strip() for value in first_line.split("\t")}
+    missing = required_columns - columns
+    if missing:
+        raise UnsupportedSensorFormatError(
+            zip_path,
+            member_name,
+            f"text header is missing required columns: {sorted(missing)}",
+        )
+
+
 def parse_sensor_zip(
     zip_path: str | Path,
     ppg_samples_per_row: int = 20,
@@ -117,12 +158,17 @@ def parse_sensor_zip(
             with archive.open(info_entries[0]) as handle:
                 info = json.load(handle)
 
+        _assert_text_sensor_member(
+            archive,
+            zip_path,
+            text_entries[0],
+            set(TIME_COLUMNS) | set(ACC_COLUMNS) | set(GYRO_COLUMNS),
+        )
+
         acc_expander = _PacketExpander(3, timestamp_anchor)
         gyro_expander = _PacketExpander(3, timestamp_anchor)
         ppg_expander = _PacketExpander(1, timestamp_anchor)
         with archive.open(text_entries[0]) as raw_handle:
-            import io
-
             with io.TextIOWrapper(raw_handle, encoding="utf-8-sig", newline="") as text_handle:
                 reader = csv.reader(text_handle, delimiter="\t")
                 header = next(reader)
@@ -170,7 +216,26 @@ def inspect_ppg_layout(zip_path: str | Path, maximum_rows: int = 100_000) -> dic
     ppg_rows = 0
     with zipfile.ZipFile(zip_path) as archive:
         text_name = next(name for name in archive.namelist() if name.lower().endswith(".txt"))
-        import io
+        try:
+            _assert_text_sensor_member(
+                archive,
+                zip_path,
+                text_name,
+                set(TIME_COLUMNS)
+                | set(ACC_COLUMNS)
+                | set(GYRO_COLUMNS)
+                | {f"PPG{number}" for number in range(1, 45)},
+            )
+        except UnsupportedSensorFormatError as error:
+            return {
+                "zip_name": zip_path.name,
+                "status": "unsupported_binary",
+                "text_member": text_name,
+                "error": error.reason,
+                "rows_scanned": 0,
+                "ppg_rows": 0,
+                "nonzero_fraction_by_slot": [0.0] * 44,
+            }
 
         with archive.open(text_name) as raw_handle:
             with io.TextIOWrapper(raw_handle, encoding="utf-8-sig", newline="") as text_handle:
@@ -188,6 +253,7 @@ def inspect_ppg_layout(zip_path: str | Path, maximum_rows: int = 100_000) -> dic
                         nonzero_counts[slot] += int(value != 0.0)
     return {
         "zip_name": zip_path.name,
+        "status": "ok",
         "rows_scanned": min(maximum_rows, row_number + 1 if "row_number" in locals() else 0),
         "ppg_rows": ppg_rows,
         "nonzero_fraction_by_slot": (

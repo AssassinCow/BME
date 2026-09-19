@@ -15,6 +15,19 @@ class Match:
 
 
 def interval_iou_matrix(truth: np.ndarray, prediction: np.ndarray) -> np.ndarray:
+    truth = np.asarray(truth, dtype=np.float64)
+    prediction = np.asarray(prediction, dtype=np.float64)
+    if truth.size == 0:
+        truth = np.empty((0, 2), dtype=np.float64)
+    if prediction.size == 0:
+        prediction = np.empty((0, 2), dtype=np.float64)
+    for name, intervals in (("truth", truth), ("prediction", prediction)):
+        if intervals.ndim != 2 or intervals.shape[1] != 2:
+            raise ValueError(f"{name} intervals must have shape (n, 2)")
+        if not np.isfinite(intervals).all():
+            raise ValueError(f"{name} intervals must be finite")
+        if (intervals[:, 1] <= intervals[:, 0]).any():
+            raise ValueError(f"{name} intervals must have positive duration")
     if len(truth) == 0 or len(prediction) == 0:
         return np.zeros((len(truth), len(prediction)), dtype=np.float64)
     truth_start = truth[:, 0][:, None]
@@ -34,6 +47,8 @@ def match_events(
     iou_threshold: float = 0.25,
     method: str = "hungarian",
 ) -> list[Match]:
+    if not np.isfinite(iou_threshold) or not 0 <= iou_threshold < 1:
+        raise ValueError("iou_threshold must be in [0, 1)")
     iou = interval_iou_matrix(truth, prediction)
     if iou.size == 0:
         return []
@@ -70,6 +85,15 @@ def evaluate_events(
     iou_threshold: float = 0.25,
     method: str = "hungarian",
 ) -> tuple[dict[str, float], pd.DataFrame]:
+    for name, frame in (("truth", truth), ("prediction", prediction)):
+        required = {"subject_key", "start_ms", "end_ms"}
+        missing = required - set(frame.columns)
+        if missing and len(frame):
+            raise ValueError(f"{name} is missing columns: {sorted(missing)}")
+    if truth.empty and "subject_key" not in truth.columns:
+        truth = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
+    if prediction.empty and "subject_key" not in prediction.columns:
+        prediction = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
     matches_output: list[dict[str, object]] = []
     true_positive = 0
     total_truth = 0

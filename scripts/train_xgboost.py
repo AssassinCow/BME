@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 import _bootstrap  # noqa: F401
+
 from bme_eating.cli import command_train_xgb
 
 
@@ -19,6 +20,11 @@ def main() -> None:
         required=True,
         choices=range(5),
         help="Outer subject fold: 0, 1, 2, 3, or 4.",
+    )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore the XGBoost trial checkpoint and start the search from scratch.",
     )
     command_train_xgb(parser.parse_args())
 

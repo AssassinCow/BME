@@ -20,6 +20,11 @@ def main() -> None:
         default=100_000,
         help="Maximum text rows inspected per ZIP. Default: 100000.",
     )
+    parser.add_argument(
+        "--no-resume",
+        action="store_true",
+        help="Ignore any schema audit checkpoint and start from the first ZIP.",
+    )
     command_audit(parser.parse_args())
 
 

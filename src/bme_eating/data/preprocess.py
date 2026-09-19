@@ -101,15 +101,21 @@ def _save_segment(
     compressed: bool,
 ) -> None:
     writer = np.savez_compressed if compressed else np.savez
-    writer(
-        output_path,
-        motion_timestamp_ms=motion_timestamp_ms,
-        motion_values=motion_values.astype(np.float32),
-        motion_mask=motion_mask.astype(np.uint8),
-        ppg_timestamp_ms=ppg_timestamp_ms,
-        ppg_values=ppg_values.astype(np.float32),
-        ppg_mask=ppg_mask.astype(np.uint8),
-    )
+    temporary_path = output_path.with_name(output_path.name + ".tmp")
+    try:
+        with temporary_path.open("wb") as handle:
+            writer(
+                handle,
+                motion_timestamp_ms=motion_timestamp_ms,
+                motion_values=motion_values.astype(np.float32),
+                motion_mask=motion_mask.astype(np.uint8),
+                ppg_timestamp_ms=ppg_timestamp_ms,
+                ppg_values=ppg_values.astype(np.float32),
+                ppg_mask=ppg_mask.astype(np.uint8),
+            )
+        temporary_path.replace(output_path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def preprocess_attachment(
@@ -125,6 +131,13 @@ def preprocess_attachment(
         ppg_samples_per_row=int(data_config["ppg_samples_per_row"]),
         timestamp_anchor=str(data_config["packet_timestamp_anchor"]),
     )
+    parsed = ParsedAttachment(
+        acc=_collapse_duplicate_timestamps(parsed.acc),
+        gyro=_collapse_duplicate_timestamps(parsed.gyro),
+        ppg=_collapse_duplicate_timestamps(parsed.ppg),
+        source_name=parsed.source_name,
+        info=parsed.info,
+    )
     ranges = _split_ranges(
         parsed.acc.timestamp_ms,
         float(data_config["gap_factor"]),
@@ -137,6 +150,11 @@ def preprocess_attachment(
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, object]] = []
     token = _record_token(zip_path)
+    if overwrite:
+        for stale_path in output_dir.glob(f"{token}_s*.npz"):
+            stale_path.unlink(missing_ok=True)
+        for stale_path in output_dir.glob(f"{token}_s*.npz.tmp"):
+            stale_path.unlink(missing_ok=True)
 
     for segment_number, (start_index, end_index) in enumerate(ranges):
         acc = SensorSeries(

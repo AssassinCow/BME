@@ -36,6 +36,35 @@ def build_anchor_index(
     output_step_seconds: int,
     output_path: Path,
 ) -> pd.DataFrame:
+    anchor_columns = [
+        "segment_id",
+        "segment_path",
+        "subject_key",
+        "timestamp_ms",
+        "state_target",
+        "start_target",
+        "end_target",
+        "start_loss_mask",
+        "end_loss_mask",
+        "distance_to_event_seconds",
+        "hand_relation",
+    ]
+    if output_step_seconds <= 0:
+        raise ValueError("output_step_seconds must be positive")
+    event_columns = [
+        "event_id",
+        "subject_key",
+        "start_ms",
+        "end_ms",
+        "hand_relation",
+        "valid_duration",
+    ]
+    if events.empty:
+        events = pd.DataFrame(columns=event_columns)
+    else:
+        missing = set(event_columns) - set(events.columns)
+        if missing:
+            raise ValueError(f"Events are missing columns: {sorted(missing)}")
     step_ms = int(output_step_seconds * 1000)
     sigma_ms = 6000.0
     rows: list[pd.DataFrame] = []
@@ -104,7 +133,7 @@ def build_anchor_index(
                 }
             )
         )
-    anchors = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    anchors = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=anchor_columns)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     anchors.to_parquet(output_path, index=False)
     return anchors
@@ -112,6 +141,11 @@ def build_anchor_index(
 
 def classify_event_coverage(events: pd.DataFrame, segments: pd.DataFrame) -> pd.DataFrame:
     classified = events.copy()
+    if classified.empty:
+        classified["coverage"] = pd.Series(dtype="object")
+        return classified
+    if "valid_duration" not in classified.columns:
+        classified["valid_duration"] = False
     coverage: list[str] = []
     for event in classified.itertuples(index=False):
         if not event.valid_duration:

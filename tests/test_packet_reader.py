@@ -1,9 +1,16 @@
 import csv
 import io
 import json
+import pickle
 import zipfile
 
-from bme_eating.data.packet_reader import parse_sensor_zip
+import pytest
+
+from bme_eating.data.packet_reader import (
+    UnsupportedSensorFormatError,
+    inspect_ppg_layout,
+    parse_sensor_zip,
+)
 
 
 def test_packet_timestamps_are_expanded(tmp_path):
@@ -35,4 +42,27 @@ def test_packet_timestamps_are_expanded(tmp_path):
     assert parsed.acc.timestamp_ms[1] == 1050
     assert parsed.ppg.timestamp_ms[0] == 1000
     assert parsed.ppg.timestamp_ms[1] > parsed.ppg.timestamp_ms[0]
+
+
+def test_binary_sensor_member_is_reported_without_crashing_audit(tmp_path):
+    path = tmp_path / "binary.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("info.json", json.dumps({"metadataType": "SensorOriginalData"}))
+        archive.writestr("sensor.txt", b"\x00\xff\x99\x05\x08\x01\x00\x00")
+
+    layout = inspect_ppg_layout(path)
+    assert layout["status"] == "unsupported_binary"
+    assert layout["text_member"] == "sensor.txt"
+    assert layout["rows_scanned"] == 0
+
+    with pytest.raises(UnsupportedSensorFormatError, match="not UTF-8 text"):
+        parse_sensor_zip(path)
+
+
+def test_unsupported_sensor_format_error_is_process_pool_pickleable(tmp_path):
+    error = UnsupportedSensorFormatError(tmp_path / "sample.zip", "sensor.txt", "binary")
+    restored = pickle.loads(pickle.dumps(error))
+    assert restored.zip_path == error.zip_path
+    assert restored.member_name == error.member_name
+    assert restored.reason == error.reason
 

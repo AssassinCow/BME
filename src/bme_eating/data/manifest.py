@@ -22,7 +22,10 @@ def _parse_hand(value: object) -> str:
 def _load_download_state(data_root: Path) -> dict[str, Any]:
     state_path = data_root / "manifests" / "download_state.json"
     with state_path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        state = json.load(handle)
+    if not isinstance(state, dict) or not isinstance(state.get("attachments", []), list):
+        raise ValueError(f"Invalid download state format: {state_path}")
+    return state
 
 
 def _resolve_attachment_path(data_root: Path, relative_path: str | Path) -> Path:
@@ -87,7 +90,15 @@ def build_secure_indices(
                 "zip_size_bytes": int(item.get("size_bytes") or absolute_path.stat().st_size),
             }
         )
-    records = pd.DataFrame(attachment_rows).drop_duplicates("zip_path")
+    record_columns = [
+        "subject_key",
+        "uniqueid",
+        "object_path",
+        "zip_path",
+        "zip_sha256",
+        "zip_size_bytes",
+    ]
+    records = pd.DataFrame(attachment_rows, columns=record_columns).drop_duplicates("zip_path")
 
     meals = meal_metadata[meal_metadata["normalized_subject"].isin(valid_subjects)].copy()
     meals["subject_key"] = meals["normalized_subject"].map(
@@ -119,7 +130,11 @@ def build_secure_indices(
             "hand_relation",
         ]
     ].copy()
-    events["valid_duration"] = events["end_ms"] > events["start_ms"]
+    events["valid_duration"] = (
+        events["start_ms"].notna()
+        & events["end_ms"].notna()
+        & (events["end_ms"] > events["start_ms"])
+    )
 
     secure_dir = output_root / "indices"
     secure_dir.mkdir(parents=True, exist_ok=True)

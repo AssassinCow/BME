@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from bme_eating.data.deep_dataset import _load_segment_archive
 from bme_eating.features.signal import ppg_quality_features, robust_statistics, spectral_summary
 
 
@@ -136,13 +137,13 @@ def build_segment_features(
     motion_bucket_seconds: list[int],
     ppg_bucket_seconds: list[int],
 ) -> pd.DataFrame:
-    with np.load(segment_path) as payload:
-        motion_time = payload["motion_timestamp_ms"]
-        motion_values = payload["motion_values"]
-        motion_mask = payload["motion_mask"].astype(bool)
-        ppg_time = payload["ppg_timestamp_ms"]
-        ppg_values = payload["ppg_values"].reshape(-1)
-        ppg_mask = payload["ppg_mask"].astype(bool).reshape(-1)
+    payload = _load_segment_archive(segment_path)
+    motion_time = payload["motion_timestamp_ms"]
+    motion_values = payload["motion_values"]
+    motion_mask = payload["motion_mask"].astype(bool)
+    ppg_time = payload["ppg_timestamp_ms"]
+    ppg_values = payload["ppg_values"].reshape(-1)
+    ppg_mask = payload["ppg_mask"].astype(bool).reshape(-1)
     rows: list[dict[str, object]] = []
     for anchor in anchors.itertuples(index=False):
         end_ms = int(anchor.timestamp_ms)

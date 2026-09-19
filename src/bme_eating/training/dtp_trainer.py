@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import math
 import random
-from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +13,7 @@ from sklearn.metrics import average_precision_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from bme_eating.data.deep_dataset import (
     DTPDataset,
@@ -77,13 +77,14 @@ def _prediction_frame(
     loader: DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype,
+    description: str = "Inference",
 ) -> tuple[pd.DataFrame, float]:
     model.eval()
     rows: list[dict[str, object]] = []
     targets: list[float] = []
     probabilities: list[float] = []
     with torch.inference_mode():
-        for batch in loader:
+        for batch in tqdm(loader, desc=description, unit="batch", leave=False):
             moved = _move_batch(batch, device)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
                 output = model(moved)
@@ -106,6 +107,12 @@ def _prediction_frame(
                 )
     auprc = average_precision_score(np.asarray(targets) > 0, probabilities) if targets else 0.0
     return pd.DataFrame(rows), float(auprc)
+
+
+def _save_torch_checkpoint(payload: dict[str, Any], path: Path) -> None:
+    temporary_path = path.with_name(path.name + ".tmp")
+    torch.save(payload, temporary_path)
+    temporary_path.replace(path)
 
 
 def _postprocess_kwargs(config: dict[str, Any]) -> dict[str, float]:
@@ -142,6 +149,10 @@ def train_dtp_fold(
     train_anchors = train_anchors.reset_index(drop=True)
     validation_anchors = validation_anchors.reset_index(drop=True)
     test_anchors = test_anchors.reset_index(drop=True)
+    if train_anchors.empty or validation_anchors.empty or test_anchors.empty:
+        raise ValueError(
+            f"Fold {outer_fold} must have non-empty train, validation, and test anchors"
+        )
     validation_proxy = _validation_proxy(
         validation_anchors,
         int(training_config["validation_background_segments_per_subject"]),
@@ -217,8 +228,11 @@ def train_dtp_fold(
         weight_decay=float(training_config["weight_decay"]),
     )
     accumulation = int(training_config["gradient_accumulation"])
+    max_epochs = int(training_config["max_epochs"])
+    if accumulation <= 0 or max_epochs <= 0:
+        raise ValueError("gradient_accumulation and max_epochs must be positive")
     total_steps = (
-        math.ceil(len(train_loader) / accumulation) * int(training_config["max_epochs"])
+        math.ceil(len(train_loader) / accumulation) * max_epochs
     )
     scheduler = LambdaLR(
         optimizer,
@@ -243,6 +257,7 @@ def train_dtp_fold(
     patience = 0
     history: list[dict[str, float]] = []
     checkpoint_path = output_dir / "best.pt"
+    last_checkpoint_path = output_dir / "last.pt"
     if resume_path is not None:
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model"])
@@ -252,6 +267,9 @@ def train_dtp_fold(
         start_epoch = int(checkpoint["epoch"]) + 1
         best_f1 = float(checkpoint["best_f1"])
         best_boundary_mae = float(checkpoint["best_boundary_mae"])
+        patience = int(checkpoint.get("patience", 0))
+        history = list(checkpoint.get("history", []))
+        tqdm.write(f"Resuming DTP-SQF at epoch {start_epoch + 1}/{max_epochs}")
 
     validation_subjects = set(validation_anchors["subject_key"].unique())
     validation_truth = events[
@@ -259,12 +277,18 @@ def train_dtp_fold(
         & events["valid_duration"]
         & (events["coverage"] == "full")
     ]
-    for epoch in range(start_epoch, int(training_config["max_epochs"])):
+    for epoch in range(start_epoch, max_epochs):
         batch_sampler.set_epoch(epoch)
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
-        for batch_index, batch in enumerate(train_loader):
+        train_progress = tqdm(
+            train_loader,
+            desc=f"Epoch {epoch + 1}/{max_epochs}",
+            unit="batch",
+            leave=False,
+        )
+        for batch_index, batch in enumerate(train_progress):
             moved = _move_batch(batch, device)
             with torch.amp.autocast("cuda", dtype=amp_dtype):
                 output = model(moved)
@@ -272,6 +296,7 @@ def train_dtp_fold(
                 scaled_loss = loss / accumulation
             scaler.scale(scaled_loss).backward()
             running_loss += float(loss.detach().cpu())
+            train_progress.set_postfix(loss=f"{running_loss / (batch_index + 1):.4f}")
             if (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(train_loader):
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
@@ -295,10 +320,35 @@ def train_dtp_fold(
                 }
             )
             pd.DataFrame(history).to_csv(output_dir / "history.csv", index=False)
+            _save_torch_checkpoint(
+                {
+                    "epoch": epoch,
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "scaler": scaler.state_dict(),
+                    "best_f1": best_f1,
+                    "best_boundary_mae": best_boundary_mae,
+                    "patience": patience,
+                    "history": history,
+                    "model_config": model_config,
+                    "training_config": training_config,
+                    "outer_fold": outer_fold,
+                },
+                last_checkpoint_path,
+            )
+            tqdm.write(
+                f"Epoch {epoch + 1}/{max_epochs}: "
+                f"train_loss={history[-1]['train_loss']:.4f}; validation skipped"
+            )
             continue
 
         validation_predictions, validation_auprc = _prediction_frame(
-            model, validation_loader, device, amp_dtype
+            model,
+            validation_loader,
+            device,
+            amp_dtype,
+            description=f"Validating epoch {epoch + 1}",
         )
         validation_events = probabilities_to_events(
             validation_predictions, **_postprocess_kwargs(postprocess_config)
@@ -332,32 +382,45 @@ def train_dtp_fold(
             best_f1 = metrics["f1"]
             best_boundary_mae = boundary_mae
             patience = 0
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "scheduler": scheduler.state_dict(),
-                    "scaler": scaler.state_dict(),
-                    "best_f1": best_f1,
-                    "best_boundary_mae": best_boundary_mae,
-                    "model_config": model_config,
-                    "training_config": training_config,
-                    "outer_fold": outer_fold,
-                },
-                checkpoint_path,
-            )
+        else:
+            patience += 1
+        checkpoint_payload = {
+            "epoch": epoch,
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
+            "best_f1": best_f1,
+            "best_boundary_mae": best_boundary_mae,
+            "patience": patience,
+            "history": history,
+            "model_config": model_config,
+            "training_config": training_config,
+            "outer_fold": outer_fold,
+        }
+        if improved:
+            _save_torch_checkpoint(checkpoint_payload, checkpoint_path)
             validation_predictions.to_parquet(
                 output_dir / "best_validation_predictions.parquet", index=False
             )
-        else:
-            patience += 1
-            if patience >= int(training_config["early_stopping_epochs"]):
-                break
+        _save_torch_checkpoint(checkpoint_payload, last_checkpoint_path)
+        tqdm.write(
+            f"Epoch {epoch + 1}/{max_epochs}: "
+            f"train_loss={history[-1]['train_loss']:.4f}, "
+            f"validation_auprc={validation_auprc:.4f}, "
+            f"validation_f1={metrics['f1']:.4f}, patience={patience}"
+        )
+        if patience >= int(training_config["early_stopping_epochs"]):
+            tqdm.write("Early stopping threshold reached.")
+            break
 
+    if not checkpoint_path.exists():
+        raise RuntimeError("Training ended without producing a best checkpoint")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"])
-    test_predictions, test_auprc = _prediction_frame(model, test_loader, device, amp_dtype)
+    test_predictions, test_auprc = _prediction_frame(
+        model, test_loader, device, amp_dtype, description="Predicting test fold"
+    )
     test_predictions.to_parquet(output_dir / "test_predictions.parquet", index=False)
     metadata = {
         "outer_fold": outer_fold,

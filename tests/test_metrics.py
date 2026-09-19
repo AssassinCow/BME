@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from bme_eating.metrics import evaluate_events, match_events
 
@@ -25,4 +26,9 @@ def test_duplicate_predictions_match_one_truth_once():
     metrics, _ = evaluate_events(truth, prediction)
     assert metrics["true_positive"] == 1
     assert metrics["false_positive"] == 1
+
+
+def test_metrics_reject_reversed_intervals():
+    with pytest.raises(ValueError, match="positive duration"):
+        match_events(np.asarray([[100.0, 0.0]]), np.asarray([[0.0, 100.0]]))
 

@@ -20,3 +20,23 @@ def test_subjects_are_assigned_to_one_fold(tmp_path):
     assert set(folds) == {f"s{index}" for index in range(10)}
     assert all(0 <= fold < 5 for fold in folds.values())
 
+
+def test_background_subjects_without_full_events_are_assigned(tmp_path):
+    rows = [
+        {
+            "subject_key": "s0",
+            "event_id": "e0",
+            "valid_duration": True,
+            "coverage": "full",
+            "hand_relation": "same",
+        }
+    ]
+    folds = create_subject_folds(
+        pd.DataFrame(rows),
+        2,
+        2026,
+        tmp_path / "folds.json",
+        subject_keys={"s0", "background_only"},
+    )
+    assert set(folds) == {"s0", "background_only"}
+

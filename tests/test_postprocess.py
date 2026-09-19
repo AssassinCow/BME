@@ -1,6 +1,8 @@
 import pandas as pd
+import pytest
 
-from bme_eating.postprocess import probabilities_to_events
+import bme_eating.postprocess as postprocess_module
+from bme_eating.postprocess import probabilities_to_events, tune_postprocess_parameters
 
 
 def test_hysteresis_creates_one_event():
@@ -25,4 +27,101 @@ def test_hysteresis_creates_one_event():
     )
     assert len(events) == 1
     assert events.iloc[0].end_ms > events.iloc[0].start_ms
+
+
+def test_duplicate_prediction_timestamps_are_collapsed():
+    frame = pd.DataFrame(
+        {
+            "subject_key": ["s", "s", "s"],
+            "segment_id": ["x", "x", "x"],
+            "timestamp_ms": [0, 0, 3000],
+            "state_probability": [0.8, 0.8, 0.0],
+            "start_probability": [0.9, 0.7, 0.0],
+            "end_probability": [0.0, 0.0, 0.9],
+        }
+    )
+    events = probabilities_to_events(frame, 1, 0.6, 0.3, 0, 0, 3)
+    assert len(events) == 1
+
+
+def test_postprocess_rejects_nonfinite_probability():
+    frame = pd.DataFrame(
+        {
+            "subject_key": ["s"],
+            "segment_id": ["x"],
+            "timestamp_ms": [0],
+            "state_probability": [float("nan")],
+            "start_probability": [0.0],
+            "end_probability": [0.0],
+        }
+    )
+    with pytest.raises(ValueError, match="finite"):
+        probabilities_to_events(frame, 1, 0.6, 0.3, 0, 0, 3)
+
+
+def test_postprocess_search_resumes_from_matching_checkpoint(tmp_path, monkeypatch):
+    predictions = pd.DataFrame(
+        {
+            "subject_key": ["s"] * 4,
+            "segment_id": ["x"] * 4,
+            "timestamp_ms": [0, 3000, 6000, 9000],
+            "state_probability": [0.0, 0.9, 0.8, 0.0],
+            "start_probability": [0.0, 1.0, 0.0, 0.0],
+            "end_probability": [0.0, 0.0, 0.0, 1.0],
+        }
+    )
+    truth = pd.DataFrame(
+        {"subject_key": ["s"], "start_ms": [3000], "end_ms": [9000]}
+    )
+    search = {
+        "ema_half_life_seconds": [0.1],
+        "high_threshold": [0.6, 0.7],
+        "low_threshold": [0.3],
+        "minimum_event_seconds": [0],
+        "merge_gap_seconds": [0],
+        "boundary_lookback_seconds": [3],
+    }
+    checkpoint = tmp_path / "postprocess.checkpoint.jsonl"
+    calls = 0
+    original = postprocess_module.evaluate_events
+
+    def counted_evaluate(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(postprocess_module, "evaluate_events", counted_evaluate)
+    first_best, first_trials = tune_postprocess_parameters(
+        predictions,
+        truth,
+        search,
+        0.25,
+        checkpoint_path=checkpoint,
+        show_progress=False,
+    )
+    checkpoint_lines = checkpoint.read_text(encoding="utf-8").splitlines()
+    checkpoint.write_text(
+        "\n".join(checkpoint_lines[:2]) + '\n{"interrupted":', encoding="utf-8"
+    )
+    second_best, second_trials = tune_postprocess_parameters(
+        predictions,
+        truth,
+        search,
+        0.25,
+        checkpoint_path=checkpoint,
+        show_progress=False,
+    )
+    third_best, third_trials = tune_postprocess_parameters(
+        predictions,
+        truth,
+        search,
+        0.25,
+        checkpoint_path=checkpoint,
+        show_progress=False,
+    )
+
+    assert calls == 3
+    assert first_best == second_best == third_best
+    pd.testing.assert_frame_equal(first_trials, second_trials)
+    pd.testing.assert_frame_equal(first_trials, third_trials)
 
