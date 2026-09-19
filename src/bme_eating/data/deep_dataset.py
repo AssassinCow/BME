@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from collections import OrderedDict
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -202,6 +203,10 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         training: bool = False,
         ppg_augmentation_probability: float = 0.0,
         seed: int = 2026,
+        motion_block_seconds: int = 3,
+        ppg_block_seconds: int = 15,
+        motion_bucket_counts: Sequence[int] = (1, 2, 4, 8, 16, 32, 64),
+        ppg_bucket_counts: Sequence[int] = (1, 2, 4, 8, 16),
     ) -> None:
         self.anchors = anchors.reset_index(drop=True)
         self.session_reader = SessionWindowReader(segments, cache_size=8)
@@ -210,6 +215,25 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         self.training = training
         self.ppg_augmentation_probability = float(ppg_augmentation_probability)
         self.seed = int(seed)
+        self.motion_block_seconds = int(motion_block_seconds)
+        self.ppg_block_seconds = int(ppg_block_seconds)
+        self.motion_bucket_counts = tuple(int(value) for value in motion_bucket_counts)
+        self.ppg_bucket_counts = tuple(int(value) for value in ppg_bucket_counts)
+        if self.motion_block_seconds <= 0 or self.ppg_block_seconds <= 0:
+            raise ValueError("DTP block durations must be positive")
+        if not self.motion_bucket_counts or min(self.motion_bucket_counts) <= 0:
+            raise ValueError("Motion bucket counts must be non-empty and positive")
+        if not self.ppg_bucket_counts or min(self.ppg_bucket_counts) <= 0:
+            raise ValueError("PPG bucket counts must be non-empty and positive")
+        if self.future_context_seconds and (
+            self.future_context_seconds % self.motion_block_seconds != 0
+            or self.future_context_seconds % self.ppg_block_seconds != 0
+        ):
+            raise ValueError("Future context must be divisible by both DTP block durations")
+        self.motion_block_count = sum(self.motion_bucket_counts)
+        self.ppg_block_count = sum(self.ppg_bucket_counts)
+        self.motion_history_seconds = self.motion_block_seconds * self.motion_block_count
+        self.ppg_history_seconds = self.ppg_block_seconds * self.ppg_block_count
         self._cache: OrderedDict[str, dict[str, np.ndarray]] = OrderedDict()
         self._cache_size = 4
 
@@ -237,9 +261,12 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         rng: np.random.Generator,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         raw, valid = _sample_grid(timestamp_ms, values, mask, start_ms, seconds, 50)
-        block_count = seconds // 15
-        raw = raw.reshape(block_count, 750)
-        valid = valid.reshape(block_count, 750)
+        if seconds % self.ppg_block_seconds != 0:
+            raise ValueError("PPG duration must be divisible by the configured block duration")
+        block_count = seconds // self.ppg_block_seconds
+        samples_per_block = self.ppg_block_seconds * 50
+        raw = raw.reshape(block_count, samples_per_block)
+        valid = valid.reshape(block_count, samples_per_block)
         quality_features = np.zeros((block_count, 8), dtype=np.float32)
         quality_target = np.zeros(block_count, dtype=np.float32)
         for block_index in range(block_count):
@@ -261,20 +288,23 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         anchor = self.anchors.iloc[index]
         timestamp_ms = int(anchor.timestamp_ms)
         session_id = str(getattr(anchor, "session_id", anchor.segment_id))
+        maximum_history_seconds = max(
+            self.motion_history_seconds, self.ppg_history_seconds
+        )
         payload = self.session_reader.read(
             session_id,
-            timestamp_ms - 465_000,
+            timestamp_ms - maximum_history_seconds * 1000,
             timestamp_ms + self.future_context_seconds * 1000,
         )
         rng = np.random.default_rng(self.seed + index)
 
-        motion_start = timestamp_ms - 381_000
+        motion_start = timestamp_ms - self.motion_history_seconds * 1000
         motion, motion_mask = _sample_grid(
             payload["motion_timestamp_ms"],
             payload["motion_values"],
             payload["motion_mask"].astype(bool),
             motion_start,
-            381,
+            self.motion_history_seconds,
             100,
         )
         motion = np.clip(
@@ -283,8 +313,11 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             10.0,
         )
         motion[~motion_mask] = 0.0
-        motion = motion.reshape(127, 300, 6)
-        motion_mask = motion_mask.reshape(127, 300, 6)
+        motion_samples_per_block = self.motion_block_seconds * 100
+        motion = motion.reshape(self.motion_block_count, motion_samples_per_block, 6)
+        motion_mask = motion_mask.reshape(
+            self.motion_block_count, motion_samples_per_block, 6
+        )
         motion_blocks = np.concatenate(
             (motion, motion_mask.astype(np.float32)), axis=2
         ).transpose(0, 2, 1)
@@ -294,8 +327,8 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             payload["ppg_timestamp_ms"],
             payload["ppg_values"],
             payload["ppg_mask"].astype(bool),
-            timestamp_ms - 465_000,
-            465,
+            timestamp_ms - self.ppg_history_seconds * 1000,
+            self.ppg_history_seconds,
             rng,
         )
         ppg_valid = (ppg_blocks[:, 1].mean(axis=1) > 0.5).astype(np.float32)
@@ -336,9 +369,14 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
                 10.0,
             )
             future_motion[~future_motion_mask] = 0.0
-            motion_count = self.future_context_seconds // 3
-            future_motion = future_motion.reshape(motion_count, 300, 6)
-            future_motion_mask = future_motion_mask.reshape(motion_count, 300, 6)
+            motion_count = self.future_context_seconds // self.motion_block_seconds
+            motion_samples_per_block = self.motion_block_seconds * 100
+            future_motion = future_motion.reshape(
+                motion_count, motion_samples_per_block, 6
+            )
+            future_motion_mask = future_motion_mask.reshape(
+                motion_count, motion_samples_per_block, 6
+            )
             result["future_motion_blocks"] = torch.from_numpy(
                 np.concatenate(
                     (future_motion, future_motion_mask.astype(np.float32)), axis=2
@@ -382,12 +420,16 @@ class SegmentBalancedBatchSampler(Sampler[list[int]]):
         self.positive_fraction = float(positive_fraction)
         self.seed = int(seed)
         self.epoch = 0
-        positive_rows = anchors[anchors["state_target"] > 0]
+        state_loss_mask = anchors.get(
+            "state_loss_mask", pd.Series(1.0, index=anchors.index)
+        )
+        eligible_rows = anchors[state_loss_mask.fillna(0.0).astype(float) > 0]
+        positive_rows = eligible_rows[eligible_rows["state_target"] > 0]
         self.positive_by_event: dict[str, np.ndarray] = {}
         for event_id, group in positive_rows.groupby("event_id", sort=True):
             key = str(event_id) or f"segment:{group.iloc[0].segment_id}"
             self.positive_by_event[key] = group.index.to_numpy(dtype=np.int64)
-        negative_rows = anchors[anchors["state_target"] <= 0]
+        negative_rows = eligible_rows[eligible_rows["state_target"] <= 0]
         distance = negative_rows["distance_to_event_seconds"].to_numpy(dtype=np.float64)
         self.near_negative = negative_rows.index.to_numpy(dtype=np.int64)[distance <= 1800.0]
         self.far_negative = negative_rows.index.to_numpy(dtype=np.int64)[distance > 1800.0]

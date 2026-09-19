@@ -111,6 +111,25 @@ def test_balanced_sampler_has_exact_positive_fraction_per_batch():
         assert int((anchors.loc[batch, "state_target"] > 0).sum()) == 4
 
 
+def test_balanced_sampler_excludes_state_masked_anchors():
+    anchors = pd.DataFrame(
+        {
+            "segment_id": ["s"] * 8,
+            "event_id": ["visible", "masked", "", "", "", "", "", ""],
+            "state_target": [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            "state_loss_mask": [1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            "distance_to_event_seconds": [0.0, 0.0, 30.0, 30.0, 60.0, 3600.0, 3600.0, 3600.0],
+        }
+    )
+    sampler = SegmentBalancedBatchSampler(anchors, 4, 10, 0.5, 2026)
+
+    sampled = {index for batch in sampler for index in batch}
+
+    assert 1 not in sampled
+    assert 3 not in sampled
+    assert sampled <= {0, 2, 4, 5, 6, 7}
+
+
 def test_downsampling_filter_attenuates_above_nyquist_energy():
     timestamps = np.arange(0, 4000, 2, dtype=np.int64)
     seconds = timestamps / 1000.0

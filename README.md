@@ -64,7 +64,13 @@ python scripts/audit_data.py --config configs/base.yaml --schema-zips all --maxi
 
 审计严格检查标准 53 列表头。对于带不透明二进制前缀的附件，只允许找到一次完整标准表头，并从该偏移开始按 UTF-8 TSV 严格解析。不会猜测或输出前缀内容。
 
-当前门禁为 39 名可确认受试者、1112 个附件、16 个 `recovered_text_suffix`。官方确认疑似误写 ID 后，应同时修改显式 alias 和期望值。
+当前严格审计确认 1112 个附件中有 1096 个 `documented_text`、4 个单表头 `recovered_text_suffix` 和 12 个重复表头附件。重复表头附件不得直接跳过表头拼接，先运行专项审计：
+
+```powershell
+python scripts/audit_multisection.py --config configs/base.yaml
+```
+
+专项审计只保存包级指纹、相对持续时间和冲突计数，不保存原始传感器值、文件名、受试者 ID 或绝对时间戳，也不会修改原始数据。出现 `conflicting_overlap`、`partial_overlap`、`mixed_relationships`、`nonmonotonic_section` 或 `invalid` 时命令会以非零状态结束，这是数据门禁生效，不是脚本崩溃。官方确认疑似误写 ID 后，应同时修改显式 alias 和期望值。
 
 ### 3.2 预处理、session 和 coverage
 
@@ -144,6 +150,8 @@ python scripts/build_features.py --config configs/baseline_dyadic.yaml --workers
 python scripts/train_xgboost.py --config configs/baseline_dyadic.yaml --fold 0
 ```
 
+指数桶采用右闭区间 `(start, end]`，相邻桶不共享边界样本。每个桶保留统计量、按原始时间位置计算的趋势、最后有效表示和有效率；PPG 桶另外保留零值段质量特征。特征缓存包含实现版本，修复后运行 `build_features.py` 会自动生成新缓存，不会复用旧桶特征。
+
 运动历史桶为 `1/2/4/8/16/32/64 x 3 秒`，总历史约 381 秒；PPG 为 `1/2/4/8/16 x 15 秒`，总历史约 465 秒。桶互不重叠，靠近当前时刻精细、远处压缩。所有历史通过 session reader 跨附件读取，但不跨 session。
 
 只有 fold 0 相对局部基线有稳定收益时，才运行全部五折。
@@ -154,6 +162,8 @@ python scripts/train_xgboost.py --config configs/baseline_dyadic.yaml --fold 0
 python scripts/smoke_test_model.py --config configs/dtp_sqf.yaml --batch-size 1
 python scripts/train_dtp_sqf.py --config configs/dtp_sqf.yaml --fold 0
 ```
+
+DTP 历史长度、块数、桶时长和桶年龄均由 `motion_block_seconds`、`ppg_block_seconds` 及两组 `bucket_counts` 推导。`state_loss_mask=0` 的锚点不进入 batch 正负样本配额，也不进入窗口 AUPRC；它们仍可保留在完整时间轴预测中用于事件后处理。
 
 DTP 与指数桶共享 session reader。每个 batch 精确满足 `positive_sampling_fraction`，正样本按事件均匀选择，负样本由近事件和远背景组成。验证覆盖完整验证受试者时间轴，并在每个验证 epoch 搜索事件阈值，不再用固定 `0.6/0.3` 选择模型。
 
@@ -201,6 +211,7 @@ python scripts/compare_models.py `
 python scripts/check_environment.py
 python -m pytest -q
 python scripts/audit_data.py --config configs/base.yaml --schema-zips all --maximum-rows 1000000000
+python scripts/audit_multisection.py --config configs/base.yaml
 python scripts/preprocess_data.py --config configs/base.yaml --workers 8 --overwrite
 python scripts/validate_data.py --config configs/base.yaml
 # 人工确认后：

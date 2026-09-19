@@ -178,15 +178,44 @@ def _bucket_average(values: torch.Tensor, valid: torch.Tensor, widths: Sequence[
     return torch.stack(output, dim=1)
 
 
+def _bucket_geometry(counts: Sequence[int], block_seconds: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    durations = tuple(int(count) * int(block_seconds) for count in counts)
+    ages: list[int] = []
+    elapsed = 0
+    for duration in durations:
+        ages.append(elapsed)
+        elapsed += duration
+    return durations, tuple(ages)
+
+
 class DTPSQF(nn.Module):
     def __init__(self, config: dict[str, object]) -> None:
         super().__init__()
         embedding_dim = int(config["embedding_dim"])
         token_dim = int(config["token_dim"])
         dropout = float(config["dropout"])
+        self.motion_block_seconds = int(config.get("motion_block_seconds", 3))
+        self.ppg_block_seconds = int(config.get("ppg_block_seconds", 15))
         self.motion_bucket_counts = tuple(int(value) for value in config["motion_bucket_counts"])
         self.ppg_bucket_counts = tuple(int(value) for value in config["ppg_bucket_counts"])
         self.future_context_seconds = int(config.get("future_context_seconds", 0))
+        if self.motion_block_seconds <= 0 or self.ppg_block_seconds <= 0:
+            raise ValueError("DTP block durations must be positive")
+        if not self.motion_bucket_counts or min(self.motion_bucket_counts) <= 0:
+            raise ValueError("Motion bucket counts must be non-empty and positive")
+        if not self.ppg_bucket_counts or min(self.ppg_bucket_counts) <= 0:
+            raise ValueError("PPG bucket counts must be non-empty and positive")
+        if self.future_context_seconds and (
+            self.future_context_seconds % self.motion_block_seconds != 0
+            or self.future_context_seconds % self.ppg_block_seconds != 0
+        ):
+            raise ValueError("Future context must be divisible by both DTP block durations")
+        self.motion_bucket_durations, self.motion_bucket_ages = _bucket_geometry(
+            self.motion_bucket_counts, self.motion_block_seconds
+        )
+        self.ppg_bucket_durations, self.ppg_bucket_ages = _bucket_geometry(
+            self.ppg_bucket_counts, self.ppg_block_seconds
+        )
 
         self.motion_encoder = LocalEncoder(
             input_channels=12,
@@ -232,7 +261,10 @@ class DTPSQF(nn.Module):
         self.future_ppg_missing = nn.Parameter(torch.zeros(1, 1, token_dim))
         self.query = nn.Parameter(torch.zeros(1, 1, token_dim))
         self.modality_embedding = nn.Embedding(4, token_dim)
-        self.scale_embedding = nn.Embedding(9, token_dim)
+        self.maximum_scale = max(
+            len(self.motion_bucket_counts), len(self.ppg_bucket_counts)
+        ) + 1
+        self.scale_embedding = nn.Embedding(self.maximum_scale + 1, token_dim)
         self.time_projection = nn.Sequential(nn.Linear(3, token_dim), nn.Tanh())
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=token_dim,
@@ -342,10 +374,6 @@ class DTPSQF(nn.Module):
         tokens = torch.cat(
             (query, motion_tokens, ppg_tokens, future_motion_token, future_ppg_token), dim=1
         )
-        motion_durations = [3, 6, 12, 24, 48, 96, 192]
-        motion_ages = [0, 3, 9, 21, 45, 93, 189]
-        ppg_durations = [15, 30, 60, 120, 240]
-        ppg_ages = [0, 15, 45, 105, 225]
         motion_bucket_valid = torch.stack(
             [
                 block.float().mean(dim=1)
@@ -369,10 +397,22 @@ class DTPSQF(nn.Module):
         )
         tokens = self._decorate(
             tokens,
-            modality=[0] + [1] * 7 + [2] * 5 + [3, 3],
-            scale=[0] + list(range(1, 8)) + list(range(1, 6)) + [8, 8],
-            duration_seconds=[0] + motion_durations + ppg_durations + [self.future_context_seconds] * 2,
-            age_seconds=[0] + motion_ages + ppg_ages + [-self.future_context_seconds] * 2,
+            modality=[0]
+            + [1] * len(self.motion_bucket_counts)
+            + [2] * len(self.ppg_bucket_counts)
+            + [3, 3],
+            scale=[0]
+            + list(range(1, len(self.motion_bucket_counts) + 1))
+            + list(range(1, len(self.ppg_bucket_counts) + 1))
+            + [self.maximum_scale, self.maximum_scale],
+            duration_seconds=[0]
+            + list(self.motion_bucket_durations)
+            + list(self.ppg_bucket_durations)
+            + [self.future_context_seconds] * 2,
+            age_seconds=[0]
+            + list(self.motion_bucket_ages)
+            + list(self.ppg_bucket_ages)
+            + [-self.future_context_seconds] * 2,
             valid_fraction=valid_fraction,
         )
         encoded = self.transformer(tokens)

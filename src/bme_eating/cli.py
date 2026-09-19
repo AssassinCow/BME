@@ -18,6 +18,7 @@ from tqdm import tqdm
 from bme_eating.config import load_config, resolve_roots
 from bme_eating.data.labels import build_anchor_index, classify_event_coverage
 from bme_eating.data.manifest import build_secure_indices
+from bme_eating.data.multisection import audit_repeated_header_attachments
 from bme_eating.data.packet_reader import UnsupportedSensorFormatError, inspect_ppg_layout
 from bme_eating.data.preprocess import (
     assign_virtual_sessions,
@@ -46,6 +47,8 @@ _RECOVERABLE_INPUT_ERRORS = (
     TypeError,
     RuntimeError,
 )
+
+_FEATURE_CACHE_SCHEMA_VERSION = "v2.1-nonoverlap-terminal-validity"
 
 
 def _invalid_subjects(config: dict[str, Any]) -> set[str]:
@@ -249,6 +252,47 @@ def command_audit(args: argparse.Namespace) -> None:
     if active_slots > int(config["data"]["ppg_samples_per_row"]):
         raise SystemExit(
             "Observed nonzero PPG slots exceed ppg_samples_per_row; update config before preprocessing."
+        )
+
+
+def command_audit_multisection(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    _, output_root = resolve_roots(config)
+    index_dir = output_root / "indices"
+    records_path = index_dir / "records.parquet"
+    schema_audit_path = index_dir / "schema_audit.json"
+    if not records_path.exists() or not schema_audit_path.exists():
+        raise SystemExit("Run the full schema audit before the multisection audit.")
+    records = pd.read_parquet(records_path)
+    schema_audit = json.loads(schema_audit_path.read_text(encoding="utf-8"))
+    report = audit_repeated_header_attachments(
+        records,
+        schema_audit,
+        int(config["data"]["ppg_samples_per_row"]),
+        show_progress=True,
+    )
+    output_path = index_dir / "multisection_audit.json"
+    temporary_path = output_path.with_name(output_path.name + ".tmp")
+    temporary_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary_path.replace(output_path)
+    summary = {
+        "attachments_audited": report["attachments_audited"],
+        "classification_counts": report["classification_counts"],
+        "automatic_recovery_performed": False,
+    }
+    print(output_path)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    blocking = {
+        key: value
+        for key, value in report["classification_counts"].items()
+        if key not in {"exact_duplicate_overlap", "disjoint_sections"} and int(value) > 0
+    }
+    if blocking:
+        raise SystemExit(
+            "Multisection audit found attachments that are not safe for exact deduplication: "
+            + json.dumps(blocking, sort_keys=True)
         )
 
 
@@ -458,6 +502,7 @@ def _feature_cache_path(
     path = Path(segment_path)
     stat = path.stat()
     digest = hashlib.sha256()
+    digest.update(_FEATURE_CACHE_SCHEMA_VERSION.encode())
     digest.update(
         json.dumps(feature_config, sort_keys=True, separators=(",", ":")).encode()
     )
@@ -936,32 +981,52 @@ def command_smoke_model(args: argparse.Namespace) -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is unavailable. Run this command on the RTX 4080 computer.")
     device = torch.device("cuda")
-    future = int(config["model"].get("future_context_seconds", 0))
+    model = DTPSQF(config["model"]).to(device)
+    future = model.future_context_seconds
     batch_size = int(args.batch_size)
+    motion_block_count = sum(model.motion_bucket_counts)
+    ppg_block_count = sum(model.ppg_bucket_counts)
+    motion_samples = model.motion_block_seconds * 100
+    ppg_samples = model.ppg_block_seconds * 50
     batch: dict[str, torch.Tensor] = {
-        "motion_blocks": torch.randn(batch_size, 127, 12, 300, device=device),
-        "motion_valid": torch.ones(batch_size, 127, device=device),
-        "ppg_blocks": torch.randn(batch_size, 31, 2, 750, device=device),
-        "ppg_quality": torch.rand(batch_size, 31, 8, device=device),
-        "ppg_valid": torch.ones(batch_size, 31, device=device),
+        "motion_blocks": torch.randn(
+            batch_size, motion_block_count, 12, motion_samples, device=device
+        ),
+        "motion_valid": torch.ones(batch_size, motion_block_count, device=device),
+        "ppg_blocks": torch.randn(
+            batch_size, ppg_block_count, 2, ppg_samples, device=device
+        ),
+        "ppg_quality": torch.rand(batch_size, ppg_block_count, 8, device=device),
+        "ppg_valid": torch.ones(batch_size, ppg_block_count, device=device),
     }
     if future:
         batch.update(
             {
                 "future_motion_blocks": torch.randn(
-                    batch_size, future // 3, 12, 300, device=device
+                    batch_size,
+                    future // model.motion_block_seconds,
+                    12,
+                    motion_samples,
+                    device=device,
                 ),
-                "future_motion_valid": torch.ones(batch_size, future // 3, device=device),
+                "future_motion_valid": torch.ones(
+                    batch_size, future // model.motion_block_seconds, device=device
+                ),
                 "future_ppg_blocks": torch.randn(
-                    batch_size, future // 15, 2, 750, device=device
+                    batch_size,
+                    future // model.ppg_block_seconds,
+                    2,
+                    ppg_samples,
+                    device=device,
                 ),
                 "future_ppg_quality": torch.rand(
-                    batch_size, future // 15, 8, device=device
+                    batch_size, future // model.ppg_block_seconds, 8, device=device
                 ),
-                "future_ppg_valid": torch.ones(batch_size, future // 15, device=device),
+                "future_ppg_valid": torch.ones(
+                    batch_size, future // model.ppg_block_seconds, device=device
+                ),
             }
         )
-    model = DTPSQF(config["model"]).to(device)
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
         output = model(batch)
     print({key: tuple(value.shape) for key, value in output.items()})

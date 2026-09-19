@@ -9,7 +9,6 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import average_precision_score
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -21,7 +20,11 @@ from bme_eating.data.deep_dataset import (
     compute_normalization,
     save_normalization,
 )
-from bme_eating.metrics import evaluate_events, partition_evaluation_events
+from bme_eating.metrics import (
+    evaluate_events,
+    masked_average_precision,
+    partition_evaluation_events,
+)
 from bme_eating.models.dtp_sqf import DTPSQF
 from bme_eating.models.losses import DTPLoss
 from bme_eating.models.xgb_baseline import assign_train_validation_test
@@ -67,6 +70,7 @@ def _prediction_frame(
     rows: list[dict[str, object]] = []
     targets: list[float] = []
     probabilities: list[float] = []
+    state_masks: list[float] = []
     with torch.inference_mode():
         for batch in tqdm(loader, desc=description, unit="batch", leave=False):
             moved = _move_batch(batch, device)
@@ -76,8 +80,10 @@ def _prediction_frame(
             start = torch.sigmoid(output["start_logit"]).cpu().numpy()
             end = torch.sigmoid(output["end_logit"]).cpu().numpy()
             target = batch["state_target"].numpy()
+            state_mask = batch.get("state_loss_mask", torch.ones_like(batch["state_target"]))
             targets.extend(target.tolist())
             probabilities.extend(state.tolist())
+            state_masks.extend(state_mask.numpy().tolist())
             for index in range(len(state)):
                 rows.append(
                     {
@@ -90,7 +96,9 @@ def _prediction_frame(
                         "end_probability": float(end[index]),
                     }
                 )
-    auprc = average_precision_score(np.asarray(targets) > 0, probabilities) if targets else 0.0
+    auprc = masked_average_precision(
+        np.asarray(targets), np.asarray(probabilities), np.asarray(state_masks)
+    )
     return pd.DataFrame(rows), float(auprc)
 
 
@@ -152,6 +160,10 @@ def train_dtp_fold(
         training=True,
         ppg_augmentation_probability=float(training_config["ppg_augmentation_probability"]),
         seed=seed,
+        motion_block_seconds=int(model_config.get("motion_block_seconds", 3)),
+        ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
+        motion_bucket_counts=model_config["motion_bucket_counts"],
+        ppg_bucket_counts=model_config["ppg_bucket_counts"],
     )
     validation_dataset = DTPDataset(
         validation_anchors,
@@ -160,6 +172,10 @@ def train_dtp_fold(
         future_context_seconds=future_seconds,
         training=False,
         seed=seed,
+        motion_block_seconds=int(model_config.get("motion_block_seconds", 3)),
+        ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
+        motion_bucket_counts=model_config["motion_bucket_counts"],
+        ppg_bucket_counts=model_config["ppg_bucket_counts"],
     )
     test_dataset = DTPDataset(
         test_anchors,
@@ -168,6 +184,10 @@ def train_dtp_fold(
         future_context_seconds=future_seconds,
         training=False,
         seed=seed,
+        motion_block_seconds=int(model_config.get("motion_block_seconds", 3)),
+        ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
+        motion_bucket_counts=model_config["motion_bucket_counts"],
+        ppg_bucket_counts=model_config["ppg_bucket_counts"],
     )
     batch_sampler = SegmentBalancedBatchSampler(
         train_anchors,
@@ -222,7 +242,11 @@ def train_dtp_fold(
         optimizer,
         _learning_rate_schedule(float(training_config["warmup_fraction"]), total_steps),
     )
-    positive_rate = float((train_anchors["state_target"] > 0).mean())
+    train_state_mask = train_anchors.get(
+        "state_loss_mask", pd.Series(1.0, index=train_anchors.index)
+    )
+    eligible_train = train_anchors[train_state_mask.fillna(0.0).astype(float) > 0]
+    positive_rate = float((eligible_train["state_target"] > 0).mean())
     positive_alpha = float(np.clip(1.0 - positive_rate, 0.5, 0.95))
     criterion = DTPLoss(
         positive_alpha=positive_alpha,

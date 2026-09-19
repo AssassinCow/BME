@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
+from sklearn.metrics import average_precision_score
 
 
 @dataclass(frozen=True)
@@ -12,6 +13,23 @@ class Match:
     truth_index: int
     prediction_index: int
     iou: float
+
+
+def masked_average_precision(
+    targets: np.ndarray, probabilities: np.ndarray, mask: np.ndarray
+) -> float:
+    targets = np.asarray(targets, dtype=np.float64).reshape(-1)
+    probabilities = np.asarray(probabilities, dtype=np.float64).reshape(-1)
+    mask = np.asarray(mask, dtype=np.float64).reshape(-1)
+    if not (len(targets) == len(probabilities) == len(mask)):
+        raise ValueError("Targets, probabilities, and mask must have equal lengths")
+    eligible = (mask > 0) & np.isfinite(targets) & np.isfinite(probabilities)
+    if not eligible.any():
+        return 0.0
+    binary_targets = targets[eligible] > 0
+    if not binary_targets.any():
+        return 0.0
+    return float(average_precision_score(binary_targets, probabilities[eligible]))
 
 
 def partition_evaluation_events(

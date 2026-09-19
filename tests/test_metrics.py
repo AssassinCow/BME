@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from bme_eating.metrics import evaluate_events, match_events
+from bme_eating.metrics import evaluate_events, masked_average_precision, match_events
 
 
 def test_iou_must_be_strictly_greater_than_threshold():
@@ -51,4 +51,31 @@ def test_predictions_overlapping_ignore_intervals_are_not_false_positives():
     metrics, _ = evaluate_events(truth, prediction, ignore=ignore)
     assert metrics["false_positive"] == 0
     assert metrics["ignored_predictions"] == 1
+
+
+def test_window_auprc_excludes_state_masked_anchors():
+    auprc = masked_average_precision(
+        targets=np.array([1.0, 0.0, 0.0]),
+        probabilities=np.array([0.9, 0.1, 0.99]),
+        mask=np.array([1.0, 1.0, 0.0]),
+    )
+
+    assert np.isclose(auprc, 1.0)
+
+
+def test_window_auprc_returns_zero_without_eligible_positive():
+    assert masked_average_precision(
+        targets=np.array([0.0, 1.0]),
+        probabilities=np.array([0.2, 0.8]),
+        mask=np.array([1.0, 0.0]),
+    ) == 0.0
+
+
+def test_window_auprc_rejects_mismatched_lengths():
+    with pytest.raises(ValueError, match="equal lengths"):
+        masked_average_precision(
+            targets=np.array([1.0]),
+            probabilities=np.array([0.9, 0.1]),
+            mask=np.array([1.0]),
+        )
 
