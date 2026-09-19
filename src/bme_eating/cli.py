@@ -18,7 +18,11 @@ from tqdm import tqdm
 from bme_eating.config import load_config, resolve_roots
 from bme_eating.data.labels import build_anchor_index, classify_event_coverage
 from bme_eating.data.manifest import build_secure_indices
-from bme_eating.data.multisection import audit_repeated_header_attachments
+from bme_eating.data.multisection import (
+    audit_repeated_header_attachments,
+    validate_multisection_preprocess_policy,
+    write_quarantine_manifest,
+)
 from bme_eating.data.packet_reader import UnsupportedSensorFormatError, inspect_ppg_layout
 from bme_eating.data.preprocess import (
     assign_virtual_sessions,
@@ -302,6 +306,7 @@ def _preprocess_job(
     data_config: dict[str, object],
     compressed: bool,
     overwrite: bool,
+    parser_mode: str = "standard",
 ) -> tuple[list[dict[str, object]], dict[str, object] | None]:
     try:
         rows = preprocess_attachment(
@@ -310,6 +315,7 @@ def _preprocess_job(
             data_config,
             compressed=compressed,
             overwrite=overwrite,
+            parser_mode=parser_mode,
         )
     except UnsupportedSensorFormatError as error:
         return [], {
@@ -349,7 +355,43 @@ def command_preprocess(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     data_root, output_root = resolve_roots(config)
     records, events = _indices(config, data_root, output_root)
+    index_dir = output_root / "indices"
+    schema_audit_path = index_dir / "schema_audit.json"
+    multisection_audit_path = index_dir / "multisection_audit.json"
+    if not schema_audit_path.exists() or not multisection_audit_path.exists():
+        raise RuntimeError(
+            "Full schema and multisection audits are required before preprocessing"
+        )
+    schema_audit = json.loads(schema_audit_path.read_text(encoding="utf-8"))
+    multisection_audit = json.loads(
+        multisection_audit_path.read_text(encoding="utf-8")
+    )
+    exact_hashes, quarantined_hashes = validate_multisection_preprocess_policy(
+        records,
+        schema_audit,
+        multisection_audit,
+        expected_exact=int(
+            config["quality_gates"]["expected_recovered_multisection_deduplicated"]
+        ),
+        expected_quarantined=int(
+            config["quality_gates"]["expected_quarantined_conflicting_multisection"]
+        ),
+        expected_documented=int(config["quality_gates"]["expected_documented_text"]),
+        expected_text_suffix=int(
+            config["quality_gates"]["expected_recovered_text_suffix"]
+        ),
+    )
+    write_quarantine_manifest(index_dir, quarantined_hashes)
     segment_dir = output_root / "segments"
+    for digest in quarantined_hashes:
+        token = digest[:20]
+        for stale_path in segment_dir.glob(f"{token}_s*.npz"):
+            stale_path.unlink(missing_ok=True)
+        for stale_path in segment_dir.glob(f"{token}_s*.npz.tmp"):
+            stale_path.unlink(missing_ok=True)
+    selected_records = records[
+        ~records["zip_sha256"].astype(str).str.lower().isin(quarantined_hashes)
+    ]
     workers = int(args.workers or config["preprocess"]["workers"])
     all_rows: list[dict[str, object]] = []
     preprocess_issues: list[dict[str, object]] = []
@@ -362,8 +404,13 @@ def command_preprocess(args: argparse.Namespace) -> None:
                 dict(config["data"]),
                 bool(config["preprocess"]["compression"]),
                 bool(args.overwrite or config["preprocess"]["overwrite"]),
+                (
+                    "exact_multisection"
+                    if str(record.zip_sha256).lower() in exact_hashes
+                    else "standard"
+                ),
             ): record._asdict()
-            for record in records.itertuples(index=False)
+            for record in selected_records.itertuples(index=False)
         }
         for future in tqdm(as_completed(futures), total=len(futures), desc="Preprocessing"):
             try:
@@ -437,6 +484,7 @@ def command_preprocess(args: argparse.Namespace) -> None:
                 "segments": len(segments),
                 "anchors": len(anchors),
                 "preprocess_issues": len(preprocess_issues),
+                "quarantined_attachments": len(quarantined_hashes),
                 "events_by_coverage": events["coverage"].value_counts().to_dict(),
             },
             ensure_ascii=False,

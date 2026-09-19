@@ -10,7 +10,11 @@ import numpy as np
 import pandas as pd
 from scipy.signal import butter, sosfiltfilt
 
-from bme_eating.data.packet_reader import ParsedAttachment, parse_sensor_zip
+from bme_eating.data.packet_reader import (
+    ParsedAttachment,
+    parse_multisection_sensor_zip,
+    parse_sensor_zip,
+)
 from bme_eating.types import SensorSeries
 
 
@@ -225,9 +229,13 @@ def preprocess_attachment(
     data_config: dict[str, object],
     compressed: bool = True,
     overwrite: bool = False,
+    parser_mode: str = "standard",
 ) -> list[dict[str, object]]:
     zip_path = Path(str(record["zip_path"]))
-    parsed: ParsedAttachment = parse_sensor_zip(
+    if parser_mode not in {"standard", "exact_multisection"}:
+        raise ValueError(f"unsupported parser mode: {parser_mode}")
+    parser = parse_multisection_sensor_zip if parser_mode == "exact_multisection" else parse_sensor_zip
+    parsed: ParsedAttachment = parser(
         zip_path,
         ppg_samples_per_row=int(data_config["ppg_samples_per_row"]),
         timestamp_anchor=str(data_config["packet_timestamp_anchor"]),

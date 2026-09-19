@@ -7,6 +7,13 @@ from typing import Any
 
 import pandas as pd
 
+from bme_eating.data.multisection import (
+    EXACT_RECOVERY_CLASSIFICATION,
+    QUARANTINE_CLASSIFICATION,
+    QUARANTINE_STATUS,
+    validate_multisection_preprocess_policy,
+)
+
 
 def _frame_digest(frame: pd.DataFrame, columns: list[str]) -> str:
     selected = frame.reindex(columns=columns).sort_values(columns).reset_index(drop=True)
@@ -36,6 +43,42 @@ def build_quality_report(output_root: Path) -> dict[str, Any]:
     segments = pd.read_parquet(index_dir / "segments.parquet")
     events = pd.read_parquet(index_dir / "events.parquet")
     schema_audit = json.loads((index_dir / "schema_audit.json").read_text(encoding="utf-8"))
+    unsupported_count = int(
+        schema_audit.get("layout_status_counts", {}).get("unsupported_binary", 0)
+    )
+    exact_hashes: set[str] = set()
+    quarantine_hash_set: set[str] = set()
+    multisection_audit: dict[str, Any] = {
+        "attachments_audited": 0,
+        "classification_counts": {},
+    }
+    if unsupported_count:
+        multisection_audit = json.loads(
+            (index_dir / "multisection_audit.json").read_text(encoding="utf-8")
+        )
+        quarantine_manifest = json.loads(
+            (index_dir / "quarantined_attachments.json").read_text(encoding="utf-8")
+        )
+        exact_hashes, policy_quarantined_hashes = validate_multisection_preprocess_policy(
+            records, schema_audit, multisection_audit
+        )
+        quarantine_entries = quarantine_manifest.get("attachments", [])
+        if not isinstance(quarantine_entries, list):
+            raise RuntimeError("quarantine manifest attachments must be a list")
+        quarantine_hashes: list[str] = []
+        for entry in quarantine_entries:
+            if set(entry) != {"source_zip_sha256", "classification", "status"}:
+                raise RuntimeError("quarantine manifest contains unexpected or missing fields")
+            if entry["classification"] != QUARANTINE_CLASSIFICATION:
+                raise RuntimeError("quarantine manifest contains an unexpected classification")
+            if entry["status"] != QUARANTINE_STATUS:
+                raise RuntimeError("quarantine manifest contains an unexpected status")
+            quarantine_hashes.append(str(entry["source_zip_sha256"]).lower())
+        if len(set(quarantine_hashes)) != len(quarantine_hashes):
+            raise RuntimeError("quarantine manifest contains duplicate source ZIP hashes")
+        quarantine_hash_set = set(quarantine_hashes)
+        if quarantine_hash_set != policy_quarantined_hashes:
+            raise RuntimeError("quarantine manifest hashes do not match the audited policy")
     fold_digest, fold_subjects = _subject_fold_digest(index_dir)
     required_segment_columns = {
         "acc_valid_fraction",
@@ -81,6 +124,9 @@ def build_quality_report(output_root: Path) -> dict[str, Any]:
     )
     record_hashes = set(records["zip_sha256"].astype(str).str.lower())
     segment_hashes = set(segments["source_zip_sha256"].astype(str).str.lower())
+    missing_hashes = record_hashes - segment_hashes
+    unaccounted_missing_hashes = missing_hashes - quarantine_hash_set
+    quarantined_in_segments = quarantine_hash_set & segment_hashes
     report = {
         "artifact_schema_version": "v2",
         "records": int(len(records)),
@@ -93,7 +139,10 @@ def build_quality_report(output_root: Path) -> dict[str, Any]:
         "coverage_counts": events["coverage"].value_counts().sort_index().to_dict(),
         "parser_status_by_attachment": parser_by_attachment,
         "preprocessed_attachments": len(segment_hashes),
-        "missing_preprocessed_attachments": len(record_hashes - segment_hashes),
+        "missing_preprocessed_attachments": len(missing_hashes),
+        "quarantined_attachments": len(quarantine_hash_set),
+        "unaccounted_missing_attachments": len(unaccounted_missing_hashes),
+        "quarantined_attachments_in_segments": len(quarantined_in_segments),
         "unexpected_preprocessed_attachments": len(segment_hashes - record_hashes),
         "subject_time_overlaps": subject_overlaps,
         "session_time_overlaps": session_overlaps,
@@ -119,6 +168,16 @@ def build_quality_report(output_root: Path) -> dict[str, Any]:
             str(key): int(value)
             for key, value in sorted(schema_audit["layout_status_counts"].items())
         },
+        "multisection_attachments_audited": int(
+            multisection_audit.get("attachments_audited", -1)
+        ),
+        "multisection_classification_counts": {
+            str(key): int(value)
+            for key, value in sorted(
+                multisection_audit.get("classification_counts", {}).items()
+            )
+        },
+        "multisection_exact_recovery_attachments": len(exact_hashes),
         "invalid_source_hashes": int(
             (~segments["source_zip_sha256"].astype(str).str.fullmatch(r"[0-9a-fA-F]{64}")).sum()
         ),
@@ -147,15 +206,21 @@ def validate_quality_invariants(report: dict[str, Any]) -> None:
         failures.append("a subject has overlapping source segments")
     if int(report["invalid_source_hashes"]) != 0:
         failures.append("source ZIP hashes are missing or invalid")
-    if int(report["missing_preprocessed_attachments"]) != 0:
-        failures.append("some attachments produced no segments")
+    if int(report["missing_preprocessed_attachments"]) != int(
+        report["quarantined_attachments"]
+    ):
+        failures.append("missing preprocessed attachments are not exactly the quarantined set")
+    if int(report["unaccounted_missing_attachments"]) != 0:
+        failures.append("some non-quarantined attachments produced no segments")
+    if int(report["quarantined_attachments_in_segments"]) != 0:
+        failures.append("a quarantined attachment appears in segments")
     if int(report["unexpected_preprocessed_attachments"]) != 0:
         failures.append("segments reference unknown attachments")
     if int(report["subject_folds_subjects"]) != int(report["subjects"]):
         failures.append("subject fold assignments do not cover all subjects")
     if int(report["schema_layout_files_inspected"]) != int(report["records"]):
         failures.append("schema audit did not inspect every attachment")
-    allowed_statuses = {"documented_text", "recovered_text_suffix"}
+    allowed_statuses = {"documented_text", "recovered_text_suffix", "unsupported_binary"}
     unexpected_statuses = {
         key: value
         for key, value in report["schema_layout_status_counts"].items()
@@ -163,6 +228,18 @@ def validate_quality_invariants(report: dict[str, Any]) -> None:
     }
     if unexpected_statuses:
         failures.append("schema audit contains unsupported attachment statuses")
+    if int(report["schema_layout_status_counts"].get("unsupported_binary", 0)) != int(
+        report["multisection_attachments_audited"]
+    ):
+        failures.append("unsupported schema attachments are not fully accounted for")
+    if int(report["schema_layout_status_counts"].get("unsupported_binary", 0)):
+        if report["multisection_classification_counts"] != {
+            EXACT_RECOVERY_CLASSIFICATION: 1,
+            QUARANTINE_CLASSIFICATION: 11,
+        }:
+            failures.append("multisection classification policy changed")
+        if int(report["quarantined_attachments"]) != 11:
+            failures.append("quarantined attachment count changed")
     if failures:
         raise RuntimeError("Data quality invariants failed: " + "; ".join(failures))
 
@@ -182,20 +259,25 @@ def validate_configured_expectations(
     checks = {
         "records": int(expectations["expected_records"]),
         "subjects": int(expectations["expected_subjects"]),
+        "preprocessed_attachments": int(expectations["expected_preprocessed_attachments"]),
+        "quarantined_attachments": int(
+            expectations["expected_quarantined_conflicting_multisection"]
+        ),
     }
     mismatches = [
         f"{name}: observed={report.get(name)} expected={expected}"
         for name, expected in checks.items()
         if int(report.get(name, -1)) != expected
     ]
-    recovered = int(
-        report.get("parser_status_by_attachment", {}).get("recovered_text_suffix", 0)
-    )
-    expected_recovered = int(expectations["expected_recovered_text_suffix"])
-    if recovered != expected_recovered:
-        mismatches.append(
-            f"recovered_text_suffix: observed={recovered} expected={expected_recovered}"
-        )
+    for status in (
+        "documented_text",
+        "recovered_text_suffix",
+        "recovered_multisection_deduplicated",
+    ):
+        observed = int(report.get("parser_status_by_attachment", {}).get(status, 0))
+        expected = int(expectations[f"expected_{status}"])
+        if observed != expected:
+            mismatches.append(f"{status}: observed={observed} expected={expected}")
     for name in ("ppg_samples_per_row", "ppg_available_columns"):
         expected = [int(expectations[f"expected_{name}"])]
         observed = [int(value) for value in report.get(name, [])]

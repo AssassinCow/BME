@@ -70,7 +70,9 @@ python scripts/audit_data.py --config configs/base.yaml --schema-zips all --maxi
 python scripts/audit_multisection.py --config configs/base.yaml
 ```
 
-专项审计只保存包级指纹、相对持续时间和冲突计数，不保存原始传感器值、文件名、受试者 ID 或绝对时间戳，也不会修改原始数据。出现 `conflicting_overlap`、`partial_overlap`、`mixed_relationships`、`nonmonotonic_section` 或 `invalid` 时命令会以非零状态结束，这是数据门禁生效，不是脚本崩溃。官方确认疑似误写 ID 后，应同时修改显式 alias 和期望值。
+专项审计只保存包级指纹、相对持续时间和冲突计数，不保存原始传感器值、文件名、受试者 ID 或绝对时间戳，也不会修改原始数据。当前已复核结果固定为 1 个 `exact_duplicate_overlap` 和 11 个 `conflicting_overlap`。由于存在冲突附件，命令会以非零状态结束，这是数据门禁生效，不是脚本崩溃；只要已生成完整的 `indices\multisection_audit.json`，即可继续执行下一步预处理。
+
+预处理不会任意选择冲突段：1 个精确重复附件按展开后的样本时间戳做确定性去重，只有时间戳相同且数值完全一致才合并；11 个冲突附件显式隔离。隔离清单 `indices\quarantined_attachments.json` 只保存 ZIP SHA-256、分类和状态，不含文件名、路径、受试者或原始值。任何审计哈希、数量或分类变化都会在读取原始附件前停止。官方确认疑似误写 ID 后，应同时修改显式 alias 和期望值。
 
 ### 3.2 预处理、session 和 coverage
 
@@ -89,7 +91,7 @@ python scripts/preprocess_data.py --config configs/base.yaml --workers 8 --overw
 
 本次 schema 增加了分模态有效率、PPG 槽位、折分指纹和真实历史可用时长。已有 v2 产物不能增量复用，第一次验收必须带 `--overwrite` 全量重建。
 
-任意附件仍无法解析、出现 session 时间重叠、数量不符或恢复附件数不符时，流程停止。
+任意允许附件仍无法解析、出现 session 时间重叠、数量不符或恢复/隔离计数不符时，流程停止。质量门禁要求 `1112 = 1101 已预处理 + 11 已隔离`，并要求 1096 个 `documented_text`、4 个 `recovered_text_suffix` 和 1 个 `recovered_multisection_deduplicated`。预处理会删除这 11 个隔离哈希对应的旧派生 NPZ，但不会修改或删除原始 ZIP。
 
 主要产物位于 `%BME_OUTPUT_ROOT%\v2`：
 
@@ -100,6 +102,7 @@ indices\events.parquet
 indices\anchors.parquet
 indices\subject_folds.json
 indices\quality_report.json
+indices\quarantined_attachments.json
 segments\*.npz
 ```
 

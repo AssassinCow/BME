@@ -153,7 +153,9 @@ def _parse_timestamp(value: str, row_number: int, column: str) -> int:
     return int(parsed)
 
 
-def _find_sensor_header_offsets(handle: zipfile.ZipExtFile) -> list[int]:
+def _find_sensor_header_offsets(
+    handle: zipfile.ZipExtFile, stop_after: int | None = 2
+) -> list[int]:
     offsets: set[int] = set()
     overlap = len(_SENSOR_HEADER_BYTES) + 2
     tail = b""
@@ -175,7 +177,7 @@ def _find_sensor_header_offsets(handle: zipfile.ZipExtFile) -> list[int]:
             start = position + 1
         consumed += len(chunk)
         tail = buffer[-overlap:]
-        if len(offsets) > 1:
+        if stop_after is not None and len(offsets) >= stop_after:
             break
     return sorted(offsets)
 
@@ -329,6 +331,153 @@ def parse_sensor_zip(
         parser_status=parser_status,
         text_offset_bytes=text_offset if parser_status == "recovered_text_suffix" else 0,
         left_censored=parser_status == "recovered_text_suffix",
+    )
+
+
+def _merge_exact_sensor_series(
+    series_list: list[SensorSeries],
+    zip_path: Path,
+    modality: str,
+) -> SensorSeries:
+    nonempty = [series for series in series_list if len(series.timestamp_ms)]
+    if not nonempty:
+        dimensions = series_list[0].values.shape[1] if series_list else 1
+        return SensorSeries(
+            timestamp_ms=np.empty(0, dtype=np.int64),
+            values=np.empty((0, dimensions), dtype=np.float32),
+        )
+    timestamps = np.concatenate([series.timestamp_ms for series in nonempty])
+    values = np.concatenate([series.values for series in nonempty], axis=0)
+    order = np.argsort(timestamps, kind="stable")
+    timestamps = timestamps[order]
+    values = values[order]
+    unique_timestamps: list[int] = []
+    unique_values: list[np.ndarray] = []
+    start = 0
+    while start < len(timestamps):
+        end = start + 1
+        while end < len(timestamps) and timestamps[end] == timestamps[start]:
+            end += 1
+        reference = values[start]
+        if not np.all(values[start:end] == reference):
+            raise UnsupportedSensorFormatError(
+                zip_path,
+                modality,
+                f"multisection {modality} samples conflict at an expanded timestamp",
+            )
+        unique_timestamps.append(int(timestamps[start]))
+        unique_values.append(reference)
+        start = end
+    return SensorSeries(
+        timestamp_ms=np.asarray(unique_timestamps, dtype=np.int64),
+        values=np.asarray(unique_values, dtype=np.float32),
+    )
+
+
+def parse_multisection_sensor_zip(
+    zip_path: str | Path,
+    ppg_samples_per_row: int = 20,
+    timestamp_anchor: str = "start",
+) -> ParsedAttachment:
+    """Strictly parse repeated-header text sections and deduplicate exact samples."""
+    zip_path = Path(zip_path)
+    if not 1 <= ppg_samples_per_row <= 44:
+        raise ValueError("ppg_samples_per_row must be between 1 and 44")
+    with zipfile.ZipFile(zip_path) as archive:
+        text_entries = [name for name in archive.namelist() if name.lower().endswith(".txt")]
+        if len(text_entries) != 1:
+            raise ValueError(f"Expected one sensor text file in {zip_path}, found {text_entries}")
+        member_name = text_entries[0]
+        info_entries = [name for name in archive.namelist() if name.lower().endswith("info.json")]
+        info: dict[str, object] = {}
+        if info_entries:
+            with archive.open(info_entries[0]) as handle:
+                info = json.load(handle)
+        with archive.open(member_name) as handle:
+            header_offsets = _find_sensor_header_offsets(handle, stop_after=None)
+        if len(header_offsets) < 2:
+            raise UnsupportedSensorFormatError(
+                zip_path, member_name, "multisection recovery requires repeated standard headers"
+            )
+
+        raw_handle = archive.open(member_name)
+        section_series: list[tuple[SensorSeries, SensorSeries, SensorSeries]] = []
+        try:
+            raw_handle.seek(header_offsets[0])
+            text_handle = io.TextIOWrapper(raw_handle, encoding="utf-8", errors="strict", newline="")
+            reader = csv.reader(text_handle, delimiter="\t")
+            expanders: tuple[_PacketExpander, _PacketExpander, _PacketExpander] | None = None
+            section_count = 0
+            for row_number, row in enumerate(reader, start=1):
+                if [value.strip() for value in row] == SENSOR_COLUMNS:
+                    if expanders is not None:
+                        section_series.append(tuple(expander.finish() for expander in expanders))
+                    expanders = (
+                        _PacketExpander(3, timestamp_anchor),
+                        _PacketExpander(3, timestamp_anchor),
+                        _PacketExpander(1, timestamp_anchor),
+                    )
+                    section_count += 1
+                    continue
+                if expanders is None:
+                    raise UnsupportedSensorFormatError(
+                        zip_path, member_name, "text suffix does not start with the standard header"
+                    )
+                if len(row) != len(SENSOR_COLUMNS):
+                    raise UnsupportedSensorFormatError(
+                        zip_path,
+                        member_name,
+                        f"row {row_number} has {len(row)} columns; expected {len(SENSOR_COLUMNS)}",
+                    )
+                acc_expander, gyro_expander, ppg_expander = expanders
+                acc_expander.add(
+                    _parse_timestamp(row[0], row_number, "ACC_TIME"),
+                    np.asarray(
+                        [_parse_sensor_value(row[index], row_number, SENSOR_COLUMNS[index])
+                         for index in range(47, 50)],
+                        dtype=np.float32,
+                    ),
+                )
+                gyro_expander.add(
+                    _parse_timestamp(row[2], row_number, "GYRO_TIME"),
+                    np.asarray(
+                        [_parse_sensor_value(row[index], row_number, SENSOR_COLUMNS[index])
+                         for index in range(50, 53)],
+                        dtype=np.float32,
+                    ),
+                )
+                ppg_timestamp = _parse_timestamp(row[1], row_number, "PPG_TIME")
+                if ppg_timestamp > 0:
+                    ppg_expander.add(
+                        ppg_timestamp,
+                        np.asarray(
+                            [_parse_sensor_value(row[index], row_number, SENSOR_COLUMNS[index])
+                             for index in range(3, 3 + ppg_samples_per_row)],
+                            dtype=np.float32,
+                        ).reshape(-1, 1),
+                    )
+            if expanders is not None:
+                section_series.append(tuple(expander.finish() for expander in expanders))
+        except (UnicodeDecodeError, csv.Error) as error:
+            raise UnsupportedSensorFormatError(
+                zip_path, member_name, "multisection text is not valid UTF-8 TSV"
+            ) from error
+        finally:
+            raw_handle.close()
+        if section_count != len(header_offsets) or len(section_series) != len(header_offsets):
+            raise UnsupportedSensorFormatError(
+                zip_path, member_name, "not every repeated-header section was parsed"
+            )
+
+    return ParsedAttachment(
+        acc=_merge_exact_sensor_series([item[0] for item in section_series], zip_path, "acc"),
+        gyro=_merge_exact_sensor_series([item[1] for item in section_series], zip_path, "gyro"),
+        ppg=_merge_exact_sensor_series([item[2] for item in section_series], zip_path, "ppg"),
+        source_name=member_name,
+        info=info,
+        parser_status="recovered_multisection_deduplicated",
+        text_offset_bytes=header_offsets[0],
+        left_censored=header_offsets[0] > 0,
     )
 
 

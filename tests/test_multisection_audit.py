@@ -1,14 +1,22 @@
 import csv
 import io
+import json
 import zipfile
 
 import pandas as pd
+import pytest
 
 from bme_eating.data.multisection import (
     audit_multisection_zip,
     audit_repeated_header_attachments,
+    validate_multisection_preprocess_policy,
+    write_quarantine_manifest,
 )
-from bme_eating.data.packet_reader import SENSOR_COLUMNS
+from bme_eating.data.packet_reader import (
+    SENSOR_COLUMNS,
+    UnsupportedSensorFormatError,
+    parse_multisection_sensor_zip,
+)
 
 
 def _row(timestamp, value=1.0):
@@ -131,3 +139,117 @@ def test_multisection_report_omits_paths_names_subjects_and_raw_values(tmp_path)
     assert path.name not in serialized
     assert "private-subject" not in serialized
     assert "source_zip_sha256" in report["results"][0]
+
+
+def test_multisection_parser_deduplicates_exact_expanded_samples(tmp_path):
+    path = tmp_path / "duplicate.zip"
+    rows = [_row(1000, 1.0), _row(1100, 2.0)]
+    _write_multisection_zip(path, [_section(rows), _section(rows)])
+
+    parsed = parse_multisection_sensor_zip(path, ppg_samples_per_row=2)
+
+    assert parsed.parser_status == "recovered_multisection_deduplicated"
+    assert parsed.left_censored is True
+    assert len(parsed.acc.timestamp_ms) == 2
+    assert len(parsed.gyro.timestamp_ms) == 2
+    assert len(parsed.ppg.timestamp_ms) == 4
+    assert len(set(parsed.acc.timestamp_ms.tolist())) == 2
+    assert len(set(parsed.ppg.timestamp_ms.tolist())) == 4
+
+
+def test_multisection_parser_rejects_conflicting_expanded_samples(tmp_path):
+    path = tmp_path / "conflict.zip"
+    _write_multisection_zip(
+        path,
+        [
+            _section([_row(1000, 1.0), _row(1100, 2.0)]),
+            _section([_row(1000, 1.0), _row(1100, 3.0)]),
+        ],
+    )
+
+    with pytest.raises(UnsupportedSensorFormatError, match="samples conflict"):
+        parse_multisection_sensor_zip(path, ppg_samples_per_row=2)
+
+
+def _policy_inputs(tmp_path):
+    hashes = [f"{value:064x}" for value in range(1, 13)]
+    records = pd.DataFrame(
+        [
+            {"zip_path": str(tmp_path / f"attachment-{index}.zip"), "zip_sha256": digest}
+            for index, digest in enumerate(hashes)
+        ]
+    )
+    schema = {
+        "layout_files_inspected": 12,
+        "layout_status_counts": {"unsupported_binary": 12},
+        "layouts": [
+            {
+                "zip_name": f"attachment-{index}.zip",
+                "status": "unsupported_binary",
+                "error": "standard sensor header occurs more than once",
+            }
+            for index in range(12)
+        ]
+    }
+    results = [
+        {
+            "source_zip_sha256": digest,
+            "classification": (
+                "exact_duplicate_overlap" if index == 0 else "conflicting_overlap"
+            ),
+        }
+        for index, digest in enumerate(hashes)
+    ]
+    audit = {
+        "attachments_audited": 12,
+        "automatic_recovery_performed": False,
+        "classification_counts": {
+            "conflicting_overlap": 11,
+            "exact_duplicate_overlap": 1,
+        },
+        "results": results,
+    }
+    return records, schema, audit, hashes
+
+
+def test_multisection_policy_requires_exact_hash_and_classification_set(tmp_path):
+    records, schema, audit, hashes = _policy_inputs(tmp_path)
+
+    exact, quarantined = validate_multisection_preprocess_policy(records, schema, audit)
+
+    assert exact == {hashes[0]}
+    assert quarantined == set(hashes[1:])
+
+    changed = json.loads(json.dumps(audit))
+    changed["results"][0]["source_zip_sha256"] = "f" * 64
+    with pytest.raises(RuntimeError, match="hashes do not match"):
+        validate_multisection_preprocess_policy(records, schema, changed)
+
+    changed = json.loads(json.dumps(audit))
+    changed["results"][0]["classification"] = "conflicting_overlap"
+    changed["classification_counts"] = {"conflicting_overlap": 12}
+    with pytest.raises(RuntimeError, match="classifications changed"):
+        validate_multisection_preprocess_policy(records, schema, changed)
+
+
+def test_quarantine_manifest_contains_no_identity_or_path(tmp_path):
+    quarantined = {"a" * 64, "b" * 64}
+    path = write_quarantine_manifest(tmp_path, quarantined)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["attachments"] == [
+        {
+            "source_zip_sha256": "a" * 64,
+            "classification": "conflicting_overlap",
+            "status": "quarantined_conflicting_multisection",
+        },
+        {
+            "source_zip_sha256": "b" * 64,
+            "classification": "conflicting_overlap",
+            "status": "quarantined_conflicting_multisection",
+        },
+    ]
+    serialized = json.dumps(payload)
+    assert "zip_path" not in serialized
+    assert "subject" not in serialized
+    assert "filename" not in serialized

@@ -1,5 +1,6 @@
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
@@ -276,6 +277,95 @@ def test_quality_report_detects_overlaps_across_different_sessions(tmp_path):
     assert report["session_time_overlaps"] == 0
     with pytest.raises(RuntimeError, match="overlapping source segments"):
         validate_quality_invariants(report)
+
+
+def _valid_quarantine_quality_report():
+    return {
+        "subject_time_overlaps": 0,
+        "invalid_source_hashes": 0,
+        "missing_preprocessed_attachments": 11,
+        "quarantined_attachments": 11,
+        "unaccounted_missing_attachments": 0,
+        "quarantined_attachments_in_segments": 0,
+        "unexpected_preprocessed_attachments": 0,
+        "subject_folds_subjects": 39,
+        "subjects": 39,
+        "schema_layout_files_inspected": 1112,
+        "records": 1112,
+        "schema_layout_status_counts": {
+            "documented_text": 1096,
+            "recovered_text_suffix": 4,
+            "unsupported_binary": 12,
+        },
+        "multisection_attachments_audited": 12,
+        "multisection_classification_counts": {
+            "conflicting_overlap": 11,
+            "exact_duplicate_overlap": 1,
+        },
+    }
+
+
+def test_quality_invariants_accept_exactly_accounted_quarantine():
+    validate_quality_invariants(_valid_quarantine_quality_report())
+
+
+def test_quality_invariants_reject_unaccounted_missing_attachment():
+    report = deepcopy(_valid_quarantine_quality_report())
+    report["missing_preprocessed_attachments"] = 12
+    report["unaccounted_missing_attachments"] = 1
+
+    with pytest.raises(RuntimeError, match="non-quarantined attachments"):
+        validate_quality_invariants(report)
+
+
+def test_quality_invariants_reject_quarantined_attachment_in_segments():
+    report = deepcopy(_valid_quarantine_quality_report())
+    report["quarantined_attachments_in_segments"] = 1
+
+    with pytest.raises(RuntimeError, match="appears in segments"):
+        validate_quality_invariants(report)
+
+
+def test_coverage_is_recomputed_from_retained_segments_only(tmp_path):
+    retained = tmp_path / "retained.npz"
+    excluded = tmp_path / "excluded.npz"
+    timestamps = np.arange(0, 11_000, 1000, dtype=np.int64)
+    _write_segment(retained, timestamps, np.ones(len(timestamps), dtype=bool))
+    _write_segment(excluded, timestamps + 20_000, np.ones(len(timestamps), dtype=bool))
+    retained_segments = pd.DataFrame(
+        [
+            {
+                "subject_key": "s",
+                "segment_id": "retained",
+                "segment_path": retained,
+                "start_ms": 0,
+                "end_ms": 10_000,
+            }
+        ]
+    )
+    events = pd.DataFrame(
+        [
+            {
+                "event_id": "covered",
+                "subject_key": "s",
+                "start_ms": 1000,
+                "end_ms": 9000,
+                "valid_duration": True,
+            },
+            {
+                "event_id": "excluded-only",
+                "subject_key": "s",
+                "start_ms": 21_000,
+                "end_ms": 29_000,
+                "valid_duration": True,
+            },
+        ]
+    )
+
+    classified = classify_event_coverage(events, retained_segments, output_step_seconds=1)
+
+    assert classified.set_index("event_id").loc["covered", "coverage"] == "full"
+    assert classified.set_index("event_id").loc["excluded-only", "coverage"] == "none"
 
 
 def test_cross_attachment_session_produces_one_event_without_subject_leakage(tmp_path):

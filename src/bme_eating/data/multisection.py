@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import io
+import json
 import math
 import zipfile
 from dataclasses import dataclass, field
@@ -14,6 +15,12 @@ import numpy as np
 import pandas as pd
 
 from bme_eating.data.packet_reader import SENSOR_COLUMNS, _SENSOR_HEADER_BYTES
+
+
+REPEATED_HEADER_ERROR = "standard sensor header occurs more than once"
+EXACT_RECOVERY_CLASSIFICATION = "exact_duplicate_overlap"
+QUARANTINE_CLASSIFICATION = "conflicting_overlap"
+QUARANTINE_STATUS = "quarantined_conflicting_multisection"
 
 
 @dataclass(frozen=True)
@@ -346,7 +353,7 @@ def audit_repeated_header_attachments(
         str(layout.get("zip_name", ""))
         for layout in layouts
         if layout.get("status") == "unsupported_binary"
-        and layout.get("error") == "standard sensor header occurs more than once"
+        and layout.get("error") == REPEATED_HEADER_ERROR
     }
     if not repeated_names:
         raise ValueError("schema audit contains no repeated-header attachments")
@@ -407,3 +414,144 @@ def audit_repeated_header_attachments(
         "automatic_recovery_performed": False,
         "results": results,
     }
+
+
+def validate_multisection_preprocess_policy(
+    records: pd.DataFrame,
+    schema_audit: dict[str, Any],
+    multisection_audit: dict[str, Any],
+    expected_exact: int = 1,
+    expected_quarantined: int = 11,
+    expected_documented: int | None = None,
+    expected_text_suffix: int | None = None,
+) -> tuple[set[str], set[str]]:
+    """Bind preprocessing decisions to the audited repeated-header attachment hashes."""
+    required = {"zip_path", "zip_sha256"}
+    missing = required - set(records.columns)
+    if missing:
+        raise RuntimeError(f"records index is missing columns: {sorted(missing)}")
+    layouts = schema_audit.get("layouts", [])
+    if not isinstance(layouts, list):
+        raise RuntimeError("schema audit layouts must be a list")
+    if "layout_files_inspected" in schema_audit and int(
+        schema_audit["layout_files_inspected"]
+    ) != len(layouts):
+        raise RuntimeError("schema audit inspected count does not match its layouts")
+    if len(layouts) != len(records):
+        raise RuntimeError("schema audit does not contain one layout per indexed attachment")
+    derived_status_counts: dict[str, int] = {}
+    for layout in layouts:
+        status = str(layout.get("status", ""))
+        derived_status_counts[status] = derived_status_counts.get(status, 0) + 1
+    if "layout_status_counts" in schema_audit:
+        reported_status_counts = {
+            str(key): int(value)
+            for key, value in schema_audit["layout_status_counts"].items()
+        }
+        if derived_status_counts != reported_status_counts:
+            raise RuntimeError("schema audit status counts do not match its layouts")
+    allowed_statuses = {"documented_text", "recovered_text_suffix", "unsupported_binary"}
+    if set(derived_status_counts) - allowed_statuses:
+        raise RuntimeError("schema audit contains an unexpected attachment status")
+    unsupported_layouts = [
+        layout for layout in layouts if layout.get("status") == "unsupported_binary"
+    ]
+    if len(unsupported_layouts) != expected_exact + expected_quarantined or any(
+        layout.get("error") != REPEATED_HEADER_ERROR for layout in unsupported_layouts
+    ):
+        raise RuntimeError("schema audit unsupported attachments changed")
+    if expected_documented is not None and derived_status_counts.get("documented_text", 0) != int(
+        expected_documented
+    ):
+        raise RuntimeError("schema audit documented-text attachment count changed")
+    if expected_text_suffix is not None and derived_status_counts.get(
+        "recovered_text_suffix", 0
+    ) != int(expected_text_suffix):
+        raise RuntimeError("schema audit recovered-text-suffix attachment count changed")
+    repeated_names = [
+        str(layout.get("zip_name", ""))
+        for layout in layouts
+        if layout.get("status") == "unsupported_binary"
+        and layout.get("error") == REPEATED_HEADER_ERROR
+    ]
+    if len(repeated_names) != expected_exact + expected_quarantined:
+        raise RuntimeError("schema audit repeated-header attachment count changed")
+    if len(set(repeated_names)) != len(repeated_names):
+        raise RuntimeError("schema audit contains duplicate repeated-header attachment names")
+    records_by_name: dict[str, list[str]] = {}
+    for record in records.itertuples(index=False):
+        records_by_name.setdefault(Path(str(record.zip_path)).name, []).append(
+            str(record.zip_sha256).lower()
+        )
+    schema_hashes: set[str] = set()
+    for name in repeated_names:
+        matches = records_by_name.get(name, [])
+        if len(matches) != 1:
+            raise RuntimeError(
+                "each repeated-header schema entry must map to exactly one indexed attachment"
+            )
+        digest = matches[0]
+        if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
+            raise RuntimeError("repeated-header attachment has an invalid source ZIP SHA-256")
+        schema_hashes.add(digest)
+
+    results = multisection_audit.get("results", [])
+    if not isinstance(results, list):
+        raise RuntimeError("multisection audit results must be a list")
+    if int(multisection_audit.get("attachments_audited", -1)) != len(results):
+        raise RuntimeError("multisection audit attachment count does not match its results")
+    if multisection_audit.get("automatic_recovery_performed") is not False:
+        raise RuntimeError("multisection audit must not perform automatic recovery")
+    result_by_hash: dict[str, str] = {}
+    derived_counts: dict[str, int] = {}
+    for result in results:
+        digest = str(result.get("source_zip_sha256", "")).lower()
+        classification = str(result.get("classification", ""))
+        if digest in result_by_hash:
+            raise RuntimeError("multisection audit contains duplicate source ZIP hashes")
+        result_by_hash[digest] = classification
+        derived_counts[classification] = derived_counts.get(classification, 0) + 1
+    reported_counts = {
+        str(key): int(value)
+        for key, value in multisection_audit.get("classification_counts", {}).items()
+    }
+    if derived_counts != reported_counts:
+        raise RuntimeError("multisection audit classification counts do not match its results")
+    if set(result_by_hash) != schema_hashes:
+        raise RuntimeError("multisection audit hashes do not match repeated-header schema attachments")
+    expected_counts = {
+        EXACT_RECOVERY_CLASSIFICATION: expected_exact,
+        QUARANTINE_CLASSIFICATION: expected_quarantined,
+    }
+    if derived_counts != expected_counts:
+        raise RuntimeError(
+            f"multisection classifications changed: observed={derived_counts} expected={expected_counts}"
+        )
+    exact = {
+        digest for digest, classification in result_by_hash.items()
+        if classification == EXACT_RECOVERY_CLASSIFICATION
+    }
+    quarantined = {
+        digest for digest, classification in result_by_hash.items()
+        if classification == QUARANTINE_CLASSIFICATION
+    }
+    return exact, quarantined
+
+
+def write_quarantine_manifest(index_dir: Path, quarantined_hashes: set[str]) -> Path:
+    payload = {
+        "version": 1,
+        "attachments": [
+            {
+                "source_zip_sha256": digest,
+                "classification": QUARANTINE_CLASSIFICATION,
+                "status": QUARANTINE_STATUS,
+            }
+            for digest in sorted(quarantined_hashes)
+        ],
+    }
+    output_path = index_dir / "quarantined_attachments.json"
+    temporary_path = output_path.with_name(output_path.name + ".tmp")
+    temporary_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary_path.replace(output_path)
+    return output_path
