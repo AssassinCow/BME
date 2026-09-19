@@ -56,6 +56,35 @@ def spectral_summary(values: np.ndarray, sampling_hz: float) -> dict[str, float]
     }
 
 
+def contiguous_true_ranges(mask: np.ndarray) -> list[tuple[int, int]]:
+    mask = np.asarray(mask, dtype=bool).reshape(-1)
+    padded = np.concatenate(([False], mask, [False])).astype(np.int8)
+    changes = np.diff(padded)
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1)
+    return [(int(start), int(end)) for start, end in zip(starts, ends)]
+
+
+def masked_spectral_summary(
+    values: np.ndarray,
+    mask: np.ndarray,
+    sampling_hz: float,
+) -> dict[str, float]:
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    mask = np.asarray(mask, dtype=bool).reshape(-1) & np.isfinite(values)
+    summaries: list[tuple[int, dict[str, float]]] = []
+    for start, end in contiguous_true_ranges(mask):
+        if end - start >= 16:
+            summaries.append((end - start, spectral_summary(values[start:end], sampling_hz)))
+    if not summaries:
+        return spectral_summary(np.empty(0), sampling_hz)
+    total = float(sum(length for length, _ in summaries))
+    return {
+        name: float(sum(length * summary[name] for length, summary in summaries) / total)
+        for name in summaries[0][1]
+    }
+
+
 def ppg_quality_features(
     values: np.ndarray,
     mask: np.ndarray,
@@ -79,7 +108,10 @@ def ppg_quality_features(
     clipping_ratio = float(
         np.mean((valid_values <= lower + tolerance) | (valid_values >= upper - tolerance))
     )
-    differences = np.diff(valid_values)
+    adjacent_valid = mask[:-1] & mask[1:]
+    differences = np.diff(values)[adjacent_valid]
+    if len(differences) == 0:
+        differences = np.zeros(1, dtype=np.float64)
     difference_median = np.median(differences)
     difference_mad = np.median(np.abs(differences - difference_median)) + 1e-12
     derivative_outlier_ratio = float(
@@ -87,29 +119,30 @@ def ppg_quality_features(
     )
     flatline_ratio = float(np.mean(np.abs(differences) <= tolerance))
 
-    detrended = signal.detrend(valid_values)
-    frequencies, power = signal.welch(
-        detrended,
-        fs=sampling_hz,
-        nperseg=min(len(detrended), 1024),
+    spectral = masked_spectral_summary(values, mask, sampling_hz)
+    spectral_concentration = float(spectral["power_0p5_2"] + spectral["power_2_5"])
+    outside_fraction = max(1.0 - spectral_concentration, 1e-12)
+    robust_snr = float(
+        np.clip(np.log1p(spectral_concentration / outside_fraction) / np.log(11.0), 0, 1)
     )
-    total_power = float(power.sum()) + 1e-12
-    pulse_band = (frequencies >= 0.5) & (frequencies <= 4.0)
-    spectral_concentration = float(power[pulse_band].sum() / total_power)
-    outside_power = max(total_power - float(power[pulse_band].sum()), 1e-12)
-    robust_snr = float(np.clip(np.log1p(total_power / outside_power) / np.log(11.0), 0, 1))
 
-    centered = detrended - detrended.mean()
-    autocorrelation = signal.fftconvolve(centered, centered[::-1], mode="full")
-    autocorrelation = autocorrelation[len(centered) - 1 :]
-    autocorrelation /= max(float(autocorrelation[0]), 1e-12)
+    longest = max(contiguous_true_ranges(mask), key=lambda item: item[1] - item[0])
+    contiguous = values[longest[0] : longest[1]]
     minimum_lag = max(1, int(round(0.25 * sampling_hz)))
-    maximum_lag = min(len(autocorrelation), int(round(2.0 * sampling_hz)))
-    autocorrelation_peak = (
-        float(np.clip(np.max(autocorrelation[minimum_lag:maximum_lag]), 0, 1))
-        if maximum_lag > minimum_lag
-        else 0.0
-    )
+    if len(contiguous) <= max(2, minimum_lag):
+        autocorrelation_peak = 0.0
+    else:
+        centered = signal.detrend(contiguous)
+        centered -= float(np.mean(centered))
+        autocorrelation = signal.fftconvolve(centered, centered[::-1], mode="full")
+        autocorrelation = autocorrelation[len(centered) - 1 :]
+        autocorrelation /= max(float(autocorrelation[0]), 1e-12)
+        maximum_lag = min(len(autocorrelation), int(round(2.0 * sampling_hz)))
+        autocorrelation_peak = (
+            float(np.clip(np.max(autocorrelation[minimum_lag:maximum_lag]), 0, 1))
+            if maximum_lag > minimum_lag
+            else 0.0
+        )
 
     features = np.asarray(
         [
@@ -181,4 +214,3 @@ def robust_statistics(values: np.ndarray) -> dict[str, float]:
         else 0.0,
         "slope": slope,
     }
-

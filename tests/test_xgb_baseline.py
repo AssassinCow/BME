@@ -1,6 +1,19 @@
+import numpy as np
 import pandas as pd
 
-from bme_eating.models.xgb_baseline import train_xgboost_fold
+from bme_eating.models.xgb_baseline import _event_balanced_weights, train_xgboost_fold
+
+
+def test_positive_sample_weights_are_balanced_by_event():
+    frame = pd.DataFrame(
+        {
+            "state_target": [1.0, 1.0, 1.0, 1.0, 0.0],
+            "event_id": ["long", "long", "long", "short", ""],
+        }
+    )
+    weights = _event_balanced_weights(frame)
+    assert np.isclose(weights[:3].sum(), weights[3])
+    assert weights[4] == 1.0
 
 
 def test_xgboost_search_checkpoint_resumes_completed_trials(tmp_path):
@@ -15,8 +28,12 @@ def test_xgboost_search_checkpoint_resumes_completed_trials(tmp_path):
                 {
                     "subject_key": subject_key,
                     "segment_id": f"{subject_key}-segment",
+                    "session_id": f"{subject_key}-session",
                     "timestamp_ms": row_index * 3000,
                     "state_target": float(positive),
+                    "state_loss_mask": 1.0,
+                    "event_id": f"{subject_key}-event" if positive else "",
+                    "hand_relation": "same" if subject_index % 2 else "different",
                     "distance_to_event_seconds": 0.0 if positive else 3600.0,
                     "feature_a": float(subject_index + row_index),
                     "feature_b": float(positive),

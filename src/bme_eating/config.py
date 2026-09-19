@@ -60,6 +60,9 @@ def require_environment_path(config: dict[str, Any], key: str) -> Path:
 def resolve_roots(config: dict[str, Any]) -> tuple[Path, Path]:
     _load_project_dotenv(config)
     data_root = require_environment_path(config, "data_root_env")
-    output_root = require_environment_path(config, "output_root_env")
+    output_base = require_environment_path(config, "output_root_env")
+    artifact_version = str(config["project"].get("artifact_schema_version", "")).strip()
+    output_root = output_base / artifact_version if artifact_version else output_base
+    config["_output_base_path"] = str(output_base)
     output_root.mkdir(parents=True, exist_ok=True)
     return data_root, output_root

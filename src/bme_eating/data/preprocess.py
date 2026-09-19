@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
+from scipy.signal import butter, sosfiltfilt
 
 from bme_eating.data.packet_reader import ParsedAttachment, parse_sensor_zip
 from bme_eating.types import SensorSeries
@@ -86,8 +88,107 @@ def _interpolate_with_mask(
     return output, mask
 
 
-def _record_token(zip_path: Path) -> str:
-    return hashlib.sha256(str(zip_path).encode("utf-8")).hexdigest()[:16]
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _record_token(zip_path: Path, declared_sha256: object) -> str:
+    value = str(declared_sha256 or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        value = _file_sha256(zip_path)
+    return value[:20]
+
+
+def _antialias_series(
+    series: SensorSeries,
+    target_hz: float,
+    maximum_gap_ms: int,
+) -> tuple[SensorSeries, float]:
+    if len(series.timestamp_ms) < 2:
+        return series, 0.0
+    median_period_ms = _positive_median_difference(series.timestamp_ms)
+    source_hz = 1000.0 / median_period_ms if median_period_ms > 0 else 0.0
+    if source_hz <= target_hz * 1.05:
+        return series, source_hz
+    normalized_cutoff = min(0.99, 0.8 * target_hz / source_hz)
+    sos = butter(4, normalized_cutoff, btype="lowpass", output="sos")
+    values = series.values.astype(np.float64, copy=True)
+    differences = np.diff(series.timestamp_ms.astype(np.float64))
+    split_points = np.flatnonzero((differences <= 0) | (differences > maximum_gap_ms)) + 1
+    boundaries = np.concatenate(([0], split_points, [len(series.timestamp_ms)]))
+    for start, end in zip(boundaries[:-1], boundaries[1:]):
+        if end - start < 16:
+            continue
+        try:
+            values[start:end] = sosfiltfilt(sos, values[start:end], axis=0)
+        except ValueError:
+            continue
+    return SensorSeries(series.timestamp_ms, values.astype(np.float32)), source_hz
+
+
+def assign_virtual_sessions(segments: pd.DataFrame, maximum_gap_ms: int) -> pd.DataFrame:
+    if maximum_gap_ms < 0:
+        raise ValueError("maximum_gap_ms must be non-negative")
+    if segments.empty:
+        result = segments.copy()
+        for column in (
+            "session_id",
+            "session_position",
+            "previous_segment_id",
+            "next_segment_id",
+            "gap_from_previous_ms",
+            "left_censored",
+            "right_censored",
+        ):
+            result[column] = pd.Series(dtype="object")
+        return result
+    required = {"segment_id", "subject_key", "start_ms", "end_ms"}
+    missing = required - set(segments.columns)
+    if missing:
+        raise ValueError(f"Segments are missing columns: {sorted(missing)}")
+    ordered = segments.sort_values(
+        ["subject_key", "start_ms", "end_ms", "segment_id"]
+    ).reset_index(drop=True)
+    output: list[pd.DataFrame] = []
+    for subject_key, subject_segments in ordered.groupby("subject_key", sort=True):
+        rows = subject_segments.reset_index(drop=True).copy()
+        groups: list[int] = []
+        group_number = -1
+        previous_end: int | None = None
+        gaps: list[float] = []
+        for row in rows.itertuples(index=False):
+            gap = float("nan") if previous_end is None else int(row.start_ms) - previous_end
+            if previous_end is None or gap < 0 or gap > maximum_gap_ms:
+                group_number += 1
+                gaps.append(float("nan"))
+            else:
+                gaps.append(float(gap))
+            groups.append(group_number)
+            previous_end = int(row.end_ms)
+        rows["_session_group"] = groups
+        rows["gap_from_previous_ms"] = gaps
+        for _, session in rows.groupby("_session_group", sort=False):
+            session = session.copy().reset_index(drop=True)
+            first_segment = str(session.iloc[0]["segment_id"])
+            digest = hashlib.sha256(
+                f"session-v2|{subject_key}|{first_segment}".encode("utf-8")
+            ).hexdigest()[:20]
+            segment_ids = session["segment_id"].astype(str).tolist()
+            session["session_id"] = digest
+            session["session_position"] = np.arange(len(session), dtype=np.int32)
+            session["previous_segment_id"] = [""] + segment_ids[:-1]
+            session["next_segment_id"] = segment_ids[1:] + [""]
+            source_left = session.get(
+                "source_left_censored", pd.Series(False, index=session.index)
+            ).astype(bool)
+            session["left_censored"] = source_left | (session.index == 0)
+            session["right_censored"] = session.index == len(session) - 1
+            output.append(session.drop(columns="_session_group"))
+    return pd.concat(output, ignore_index=True)
 
 
 def _save_segment(
@@ -137,6 +238,9 @@ def preprocess_attachment(
         ppg=_collapse_duplicate_timestamps(parsed.ppg),
         source_name=parsed.source_name,
         info=parsed.info,
+        parser_status=parsed.parser_status,
+        text_offset_bytes=parsed.text_offset_bytes,
+        left_censored=parsed.left_censored,
     )
     ranges = _split_ranges(
         parsed.acc.timestamp_ms,
@@ -147,9 +251,18 @@ def preprocess_attachment(
     ppg_period_ms = 1000.0 / float(data_config["ppg_target_hz"])
     minimum_duration_ms = int(float(data_config.get("minimum_segment_seconds", 30)) * 1000)
     maximum_gap_ms = int(data_config["maximum_interpolation_gap_ms"])
+    acc_filtered, acc_source_hz = _antialias_series(
+        parsed.acc, float(data_config["motion_target_hz"]), maximum_gap_ms
+    )
+    gyro_filtered, gyro_source_hz = _antialias_series(
+        parsed.gyro, float(data_config["motion_target_hz"]), maximum_gap_ms
+    )
+    ppg_filtered, ppg_source_hz = _antialias_series(
+        parsed.ppg, float(data_config["ppg_target_hz"]), maximum_gap_ms
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, object]] = []
-    token = _record_token(zip_path)
+    token = _record_token(zip_path, record.get("zip_sha256"))
     if overwrite:
         for stale_path in output_dir.glob(f"{token}_s*.npz"):
             stale_path.unlink(missing_ok=True)
@@ -158,8 +271,8 @@ def preprocess_attachment(
 
     for segment_number, (start_index, end_index) in enumerate(ranges):
         acc = SensorSeries(
-            parsed.acc.timestamp_ms[start_index:end_index],
-            parsed.acc.values[start_index:end_index],
+            acc_filtered.timestamp_ms[start_index:end_index],
+            acc_filtered.values[start_index:end_index],
         )
         if len(acc.timestamp_ms) < 2:
             continue
@@ -172,7 +285,7 @@ def preprocess_attachment(
         ).astype(np.int64)
         acc_values, acc_mask = _interpolate_with_mask(acc, motion_time, maximum_gap_ms)
         gyro_values, gyro_mask = _interpolate_with_mask(
-            parsed.gyro, motion_time, maximum_gap_ms
+            gyro_filtered, motion_time, maximum_gap_ms
         )
         motion_values = np.concatenate((acc_values, gyro_values), axis=1)
         motion_mask = np.concatenate((acc_mask, gyro_mask), axis=1)
@@ -181,7 +294,7 @@ def preprocess_attachment(
             np.arange(start_ms, end_ms + ppg_period_ms / 2, ppg_period_ms)
         ).astype(np.int64)
         ppg_values, ppg_mask = _interpolate_with_mask(
-            parsed.ppg, ppg_time, maximum_gap_ms
+            ppg_filtered, ppg_time, maximum_gap_ms
         )
         segment_id = f"{token}_s{segment_number:03d}"
         output_path = output_dir / f"{segment_id}.npz"
@@ -204,21 +317,37 @@ def preprocess_attachment(
                 "start_ms": start_ms,
                 "end_ms": end_ms,
                 "duration_seconds": (end_ms - start_ms) / 1000.0,
+                "acc_valid_fraction": float(acc_mask.mean()),
+                "gyro_valid_fraction": float(gyro_mask.mean()),
                 "motion_valid_fraction": float(motion_mask.mean()),
                 "ppg_valid_fraction": float(ppg_mask.mean()),
+                "ppg_samples_per_row": int(data_config["ppg_samples_per_row"]),
+                "ppg_available_columns": int(data_config["ppg_available_columns"]),
                 "source_zip_sha256": str(record.get("zip_sha256", "")),
+                "parser_status": parsed.parser_status,
+                "text_offset_bytes": int(parsed.text_offset_bytes),
+                "source_left_censored": bool(parsed.left_censored and segment_number == 0),
+                "acc_source_hz": float(acc_source_hz),
+                "gyro_source_hz": float(gyro_source_hz),
+                "ppg_source_hz": float(ppg_source_hz),
             }
         )
     return rows
 
 
 def write_preprocess_summary(rows: Iterable[dict[str, object]], output_path: Path) -> None:
-    frame = pd.DataFrame(rows)
+    frame = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
     frame.to_parquet(output_path, index=False)
     summary = {
         "segments": int(len(frame)),
         "subjects": int(frame["subject_key"].nunique()) if len(frame) else 0,
         "duration_hours": float(frame["duration_seconds"].sum() / 3600) if len(frame) else 0,
+        "mean_acc_valid_fraction": float(frame["acc_valid_fraction"].mean())
+        if len(frame)
+        else 0,
+        "mean_gyro_valid_fraction": float(frame["gyro_valid_fraction"].mean())
+        if len(frame)
+        else 0,
         "mean_motion_valid_fraction": float(frame["motion_valid_fraction"].mean())
         if len(frame)
         else 0,

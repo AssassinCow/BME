@@ -13,21 +13,28 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
-import xgboost
 from tqdm import tqdm
 
 from bme_eating.config import load_config, resolve_roots
 from bme_eating.data.labels import build_anchor_index, classify_event_coverage
 from bme_eating.data.manifest import build_secure_indices
 from bme_eating.data.packet_reader import UnsupportedSensorFormatError, inspect_ppg_layout
-from bme_eating.data.preprocess import preprocess_attachment, write_preprocess_summary
+from bme_eating.data.preprocess import (
+    assign_virtual_sessions,
+    preprocess_attachment,
+    write_preprocess_summary,
+)
+from bme_eating.data.quality import (
+    build_quality_report,
+    validate_configured_expectations,
+    validate_quality_gate,
+    validate_quality_invariants,
+)
 from bme_eating.data.splits import create_subject_folds, load_subject_folds
 from bme_eating.features.baseline import build_segment_features
-from bme_eating.metrics import evaluate_events
+from bme_eating.metrics import evaluate_events, partition_evaluation_events
 from bme_eating.models.dtp_sqf import DTPSQF
-from bme_eating.models.xgb_baseline import predict_xgboost, train_xgboost_fold
 from bme_eating.postprocess import probabilities_to_events, tune_postprocess_parameters
-from bme_eating.training.dtp_trainer import train_dtp_fold
 
 _RECOVERABLE_INPUT_ERRORS = (
     OSError,
@@ -56,6 +63,8 @@ def _indices(config: dict[str, Any], data_root: Path, output_root: Path):
         output_root,
         _invalid_subjects(config),
         str(config["data"]["formal_subject_pattern"]),
+        subject_aliases=dict(config["data"].get("subject_aliases", {})),
+        privacy_root=Path(config.get("_output_base_path", output_root)),
     )
 
 
@@ -140,6 +149,10 @@ def _audit_layout_issue(zip_path: str, error: Exception) -> dict[str, object]:
 
 
 def command_environment(_: argparse.Namespace) -> None:
+    try:
+        import xgboost
+    except ImportError as error:
+        raise SystemExit("XGBoost is unavailable in the active environment.") from error
     payload = {
         "python": sys.version,
         "platform": platform.platform(),
@@ -161,12 +174,7 @@ def command_environment(_: argparse.Namespace) -> None:
 def command_audit(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     data_root, output_root = resolve_roots(config)
-    records, events = build_secure_indices(
-        data_root,
-        output_root,
-        _invalid_subjects(config),
-        str(config["data"]["formal_subject_pattern"]),
-    )
+    records, events = _indices(config, data_root, output_root)
     if args.schema_zips == "all":
         selected = records
     else:
@@ -225,6 +233,19 @@ def command_audit(args: argparse.Namespace) -> None:
     audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
     checkpoint_path.unlink(missing_ok=True)
     print(audit_path)
+    allowed_statuses = {"documented_text", "recovered_text_suffix"}
+    bad_statuses = {
+        status: count
+        for status, count in layout_status_counts.items()
+        if status not in allowed_statuses and count
+    }
+    if args.schema_zips == "all" and len(layouts) != len(records):
+        raise SystemExit("Full schema audit did not inspect every indexed attachment.")
+    if bad_statuses:
+        raise SystemExit(
+            "Schema audit found unsupported or invalid attachments: "
+            + json.dumps(bad_statuses, sort_keys=True)
+        )
     if active_slots > int(config["data"]["ppg_samples_per_row"]):
         raise SystemExit(
             "Observed nonzero PPG slots exceed ppg_samples_per_row; update config before preprocessing."
@@ -332,19 +353,23 @@ def command_preprocess(args: argparse.Namespace) -> None:
     issues_path.write_text(
         json.dumps(preprocess_issues, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    fatal_issues = [
-        issue for issue in preprocess_issues if issue.get("status") != "unsupported_binary"
-    ]
-    if fatal_issues:
+    if preprocess_issues:
         raise RuntimeError(
-            f"Preprocessing failed for {len(fatal_issues)} attachment(s); see {issues_path}"
+            f"Preprocessing failed for {len(preprocess_issues)} attachment(s); see {issues_path}"
         )
     if not all_rows:
         raise RuntimeError(f"Preprocessing produced no segments; see {issues_path}")
+    segments = assign_virtual_sessions(
+        pd.DataFrame(all_rows),
+        int(float(config["data"]["session_join_gap_seconds"]) * 1000),
+    )
     segment_index_path = output_root / "indices" / "segments.parquet"
-    write_preprocess_summary(all_rows, segment_index_path)
-    segments = pd.DataFrame(all_rows)
-    events = classify_event_coverage(events, segments)
+    write_preprocess_summary(segments, segment_index_path)
+    events = classify_event_coverage(
+        events,
+        segments,
+        int(config["data"]["output_step_seconds"]),
+    )
     events.to_parquet(output_root / "indices" / "events.parquet", index=False)
     anchors = build_anchor_index(
         segments,
@@ -359,6 +384,9 @@ def command_preprocess(args: argparse.Namespace) -> None:
         output_root / "indices" / "subject_folds.json",
         subject_keys=set(segments["subject_key"].astype(str)),
     )
+    quality_report = build_quality_report(output_root)
+    validate_configured_expectations(quality_report, config["quality_gates"])
+    validate_quality_invariants(quality_report)
     print(
         json.dumps(
             {
@@ -378,6 +406,7 @@ def _feature_job(
     anchors: pd.DataFrame,
     feature_config: dict[str, Any],
     cache_path: str | None = None,
+    context_segments: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object] | None]:
     try:
         if cache_path is not None and Path(cache_path).exists():
@@ -392,6 +421,7 @@ def _feature_job(
             bool(feature_config["include_dyadic"]),
             [int(value) for value in feature_config["motion_bucket_seconds"]],
             [int(value) for value in feature_config["ppg_bucket_seconds"]],
+            context_segments=context_segments,
         )
         if cache_path is not None:
             target = Path(cache_path)
@@ -423,6 +453,7 @@ def _feature_cache_path(
     segment_path: str,
     anchors: pd.DataFrame,
     feature_config: dict[str, Any],
+    context_segments: pd.DataFrame | None = None,
 ) -> Path:
     path = Path(segment_path)
     stat = path.stat()
@@ -430,8 +461,14 @@ def _feature_cache_path(
     digest.update(
         json.dumps(feature_config, sort_keys=True, separators=(",", ":")).encode()
     )
-    digest.update(str(path.resolve()).encode())
+    digest.update(path.name.encode())
     digest.update(f"{stat.st_size}|{stat.st_mtime_ns}".encode())
+    if context_segments is not None:
+        for row in context_segments.sort_values("segment_id").itertuples(index=False):
+            context_path = Path(str(row.segment_path))
+            context_stat = context_path.stat()
+            digest.update(str(row.segment_id).encode())
+            digest.update(f"{context_stat.st_size}|{context_stat.st_mtime_ns}".encode())
     digest.update(pd.util.hash_pandas_object(anchors, index=True).to_numpy().tobytes())
     return cache_dir / f"{path.stem}-{digest.hexdigest()[:16]}.parquet"
 
@@ -439,25 +476,27 @@ def _feature_cache_path(
 def command_build_features(args: argparse.Namespace) -> None:
     config = load_config(args.config)
     _, output_root = resolve_roots(config)
+    validate_quality_gate(output_root)
     anchors = pd.read_parquet(output_root / "indices" / "anchors.parquet")
+    segments = pd.read_parquet(output_root / "indices" / "segments.parquet")
     grouped = list(anchors.groupby("segment_id", sort=False))
     workers = int(args.workers or config["features"]["workers"])
     feature_name = "baseline_dyadic" if config["features"]["include_dyadic"] else "baseline"
     cache_dir = output_root / "features" / ".cache" / feature_name
-    jobs = [
-        (
-            str(group.iloc[0].segment_path),
+    jobs = []
+    for _, group in grouped:
+        session_id = str(group.iloc[0].get("session_id", group.iloc[0].segment_id))
+        context = segments[segments["session_id"].astype(str) == session_id].copy()
+        segment_path = str(group.iloc[0].segment_path)
+        cache_path = _feature_cache_path(
+            cache_dir,
+            segment_path,
             group,
-            _feature_cache_path(
-                cache_dir,
-                str(group.iloc[0].segment_path),
-                group,
-                dict(config["features"]),
-            ),
+            dict(config["features"]),
+            context,
         )
-        for _, group in grouped
-    ]
-    cached_count = sum(cache_path.exists() for _, _, cache_path in jobs)
+        jobs.append((segment_path, group, cache_path, context))
+    cached_count = sum(cache_path.exists() for _, _, cache_path, _ in jobs)
     print(f"Feature cache: {cached_count}/{len(jobs)} segments reusable", flush=True)
     frames: list[pd.DataFrame] = []
     feature_issues: list[dict[str, object]] = []
@@ -469,8 +508,9 @@ def command_build_features(args: argparse.Namespace) -> None:
                 group,
                 dict(config["features"]),
                 str(cache_path),
+                context,
             ): segment_path
-            for segment_path, group, cache_path in jobs
+            for segment_path, group, cache_path, context in jobs
         }
         for future in tqdm(as_completed(futures), total=len(futures), desc="Extracting features"):
             try:
@@ -520,7 +560,8 @@ def _evaluate_prediction_file(
     predictions: pd.DataFrame,
     truth: pd.DataFrame,
     postprocess_config: dict[str, Any],
-) -> tuple[pd.DataFrame, dict[str, object]]:
+    ignore: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict[str, object], pd.DataFrame]:
     events = probabilities_to_events(
         predictions,
         ema_half_life_seconds=float(postprocess_config["ema_half_life_seconds"]),
@@ -531,15 +572,35 @@ def _evaluate_prediction_file(
         boundary_lookback_seconds=float(postprocess_config["boundary_lookback_seconds"]),
     )
     output: dict[str, object] = {}
-    for method in ("hungarian", "greedy"):
+    primary_method = str(
+        postprocess_config.get("matching_method", "max_cardinality_iou")
+    )
+    methods = list(dict.fromkeys((primary_method, "hungarian_iou_legacy", "greedy")))
+    primary_matches = pd.DataFrame()
+    for method in methods:
         metrics, matches = evaluate_events(
             truth,
             events,
             iou_threshold=float(postprocess_config["iou_threshold"]),
             method=method,
+            ignore=ignore,
+        )
+        exposure_hours = 0.0
+        if len(predictions):
+            for _, group in predictions.groupby(["subject_key", "session_id"]):
+                exposure_hours += max(
+                    0.0,
+                    (float(group["timestamp_ms"].max())
+                    - float(group["timestamp_ms"].min())
+                    + 3000.0)
+                    / 3_600_000.0,
+                )
+        metrics["false_positives_per_observed_hour"] = (
+            float(metrics["false_positive"]) / exposure_hours if exposure_hours else 0.0
         )
         output[method] = metrics
-        if method == "hungarian" and len(matches):
+        if method == primary_method:
+            primary_matches = matches
             relation_summary: dict[str, object] = {}
             for relation in ("same", "different", "unknown"):
                 truth_count = int((truth["hand_relation"] == relation).sum())
@@ -560,7 +621,136 @@ def _evaluate_prediction_file(
                     else None,
                 }
             output["hand_relation"] = relation_summary
-    return events, output
+            coverage_summary: dict[str, object] = {}
+            truth_with_band = truth.copy()
+            ratios = truth_with_band.get(
+                "coverage_ratio", pd.Series(1.0, index=truth_with_band.index)
+            ).fillna(0.0)
+            truth_with_band["coverage_band"] = pd.cut(
+                ratios,
+                bins=[-np.inf, 0.9, 0.99, np.inf],
+                labels=["le_0p90", "0p90_to_0p99", "gt_0p99"],
+                include_lowest=True,
+            ).astype(str)
+            matched_keys = set(
+                zip(
+                    matches.get("subject_key", []),
+                    matches.get("truth_start_ms", []),
+                    matches.get("truth_end_ms", []),
+                )
+            )
+            for band, band_truth in truth_with_band.groupby("coverage_band", sort=True):
+                hits = sum(
+                    (str(row.subject_key), int(row.start_ms), int(row.end_ms))
+                    in matched_keys
+                    for row in band_truth.itertuples(index=False)
+                )
+                coverage_summary[str(band)] = {
+                    "truth_events": int(len(band_truth)),
+                    "matched_events": int(hits),
+                    "sensitivity": hits / len(band_truth) if len(band_truth) else None,
+                }
+            output["coverage"] = coverage_summary
+    strict_metrics, _ = evaluate_events(
+        truth,
+        events,
+        iou_threshold=float(postprocess_config["iou_threshold"]),
+        method=primary_method,
+    )
+    output["strict_no_ignore"] = strict_metrics
+    output["primary_method"] = primary_method
+    by_subject: dict[str, dict[str, float]] = {}
+    for subject_key in sorted(
+        set(truth.get("subject_key", [])) | set(events.get("subject_key", []))
+    ):
+        subject_truth = truth[truth["subject_key"] == subject_key]
+        subject_events = events[events["subject_key"] == subject_key]
+        subject_ignore = (
+            ignore[ignore["subject_key"] == subject_key]
+            if ignore is not None
+            else None
+        )
+        subject_metrics, _ = evaluate_events(
+            subject_truth,
+            subject_events,
+            iou_threshold=float(postprocess_config["iou_threshold"]),
+            method=primary_method,
+            ignore=subject_ignore,
+        )
+        by_subject[str(subject_key)] = subject_metrics
+    output["by_subject"] = by_subject
+    output["evaluation_counts"] = {
+        "evaluable_truth": int(len(truth)),
+        "ignored_truth": int(len(ignore)) if ignore is not None else 0,
+        "predicted_events": int(len(events)),
+    }
+    matched_truth = set(
+        zip(
+            primary_matches.get("subject_key", []),
+            primary_matches.get("truth_start_ms", []),
+            primary_matches.get("truth_end_ms", []),
+        )
+    )
+    matched_prediction = set(
+        zip(
+            primary_matches.get("subject_key", []),
+            primary_matches.get("prediction_start_ms", []),
+            primary_matches.get("prediction_end_ms", []),
+        )
+    )
+    failures: list[dict[str, object]] = []
+    for row in truth.itertuples(index=False):
+        key = (str(row.subject_key), int(row.start_ms), int(row.end_ms))
+        if key not in matched_truth:
+            failures.append(
+                {
+                    "failure_type": "false_negative",
+                    "subject_key": str(row.subject_key),
+                    "start_ms": int(row.start_ms),
+                    "end_ms": int(row.end_ms),
+                    "score": np.nan,
+                    "hand_relation": str(getattr(row, "hand_relation", "unknown")),
+                    "coverage_ratio": float(getattr(row, "coverage_ratio", np.nan)),
+                }
+            )
+    ignore_frame = (
+        ignore if ignore is not None else pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
+    )
+    for row in events.itertuples(index=False):
+        key = (str(row.subject_key), int(row.start_ms), int(row.end_ms))
+        if key in matched_prediction:
+            continue
+        subject_ignore = ignore_frame[ignore_frame["subject_key"] == row.subject_key]
+        ignored = False
+        if len(subject_ignore):
+            ignored = bool(
+                (
+                    np.minimum(int(row.end_ms), subject_ignore["end_ms"].to_numpy())
+                    > np.maximum(int(row.start_ms), subject_ignore["start_ms"].to_numpy())
+                ).any()
+            )
+        if not ignored:
+            failures.append(
+                {
+                    "failure_type": "false_positive",
+                    "subject_key": str(row.subject_key),
+                    "start_ms": int(row.start_ms),
+                    "end_ms": int(row.end_ms),
+                    "score": float(row.score),
+                    "hand_relation": "background",
+                    "coverage_ratio": np.nan,
+                }
+            )
+    failure_columns = [
+        "failure_type",
+        "subject_key",
+        "start_ms",
+        "end_ms",
+        "score",
+        "hand_relation",
+        "coverage_ratio",
+    ]
+    return events, output, pd.DataFrame(failures, columns=failure_columns)
 
 
 def _tune_and_save_postprocess(
@@ -568,6 +758,7 @@ def _tune_and_save_postprocess(
     validation_truth: pd.DataFrame,
     config: dict[str, Any],
     output_dir: Path,
+    ignore: pd.DataFrame | None = None,
 ) -> dict[str, float]:
     best, trials = tune_postprocess_parameters(
         validation_predictions,
@@ -575,25 +766,48 @@ def _tune_and_save_postprocess(
         config["postprocess_search"],
         float(config["postprocess"]["iou_threshold"]),
         checkpoint_path=output_dir / "postprocess_search.checkpoint.jsonl",
+        ignore=ignore,
+        matching_method=str(
+            config["postprocess"].get("matching_method", "max_cardinality_iou")
+        ),
     )
     best["iou_threshold"] = float(config["postprocess"]["iou_threshold"])
+    best["matching_method"] = str(
+        config["postprocess"].get("matching_method", "max_cardinality_iou")
+    )
+    high_values = sorted(float(value) for value in trials["high_threshold"].unique())
+    threshold_at_boundary = len(high_values) < 3 or float(best["high_threshold"]) in {
+        high_values[0],
+        high_values[-1],
+    }
+    best["threshold_at_search_boundary"] = threshold_at_boundary
     (output_dir / "selected_postprocess.json").write_text(
         json.dumps(best, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     trials.to_csv(output_dir / "postprocess_trials.csv", index=False)
+    if (
+        bool(config["postprocess_search"].get("require_interior_threshold", True))
+        and threshold_at_boundary
+    ):
+        raise RuntimeError(
+            "Best high threshold is on the search boundary; expand the validation-only grid"
+        )
     return best
 
 
 def command_train_xgb(args: argparse.Namespace) -> None:
+    from bme_eating.models.xgb_baseline import predict_xgboost, train_xgboost_fold
+
     config = load_config(args.config)
     _, output_root = resolve_roots(config)
+    validate_quality_gate(output_root)
     feature_name = "baseline_dyadic" if config["features"]["include_dyadic"] else "baseline"
     print("[1/5] Loading features and subject folds...", flush=True)
     features = pd.read_parquet(output_root / "features" / f"{feature_name}.parquet")
     subject_folds = load_subject_folds(output_root / "indices" / "subject_folds.json")
     experiment_dir = output_root / "experiments" / feature_name / f"fold_{args.fold}"
     print("[2/5] Tuning and fitting XGBoost...", flush=True)
-    model, columns, validation, test = train_xgboost_fold(
+    model, columns, validation_predictions, test = train_xgboost_fold(
         features,
         subject_folds,
         int(args.fold),
@@ -602,43 +816,46 @@ def command_train_xgb(args: argparse.Namespace) -> None:
         resume_search=not bool(getattr(args, "no_resume", False)),
     )
     print("[3/5] Predicting validation and test windows...", flush=True)
-    validation_predictions = predict_xgboost(model, validation, columns)
     validation_predictions.to_parquet(
         experiment_dir / "validation_predictions.parquet", index=False
     )
     predictions = predict_xgboost(model, test, columns)
     predictions.to_parquet(experiment_dir / "test_predictions.parquet", index=False)
     events = pd.read_parquet(output_root / "indices" / "events.parquet")
-    validation_subjects = set(validation["subject_key"].unique())
-    validation_truth = events[
-        events["subject_key"].isin(validation_subjects)
-        & events["valid_duration"]
-        & (events["coverage"] == "full")
-    ]
+    validation_subjects = set(validation_predictions["subject_key"].unique())
+    validation_truth, validation_ignore = partition_evaluation_events(
+        events, validation_subjects
+    )
     print("[4/5] Tuning event postprocessing on CPU...", flush=True)
     selected_postprocess = _tune_and_save_postprocess(
-        validation_predictions, validation_truth, config, experiment_dir
+        validation_predictions,
+        validation_truth,
+        config,
+        experiment_dir,
+        validation_ignore,
     )
     test_subjects = set(test["subject_key"].unique())
-    truth = events[
-        events["subject_key"].isin(test_subjects)
-        & events["valid_duration"]
-        & (events["coverage"] == "full")
-    ]
+    truth, test_ignore = partition_evaluation_events(events, test_subjects)
     print("[5/5] Evaluating the held-out fold...", flush=True)
-    predicted_events, metrics = _evaluate_prediction_file(
-        predictions, truth, selected_postprocess
+    predicted_events, metrics, failures = _evaluate_prediction_file(
+        predictions, truth, selected_postprocess, test_ignore
     )
     predicted_events.to_csv(experiment_dir / "test_events.csv", index=False)
+    failures.to_csv(experiment_dir / "test_failure_cases.csv", index=False)
     (experiment_dir / "test_metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if float(metrics[str(metrics["primary_method"])]["sensitivity"]) <= 0:
+        raise RuntimeError("Held-out fold has zero event recall; model upgrade is blocked")
     print(experiment_dir)
 
 
 def command_train_dtp(args: argparse.Namespace) -> None:
+    from bme_eating.training.dtp_trainer import train_dtp_fold
+
     config = load_config(args.config)
     _, output_root = resolve_roots(config)
+    validate_quality_gate(output_root)
     print("[1/4] Loading anchors, segments, events, and subject folds...", flush=True)
     anchors = pd.read_parquet(output_root / "indices" / "anchors.parquet")
     segments = pd.read_parquet(output_root / "indices" / "segments.parquet")
@@ -657,7 +874,7 @@ def command_train_dtp(args: argparse.Namespace) -> None:
         config["model"],
         config["training"],
         config["loss"],
-        config["postprocess"],
+        {**config["postprocess"], "search": config["postprocess_search"]},
         experiment_dir,
         Path(args.resume) if args.resume else None,
     )
@@ -666,31 +883,32 @@ def command_train_dtp(args: argparse.Namespace) -> None:
         experiment_dir / "best_validation_predictions.parquet"
     )
     validation_subjects = set(validation_predictions["subject_key"].unique())
-    validation_truth = events[
-        events["subject_key"].isin(validation_subjects)
-        & events["valid_duration"]
-        & (events["coverage"] == "full")
-    ]
+    validation_truth, validation_ignore = partition_evaluation_events(
+        events, validation_subjects
+    )
     print("[3/4] Tuning event postprocessing on CPU...", flush=True)
     selected_postprocess = _tune_and_save_postprocess(
-        validation_predictions, validation_truth, config, experiment_dir
+        validation_predictions,
+        validation_truth,
+        config,
+        experiment_dir,
+        validation_ignore,
     )
     test_subjects = {
         subject for subject, fold in subject_folds.items() if fold == int(args.fold)
     }
-    truth = events[
-        events["subject_key"].isin(test_subjects)
-        & events["valid_duration"]
-        & (events["coverage"] == "full")
-    ]
+    truth, test_ignore = partition_evaluation_events(events, test_subjects)
     print("[4/4] Evaluating the held-out fold...", flush=True)
-    predicted_events, metrics = _evaluate_prediction_file(
-        predictions, truth, selected_postprocess
+    predicted_events, metrics, failures = _evaluate_prediction_file(
+        predictions, truth, selected_postprocess, test_ignore
     )
     predicted_events.to_csv(experiment_dir / "test_events.csv", index=False)
+    failures.to_csv(experiment_dir / "test_failure_cases.csv", index=False)
     (experiment_dir / "test_metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    if float(metrics[str(metrics["primary_method"])]["sensitivity"]) <= 0:
+        raise RuntimeError("Held-out fold has zero event recall; model upgrade is blocked")
     print(checkpoint)
 
 
@@ -700,17 +918,14 @@ def command_evaluate(args: argparse.Namespace) -> None:
     predictions = pd.read_parquet(args.predictions)
     events = pd.read_parquet(output_root / "indices" / "events.parquet")
     subjects = set(predictions["subject_key"].unique())
-    truth = events[
-        events["subject_key"].isin(subjects)
-        & events["valid_duration"]
-        & (events["coverage"] == "full")
-    ]
-    predicted_events, metrics = _evaluate_prediction_file(
-        predictions, truth, config["postprocess"]
+    truth, ignore = partition_evaluation_events(events, subjects)
+    predicted_events, metrics, failures = _evaluate_prediction_file(
+        predictions, truth, config["postprocess"], ignore
     )
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
     predicted_events.to_csv(output_dir / "events.csv", index=False)
+    failures.to_csv(output_dir / "failure_cases.csv", index=False)
     (output_dir / "metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )

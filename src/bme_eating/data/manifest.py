@@ -55,17 +55,25 @@ def build_secure_indices(
     output_root: Path,
     invalid_subjects: set[str],
     subject_pattern: str,
+    subject_aliases: dict[str, str] | None = None,
+    privacy_root: Path | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     state = _load_download_state(data_root)
     sensor_metadata = pd.read_csv(data_root / "derived" / "valid_metadata" / "sensor.csv")
     meal_metadata = pd.read_csv(data_root / "derived" / "valid_metadata" / "meal.csv")
-    salt = load_or_create_subject_salt(output_root)
+    salt = load_or_create_subject_salt(privacy_root or output_root)
     formal_pattern = re.compile(subject_pattern)
+    aliases = {
+        normalize_subject_id(source): normalize_subject_id(target)
+        for source, target in (subject_aliases or {}).items()
+    }
 
-    sensor_metadata["normalized_subject"] = sensor_metadata["externalid"].map(
-        normalize_subject_id
-    )
-    meal_metadata["normalized_subject"] = meal_metadata["externalid"].map(normalize_subject_id)
+    def canonical_subject(value: object) -> str:
+        normalized = normalize_subject_id(value)
+        return aliases.get(normalized, normalized)
+
+    sensor_metadata["normalized_subject"] = sensor_metadata["externalid"].map(canonical_subject)
+    meal_metadata["normalized_subject"] = meal_metadata["externalid"].map(canonical_subject)
 
     valid_subjects = {
         value
@@ -75,7 +83,7 @@ def build_secure_indices(
 
     attachment_rows = []
     for item in state["attachments"]:
-        normalized = normalize_subject_id(item.get("externalid"))
+        normalized = canonical_subject(item.get("externalid"))
         if normalized not in valid_subjects:
             continue
         if item.get("status") != "downloaded" or item.get("invalid_externalid"):

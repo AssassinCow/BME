@@ -14,6 +14,23 @@ class Match:
     iou: float
 
 
+def partition_evaluation_events(
+    events: pd.DataFrame, subject_keys: set[str]
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    required = {"subject_key", "valid_duration"}
+    missing = required - set(events.columns)
+    if missing:
+        raise ValueError(f"Events are missing columns: {sorted(missing)}")
+    selected = events[events["subject_key"].isin(subject_keys) & events["valid_duration"]]
+    if "evaluable" in selected.columns:
+        evaluable = selected["evaluable"].fillna(False).astype(bool)
+    elif "coverage" in selected.columns:
+        evaluable = selected["coverage"].eq("full")
+    else:
+        raise ValueError("Events must contain evaluable or coverage")
+    return selected[evaluable].copy(), selected[~evaluable].copy()
+
+
 def interval_iou_matrix(truth: np.ndarray, prediction: np.ndarray) -> np.ndarray:
     truth = np.asarray(truth, dtype=np.float64)
     prediction = np.asarray(prediction, dtype=np.float64)
@@ -45,7 +62,7 @@ def match_events(
     truth: np.ndarray,
     prediction: np.ndarray,
     iou_threshold: float = 0.25,
-    method: str = "hungarian",
+    method: str = "max_cardinality_iou",
 ) -> list[Match]:
     if not np.isfinite(iou_threshold) or not 0 <= iou_threshold < 1:
         raise ValueError("iou_threshold must be in [0, 1)")
@@ -53,7 +70,23 @@ def match_events(
     if iou.size == 0:
         return []
     matches: list[Match] = []
-    if method == "hungarian":
+    if method == "max_cardinality_iou":
+        truth_count, prediction_count = iou.shape
+        size = truth_count + prediction_count
+        cardinality_bonus = float(min(truth_count, prediction_count) + 1)
+        score = np.zeros((size, size), dtype=np.float64)
+        valid = iou > iou_threshold
+        score[:truth_count, :prediction_count] = np.where(
+            valid, cardinality_bonus + iou, -cardinality_bonus
+        )
+        truth_indices, prediction_indices = linear_sum_assignment(-score)
+        for truth_index, prediction_index in zip(truth_indices, prediction_indices):
+            if truth_index >= truth_count or prediction_index >= prediction_count:
+                continue
+            value = float(iou[truth_index, prediction_index])
+            if value > iou_threshold:
+                matches.append(Match(int(truth_index), int(prediction_index), value))
+    elif method in {"hungarian", "hungarian_iou_legacy"}:
         truth_indices, prediction_indices = linear_sum_assignment(-iou)
         for truth_index, prediction_index in zip(truth_indices, prediction_indices):
             value = float(iou[truth_index, prediction_index])
@@ -83,7 +116,8 @@ def evaluate_events(
     truth: pd.DataFrame,
     prediction: pd.DataFrame,
     iou_threshold: float = 0.25,
-    method: str = "hungarian",
+    method: str = "max_cardinality_iou",
+    ignore: pd.DataFrame | None = None,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     for name, frame in (("truth", truth), ("prediction", prediction)):
         required = {"subject_key", "start_ms", "end_ms"}
@@ -94,11 +128,21 @@ def evaluate_events(
         truth = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
     if prediction.empty and "subject_key" not in prediction.columns:
         prediction = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
+    if ignore is None:
+        ignore = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
+    elif ignore.empty and "subject_key" not in ignore.columns:
+        ignore = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
     matches_output: list[dict[str, object]] = []
     true_positive = 0
     total_truth = 0
     total_prediction = 0
-    for subject_key in sorted(set(truth.get("subject_key", [])) | set(prediction.get("subject_key", []))):
+    ignored_predictions = 0
+    subjects = (
+        set(truth.get("subject_key", []))
+        | set(prediction.get("subject_key", []))
+        | set(ignore.get("subject_key", []))
+    )
+    for subject_key in sorted(subjects):
         subject_truth = truth[truth["subject_key"] == subject_key].reset_index(drop=True)
         subject_prediction = prediction[prediction["subject_key"] == subject_key].reset_index(drop=True)
         truth_intervals = subject_truth[["start_ms", "end_ms"]].to_numpy(dtype=np.float64)
@@ -106,9 +150,27 @@ def evaluate_events(
             dtype=np.float64
         )
         matches = match_events(truth_intervals, prediction_intervals, iou_threshold, method)
+        matched_prediction_indices = {match.prediction_index for match in matches}
+        subject_ignore = ignore[ignore["subject_key"] == subject_key]
+        ignored_indices: set[int] = set()
+        if len(subject_ignore):
+            ignore_intervals = subject_ignore[["start_ms", "end_ms"]].to_numpy(
+                dtype=np.float64
+            )
+            for prediction_index, interval in enumerate(prediction_intervals):
+                if prediction_index in matched_prediction_indices:
+                    continue
+                overlap = np.maximum(
+                    0.0,
+                    np.minimum(interval[1], ignore_intervals[:, 1])
+                    - np.maximum(interval[0], ignore_intervals[:, 0]),
+                )
+                if np.any(overlap > 0):
+                    ignored_indices.add(prediction_index)
         true_positive += len(matches)
         total_truth += len(subject_truth)
-        total_prediction += len(subject_prediction)
+        total_prediction += len(subject_prediction) - len(ignored_indices)
+        ignored_predictions += len(ignored_indices)
         for match in matches:
             truth_row = subject_truth.iloc[match.truth_index]
             prediction_row = subject_prediction.iloc[match.prediction_index]
@@ -144,6 +206,7 @@ def evaluate_events(
         "true_positive": float(true_positive),
         "false_positive": float(false_positive),
         "false_negative": float(false_negative),
+        "ignored_predictions": float(ignored_predictions),
         "precision": float(precision),
         "sensitivity": float(sensitivity),
         "f1": float(f1),

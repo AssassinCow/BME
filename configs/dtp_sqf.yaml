@@ -21,7 +21,6 @@ training:
   steps_per_epoch: 5000
   inference_batch_size: 16
   validation_every_epochs: 2
-  validation_background_segments_per_subject: 1
   num_workers: 8
   max_epochs: 80
   early_stopping_epochs: 12

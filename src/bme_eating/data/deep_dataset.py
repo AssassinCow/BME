@@ -12,6 +12,7 @@ import torch
 from torch.utils.data import Dataset, Sampler
 
 from bme_eating.features.signal import ppg_quality_features
+from bme_eating.data.session import SessionWindowReader
 
 
 @dataclass(frozen=True)
@@ -195,6 +196,7 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
     def __init__(
         self,
         anchors: pd.DataFrame,
+        segments: pd.DataFrame,
         normalization: Normalization,
         future_context_seconds: int = 0,
         training: bool = False,
@@ -202,6 +204,7 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         seed: int = 2026,
     ) -> None:
         self.anchors = anchors.reset_index(drop=True)
+        self.session_reader = SessionWindowReader(segments, cache_size=8)
         self.normalization = normalization
         self.future_context_seconds = int(future_context_seconds)
         self.training = training
@@ -256,8 +259,13 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str | int]:
         anchor = self.anchors.iloc[index]
-        payload = self._load_segment(str(anchor.segment_path))
         timestamp_ms = int(anchor.timestamp_ms)
+        session_id = str(getattr(anchor, "session_id", anchor.segment_id))
+        payload = self.session_reader.read(
+            session_id,
+            timestamp_ms - 465_000,
+            timestamp_ms + self.future_context_seconds * 1000,
+        )
         rng = np.random.default_rng(self.seed + index)
 
         motion_start = timestamp_ms - 381_000
@@ -300,12 +308,16 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             "ppg_quality_target": torch.from_numpy(ppg_quality_target),
             "ppg_valid": torch.from_numpy(ppg_valid),
             "state_target": torch.tensor(float(anchor.state_target), dtype=torch.float32),
+            "state_loss_mask": torch.tensor(
+                float(getattr(anchor, "state_loss_mask", 1.0)), dtype=torch.float32
+            ),
             "start_target": torch.tensor(float(anchor.start_target), dtype=torch.float32),
             "end_target": torch.tensor(float(anchor.end_target), dtype=torch.float32),
             "start_loss_mask": torch.tensor(float(anchor.start_loss_mask), dtype=torch.float32),
             "end_loss_mask": torch.tensor(float(anchor.end_loss_mask), dtype=torch.float32),
             "subject_key": str(anchor.subject_key),
             "segment_id": str(anchor.segment_id),
+            "session_id": session_id,
             "timestamp_ms": int(timestamp_ms),
         }
         if self.future_context_seconds > 0:
@@ -370,32 +382,21 @@ class SegmentBalancedBatchSampler(Sampler[list[int]]):
         self.positive_fraction = float(positive_fraction)
         self.seed = int(seed)
         self.epoch = 0
-        self.positive_by_segment: dict[str, np.ndarray] = {}
-        self.negative_by_segment: dict[str, np.ndarray] = {}
-        for segment_id, group in anchors.groupby("segment_id", sort=False):
-            indices = group.index.to_numpy(dtype=np.int64)
-            positive = indices[group["state_target"].to_numpy() > 0]
-            negative = indices[group["state_target"].to_numpy() <= 0]
-            if len(positive):
-                self.positive_by_segment[str(segment_id)] = positive
-            if len(negative):
-                self.negative_by_segment[str(segment_id)] = negative
-        self.positive_segments = np.asarray(list(self.positive_by_segment), dtype=object)
-        self.negative_segments = np.asarray(list(self.negative_by_segment), dtype=object)
-        self.positive_weights = np.asarray(
-            [len(self.positive_by_segment[str(key)]) for key in self.positive_segments],
-            dtype=np.float64,
-        )
-        self.negative_weights = np.asarray(
-            [len(self.negative_by_segment[str(key)]) for key in self.negative_segments],
-            dtype=np.float64,
-        )
-        if len(self.positive_segments) == 0 or len(self.negative_segments) == 0:
+        positive_rows = anchors[anchors["state_target"] > 0]
+        self.positive_by_event: dict[str, np.ndarray] = {}
+        for event_id, group in positive_rows.groupby("event_id", sort=True):
+            key = str(event_id) or f"segment:{group.iloc[0].segment_id}"
+            self.positive_by_event[key] = group.index.to_numpy(dtype=np.int64)
+        negative_rows = anchors[anchors["state_target"] <= 0]
+        distance = negative_rows["distance_to_event_seconds"].to_numpy(dtype=np.float64)
+        self.near_negative = negative_rows.index.to_numpy(dtype=np.int64)[distance <= 1800.0]
+        self.far_negative = negative_rows.index.to_numpy(dtype=np.int64)[distance > 1800.0]
+        self.all_negative = negative_rows.index.to_numpy(dtype=np.int64)
+        self.positive_events = np.asarray(list(self.positive_by_event), dtype=object)
+        if len(self.positive_events) == 0 or len(self.all_negative) == 0:
             raise ValueError(
-                "Training anchors must contain both positive and negative segments"
+                "Training anchors must contain both positive and negative rows"
             )
-        self.positive_weights /= self.positive_weights.sum()
-        self.negative_weights /= self.negative_weights.sum()
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -416,33 +417,18 @@ class SegmentBalancedBatchSampler(Sampler[list[int]]):
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
         positive_count = max(1, int(round(self.batch_size * self.positive_fraction)))
+        positive_count = min(positive_count, self.batch_size)
+        negative_count = self.batch_size - positive_count
         for _ in range(self.steps_per_epoch):
-            use_positive = len(self.positive_segments) > 0 and rng.random() < self.positive_fraction
-            if use_positive:
-                segment_id = str(
-                    rng.choice(self.positive_segments, p=self.positive_weights)
-                )
-                positive = self._sample(
-                    rng, self.positive_by_segment[segment_id], positive_count
-                )
-                negative_pool = self.negative_by_segment.get(segment_id)
-                if negative_pool is None or len(negative_pool) == 0:
-                    negative = self._sample(
-                        rng,
-                        self.positive_by_segment[segment_id],
-                        self.batch_size - len(positive),
-                    )
-                else:
-                    negative = self._sample(
-                        rng, negative_pool, self.batch_size - len(positive)
-                    )
-                batch = positive + negative
-            else:
-                segment_id = str(
-                    rng.choice(self.negative_segments, p=self.negative_weights)
-                )
-                batch = self._sample(
-                    rng, self.negative_by_segment[segment_id], self.batch_size
-                )
+            positive = [
+                int(rng.choice(self.positive_by_event[str(rng.choice(self.positive_events))]))
+                for _ in range(positive_count)
+            ]
+            near_count = negative_count // 2 if len(self.near_negative) else 0
+            far_count = negative_count - near_count if len(self.far_negative) else 0
+            negative = self._sample(rng, self.near_negative, near_count)
+            negative += self._sample(rng, self.far_negative, far_count)
+            negative += self._sample(rng, self.all_negative, negative_count - len(negative))
+            batch = positive + negative
             rng.shuffle(batch)
             yield batch

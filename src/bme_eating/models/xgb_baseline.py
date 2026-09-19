@@ -37,17 +37,37 @@ except ImportError:  # pragma: no cover - depends on the user's GPU environment.
 
 METADATA_COLUMNS = {
     "segment_id",
+    "session_id",
     "subject_key",
     "timestamp_ms",
     "state_target",
+    "state_loss_mask",
+    "censor_mask",
     "start_target",
     "end_target",
     "start_loss_mask",
     "end_loss_mask",
     "distance_to_event_seconds",
     "hand_relation",
+    "event_id",
+    "motion_history_available_seconds",
+    "ppg_history_available_seconds",
     "fold",
 }
+
+
+def _event_balanced_weights(frame: pd.DataFrame) -> np.ndarray:
+    weights = np.ones(len(frame), dtype=np.float32)
+    positive = frame["state_target"].to_numpy() > 0
+    if "event_id" not in frame.columns or not positive.any():
+        return weights
+    event_ids = frame["event_id"].astype(str).to_numpy()
+    positive_ids = event_ids[positive]
+    counts = pd.Series(positive_ids).value_counts()
+    raw = np.asarray([1.0 / max(int(counts.get(value, 1)), 1) for value in positive_ids])
+    raw *= positive.sum() / max(raw.sum(), 1e-12)
+    weights[positive] = raw.astype(np.float32)
+    return weights
 
 
 def feature_columns(frame: pd.DataFrame) -> list[str]:
@@ -63,6 +83,62 @@ def _inner_partition(subject_key: str, outer_fold: int, partitions: int = 3) -> 
     return int.from_bytes(digest[:4], "little") % partitions
 
 
+def _balanced_inner_partitions(
+    frame: pd.DataFrame,
+    outer_fold: int,
+    partitions: int = 3,
+) -> dict[str, int]:
+    if partitions <= 1:
+        raise ValueError("Inner CV requires at least two partitions")
+    positive = frame[frame["state_target"] > 0].copy()
+    if "event_id" in positive.columns:
+        positive = positive[positive["event_id"].astype(str) != ""].drop_duplicates(
+            ["subject_key", "event_id"]
+        )
+    summary = pd.DataFrame({"subject_key": sorted(frame["subject_key"].astype(str).unique())})
+    if len(positive):
+        relation = positive["hand_relation"] if "hand_relation" in positive else pd.Series(
+            "unknown", index=positive.index
+        )
+        counts = (
+            positive.assign(
+                same=(relation == "same").astype(int),
+                different=(relation == "different").astype(int),
+            )
+            .groupby("subject_key", as_index=False)
+            .agg(events=("state_target", "size"), same=("same", "sum"), different=("different", "sum"))
+        )
+        summary = summary.merge(counts, on="subject_key", how="left")
+    for column in ("events", "same", "different"):
+        if column not in summary:
+            summary[column] = 0
+        summary[column] = summary[column].fillna(0).astype(int)
+    summary["tie"] = summary["subject_key"].map(
+        lambda value: hashlib.sha256(f"{outer_fold}|{value}".encode()).hexdigest()
+    )
+    summary = summary.sort_values(
+        ["events", "same", "different", "tie"], ascending=[False, False, False, True]
+    )
+    targets = np.asarray(
+        [len(summary), summary["events"].sum(), summary["same"].sum(), summary["different"].sum()],
+        dtype=np.float64,
+    ) / partitions
+    totals = np.zeros((partitions, 4), dtype=np.float64)
+    assignments: dict[str, int] = {}
+    for row in summary.itertuples(index=False):
+        contribution = np.asarray([1.0, row.events, row.same, row.different])
+        scores: list[float] = []
+        for partition in range(partitions):
+            proposed = totals.copy()
+            proposed[partition] += contribution
+            normalized = (proposed - targets[None, :]) / np.maximum(targets[None, :], 1.0)
+            scores.append(float(np.square(normalized).sum()))
+        chosen = int(np.argmin(scores))
+        totals[chosen] += contribution
+        assignments[str(row.subject_key)] = chosen
+    return assignments
+
+
 def assign_train_validation_test(
     frame: pd.DataFrame,
     subject_folds: dict[str, int],
@@ -75,9 +151,8 @@ def assign_train_validation_test(
         raise ValueError(f"Subjects missing from fold map: {missing}")
     test = frame[fold == outer_fold].copy()
     outer_train = frame[fold != outer_fold].copy()
-    inner = outer_train["subject_key"].map(
-        lambda value: _inner_partition(str(value), outer_fold)
-    )
+    inner_map = _balanced_inner_partitions(outer_train, outer_fold)
+    inner = outer_train["subject_key"].astype(str).map(inner_map)
     validation = outer_train[inner == inner_validation_partition].copy()
     train = outer_train[inner != inner_validation_partition].copy()
     return train, validation, test
@@ -269,30 +344,26 @@ def train_xgboost_fold(
     output_dir: Path,
     resume_search: bool = True,
 ) -> tuple[XGBClassifier, list[str], pd.DataFrame, pd.DataFrame]:
-    train, validation, test = assign_train_validation_test(features, subject_folds, outer_fold)
-    if train.empty:
-        raise ValueError(f"No training rows available for outer fold {outer_fold}")
-    if validation.empty:
-        raise ValueError(f"No validation rows available for outer fold {outer_fold}")
+    fold = features["subject_key"].map(subject_folds)
+    if fold.isna().any():
+        missing = sorted(features.loc[fold.isna(), "subject_key"].unique())
+        raise ValueError(f"Subjects missing from fold map: {missing}")
+    outer_train = features[fold != outer_fold].copy()
+    test = features[fold == outer_fold].copy()
+    if outer_train.empty:
+        raise ValueError(f"No outer-training rows available for fold {outer_fold}")
     if test.empty:
         raise ValueError(f"No test rows available for outer fold {outer_fold}")
-    selected_train, excluded_far = sample_training_rows(
-        train,
-        float(config["near_event_minutes"]),
-        float(config["far_negative_to_positive_ratio"]),
-        int(config["random_seed"]),
-    )
-    train_y = (selected_train["state_target"].to_numpy() > 0).astype(np.int8)
-    validation_y = (validation["state_target"].to_numpy() > 0).astype(np.int8)
-    if np.unique(train_y).size < 2:
-        raise ValueError("XGBoost training rows must contain both target classes")
-    if np.unique(validation_y).size < 2:
-        raise ValueError("XGBoost validation rows must contain both target classes")
+    modeling_rows = outer_train[
+        outer_train.get("state_loss_mask", pd.Series(1.0, index=outer_train.index)) > 0
+    ].copy()
     columns = feature_columns(features)
     if not columns:
         raise ValueError("No numeric feature columns available for XGBoost")
-    train_x = selected_train[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    validation_x = validation[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    inner_map = _balanced_inner_partitions(modeling_rows, outer_fold, partitions=3)
+    inner_partition = modeling_rows["subject_key"].astype(str).map(inner_map)
+    if inner_partition.nunique() != 3:
+        raise ValueError("Balanced inner CV did not produce three non-empty subject groups")
     output_dir.mkdir(parents=True, exist_ok=True)
     sampled_parameters = list(
         ParameterSampler(
@@ -302,11 +373,13 @@ def train_xgboost_fold(
         )
     )
     checkpoint_path = output_dir / "xgboost_search.checkpoint.jsonl"
+    signature_matrix = modeling_rows[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    signature_target = (modeling_rows["state_target"].to_numpy() > 0).astype(np.int8)
     signature = _xgb_search_signature(
-        train_x,
-        train_y,
-        validation_x,
-        validation_y,
+        signature_matrix,
+        signature_target,
+        signature_matrix.iloc[:0],
+        signature_target[:0],
         config,
         outer_fold,
         sampled_parameters,
@@ -315,8 +388,6 @@ def train_xgboost_fold(
     completed_trials = {int(row["trial"]) for row in trial_results}
     if not completed_trials:
         _initialize_xgb_checkpoint(checkpoint_path, signature)
-    best_model: XGBClassifier | None = None
-    best_model_parameters: dict[str, Any] | None = None
     best_score = max(
         (float(row["validation_auprc"]) for row in trial_results), default=-np.inf
     )
@@ -329,24 +400,48 @@ def train_xgboost_fold(
     for trial, parameters in enumerate(sampled_parameters):
         if trial in completed_trials:
             continue
-        model = _make_model(config, parameters)
-        model.fit(
-            train_x,
-            train_y,
-            eval_set=[(validation_x, validation_y)],
-            verbose=False,
-        )
-        probability = _predict_probability(model, validation_x)
-        score = float(average_precision_score(validation_y, probability))
-        row = {"trial": trial, "validation_auprc": score, **parameters}
+        fold_scores: list[float] = []
+        for inner_fold in range(3):
+            inner_train = modeling_rows[inner_partition != inner_fold]
+            inner_validation = modeling_rows[inner_partition == inner_fold]
+            selected, _ = sample_training_rows(
+                inner_train,
+                float(config["near_event_minutes"]),
+                float(config["far_negative_to_positive_ratio"]),
+                int(config["random_seed"]) + inner_fold,
+            )
+            train_y = (selected["state_target"].to_numpy() > 0).astype(np.int8)
+            validation_y = (
+                inner_validation["state_target"].to_numpy() > 0
+            ).astype(np.int8)
+            if np.unique(train_y).size < 2 or np.unique(validation_y).size < 2:
+                raise ValueError(f"Inner fold {inner_fold} does not contain both classes")
+            train_x = selected[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+            validation_x = inner_validation[columns].replace(
+                [np.inf, -np.inf], np.nan
+            ).fillna(0.0)
+            model = _make_model(config, parameters)
+            model.fit(
+                train_x,
+                train_y,
+                sample_weight=_event_balanced_weights(selected),
+                eval_set=[(validation_x, validation_y)],
+                verbose=False,
+            )
+            probability = _predict_probability(model, validation_x)
+            fold_scores.append(float(average_precision_score(validation_y, probability)))
+        score = float(np.mean(fold_scores))
+        row = {
+            "trial": trial,
+            "validation_auprc": score,
+            "inner_fold_auprc": fold_scores,
+            **parameters,
+        }
         trial_results.append(row)
         completed_trials.add(trial)
         _append_xgb_checkpoint(checkpoint_path, row)
         _write_trials_csv(output_dir / "trials.csv", trial_results)
-        if score > best_score:
-            best_score = score
-            best_model = model
-            best_model_parameters = dict(parameters)
+        best_score = max(best_score, score)
         progress.update(1)
         progress.set_postfix(auprc=f"{score:.4f}", best=f"{best_score:.4f}")
     progress.close()
@@ -357,16 +452,64 @@ def train_xgboost_fold(
     best_row = max(trial_results, key=lambda row: float(row["validation_auprc"]))
     best_score = float(best_row["validation_auprc"])
     best_parameters = {name: best_row[name] for name in parameter_names}
-    if best_model is None or best_model_parameters != best_parameters:
-        tqdm.write("Refitting the best completed XGBoost trial for resumed search...")
-        best_model = _make_model(config, best_parameters)
-        best_model.fit(
+    oof_predictions: list[pd.DataFrame] = []
+    best_iterations: list[int] = []
+    for inner_fold in range(3):
+        inner_train = modeling_rows[inner_partition != inner_fold]
+        inner_validation_model = modeling_rows[inner_partition == inner_fold]
+        validation_subjects = set(inner_validation_model["subject_key"].astype(str))
+        inner_validation_full = outer_train[
+            outer_train["subject_key"].astype(str).isin(validation_subjects)
+        ]
+        selected, _ = sample_training_rows(
+            inner_train,
+            float(config["near_event_minutes"]),
+            float(config["far_negative_to_positive_ratio"]),
+            int(config["random_seed"]) + inner_fold,
+        )
+        train_x = selected[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        validation_x = inner_validation_model[columns].replace(
+            [np.inf, -np.inf], np.nan
+        ).fillna(0.0)
+        model = _make_model(config, best_parameters)
+        model.fit(
             train_x,
-            train_y,
-            eval_set=[(validation_x, validation_y)],
+            (selected["state_target"].to_numpy() > 0).astype(np.int8),
+            sample_weight=_event_balanced_weights(selected),
+            eval_set=[
+                (
+                    validation_x,
+                    (inner_validation_model["state_target"].to_numpy() > 0).astype(np.int8),
+                )
+            ],
             verbose=False,
         )
+        best_iterations.append(int(getattr(model, "best_iteration", 0)) + 1)
+        oof_predictions.append(predict_xgboost(model, inner_validation_full, columns))
 
+    selected_train, excluded_far = sample_training_rows(
+        modeling_rows,
+        float(config["near_event_minutes"]),
+        float(config["far_negative_to_positive_ratio"]),
+        int(config["random_seed"]),
+    )
+    final_estimators = max(1, int(round(float(np.median(best_iterations)))))
+    final_config = dict(config)
+    final_config["n_estimators"] = final_estimators
+    final_config["early_stopping_rounds"] = 0
+    best_model = XGBClassifier(
+        objective=final_config["objective"],
+        eval_metric=final_config["eval_metric"],
+        n_estimators=final_estimators,
+        tree_method="hist",
+        device=str(final_config["device"]),
+        random_state=int(final_config["random_seed"]),
+        n_jobs=-1,
+        **best_parameters,
+    )
+    train_x = selected_train[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    train_y = (selected_train["state_target"].to_numpy() > 0).astype(np.int8)
+    best_model.fit(train_x, train_y, sample_weight=_event_balanced_weights(selected_train))
     if len(excluded_far):
         excluded_x = excluded_far[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
         excluded_probability = _predict_probability(best_model, excluded_x)
@@ -383,12 +526,18 @@ def train_xgboost_fold(
         )
         train_y = (selected_train["state_target"].to_numpy() > 0).astype(np.int8)
         train_x = selected_train[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-        best_model = _make_model(config, best_parameters)
+        best_model = XGBClassifier(
+            objective=final_config["objective"],
+            eval_metric=final_config["eval_metric"],
+            n_estimators=final_estimators,
+            tree_method="hist",
+            device=str(final_config["device"]),
+            random_state=int(final_config["random_seed"]),
+            n_jobs=-1,
+            **best_parameters,
+        )
         best_model.fit(
-            train_x,
-            train_y,
-            eval_set=[(validation_x, validation_y)],
-            verbose=False,
+            train_x, train_y, sample_weight=_event_balanced_weights(selected_train)
         )
 
     best_model.save_model(output_dir / "model.json")
@@ -397,15 +546,21 @@ def train_xgboost_fold(
         "feature_columns": columns,
         "best_parameters": best_parameters,
         "validation_auprc": float(best_score),
+        "inner_partitions": inner_map,
+        "inner_best_iterations": best_iterations,
+        "final_estimators": final_estimators,
         "train_rows": len(selected_train),
-        "validation_rows": len(validation),
+        "validation_rows": len(outer_train),
         "test_rows": len(test),
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     _write_trials_csv(output_dir / "trials.csv", trial_results)
-    return best_model, columns, validation, test
+    validation_predictions = pd.concat(oof_predictions, ignore_index=True).sort_values(
+        ["subject_key", "session_id", "timestamp_ms"]
+    ).reset_index(drop=True)
+    return best_model, columns, validation_predictions, test
 
 
 def predict_xgboost(
@@ -415,11 +570,13 @@ def predict_xgboost(
 ) -> pd.DataFrame:
     matrix = frame[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     probability = _predict_probability(model, matrix)
-    output = frame[["subject_key", "segment_id", "timestamp_ms"]].copy()
+    output = frame[
+        ["subject_key", "segment_id", "session_id", "timestamp_ms"]
+    ].copy()
     output["state_probability"] = probability
     output["start_probability"] = 0.0
     output["end_probability"] = 0.0
-    for indices in output.groupby(["subject_key", "segment_id"], sort=False).groups.values():
+    for indices in output.groupby(["subject_key", "session_id"], sort=False).groups.values():
         ordered = output.loc[indices].sort_values("timestamp_ms")
         values = ordered["state_probability"].to_numpy()
         derivative = np.diff(values, prepend=values[0])

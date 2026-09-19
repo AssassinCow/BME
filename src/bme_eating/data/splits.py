@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -26,10 +27,25 @@ def create_subject_folds(
     if events.empty and not all_subjects:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text("{}", encoding="utf-8")
+        output_path.with_name("subject_folds.manifest.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "number_of_folds": int(number_of_folds),
+                    "seed": int(seed),
+                    "subjects": 0,
+                    "assignments_sha256": hashlib.sha256(b"{}").hexdigest(),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
         return {}
     if missing:
         raise ValueError(f"Events are missing columns: {sorted(missing)}")
-    valid = events[(events["valid_duration"]) & (events.get("coverage", "full") == "full")]
+    coverage = events.get("evaluable", events.get("coverage", "full") == "full")
+    valid = events[(events["valid_duration"]) & coverage]
     summary = (
         valid.assign(
             same=(valid["hand_relation"] == "same").astype(int),
@@ -66,6 +82,19 @@ def create_subject_folds(
         assignments[str(row.subject_key)] = chosen
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(assignments, indent=2, sort_keys=True), encoding="utf-8")
+    fingerprint = hashlib.sha256(
+        json.dumps(assignments, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    manifest = {
+        "version": 2,
+        "number_of_folds": int(number_of_folds),
+        "seed": int(seed),
+        "subjects": len(assignments),
+        "assignments_sha256": fingerprint,
+    }
+    output_path.with_name("subject_folds.manifest.json").write_text(
+        json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
+    )
     return assignments
 
 

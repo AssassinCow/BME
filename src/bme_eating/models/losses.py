@@ -10,16 +10,27 @@ def soft_focal_loss(
     target: torch.Tensor,
     positive_alpha: float,
     gamma: float,
+    mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     probability = torch.sigmoid(logits)
     binary_cross_entropy = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
     probability_target = probability * target + (1.0 - probability) * (1.0 - target)
     alpha_target = positive_alpha * target + (1.0 - positive_alpha) * (1.0 - target)
-    return (alpha_target * (1.0 - probability_target).pow(gamma) * binary_cross_entropy).mean()
+    element = alpha_target * (1.0 - probability_target).pow(gamma) * binary_cross_entropy
+    if mask is None:
+        return element.mean()
+    return (element * mask).sum() / mask.sum().clamp_min(1.0)
 
 
-def soft_dice_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def soft_dice_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
     probability = torch.sigmoid(logits)
+    if mask is not None:
+        probability = probability * mask
+        target = target * mask
     numerator = 2.0 * torch.sum(probability * target) + 1.0
     denominator = torch.sum(probability) + torch.sum(target) + 1.0
     return 1.0 - numerator / denominator
@@ -52,9 +63,15 @@ class DTPLoss(nn.Module):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         state_target = batch["state_target"]
         focal = soft_focal_loss(
-            output["state_logit"], state_target, self.positive_alpha, self.focal_gamma
+            output["state_logit"],
+            state_target,
+            self.positive_alpha,
+            self.focal_gamma,
+            batch.get("state_loss_mask"),
         )
-        dice = soft_dice_loss(output["state_logit"], state_target)
+        dice = soft_dice_loss(
+            output["state_logit"], state_target, batch.get("state_loss_mask")
+        )
         start_element = F.binary_cross_entropy_with_logits(
             output["start_logit"],
             batch["start_target"],

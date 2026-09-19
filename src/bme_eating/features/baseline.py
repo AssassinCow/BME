@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 
 from bme_eating.data.deep_dataset import _load_segment_archive
-from bme_eating.features.signal import ppg_quality_features, robust_statistics, spectral_summary
+from bme_eating.data.session import SessionWindowReader
+from bme_eating.features.signal import (
+    longest_false_run,
+    masked_spectral_summary,
+    ppg_quality_features,
+    robust_statistics,
+)
 
 
 def _slice(timestamp_ms: np.ndarray, start_ms: int, end_ms: int) -> slice:
@@ -38,12 +44,16 @@ def _motion_window_features(
         output[f"{prefix}_{name}_valid_fraction"] = float(mask[:, column].mean())
     for start, sensor_name in ((0, "acc_mag"), (3, "gyro_mag")):
         valid_rows = mask[:, start : start + 3].all(axis=1)
-        magnitude = np.linalg.norm(values[valid_rows, start : start + 3], axis=1)
+        magnitude_all = np.linalg.norm(values[:, start : start + 3], axis=1)
+        magnitude = magnitude_all[valid_rows]
         _add_statistics(output, f"{prefix}_{sensor_name}", magnitude)
-        for name, value in spectral_summary(magnitude, sampling_hz).items():
+        for name, value in masked_spectral_summary(
+            magnitude_all, valid_rows, sampling_hz
+        ).items():
             output[f"{prefix}_{sensor_name}_{name}"] = value
-        if len(magnitude) > 1:
-            jerk = np.diff(magnitude) * sampling_hz
+        adjacent_valid = valid_rows[:-1] & valid_rows[1:]
+        if adjacent_valid.any():
+            jerk = np.diff(magnitude_all)[adjacent_valid] * sampling_hz
             output[f"{prefix}_{sensor_name}_jerk_std"] = float(np.std(jerk))
             output[f"{prefix}_{sensor_name}_jerk_rms"] = float(
                 np.sqrt(np.mean(np.square(jerk)))
@@ -79,8 +89,13 @@ def _ppg_window_features(
     output: dict[str, float] = {}
     valid = values[mask]
     _add_statistics(output, f"{prefix}_ppg", valid)
-    for name, value in spectral_summary(valid, sampling_hz).items():
+    for name, value in masked_spectral_summary(values, mask, sampling_hz).items():
         output[f"{prefix}_ppg_{name}"] = value
+    zero_mask = mask & (values == 0)
+    output[f"{prefix}_ppg_zero_fraction"] = float(zero_mask.sum() / max(mask.sum(), 1))
+    output[f"{prefix}_ppg_longest_zero_run_ratio"] = float(
+        longest_false_run(~zero_mask) / max(len(zero_mask), 1)
+    )
     quality_features, quality = ppg_quality_features(values, mask, sampling_hz)
     quality_names = (
         "valid_fraction",
@@ -136,17 +151,41 @@ def build_segment_features(
     include_dyadic: bool,
     motion_bucket_seconds: list[int],
     ppg_bucket_seconds: list[int],
+    context_segments: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    payload = _load_segment_archive(segment_path)
-    motion_time = payload["motion_timestamp_ms"]
-    motion_values = payload["motion_values"]
-    motion_mask = payload["motion_mask"].astype(bool)
-    ppg_time = payload["ppg_timestamp_ms"]
-    ppg_values = payload["ppg_values"].reshape(-1)
-    ppg_mask = payload["ppg_mask"].astype(bool).reshape(-1)
+    if context_segments is None:
+        payload = _load_segment_archive(segment_path)
+        first = anchors.iloc[0]
+        context_segments = pd.DataFrame(
+            [
+                {
+                    "session_id": str(getattr(first, "session_id", first.segment_id)),
+                    "segment_id": str(first.segment_id),
+                    "segment_path": str(segment_path),
+                    "start_ms": int(payload["motion_timestamp_ms"][0]),
+                    "end_ms": int(payload["motion_timestamp_ms"][-1]),
+                }
+            ]
+        )
+    reader = SessionWindowReader(context_segments)
+    maximum_history_seconds = max(
+        int(window_seconds),
+        sum(motion_bucket_seconds) if include_dyadic else 0,
+        sum(ppg_bucket_seconds) if include_dyadic else 0,
+    )
     rows: list[dict[str, object]] = []
     for anchor in anchors.itertuples(index=False):
         end_ms = int(anchor.timestamp_ms)
+        session_id = str(getattr(anchor, "session_id", anchor.segment_id))
+        payload = reader.read(
+            session_id, end_ms - maximum_history_seconds * 1000, end_ms
+        )
+        motion_time = payload["motion_timestamp_ms"]
+        motion_values = payload["motion_values"]
+        motion_mask = payload["motion_mask"].astype(bool)
+        ppg_time = payload["ppg_timestamp_ms"]
+        ppg_values = payload["ppg_values"].reshape(-1)
+        ppg_mask = payload["ppg_mask"].astype(bool).reshape(-1)
         start_ms = end_ms - int(window_seconds * 1000)
         motion_slice = _slice(motion_time, start_ms, end_ms)
         ppg_slice = _slice(ppg_time, start_ms, end_ms)
@@ -184,15 +223,25 @@ def build_segment_features(
         features.update(
             {
                 "segment_id": anchor.segment_id,
+                "session_id": session_id,
                 "subject_key": anchor.subject_key,
                 "timestamp_ms": end_ms,
                 "state_target": float(anchor.state_target),
+                "state_loss_mask": float(getattr(anchor, "state_loss_mask", 1.0)),
+                "censor_mask": float(getattr(anchor, "censor_mask", 0.0)),
                 "start_target": float(anchor.start_target),
                 "end_target": float(anchor.end_target),
                 "start_loss_mask": float(anchor.start_loss_mask),
                 "end_loss_mask": float(anchor.end_loss_mask),
                 "distance_to_event_seconds": float(anchor.distance_to_event_seconds),
                 "hand_relation": anchor.hand_relation,
+                "event_id": str(getattr(anchor, "event_id", "")),
+                "motion_history_available_seconds": float(
+                    getattr(anchor, "motion_history_available_seconds", 0.0)
+                ),
+                "ppg_history_available_seconds": float(
+                    getattr(anchor, "ppg_history_available_seconds", 0.0)
+                ),
             }
         )
         rows.append(features)

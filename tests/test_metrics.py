@@ -32,3 +32,23 @@ def test_metrics_reject_reversed_intervals():
     with pytest.raises(ValueError, match="positive duration"):
         match_events(np.asarray([[100.0, 0.0]]), np.asarray([[0.0, 100.0]]))
 
+
+def test_maximum_cardinality_precedes_total_iou():
+    truth = np.asarray([[0.0, 1000.0], [1000.0, 2000.0]])
+    prediction = np.asarray([[0.0, 1670.0], [0.0, 260.0]])
+    matches = match_events(truth, prediction, 0.25, method="max_cardinality_iou")
+    assert len(matches) == 2
+
+
+def test_predictions_overlapping_ignore_intervals_are_not_false_positives():
+    truth = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
+    prediction = pd.DataFrame(
+        [{"subject_key": "s", "start_ms": 100, "end_ms": 200}]
+    )
+    ignore = pd.DataFrame(
+        [{"subject_key": "s", "start_ms": 50, "end_ms": 250}]
+    )
+    metrics, _ = evaluate_events(truth, prediction, ignore=ignore)
+    assert metrics["false_positive"] == 0
+    assert metrics["ignored_predictions"] == 1
+

@@ -35,12 +35,13 @@ def _frame_digest(frame: pd.DataFrame, columns: list[str]) -> str:
 def _postprocess_search_signature(
     predictions: pd.DataFrame,
     truth: pd.DataFrame,
+    ignore: pd.DataFrame,
     search: dict[str, list[float]],
     iou_threshold: float,
 ) -> str:
     prediction_columns = [
         "subject_key",
-        "segment_id",
+        "session_id",
         "timestamp_ms",
         "state_probability",
         "start_probability",
@@ -48,11 +49,12 @@ def _postprocess_search_signature(
     ]
     truth_columns = ["subject_key", "start_ms", "end_ms"]
     payload = {
-        "version": 1,
-        "search": {name: [float(value) for value in search[name]] for name in _POSTPROCESS_PARAMETER_NAMES},
+        "version": 2,
+        "search": search,
         "iou_threshold": float(iou_threshold),
         "predictions": _frame_digest(predictions, prediction_columns),
         "truth": _frame_digest(truth, truth_columns),
+        "ignore": _frame_digest(ignore, truth_columns),
     }
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
@@ -153,7 +155,7 @@ def probabilities_to_events(
         raise ValueError("Expected 0 <= low_threshold < high_threshold <= 1")
     required = {
         "subject_key",
-        "segment_id",
+        "session_id",
         "timestamp_ms",
         "state_probability",
         "start_probability",
@@ -164,7 +166,7 @@ def probabilities_to_events(
         raise ValueError(f"Missing prediction columns: {sorted(missing)}")
     if predictions.empty:
         return pd.DataFrame(
-            columns=["subject_key", "segment_id", "start_ms", "end_ms", "score"]
+            columns=["subject_key", "session_id", "start_ms", "end_ms", "score"]
         )
     numeric_columns = [
         "timestamp_ms",
@@ -178,8 +180,8 @@ def probabilities_to_events(
     if ((numeric[:, 1:] < 0) | (numeric[:, 1:] > 1)).any():
         raise ValueError("Prediction probabilities must be in [0, 1]")
     events: list[dict[str, object]] = []
-    for (subject_key, segment_id), group in predictions.groupby(
-        ["subject_key", "segment_id"], sort=False
+    for (subject_key, session_id), group in predictions.groupby(
+        ["subject_key", "session_id"], sort=False
     ):
         group = (
             group.sort_values("timestamp_ms")
@@ -217,7 +219,7 @@ def probabilities_to_events(
                 candidates.append(
                     {
                         "subject_key": subject_key,
-                        "segment_id": segment_id,
+                        "session_id": session_id,
                         "start_ms": int(timestamps[start_index]),
                         "end_ms": int(timestamps[end_index]),
                         "score": float(np.mean(smoothed[start_index : end_index + 1])),
@@ -228,7 +230,7 @@ def probabilities_to_events(
             candidates.append(
                 {
                     "subject_key": subject_key,
-                    "segment_id": segment_id,
+                    "session_id": session_id,
                     "start_ms": int(timestamps[start_index]),
                     "end_ms": int(timestamps[-1]),
                     "score": float(np.mean(smoothed[start_index:])),
@@ -248,7 +250,7 @@ def probabilities_to_events(
             else:
                 merged.append(event)
         events.extend(merged)
-    return pd.DataFrame(events, columns=["subject_key", "segment_id", "start_ms", "end_ms", "score"])
+    return pd.DataFrame(events, columns=["subject_key", "session_id", "start_ms", "end_ms", "score"])
 
 
 def tune_postprocess_parameters(
@@ -258,14 +260,37 @@ def tune_postprocess_parameters(
     iou_threshold: float,
     checkpoint_path: Path | None = None,
     show_progress: bool = True,
+    ignore: pd.DataFrame | None = None,
+    matching_method: str = "max_cardinality_iou",
 ) -> tuple[dict[str, float], pd.DataFrame]:
-    values = [search[name] for name in _POSTPROCESS_PARAMETER_NAMES]
-    combinations = [
-        tuple(float(value) for value in combination)
-        for combination in product(*values)
-        if float(combination[2]) < float(combination[1])
+    if ignore is None:
+        ignore = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
+    high_values = [float(value) for value in search.get("high_threshold", [])]
+    probabilities = predictions["state_probability"].to_numpy(dtype=np.float64)
+    for quantile in search.get("high_threshold_quantiles", []):
+        high_values.append(float(np.quantile(probabilities, float(quantile))))
+    high_values = sorted({min(1.0, max(0.0, value)) for value in high_values})
+    threshold_pairs: set[tuple[float, float]] = set()
+    for high in high_values:
+        for low in search.get("low_threshold", []):
+            if float(low) < high:
+                threshold_pairs.add((high, float(low)))
+        for ratio in search.get("low_threshold_ratios", []):
+            low = high * float(ratio)
+            if 0 <= low < high:
+                threshold_pairs.add((high, low))
+    other_names = [
+        name for name in _POSTPROCESS_PARAMETER_NAMES if name not in {"high_threshold", "low_threshold"}
     ]
-    signature = _postprocess_search_signature(predictions, truth, search, iou_threshold)
+    combinations = []
+    for other_values in product(*(search[name] for name in other_names)):
+        other = dict(zip(other_names, (float(value) for value in other_values)))
+        for high, low in sorted(threshold_pairs):
+            parameters = {**other, "high_threshold": high, "low_threshold": low}
+            combinations.append(tuple(parameters[name] for name in _POSTPROCESS_PARAMETER_NAMES))
+    signature = _postprocess_search_signature(
+        predictions, truth, ignore, search, iou_threshold
+    )
     rows = _load_search_checkpoint(checkpoint_path, signature) if checkpoint_path else []
     completed = {_parameter_key(row) for row in rows}
     if checkpoint_path is not None and not completed:
@@ -284,7 +309,11 @@ def tune_postprocess_parameters(
         parameters = dict(zip(_POSTPROCESS_PARAMETER_NAMES, combination))
         events = probabilities_to_events(predictions, **parameters)
         metrics, _ = evaluate_events(
-            truth, events, iou_threshold=iou_threshold, method="hungarian"
+            truth,
+            events,
+            iou_threshold=iou_threshold,
+            method=matching_method,
+            ignore=ignore,
         )
         boundary_values = [
             value

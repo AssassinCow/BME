@@ -21,11 +21,11 @@ from bme_eating.data.deep_dataset import (
     compute_normalization,
     save_normalization,
 )
-from bme_eating.metrics import evaluate_events
+from bme_eating.metrics import evaluate_events, partition_evaluation_events
 from bme_eating.models.dtp_sqf import DTPSQF
 from bme_eating.models.losses import DTPLoss
 from bme_eating.models.xgb_baseline import assign_train_validation_test
-from bme_eating.postprocess import probabilities_to_events
+from bme_eating.postprocess import probabilities_to_events, tune_postprocess_parameters
 
 
 def seed_everything(seed: int) -> None:
@@ -56,22 +56,6 @@ def _learning_rate_schedule(warmup_fraction: float, total_steps: int):
     return schedule
 
 
-def _validation_proxy(
-    anchors: pd.DataFrame,
-    background_segments_per_subject: int,
-) -> pd.DataFrame:
-    near_segment_ids = set(
-        anchors.loc[anchors["distance_to_event_seconds"] <= 1800.0, "segment_id"].unique()
-    )
-    selected_segment_ids = set(near_segment_ids)
-    for _, subject_rows in anchors.groupby("subject_key", sort=True):
-        background_ids = sorted(
-            set(subject_rows["segment_id"].unique()) - near_segment_ids
-        )[:background_segments_per_subject]
-        selected_segment_ids.update(background_ids)
-    return anchors[anchors["segment_id"].isin(selected_segment_ids)].reset_index(drop=True)
-
-
 def _prediction_frame(
     model: DTPSQF,
     loader: DataLoader,
@@ -99,6 +83,7 @@ def _prediction_frame(
                     {
                         "subject_key": batch["subject_key"][index],
                         "segment_id": batch["segment_id"][index],
+                        "session_id": batch["session_id"][index],
                         "timestamp_ms": int(batch["timestamp_ms"][index]),
                         "state_probability": float(state[index]),
                         "start_probability": float(start[index]),
@@ -153,10 +138,6 @@ def train_dtp_fold(
         raise ValueError(
             f"Fold {outer_fold} must have non-empty train, validation, and test anchors"
         )
-    validation_proxy = _validation_proxy(
-        validation_anchors,
-        int(training_config["validation_background_segments_per_subject"]),
-    )
     train_subjects = set(train_anchors["subject_key"].unique())
     normalization = compute_normalization(segments, train_subjects)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -165,6 +146,7 @@ def train_dtp_fold(
     future_seconds = int(model_config.get("future_context_seconds", 0))
     train_dataset = DTPDataset(
         train_anchors,
+        segments,
         normalization,
         future_context_seconds=future_seconds,
         training=True,
@@ -172,7 +154,8 @@ def train_dtp_fold(
         seed=seed,
     )
     validation_dataset = DTPDataset(
-        validation_proxy,
+        validation_anchors,
+        segments,
         normalization,
         future_context_seconds=future_seconds,
         training=False,
@@ -180,6 +163,7 @@ def train_dtp_fold(
     )
     test_dataset = DTPDataset(
         test_anchors,
+        segments,
         normalization,
         future_context_seconds=future_seconds,
         training=False,
@@ -272,11 +256,9 @@ def train_dtp_fold(
         tqdm.write(f"Resuming DTP-SQF at epoch {start_epoch + 1}/{max_epochs}")
 
     validation_subjects = set(validation_anchors["subject_key"].unique())
-    validation_truth = events[
-        events["subject_key"].isin(validation_subjects)
-        & events["valid_duration"]
-        & (events["coverage"] == "full")
-    ]
+    validation_truth, validation_ignore = partition_evaluation_events(
+        events, validation_subjects
+    )
     for epoch in range(start_epoch, max_epochs):
         batch_sampler.set_epoch(epoch)
         model.train()
@@ -350,14 +332,31 @@ def train_dtp_fold(
             amp_dtype,
             description=f"Validating epoch {epoch + 1}",
         )
-        validation_events = probabilities_to_events(
-            validation_predictions, **_postprocess_kwargs(postprocess_config)
-        )
+        if "search" in postprocess_config:
+            selected_postprocess, _ = tune_postprocess_parameters(
+                validation_predictions,
+                validation_truth,
+                postprocess_config["search"],
+                float(postprocess_config["iou_threshold"]),
+                show_progress=False,
+                ignore=validation_ignore,
+                matching_method=str(
+                    postprocess_config.get("matching_method", "max_cardinality_iou")
+                ),
+            )
+            validation_events = probabilities_to_events(
+                validation_predictions, **selected_postprocess
+            )
+        else:
+            validation_events = probabilities_to_events(
+                validation_predictions, **_postprocess_kwargs(postprocess_config)
+            )
         metrics, _ = evaluate_events(
             validation_truth,
             validation_events,
             iou_threshold=float(postprocess_config["iou_threshold"]),
-            method="hungarian",
+            method=str(postprocess_config.get("matching_method", "max_cardinality_iou")),
+            ignore=validation_ignore,
         )
         boundary_values = [
             value
@@ -431,7 +430,7 @@ def train_dtp_fold(
         "test_window_auprc": test_auprc,
         "train_rows": len(train_anchors),
         "validation_rows": len(validation_anchors),
-        "validation_proxy_rows": len(validation_proxy),
+        "validation_full_timeline_rows": len(validation_anchors),
         "test_rows": len(test_anchors),
         "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()),
     }

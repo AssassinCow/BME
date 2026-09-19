@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import statistics
 import zipfile
 from dataclasses import dataclass
@@ -14,6 +15,16 @@ from bme_eating.constants import ACC_COLUMNS, GYRO_COLUMNS, TIME_COLUMNS
 from bme_eating.types import SensorSeries
 
 
+SENSOR_COLUMNS = (
+    list(TIME_COLUMNS)
+    + [f"PPG{number}" for number in range(1, 45)]
+    + list(ACC_COLUMNS)
+    + list(GYRO_COLUMNS)
+)
+_SENSOR_HEADER_BYTES = "\t".join(SENSOR_COLUMNS).encode("utf-8")
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
 @dataclass(frozen=True)
 class ParsedAttachment:
     acc: SensorSeries
@@ -21,6 +32,9 @@ class ParsedAttachment:
     ppg: SensorSeries
     source_name: str
     info: dict[str, object]
+    parser_status: str = "documented_text"
+    text_offset_bytes: int = 0
+    left_censored: bool = False
 
 
 class UnsupportedSensorFormatError(ValueError):
@@ -103,7 +117,8 @@ class _PacketExpander:
 
 def _float_or_zero(value: str) -> float:
     try:
-        return float(value)
+        parsed = float(value)
+        return parsed if math.isfinite(parsed) else 0.0
     except (TypeError, ValueError):
         return 0.0
 
@@ -115,31 +130,114 @@ def _int_or_zero(value: str) -> int:
         return 0
 
 
-def _assert_text_sensor_member(
+def _parse_sensor_value(value: str, row_number: int, column: str) -> float:
+    try:
+        parsed = float(value.strip())
+    except (AttributeError, ValueError) as error:
+        raise ValueError(f"row {row_number} has invalid {column}") from error
+    if not math.isfinite(parsed):
+        raise ValueError(f"row {row_number} has non-finite {column}")
+    return parsed
+
+
+def _parse_timestamp(value: str, row_number: int, column: str) -> int:
+    text = value.strip()
+    if not text:
+        return 0
+    try:
+        parsed = float(text)
+    except ValueError as error:
+        raise ValueError(f"row {row_number} has invalid {column}") from error
+    if not math.isfinite(parsed):
+        raise ValueError(f"row {row_number} has non-finite {column}")
+    return int(parsed)
+
+
+def _find_sensor_header_offsets(handle: zipfile.ZipExtFile) -> list[int]:
+    offsets: set[int] = set()
+    overlap = len(_SENSOR_HEADER_BYTES) + 2
+    tail = b""
+    consumed = 0
+    while True:
+        chunk = handle.read(1024 * 1024)
+        if not chunk:
+            break
+        buffer = tail + chunk
+        base = consumed - len(tail)
+        start = 0
+        while True:
+            position = buffer.find(_SENSOR_HEADER_BYTES, start)
+            if position < 0:
+                break
+            after = position + len(_SENSOR_HEADER_BYTES)
+            if after < len(buffer) and buffer[after : after + 1] in {b"\r", b"\n"}:
+                offsets.add(base + position)
+            start = position + 1
+        consumed += len(chunk)
+        tail = buffer[-overlap:]
+        if len(offsets) > 1:
+            break
+    return sorted(offsets)
+
+
+def _locate_sensor_text(
     archive: zipfile.ZipFile,
     zip_path: Path,
     member_name: str,
     required_columns: set[str],
-) -> None:
+) -> tuple[str, int, list[str]]:
     with archive.open(member_name) as handle:
-        prefix = handle.read(4096)
-    try:
-        decoded = prefix.decode("utf-8-sig")
-    except UnicodeDecodeError as error:
-        raise UnsupportedSensorFormatError(
-            zip_path,
-            member_name,
-            f"member is not UTF-8 text (prefix={prefix[:32].hex()})",
-        ) from error
-    first_line = decoded.splitlines()[0] if decoded.splitlines() else ""
-    columns = {value.strip() for value in first_line.split("\t")}
-    missing = required_columns - columns
+        prefix = handle.read(len(_UTF8_BOM) + len(_SENSOR_HEADER_BYTES) + 2)
+        if prefix.startswith(_UTF8_BOM + _SENSOR_HEADER_BYTES):
+            offset = len(_UTF8_BOM)
+            status = "documented_text"
+        elif prefix.startswith(_SENSOR_HEADER_BYTES):
+            offset = 0
+            status = "documented_text"
+        else:
+            handle.seek(0)
+            offsets = _find_sensor_header_offsets(handle)
+            if len(offsets) != 1:
+                reason = "standard sensor header was not found"
+                if len(offsets) > 1:
+                    reason = "standard sensor header occurs more than once"
+                raise UnsupportedSensorFormatError(zip_path, member_name, reason)
+            offset = offsets[0]
+            status = "recovered_text_suffix"
+    columns = SENSOR_COLUMNS.copy()
+    missing = required_columns - set(columns)
     if missing:
         raise UnsupportedSensorFormatError(
             zip_path,
             member_name,
-            f"text header is missing required columns: {sorted(missing)}",
+            f"standard sensor header is missing required columns: {sorted(missing)}",
         )
+    return status, offset, columns
+
+
+def _sensor_rows(
+    archive: zipfile.ZipFile,
+    zip_path: Path,
+    member_name: str,
+    text_offset: int,
+):
+    raw_handle = archive.open(member_name)
+    try:
+        raw_handle.seek(text_offset)
+        text_handle = io.TextIOWrapper(raw_handle, encoding="utf-8", newline="")
+        reader = csv.reader(text_handle, delimiter="\t")
+        header = next(reader)
+        if [value.strip() for value in header] != SENSOR_COLUMNS:
+            raise UnsupportedSensorFormatError(
+                zip_path, member_name, "sensor header does not match the 53-column schema"
+            )
+        yield header, reader
+    except (UnicodeDecodeError, csv.Error) as error:
+        raise UnsupportedSensorFormatError(
+            zip_path, member_name, "sensor text suffix is not valid UTF-8 TSV"
+        ) from error
+    finally:
+        raw_handle.close()
 
 
 def parse_sensor_zip(
@@ -148,6 +246,8 @@ def parse_sensor_zip(
     timestamp_anchor: str = "start",
 ) -> ParsedAttachment:
     zip_path = Path(zip_path)
+    if not 1 <= ppg_samples_per_row <= 44:
+        raise ValueError("ppg_samples_per_row must be between 1 and 44")
     with zipfile.ZipFile(zip_path) as archive:
         text_entries = [name for name in archive.namelist() if name.lower().endswith(".txt")]
         if len(text_entries) != 1:
@@ -158,7 +258,7 @@ def parse_sensor_zip(
             with archive.open(info_entries[0]) as handle:
                 info = json.load(handle)
 
-        _assert_text_sensor_member(
+        parser_status, text_offset, _ = _locate_sensor_text(
             archive,
             zip_path,
             text_entries[0],
@@ -168,37 +268,56 @@ def parse_sensor_zip(
         acc_expander = _PacketExpander(3, timestamp_anchor)
         gyro_expander = _PacketExpander(3, timestamp_anchor)
         ppg_expander = _PacketExpander(1, timestamp_anchor)
-        with archive.open(text_entries[0]) as raw_handle:
-            with io.TextIOWrapper(raw_handle, encoding="utf-8-sig", newline="") as text_handle:
-                reader = csv.reader(text_handle, delimiter="\t")
-                header = next(reader)
+        for header, reader in _sensor_rows(
+            archive, zip_path, text_entries[0], text_offset
+        ):
                 index = {name.strip(): position for position, name in enumerate(header)}
                 required = set(TIME_COLUMNS) | set(ACC_COLUMNS) | set(GYRO_COLUMNS)
                 missing = required - set(index)
                 if missing:
                     raise ValueError(f"Missing required columns in {zip_path}: {sorted(missing)}")
-                ppg_columns = [f"PPG{number}" for number in range(1, ppg_samples_per_row + 1)]
+                ppg_columns = [f"PPG{number}" for number in range(1, 45)]
                 missing_ppg = [name for name in ppg_columns if name not in index]
                 if missing_ppg:
                     raise ValueError(f"Missing configured PPG columns: {missing_ppg}")
 
-                for row in reader:
+                for row_number, row in enumerate(reader, start=2):
                     if len(row) != len(header):
-                        continue
+                        raise UnsupportedSensorFormatError(
+                            zip_path,
+                            text_entries[0],
+                            f"row {row_number} has {len(row)} columns; expected {len(header)}",
+                        )
                     acc_expander.add(
-                        _int_or_zero(row[index["ACC_TIME"]]),
-                        np.asarray([_float_or_zero(row[index[name]]) for name in ACC_COLUMNS]),
+                        _parse_timestamp(row[index["ACC_TIME"]], row_number, "ACC_TIME"),
+                        np.asarray(
+                            [
+                                _parse_sensor_value(row[index[name]], row_number, name)
+                                for name in ACC_COLUMNS
+                            ]
+                        ),
                     )
                     gyro_expander.add(
-                        _int_or_zero(row[index["GYRO_TIME"]]),
-                        np.asarray([_float_or_zero(row[index[name]]) for name in GYRO_COLUMNS]),
+                        _parse_timestamp(row[index["GYRO_TIME"]], row_number, "GYRO_TIME"),
+                        np.asarray(
+                            [
+                                _parse_sensor_value(row[index[name]], row_number, name)
+                                for name in GYRO_COLUMNS
+                            ]
+                        ),
                     )
-                    ppg_timestamp = _int_or_zero(row[index["PPG_TIME"]])
+                    ppg_timestamp = _parse_timestamp(
+                        row[index["PPG_TIME"]], row_number, "PPG_TIME"
+                    )
                     if ppg_timestamp > 0:
-                        ppg_values = np.asarray(
-                            [_float_or_zero(row[index[name]]) for name in ppg_columns],
+                        all_ppg_values = np.asarray(
+                            [
+                                _parse_sensor_value(row[index[name]], row_number, name)
+                                for name in ppg_columns
+                            ],
                             dtype=np.float32,
-                        ).reshape(-1, 1)
+                        )
+                        ppg_values = all_ppg_values[:ppg_samples_per_row].reshape(-1, 1)
                         ppg_expander.add(ppg_timestamp, ppg_values)
 
     return ParsedAttachment(
@@ -207,6 +326,9 @@ def parse_sensor_zip(
         ppg=ppg_expander.finish(),
         source_name=text_entries[0],
         info=info,
+        parser_status=parser_status,
+        text_offset_bytes=text_offset if parser_status == "recovered_text_suffix" else 0,
+        left_censored=parser_status == "recovered_text_suffix",
     )
 
 
@@ -217,7 +339,7 @@ def inspect_ppg_layout(zip_path: str | Path, maximum_rows: int = 100_000) -> dic
     with zipfile.ZipFile(zip_path) as archive:
         text_name = next(name for name in archive.namelist() if name.lower().endswith(".txt"))
         try:
-            _assert_text_sensor_member(
+            parser_status, text_offset, _ = _locate_sensor_text(
                 archive,
                 zip_path,
                 text_name,
@@ -237,14 +359,17 @@ def inspect_ppg_layout(zip_path: str | Path, maximum_rows: int = 100_000) -> dic
                 "nonzero_fraction_by_slot": [0.0] * 44,
             }
 
-        with archive.open(text_name) as raw_handle:
-            with io.TextIOWrapper(raw_handle, encoding="utf-8-sig", newline="") as text_handle:
-                reader = csv.reader(text_handle, delimiter="\t")
-                header = next(reader)
+        for header, reader in _sensor_rows(archive, zip_path, text_name, text_offset):
                 index = {name.strip(): position for position, name in enumerate(header)}
                 for row_number, row in enumerate(reader):
                     if row_number >= maximum_rows:
                         break
+                    if len(row) != len(header):
+                        raise UnsupportedSensorFormatError(
+                            zip_path,
+                            text_name,
+                            f"row {row_number + 2} has {len(row)} columns; expected {len(header)}",
+                        )
                     if _int_or_zero(row[index["PPG_TIME"]]) <= 0:
                         continue
                     ppg_rows += 1
@@ -253,7 +378,8 @@ def inspect_ppg_layout(zip_path: str | Path, maximum_rows: int = 100_000) -> dic
                         nonzero_counts[slot] += int(value != 0.0)
     return {
         "zip_name": zip_path.name,
-        "status": "ok",
+        "status": parser_status,
+        "text_offset_bytes": text_offset if parser_status == "recovered_text_suffix" else 0,
         "rows_scanned": min(maximum_rows, row_number + 1 if "row_number" in locals() else 0),
         "ppg_rows": ppg_rows,
         "nonzero_fraction_by_slot": (
