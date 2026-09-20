@@ -2,6 +2,7 @@ extends: baseline.yaml
 
 experiment:
   name: baseline_fastslow
+  status: stopped_after_boundary_search_review
 
 postprocess:
   detector_mode: dual_ema

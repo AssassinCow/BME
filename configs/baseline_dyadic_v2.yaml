@@ -2,6 +2,7 @@ extends: baseline_boundary.yaml
 
 experiment:
   name: baseline_dyadic_v2
+  status: stopped_without_further_runs
 
 features:
   window_seconds: 15

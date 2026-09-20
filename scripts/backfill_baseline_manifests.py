@@ -23,15 +23,26 @@ def main() -> None:
     validate_quality_gate(output_root)
     for fold in range(5):
         fold_dir = output_root / "experiments" / args.experiment / f"fold_{fold}"
-        for required in ("test_metrics.json", "test_predictions.parquet", "model.json"):
+        for required in (
+            "model.json",
+            "metadata.json",
+            "validation_predictions.parquet",
+            "test_predictions.parquet",
+            "selected_postprocess.json",
+            "test_metrics.json",
+        ):
             if not (fold_dir / required).exists():
-                raise FileNotFoundError(f"Frozen baseline artifact is missing: fold_{fold}/{required}")
+                raise FileNotFoundError(
+                    f"Frozen baseline artifact is missing: fold_{fold}/{required}"
+                )
         path = write_run_manifest(fold_dir, config, output_root)
         payload = json.loads(path.read_text(encoding="utf-8"))
-        payload["git"]["commit"] = args.source_commit
-        payload["git"]["dirty"] = None
         payload["backfilled"] = True
         payload["backfill_scope"] = "fingerprints captured after the frozen run"
+        payload["artifact_provenance"] = {
+            "claimed_source_commit": args.source_commit,
+            "verification": "team-declared; backfill cannot prove original training commit",
+        }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(path)
 

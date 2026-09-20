@@ -284,8 +284,18 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         blocks = np.stack((normalized, valid.astype(np.float32)), axis=1).astype(np.float32)
         return blocks, quality_features, quality_target
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str | int]:
-        anchor = self.anchors.iloc[index]
+    def __getitem__(
+        self, index: int | tuple[int, int]
+    ) -> dict[str, torch.Tensor | str | int]:
+        if isinstance(index, tuple):
+            anchor_index, epoch = index
+        else:
+            anchor_index, epoch = index, 0
+        anchor_index = int(anchor_index)
+        epoch = int(epoch)
+        if anchor_index < 0 or anchor_index >= len(self.anchors) or epoch < 0:
+            raise IndexError(f"Invalid DTP dataset index: {(anchor_index, epoch)}")
+        anchor = self.anchors.iloc[anchor_index]
         timestamp_ms = int(anchor.timestamp_ms)
         session_id = str(getattr(anchor, "session_id", anchor.segment_id))
         maximum_history_seconds = max(
@@ -296,7 +306,9 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             timestamp_ms - maximum_history_seconds * 1000,
             timestamp_ms + self.future_context_seconds * 1000,
         )
-        rng = np.random.default_rng(self.seed + index)
+        rng = np.random.default_rng(
+            np.random.SeedSequence([self.seed, anchor_index, epoch])
+        )
 
         motion_start = timestamp_ms - self.motion_history_seconds * 1000
         motion, motion_mask = _sample_grid(
@@ -402,7 +414,7 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         return result
 
 
-class SegmentBalancedBatchSampler(Sampler[list[int]]):
+class SegmentBalancedBatchSampler(Sampler[list[tuple[int, int]]]):
     def __init__(
         self,
         anchors: pd.DataFrame,
@@ -473,4 +485,4 @@ class SegmentBalancedBatchSampler(Sampler[list[int]]):
             negative += self._sample(rng, self.all_negative, negative_count - len(negative))
             batch = positive + negative
             rng.shuffle(batch)
-            yield batch
+            yield [(index, self.epoch) for index in batch]

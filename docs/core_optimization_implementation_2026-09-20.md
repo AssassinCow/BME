@@ -1,5 +1,9 @@
 # 限时核心优化实施状态（2026-09-20）
 
+> 后续决策：本页所列 boundary/fastslow/dyadic 候选均已停止。`baseline_boundary`
+> 因活动搜索边界被拒绝；唯一继续的候选是冻结 `3ca55bb` baseline 与因果 DTP 的
+> 受限残差融合，详见 `dtp_fusion_runbook_2026-09-20.md`。
+
 ## 已实现
 
 - 冻结 `baseline`，新增 `baseline_fastslow`、`baseline_boundary`、

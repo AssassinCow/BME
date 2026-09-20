@@ -12,6 +12,21 @@ from typing import Any
 from bme_eating.config import feature_artifact_name
 
 
+def epoch_random_seed(base_seed: int, outer_fold: int, epoch: int) -> int:
+    if outer_fold < 0 or epoch < 0:
+        raise ValueError("outer_fold and epoch must be non-negative")
+    return int(
+        (int(base_seed) + 1_000_003 * int(outer_fold) + 10_007 * (int(epoch) + 1))
+        % (2**32 - 1)
+    )
+
+
+def should_validate_epoch(epoch: int, interval: int) -> bool:
+    if epoch < 0 or interval <= 0:
+        raise ValueError("epoch must be non-negative and validation interval must be positive")
+    return epoch == 0 or (epoch + 1) % interval == 0
+
+
 def _sha256(path: Path) -> str | None:
     if not path.exists() or not path.is_file():
         return None
@@ -47,7 +62,6 @@ def write_run_manifest(
 
     project_root = Path(__file__).resolve().parents[2]
     config_path = Path(str(config["_config_path"]))
-    feature_name = feature_artifact_name(config)
     tracked_inputs = {
         "config": config_path,
         "quality_report": output_root / "indices" / "quality_report.json",
@@ -55,12 +69,35 @@ def write_run_manifest(
         "subject_folds": output_root / "indices" / "subject_folds.json",
         "subject_folds_manifest": output_root / "indices" / "subject_folds.manifest.json",
         "events": output_root / "indices" / "events.parquet",
-        "features": output_root / "features" / f"{feature_name}.parquet",
+        "anchors": output_root / "indices" / "anchors.parquet",
+        "segments": output_root / "indices" / "segments.parquet",
     }
+    if "features" in config:
+        feature_name = feature_artifact_name(config)
+        tracked_inputs["features"] = output_root / "features" / f"{feature_name}.parquet"
     model_files = {
         path.name: _sha256(path)
         for path in sorted(output_dir.glob("*model.json"))
         if path.is_file()
+    }
+    artifact_names = (
+        "model.json",
+        "metadata.json",
+        "best_validation_selection.json",
+        "best_validation_predictions.parquet",
+        "validation_predictions.parquet",
+        "dtp_test_predictions.parquet",
+        "test_predictions.parquet",
+        "selected_postprocess.json",
+        "selected_fusion.json",
+        "fusion_trials.csv",
+        "test_metrics.json",
+        "best.pt",
+    )
+    artifact_hashes = {
+        name: digest
+        for name in artifact_names
+        if (digest := _sha256(output_dir / name)) is not None
     }
     try:
         import xgboost
@@ -102,6 +139,7 @@ def write_run_manifest(
             "project": int(config.get("project", {}).get("seed", 0)),
             "split": int(config.get("data", {}).get("split_seed", 0)),
             "xgboost": int(config.get("xgboost", {}).get("random_seed", 0)),
+            "training": int(config.get("training", {}).get("random_seed", 0)),
         },
         "hashes": {
             name: value
@@ -110,6 +148,7 @@ def write_run_manifest(
         },
         "resolved_config_sha256": resolved_config_hash,
         "model_hashes": model_files,
+        "artifact_hashes": artifact_hashes,
         "environment": {
             "python": platform.python_version(),
             "implementation": platform.python_implementation(),

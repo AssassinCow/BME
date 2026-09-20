@@ -2,6 +2,7 @@ extends: baseline_fastslow.yaml
 
 experiment:
   name: baseline_boundary
+  status: rejected_active_search_boundaries
 
 xgboost:
   different_hand_weight_candidates: [1.0, 1.5, 2.0]

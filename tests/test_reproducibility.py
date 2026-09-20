@@ -1,4 +1,5 @@
 import json
+import hashlib
 
 from bme_eating.reproducibility import write_run_manifest
 
@@ -12,6 +13,7 @@ def test_run_manifest_hashes_inputs_without_absolute_paths(tmp_path):
     (index_dir / "subject_folds.json").write_text("{}", encoding="utf-8")
     experiment = output_root / "experiments" / "candidate" / "fold_0"
     experiment.mkdir(parents=True)
+    (experiment / "test_predictions.parquet").write_bytes(b"prediction")
     config = {
         "_config_path": str(config_path),
         "project": {"seed": 2026},
@@ -26,4 +28,8 @@ def test_run_manifest_hashes_inputs_without_absolute_paths(tmp_path):
     payload = json.loads(path.read_text(encoding="utf-8"))
     assert payload["command"] == ["train.py", "--fold", "0"]
     assert "subject_folds" in payload["hashes"]
+    assert (
+        payload["artifact_hashes"]["test_predictions.parquet"]
+        == hashlib.sha256(b"prediction").hexdigest()
+    )
     assert str(tmp_path) not in path.read_text(encoding="utf-8")

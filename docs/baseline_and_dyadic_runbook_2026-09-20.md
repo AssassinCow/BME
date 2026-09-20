@@ -1,5 +1,9 @@
 # 新 baseline 与精简 dyadic 运行手册
 
+> 状态：已停止。`baseline_boundary` fold 0 因多个真实搜索边界被标记为
+> `rejected_active_search_boundaries`；fastslow 和所有 XGBoost dyadic 不再运行。
+> 本文仅保留为失败实验记录，当前流程改用 `dtp_fusion_runbook_2026-09-20.md`。
+
 日期：2026-09-20。以下命令在 RTX 4080 的 `bme-model` Conda 环境中运行。
 所有分数均为训练数据内部的本地评估，不是官方测试分数。
 

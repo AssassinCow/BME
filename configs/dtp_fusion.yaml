@@ -1,0 +1,21 @@
+extends: dtp_sqf.yaml
+
+experiment:
+  name: baseline_dtp_fusion
+  baseline_name: baseline
+  baseline_source_commit: 3ca55bb
+
+fusion:
+  alpha_candidates: [0.0, 0.25, 0.5]
+  beta_candidates: [-0.25, 0.0, 0.25]
+  residual_clip: 2.0
+  probability_epsilon: 0.000001
+  internal_gate:
+    minimum_f1_improvement: 0.015
+    minimum_different_sensitivity_improvement: 0.03
+    maximum_fp_per_hour_ratio: 1.2
+  fold0_gate:
+    minimum_f1_improvement: 0.02
+    maximum_fp_per_hour_ratio: 1.2
+    maximum_boundary_mae_ratio: 1.1
+

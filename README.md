@@ -245,6 +245,9 @@ python scripts/train_xgboost.py --config configs/baseline.yaml --fold 0
 
 ## 10. 9 月 20 日冻结基线与限时核心候选
 
+> 本节原有的 boundary/fastslow/dyadic 命令已停止执行，仅作为历史实验记录保留。
+> 当前唯一候选是第 11 节的冻结 baseline + 因果 DTP 受限残差融合。
+
 当前冻结基线提交为 `3ca55bb`，完整五折本地评估为：Micro F1 `0.4701`、
 strict-no-ignore macro F1 `0.4350`、同侧/异侧召回 `0.6429/0.1538`、
 平均 FP/h `0.023703`、加权起止 MAE `232.72/92.98` 秒。这些都是本地口径，
@@ -308,3 +311,63 @@ python scripts/compare_models.py `
 指纹变化会直接阻止晋级。官方 partial 计分、一对一匹配细节、提交字段和测试执行接口
 仍为 `UNKNOWN`，因此继续同时保留本地 max-cardinality、旧 Hungarian、greedy 和
 strict-no-ignore 结果。
+
+## 11. 冻结 baseline + DTP 受限残差融合
+
+不重新训练 `3ca55bb` baseline，不重新运行审计、预处理或 `build_features.py`。先更新代码、
+激活 4080 的 `bme-model` 环境，然后执行：
+
+```powershell
+python scripts/check_environment.py
+python -m pytest -q
+python scripts/smoke_test_model.py --config configs/dtp_fusion.yaml --batch-size 1
+python scripts/validate_data.py --config configs/base.yaml
+
+# 只补录冻结产物哈希和团队声明的来源提交，不训练模型、不改预测。
+python scripts/backfill_baseline_manifests.py --source-commit 3ca55bb
+
+$run = "baseline_dtp_fusion_clean_20260920a"
+python scripts/train_fusion.py `
+  --config configs/dtp_fusion.yaml `
+  --run-name $run `
+  --fold 0 `
+  --fresh
+if ($LASTEXITCODE -ne 0) { throw "fusion fold 0 failed its gate" }
+```
+
+`--fresh` 原子创建全新的实验根目录；目录只要已经存在就拒绝运行，不删除、不覆盖、也不读取
+其中任何旧 DTP checkpoint、预测或 fusion trial。该方案按定义仍只读复用冻结 baseline 概率和
+后处理参数。
+
+fold 0 通过内部验证门禁后才会生成外层预测；通过外层门禁后才允许后续折。后续折必须串行：
+
+```powershell
+1..4 | ForEach-Object {
+  python scripts/train_fusion.py `
+    --config configs/dtp_fusion.yaml `
+    --run-name $run `
+    --fold $_
+  if ($LASTEXITCODE -ne 0) { throw "fusion fold $_ failed" }
+}
+
+python scripts/compare_models.py `
+  --baseline "$env:BME_OUTPUT_ROOT\v2\experiments\baseline" `
+  --candidate "$env:BME_OUTPUT_ROOT\v2\experiments\$run" `
+  --output "$env:BME_OUTPUT_ROOT\v2\experiments\${run}_promotion.json"
+```
+
+中断后只恢复当前折，不删除 checkpoint：
+
+```powershell
+python scripts/train_fusion.py `
+  --config configs/dtp_fusion.yaml `
+  --run-name $run `
+  --fold 0 `
+  --resume "$env:BME_OUTPUT_ROOT\v2\experiments\$run\fold_0\last.pt"
+```
+
+每次验证只评估 9 个固定的 `alpha/beta` 组合，复用冻结 baseline 后处理与起止概率。
+任一门禁返回退出码 2 时停止，不扩权重、不改 DTP 结构、不重新搜索 CPU 后处理。完整说明见
+[`docs/dtp_fusion_runbook_2026-09-20.md`](docs/dtp_fusion_runbook_2026-09-20.md)。
+fold 0 外层结果被用作继续/停止门禁，因此最终五折汇总是经过 fold 0 条件筛选的本地结果，
+不能解释为完全无偏的独立测试成绩，更不能称为官方分数。

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 import json
 import math
 import random
@@ -29,6 +30,7 @@ from bme_eating.models.dtp_sqf import DTPSQF, logits_to_probability_arrays
 from bme_eating.models.losses import DTPLoss
 from bme_eating.models.xgb_baseline import assign_train_validation_test
 from bme_eating.postprocess import probabilities_to_events, tune_postprocess_parameters
+from bme_eating.reproducibility import epoch_random_seed, should_validate_epoch
 
 
 def seed_everything(seed: int) -> None:
@@ -97,13 +99,30 @@ def _prediction_frame(
     auprc = masked_average_precision(
         np.asarray(targets), np.asarray(probabilities), np.asarray(state_masks)
     )
-    return pd.DataFrame(rows), float(auprc)
+    frame = pd.DataFrame(rows)
+    for column in ("state_probability", "start_probability", "end_probability"):
+        if column in frame:
+            frame[column] = frame[column].astype(np.float32)
+    return frame, float(auprc)
 
 
 def _save_torch_checkpoint(payload: dict[str, Any], path: Path) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     torch.save(payload, temporary_path)
     temporary_path.replace(path)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        number = float(value)
+        return number if math.isfinite(number) else None
+    return value
 
 
 def _postprocess_kwargs(config: dict[str, Any]) -> dict[str, float]:
@@ -129,6 +148,10 @@ def train_dtp_fold(
     postprocess_config: dict[str, Any],
     output_dir: Path,
     resume_path: Path | None = None,
+    validation_selector: Callable[[pd.DataFrame, int], dict[str, Any]] | None = None,
+    selection_signature: str | None = None,
+    selection_gate: Callable[[dict[str, Any]], None] | None = None,
+    test_predictions_name: str = "test_predictions.parquet",
 ) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError("DTP-SQF training requires the RTX 4080 CUDA environment")
@@ -219,9 +242,13 @@ def train_dtp_fold(
 
     device = torch.device("cuda")
     model = DTPSQF(model_config).to(device)
-    encoder_parameters = list(model.motion_encoder.parameters()) + list(model.ppg_encoder.parameters())
+    encoder_parameters = list(model.motion_encoder.parameters()) + list(
+        model.ppg_encoder.parameters()
+    )
     encoder_ids = {id(parameter) for parameter in encoder_parameters}
-    head_parameters = [parameter for parameter in model.parameters() if id(parameter) not in encoder_ids]
+    head_parameters = [
+        parameter for parameter in model.parameters() if id(parameter) not in encoder_ids
+    ]
     optimizer = AdamW(
         [
             {"params": encoder_parameters, "lr": float(training_config["encoder_learning_rate"])},
@@ -233,9 +260,7 @@ def train_dtp_fold(
     max_epochs = int(training_config["max_epochs"])
     if accumulation <= 0 or max_epochs <= 0:
         raise ValueError("gradient_accumulation and max_epochs must be positive")
-    total_steps = (
-        math.ceil(len(train_loader) / accumulation) * max_epochs
-    )
+    total_steps = math.ceil(len(train_loader) / accumulation) * max_epochs
     scheduler = LambdaLR(
         optimizer,
         _learning_rate_schedule(float(training_config["warmup_fraction"]), total_steps),
@@ -262,6 +287,8 @@ def train_dtp_fold(
     best_boundary_mae = float("inf")
     patience = 0
     history: list[dict[str, float]] = []
+    best_selection: dict[str, Any] | None = None
+    best_selection_rank: tuple[float, ...] | None = None
     checkpoint_path = output_dir / "best.pt"
     last_checkpoint_path = output_dir / "last.pt"
     if resume_path is not None:
@@ -275,14 +302,26 @@ def train_dtp_fold(
         best_boundary_mae = float(checkpoint["best_boundary_mae"])
         patience = int(checkpoint.get("patience", 0))
         history = list(checkpoint.get("history", []))
+        best_selection = checkpoint.get("best_selection")
+        stored_rank = checkpoint.get("best_selection_rank")
+        best_selection_rank = tuple(float(value) for value in stored_rank) if stored_rank else None
+        stored_signature = checkpoint.get("selection_signature")
+        if validation_selector is not None and stored_signature != selection_signature:
+            raise RuntimeError(
+                "Resume checkpoint fusion signature does not match the active configuration"
+            )
         tqdm.write(f"Resuming DTP-SQF at epoch {start_epoch + 1}/{max_epochs}")
 
     validation_subjects = set(validation_anchors["subject_key"].unique())
-    validation_truth, validation_ignore = partition_evaluation_events(
-        events, validation_subjects
-    )
+    validation_truth, validation_ignore = partition_evaluation_events(events, validation_subjects)
+    validation_interval = int(training_config["validation_every_epochs"])
+    if validation_interval <= 0:
+        raise ValueError("validation_every_epochs must be positive")
     for epoch in range(start_epoch, max_epochs):
         batch_sampler.set_epoch(epoch)
+        # Deriving randomness from fold and epoch makes end-of-epoch resume equivalent
+        # to an uninterrupted run, including dropout and CUDA stochastic operations.
+        seed_everything(epoch_random_seed(seed, outer_fold, epoch))
         model.train()
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
@@ -311,8 +350,7 @@ def train_dtp_fold(
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
 
-        validation_interval = int(training_config["validation_every_epochs"])
-        should_validate = epoch == start_epoch or (epoch + 1) % validation_interval == 0
+        should_validate = should_validate_epoch(epoch, validation_interval)
         if not should_validate:
             history.append(
                 {
@@ -335,6 +373,9 @@ def train_dtp_fold(
                     "best_boundary_mae": best_boundary_mae,
                     "patience": patience,
                     "history": history,
+                    "best_selection": best_selection,
+                    "best_selection_rank": best_selection_rank,
+                    "selection_signature": selection_signature,
                     "model_config": model_config,
                     "training_config": training_config,
                     "outer_fold": outer_fold,
@@ -354,7 +395,16 @@ def train_dtp_fold(
             amp_dtype,
             description=f"Validating epoch {epoch + 1}",
         )
-        if "search" in postprocess_config:
+        current_selection: dict[str, Any] | None = None
+        if validation_selector is not None:
+            current_selection = validation_selector(validation_predictions, epoch)
+            selected_metrics = current_selection["metrics"]
+            metrics = {
+                "f1": float(selected_metrics["f1"]),
+                "start_mae_seconds": float(selected_metrics["start_mae_seconds"]),
+                "end_mae_seconds": float(selected_metrics["end_mae_seconds"]),
+            }
+        elif "search" in postprocess_config:
             selected_postprocess, _ = tune_postprocess_parameters(
                 validation_predictions,
                 validation_truth,
@@ -373,22 +423,28 @@ def train_dtp_fold(
             validation_events = probabilities_to_events(
                 validation_predictions, **_postprocess_kwargs(postprocess_config)
             )
-        metrics, _ = evaluate_events(
-            validation_truth,
-            validation_events,
-            iou_threshold=float(postprocess_config["iou_threshold"]),
-            method=str(postprocess_config.get("matching_method", "max_cardinality_iou")),
-            ignore=validation_ignore,
-        )
+        if current_selection is None:
+            metrics, _ = evaluate_events(
+                validation_truth,
+                validation_events,
+                iou_threshold=float(postprocess_config["iou_threshold"]),
+                method=str(postprocess_config.get("matching_method", "max_cardinality_iou")),
+                ignore=validation_ignore,
+            )
         boundary_values = [
             value
             for value in (metrics["start_mae_seconds"], metrics["end_mae_seconds"])
             if np.isfinite(value)
         ]
         boundary_mae = float(np.mean(boundary_values)) if boundary_values else float("inf")
-        improved = metrics["f1"] > best_f1 or (
-            math.isclose(metrics["f1"], best_f1) and boundary_mae < best_boundary_mae
-        )
+        if current_selection is not None:
+            current_rank = tuple(float(value) for value in current_selection["rank"])
+            improved = best_selection_rank is None or current_rank > best_selection_rank
+        else:
+            current_rank = None
+            improved = metrics["f1"] > best_f1 or (
+                math.isclose(metrics["f1"], best_f1) and boundary_mae < best_boundary_mae
+            )
         history.append(
             {
                 "epoch": float(epoch),
@@ -402,6 +458,8 @@ def train_dtp_fold(
         if improved:
             best_f1 = metrics["f1"]
             best_boundary_mae = boundary_mae
+            best_selection = current_selection
+            best_selection_rank = current_rank
             patience = 0
         else:
             patience += 1
@@ -415,6 +473,9 @@ def train_dtp_fold(
             "best_boundary_mae": best_boundary_mae,
             "patience": patience,
             "history": history,
+            "best_selection": best_selection,
+            "best_selection_rank": best_selection_rank,
+            "selection_signature": selection_signature,
             "model_config": model_config,
             "training_config": training_config,
             "outer_fold": outer_fold,
@@ -437,12 +498,21 @@ def train_dtp_fold(
 
     if not checkpoint_path.exists():
         raise RuntimeError("Training ended without producing a best checkpoint")
+    if validation_selector is not None:
+        if best_selection is None:
+            raise RuntimeError("Fusion training ended without a selected validation candidate")
+        (output_dir / "best_validation_selection.json").write_text(
+            json.dumps(_json_safe(best_selection), ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if selection_gate is not None:
+            selection_gate(best_selection)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"])
     test_predictions, test_auprc = _prediction_frame(
         model, test_loader, device, amp_dtype, description="Predicting test fold"
     )
-    test_predictions.to_parquet(output_dir / "test_predictions.parquet", index=False)
+    test_predictions.to_parquet(output_dir / test_predictions_name, index=False)
     metadata = {
         "outer_fold": outer_fold,
         "best_validation_f1": best_f1,
@@ -455,6 +525,7 @@ def train_dtp_fold(
         "validation_full_timeline_rows": len(validation_anchors),
         "test_rows": len(test_anchors),
         "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()),
+        "validation_selection_signature": selection_signature,
     }
     (output_dir / "metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"

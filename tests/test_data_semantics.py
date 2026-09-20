@@ -109,7 +109,9 @@ def test_balanced_sampler_has_exact_positive_fraction_per_batch():
     anchors = pd.DataFrame(rows)
     sampler = SegmentBalancedBatchSampler(anchors, 10, 5, 0.4, 2026)
     for batch in sampler:
-        assert int((anchors.loc[batch, "state_target"] > 0).sum()) == 4
+        indices = [index for index, epoch in batch]
+        assert {epoch for _, epoch in batch} == {0}
+        assert int((anchors.loc[indices, "state_target"] > 0).sum()) == 4
 
 
 def test_balanced_sampler_excludes_state_masked_anchors():
@@ -123,9 +125,12 @@ def test_balanced_sampler_excludes_state_masked_anchors():
         }
     )
     sampler = SegmentBalancedBatchSampler(anchors, 4, 10, 0.5, 2026)
+    sampler.set_epoch(3)
 
-    sampled = {index for batch in sampler for index in batch}
+    sampled_items = [item for batch in sampler for item in batch]
+    sampled = {index for index, _ in sampled_items}
 
+    assert {epoch for _, epoch in sampled_items} == {3}
     assert 1 not in sampled
     assert 3 not in sampled
     assert sampled <= {0, 2, 4, 5, 6, 7}

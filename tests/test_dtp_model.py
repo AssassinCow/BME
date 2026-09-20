@@ -3,8 +3,10 @@ import pandas as pd
 import pytest
 import torch
 
+import bme_eating.data.deep_dataset as deep_dataset_module
 from bme_eating.data.deep_dataset import DTPDataset, Normalization
 from bme_eating.models.dtp_sqf import DTPSQF, DyadicPool, logits_to_probability_arrays
+from bme_eating.reproducibility import epoch_random_seed, should_validate_epoch
 
 
 MODEL_CONFIG = {
@@ -58,7 +60,7 @@ def test_dtp_rejects_future_context_incompatible_with_block_geometry():
         DTPSQF(config)
 
 
-def test_dtp_dataset_shapes_follow_configured_history(tmp_path):
+def test_dtp_dataset_shapes_follow_configured_history(tmp_path, monkeypatch):
     motion_time = np.arange(0, 40_001, 10, dtype=np.int64)
     ppg_time = np.arange(0, 40_001, 20, dtype=np.int64)
     segment_path = tmp_path / "segment.npz"
@@ -113,6 +115,36 @@ def test_dtp_dataset_shapes_follow_configured_history(tmp_path):
 
     assert item["motion_blocks"].shape == (3, 12, 200)
     assert item["ppg_blocks"].shape == (3, 2, 500)
+
+    def deterministic_corruption(values, mask, rng):
+        return (values + rng.random()).astype(np.float32), mask
+
+    monkeypatch.setattr(deep_dataset_module, "_corrupt_ppg", deterministic_corruption)
+    training_dataset = DTPDataset(
+        anchors,
+        segments,
+        normalization,
+        training=True,
+        ppg_augmentation_probability=1.0,
+        seed=2026,
+        motion_block_seconds=2,
+        ppg_block_seconds=10,
+        motion_bucket_counts=[1, 2],
+        ppg_bucket_counts=[1, 2],
+    )
+    epoch_two_first = training_dataset[(0, 2)]["ppg_blocks"]
+    epoch_two_second = training_dataset[(0, 2)]["ppg_blocks"]
+    epoch_three = training_dataset[(0, 3)]["ppg_blocks"]
+
+    torch.testing.assert_close(epoch_two_first, epoch_two_second)
+    assert not torch.equal(epoch_two_first, epoch_three)
+
+
+def test_epoch_randomness_and_validation_schedule_are_resume_stable():
+    assert epoch_random_seed(2026, 0, 4) == epoch_random_seed(2026, 0, 4)
+    assert epoch_random_seed(2026, 0, 4) != epoch_random_seed(2026, 0, 5)
+    assert epoch_random_seed(2026, 0, 4) != epoch_random_seed(2026, 1, 4)
+    assert [epoch for epoch in range(6) if should_validate_epoch(epoch, 2)] == [0, 1, 3, 5]
 
 
 def test_dtp_output_shapes():

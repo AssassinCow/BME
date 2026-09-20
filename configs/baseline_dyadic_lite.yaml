@@ -2,6 +2,7 @@ extends: baseline_boundary.yaml
 
 experiment:
   name: baseline_dyadic_lite
+  status: stopped_without_further_runs
 
 features:
   artifact_name: baseline_dyadic_lite

@@ -37,6 +37,18 @@ from bme_eating.data.quality import (
 )
 from bme_eating.data.splits import create_subject_folds, load_subject_folds
 from bme_eating.features.baseline import build_segment_features
+from bme_eating.fusion import (
+    FusionGateError,
+    FusionValidator,
+    evaluate_fold0_gate,
+    evaluate_internal_gate,
+    fuse_prediction_frames,
+    json_safe,
+    metrics_summary_from_suite,
+    prepare_fusion_run_root,
+    validate_frozen_baseline_fold,
+    validate_fusion_run_name,
+)
 from bme_eating.metrics import evaluate_events, partition_evaluation_events
 from bme_eating.models.dtp_sqf import DTPSQF
 from bme_eating.postprocess import (
@@ -225,10 +237,7 @@ def _inspect_selected_layouts(
                     save_result(result_path, layout)
     finally:
         progress.close()
-    return [
-        completed[str(fingerprint["zip_path"])]
-        for fingerprint in selected_fingerprints
-    ]
+    return [completed[str(fingerprint["zip_path"])] for fingerprint in selected_fingerprints]
 
 
 def command_environment(_: argparse.Namespace) -> None:
@@ -263,16 +272,23 @@ def command_audit(args: argparse.Namespace) -> None:
     else:
         count = int(args.schema_zips)
         selected = (
-            records.sort_values("zip_path").groupby("subject_key", as_index=False).head(1).head(count)
+            records.sort_values("zip_path")
+            .groupby("subject_key", as_index=False)
+            .head(1)
+            .head(count)
         )
     maximum_rows = int(args.maximum_rows)
     selected_fingerprints = _selected_zip_fingerprints(selected)
     checkpoint_path = _audit_checkpoint_path(output_root)
-    completed = {} if getattr(args, "no_resume", False) else _load_audit_checkpoint(
-        checkpoint_path,
-        str(args.schema_zips),
-        maximum_rows,
-        selected_fingerprints,
+    completed = (
+        {}
+        if getattr(args, "no_resume", False)
+        else _load_audit_checkpoint(
+            checkpoint_path,
+            str(args.schema_zips),
+            maximum_rows,
+            selected_fingerprints,
+        )
     )
     requested_workers = getattr(args, "workers", None)
     workers = int(
@@ -352,9 +368,7 @@ def command_audit_multisection(args: argparse.Namespace) -> None:
     )
     output_path = index_dir / "multisection_audit.json"
     temporary_path = output_path.with_name(output_path.name + ".tmp")
-    temporary_path.write_text(
-        json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    temporary_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary_path.replace(output_path)
     summary = {
         "attachments_audited": report["attachments_audited"],
@@ -434,27 +448,17 @@ def command_preprocess(args: argparse.Namespace) -> None:
     schema_audit_path = index_dir / "schema_audit.json"
     multisection_audit_path = index_dir / "multisection_audit.json"
     if not schema_audit_path.exists() or not multisection_audit_path.exists():
-        raise RuntimeError(
-            "Full schema and multisection audits are required before preprocessing"
-        )
+        raise RuntimeError("Full schema and multisection audits are required before preprocessing")
     schema_audit = json.loads(schema_audit_path.read_text(encoding="utf-8"))
-    multisection_audit = json.loads(
-        multisection_audit_path.read_text(encoding="utf-8")
-    )
+    multisection_audit = json.loads(multisection_audit_path.read_text(encoding="utf-8"))
     exact_hashes, quarantined = validate_multisection_preprocess_policy(
         records,
         schema_audit,
         multisection_audit,
-        expected_exact=int(
-            config["quality_gates"]["expected_recovered_multisection_deduplicated"]
-        ),
-        expected_quarantined=int(
-            config["quality_gates"]["expected_quarantined_multisection"]
-        ),
+        expected_exact=int(config["quality_gates"]["expected_recovered_multisection_deduplicated"]),
+        expected_quarantined=int(config["quality_gates"]["expected_quarantined_multisection"]),
         expected_documented=int(config["quality_gates"]["expected_documented_text"]),
-        expected_text_suffix=int(
-            config["quality_gates"]["expected_recovered_text_suffix"]
-        ),
+        expected_text_suffix=int(config["quality_gates"]["expected_recovered_text_suffix"]),
     )
     write_quarantine_manifest(index_dir, quarantined)
     quarantined_hashes = set(quarantined)
@@ -493,26 +497,32 @@ def command_preprocess(args: argparse.Namespace) -> None:
                 rows, issue = future.result()
             except _RECOVERABLE_INPUT_ERRORS as error:
                 record = futures[future]
-                rows, issue = [], {
-                    "status": "preprocess_worker_error",
-                    "zip_path": str(record.get("zip_path", "")),
-                    "zip_sha256": str(record.get("zip_sha256", "")),
-                    "subject_key": str(record.get("subject_key", "")),
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                    "traceback": traceback.format_exc(),
-                }
+                rows, issue = (
+                    [],
+                    {
+                        "status": "preprocess_worker_error",
+                        "zip_path": str(record.get("zip_path", "")),
+                        "zip_sha256": str(record.get("zip_sha256", "")),
+                        "subject_key": str(record.get("subject_key", "")),
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
             except Exception as error:  # noqa: BLE001 - preserve worker diagnostics
                 record = futures[future]
-                rows, issue = [], {
-                    "status": "preprocess_worker_unexpected_error",
-                    "zip_path": str(record.get("zip_path", "")),
-                    "zip_sha256": str(record.get("zip_sha256", "")),
-                    "subject_key": str(record.get("subject_key", "")),
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                    "traceback": traceback.format_exc(),
-                }
+                rows, issue = (
+                    [],
+                    {
+                        "status": "preprocess_worker_unexpected_error",
+                        "zip_path": str(record.get("zip_path", "")),
+                        "zip_sha256": str(record.get("zip_sha256", "")),
+                        "subject_key": str(record.get("subject_key", "")),
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
             all_rows.extend(rows)
             if issue is not None:
                 preprocess_issues.append(issue)
@@ -591,8 +601,7 @@ def _feature_job(
             [int(value) for value in feature_config["ppg_bucket_seconds"]],
             context_segments=context_segments,
             motion_bucket_statistics=[
-                str(value)
-                for value in feature_config.get("motion_bucket_statistics", [])
+                str(value) for value in feature_config.get("motion_bucket_statistics", [])
             ]
             or None,
         )
@@ -632,9 +641,7 @@ def _feature_cache_path(
     stat = path.stat()
     digest = hashlib.sha256()
     digest.update(_FEATURE_CACHE_SCHEMA_VERSION.encode())
-    digest.update(
-        json.dumps(feature_config, sort_keys=True, separators=(",", ":")).encode()
-    )
+    digest.update(json.dumps(feature_config, sort_keys=True, separators=(",", ":")).encode())
     digest.update(path.name.encode())
     digest.update(f"{stat.st_size}|{stat.st_mtime_ns}".encode())
     if context_segments is not None:
@@ -690,21 +697,27 @@ def command_build_features(args: argparse.Namespace) -> None:
             try:
                 frame, issue = future.result()
             except _RECOVERABLE_INPUT_ERRORS as error:
-                frame, issue = pd.DataFrame(), {
-                    "status": "feature_worker_error",
-                    "segment_path": futures[future],
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                    "traceback": traceback.format_exc(),
-                }
+                frame, issue = (
+                    pd.DataFrame(),
+                    {
+                        "status": "feature_worker_error",
+                        "segment_path": futures[future],
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
             except Exception as error:  # noqa: BLE001 - preserve worker diagnostics
-                frame, issue = pd.DataFrame(), {
-                    "status": "feature_worker_unexpected_error",
-                    "segment_path": futures[future],
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                    "traceback": traceback.format_exc(),
-                }
+                frame, issue = (
+                    pd.DataFrame(),
+                    {
+                        "status": "feature_worker_unexpected_error",
+                        "segment_path": futures[future],
+                        "error_type": type(error).__name__,
+                        "error": str(error),
+                        "traceback": traceback.format_exc(),
+                    },
+                )
             if issue is not None:
                 feature_issues.append(issue)
             elif len(frame):
@@ -719,9 +732,11 @@ def command_build_features(args: argparse.Namespace) -> None:
         )
     if not frames:
         raise RuntimeError("Feature extraction produced no rows")
-    features = pd.concat(frames, ignore_index=True).sort_values(
-        ["subject_key", "segment_id", "timestamp_ms"]
-    ).reset_index(drop=True)
+    features = (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(["subject_key", "segment_id", "timestamp_ms"])
+        .reset_index(drop=True)
+    )
     path = output_root / "features" / f"{feature_name}.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(path.name + ".tmp")
@@ -759,16 +774,10 @@ def _evaluate_prediction_file(
             "boundary_lookback_seconds",
         )
     )
-    event_parameters = {
-        name: float(postprocess_config[name]) for name in parameter_names
-    }
-    events = probabilities_to_events(
-        predictions, detector_mode=detector_mode, **event_parameters
-    )
+    event_parameters = {name: float(postprocess_config[name]) for name in parameter_names}
+    events = probabilities_to_events(predictions, detector_mode=detector_mode, **event_parameters)
     output: dict[str, object] = {}
-    primary_method = str(
-        postprocess_config.get("matching_method", "max_cardinality_iou")
-    )
+    primary_method = str(postprocess_config.get("matching_method", "max_cardinality_iou"))
     methods = list(dict.fromkeys((primary_method, "hungarian_iou_legacy", "greedy")))
     primary_matches = pd.DataFrame()
     for method in methods:
@@ -784,9 +793,11 @@ def _evaluate_prediction_file(
             for _, group in predictions.groupby(["subject_key", "session_id"]):
                 exposure_hours += max(
                     0.0,
-                    (float(group["timestamp_ms"].max())
-                    - float(group["timestamp_ms"].min())
-                    + 3000.0)
+                    (
+                        float(group["timestamp_ms"].max())
+                        - float(group["timestamp_ms"].min())
+                        + 3000.0
+                    )
                     / 3_600_000.0,
                 )
         metrics["false_positives_per_observed_hour"] = (
@@ -835,8 +846,7 @@ def _evaluate_prediction_file(
             )
             for band, band_truth in truth_with_band.groupby("coverage_band", sort=True):
                 hits = sum(
-                    (str(row.subject_key), int(row.start_ms), int(row.end_ms))
-                    in matched_keys
+                    (str(row.subject_key), int(row.start_ms), int(row.end_ms)) in matched_keys
                     for row in band_truth.itertuples(index=False)
                 )
                 coverage_summary[str(band)] = {
@@ -860,9 +870,7 @@ def _evaluate_prediction_file(
         subject_truth = truth[truth["subject_key"] == subject_key]
         subject_events = events[events["subject_key"] == subject_key]
         subject_ignore = (
-            ignore[ignore["subject_key"] == subject_key]
-            if ignore is not None
-            else None
+            ignore[ignore["subject_key"] == subject_key] if ignore is not None else None
         )
         subject_metrics, _ = evaluate_events(
             subject_truth,
@@ -901,7 +909,11 @@ def _evaluate_prediction_file(
                 & (predictions["timestamp_ms"] >= int(row.start_ms))
                 & (predictions["timestamp_ms"] <= int(row.end_ms))
             ].sort_values("timestamp_ms")
-            raw_peak = float(event_predictions["state_probability"].max()) if len(event_predictions) else 0.0
+            raw_peak = (
+                float(event_predictions["state_probability"].max())
+                if len(event_predictions)
+                else 0.0
+            )
             smoothed_peak = raw_peak
             trigger_threshold = float(
                 postprocess_config.get(
@@ -910,7 +922,9 @@ def _evaluate_prediction_file(
             )
             if len(event_predictions):
                 timestamps = event_predictions["timestamp_ms"].to_numpy(dtype=np.int64)
-                step = float(np.median(np.diff(timestamps)) / 1000.0) if len(timestamps) > 1 else 3.0
+                step = (
+                    float(np.median(np.diff(timestamps)) / 1000.0) if len(timestamps) > 1 else 3.0
+                )
                 half_life = float(
                     postprocess_config.get(
                         "fast_ema_half_life_seconds",
@@ -944,7 +958,9 @@ def _evaluate_prediction_file(
                 }
             )
     ignore_frame = (
-        ignore if ignore is not None else pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
+        ignore
+        if ignore is not None
+        else pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
     )
     for row in events.itertuples(index=False):
         key = (str(row.subject_key), int(row.start_ms), int(row.end_ms))
@@ -1003,9 +1019,7 @@ def _tune_and_save_postprocess(
         float(config["postprocess"]["iou_threshold"]),
         checkpoint_path=output_dir / "postprocess_search.checkpoint.jsonl",
         ignore=ignore,
-        matching_method=str(
-            config["postprocess"].get("matching_method", "max_cardinality_iou")
-        ),
+        matching_method=str(config["postprocess"].get("matching_method", "max_cardinality_iou")),
         workers=int(config["postprocess_search"].get("workers", 1)),
     )
     best["iou_threshold"] = float(config["postprocess"]["iou_threshold"])
@@ -1068,9 +1082,7 @@ def command_train_xgb(args: argparse.Namespace) -> None:
         raise RuntimeError("OOF predictions overlap the held-out outer-fold subjects")
     write_run_manifest(experiment_dir, config, output_root)
     events = pd.read_parquet(output_root / "indices" / "events.parquet")
-    validation_truth, validation_ignore = partition_evaluation_events(
-        events, validation_subjects
-    )
+    validation_truth, validation_ignore = partition_evaluation_events(events, validation_subjects)
     print(
         "[4/5] Tuning event postprocessing on CPU "
         f"({int(config['postprocess_search'].get('workers', 1))} workers)...",
@@ -1133,13 +1145,9 @@ def command_train_dtp(args: argparse.Namespace) -> None:
         Path(args.resume) if args.resume else None,
     )
     predictions = pd.read_parquet(experiment_dir / "test_predictions.parquet")
-    validation_predictions = pd.read_parquet(
-        experiment_dir / "best_validation_predictions.parquet"
-    )
+    validation_predictions = pd.read_parquet(experiment_dir / "best_validation_predictions.parquet")
     validation_subjects = set(validation_predictions["subject_key"].unique())
-    validation_truth, validation_ignore = partition_evaluation_events(
-        events, validation_subjects
-    )
+    validation_truth, validation_ignore = partition_evaluation_events(events, validation_subjects)
     print(
         "[3/4] Tuning event postprocessing on CPU "
         f"({int(config['postprocess_search'].get('workers', 1))} workers)...",
@@ -1152,9 +1160,7 @@ def command_train_dtp(args: argparse.Namespace) -> None:
         experiment_dir,
         validation_ignore,
     )
-    test_subjects = {
-        subject for subject, fold in subject_folds.items() if fold == int(args.fold)
-    }
+    test_subjects = {subject for subject, fold in subject_folds.items() if fold == int(args.fold)}
     truth, test_ignore = partition_evaluation_events(events, test_subjects)
     print("[4/4] Evaluating the held-out fold...", flush=True)
     predicted_events, metrics, failures = _evaluate_prediction_file(
@@ -1168,6 +1174,293 @@ def command_train_dtp(args: argparse.Namespace) -> None:
     if float(metrics[str(metrics["primary_method"])]["sensitivity"]) <= 0:
         raise RuntimeError("Held-out fold has zero event recall; model upgrade is blocked")
     print(checkpoint)
+
+
+def _write_selected_fusion(path: Path, payload: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
+
+
+def _require_prior_fusion_folds(
+    output_root: Path, experiment_name: str, requested_fold: int
+) -> None:
+    if requested_fold <= 0:
+        return
+    for fold in range(requested_fold):
+        fold_dir = output_root / "experiments" / experiment_name / f"fold_{fold}"
+        metrics_path = fold_dir / "test_metrics.json"
+        selection_path = fold_dir / "selected_fusion.json"
+        if not metrics_path.is_file() or not selection_path.is_file():
+            raise FusionGateError(
+                f"Fusion folds must run serially; fold {fold} is incomplete", exit_code=2
+            )
+        selection = json.loads(selection_path.read_text(encoding="utf-8"))
+        if selection.get("run_name", "baseline_dtp_fusion") != experiment_name:
+            raise FusionGateError(
+                f"Fusion fold {fold} belongs to a different or legacy run", exit_code=2
+            )
+        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+        method = str(metrics["primary_method"])
+        if float(metrics[method]["sensitivity"]) <= 0:
+            raise FusionGateError(
+                f"Fusion fold {fold} has zero recall; later folds are blocked", exit_code=2
+            )
+        if fold == 0:
+            if not bool(selection.get("outer_fold_gate", {}).get("passed", False)):
+                raise FusionGateError(
+                    "Fusion fold 0 did not pass its outer gate; later folds are blocked",
+                    exit_code=2,
+                )
+
+
+def command_train_fusion(args: argparse.Namespace) -> None:
+    from bme_eating.models.xgb_baseline import assign_train_validation_test
+    from bme_eating.training.dtp_trainer import train_dtp_fold
+
+    config = load_config(args.config)
+    if int(config["model"].get("future_context_seconds", 0)) != 0:
+        raise ValueError("The fusion candidate must remain causal (future_context_seconds=0)")
+    _, output_root = resolve_roots(config)
+    validate_quality_gate(output_root)
+    fold = int(args.fold)
+    experiment = config["experiment"]
+    requested_run_name = getattr(args, "run_name", None)
+    fresh = bool(getattr(args, "fresh", False))
+    experiment_name = validate_fusion_run_name(
+        str(experiment.get("name", "baseline_dtp_fusion")), requested_run_name
+    )
+    if fresh and (fold != 0 or args.resume or requested_run_name is None):
+        raise ValueError("--fresh requires --fold 0, --run-name, and no --resume")
+    if requested_run_name is not None and fold == 0 and not fresh and not args.resume:
+        raise ValueError("A new named fusion run must start with --fresh")
+    config["experiment"] = {
+        **experiment,
+        "name": experiment_name,
+        "protocol_version": 2,
+    }
+    _require_prior_fusion_folds(output_root, experiment_name, fold)
+
+    baseline_name = str(experiment.get("baseline_name", "baseline"))
+    source_commit = str(experiment.get("baseline_source_commit", "3ca55bb"))
+    baseline_info = validate_frozen_baseline_fold(output_root, baseline_name, fold, source_commit)
+    baseline_dir = Path(baseline_info["directory"])
+    experiment_root = prepare_fusion_run_root(
+        output_root / "experiments",
+        experiment_name,
+        fresh=fresh,
+        named_run=requested_run_name is not None,
+    )
+    experiment_dir = experiment_root / f"fold_{fold}"
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    existing_selection_path = experiment_dir / "selected_fusion.json"
+    if existing_selection_path.is_file():
+        existing_selection = json.loads(existing_selection_path.read_text(encoding="utf-8"))
+        internal = existing_selection.get("internal_gate", {})
+        outer = existing_selection.get("outer_fold_gate", {})
+        if fold == 0 and internal.get("passed") is False:
+            raise FusionGateError(
+                "Fusion fold 0 was already rejected by the internal gate", exit_code=2
+            )
+        if outer.get("passed") is not None:
+            outcome = "passed" if outer.get("passed") else "rejected"
+            raise FusionGateError(
+                f"Fusion fold {fold} already completed and was {outcome}", exit_code=2
+            )
+    resume_path = Path(args.resume).expanduser().resolve() if args.resume else None
+    if resume_path is not None:
+        if resume_path.parent != experiment_dir.resolve():
+            raise ValueError("--resume must point to a checkpoint in the requested fusion fold")
+        if not resume_path.is_file():
+            raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path.name}")
+    elif any(
+        (experiment_dir / name).exists() for name in ("last.pt", "best.pt", "fusion_trials.csv")
+    ):
+        raise RuntimeError(
+            "Fusion training artifacts already exist; pass --resume with this fold's last.pt"
+        )
+
+    print("[1/4] Loading frozen baseline OOF predictions and v2 indices...", flush=True)
+    anchors = pd.read_parquet(output_root / "indices" / "anchors.parquet")
+    segments = pd.read_parquet(output_root / "indices" / "segments.parquet")
+    events = pd.read_parquet(output_root / "indices" / "events.parquet")
+    subject_folds = load_subject_folds(output_root / "indices" / "subject_folds.json")
+    _, validation_anchors, test_anchors = assign_train_validation_test(anchors, subject_folds, fold)
+    validation_subjects = set(validation_anchors["subject_key"].astype(str).unique())
+    test_subjects = set(test_anchors["subject_key"].astype(str).unique())
+    if validation_subjects & test_subjects:
+        raise RuntimeError("Inner validation subjects overlap the outer test fold")
+
+    baseline_oof_all = pd.read_parquet(baseline_dir / "validation_predictions.parquet")
+    baseline_oof_subjects = set(baseline_oof_all["subject_key"].astype(str).unique())
+    if baseline_oof_subjects & test_subjects:
+        raise RuntimeError("Frozen baseline OOF predictions contain outer-fold subjects")
+    baseline_oof = baseline_oof_all[
+        baseline_oof_all["subject_key"].astype(str).isin(validation_subjects)
+    ].copy()
+    if set(baseline_oof["subject_key"].astype(str).unique()) != validation_subjects:
+        raise RuntimeError(
+            "Frozen baseline OOF predictions do not cover every DTP validation subject"
+        )
+    validation_truth, validation_ignore = partition_evaluation_events(events, validation_subjects)
+    selected_postprocess = json.loads(
+        (baseline_dir / "selected_postprocess.json").read_text(encoding="utf-8")
+    )
+    (experiment_dir / "selected_postprocess.json").write_text(
+        json.dumps(selected_postprocess, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    validator = FusionValidator(
+        baseline=baseline_oof,
+        truth=validation_truth,
+        ignore=validation_ignore,
+        postprocess=selected_postprocess,
+        fusion_config=config["fusion"],
+        output_dir=experiment_dir,
+        forbidden_subjects=test_subjects,
+    )
+    signature_payload = {
+        "fusion_protocol_version": 2,
+        "epoch_randomness_version": 2,
+        "run_name": experiment_name,
+        "validator": validator.signature,
+        "fold": fold,
+        "model": config["model"],
+        "training": config["training"],
+        "loss": config["loss"],
+        "baseline_artifact_hashes": baseline_info["artifact_hashes"],
+        "input_hashes": baseline_info["input_hashes"],
+    }
+    selection_signature = hashlib.sha256(
+        json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    selection_record: dict[str, Any] = {}
+
+    def gate_best_selection(selection: dict[str, Any]) -> None:
+        nonlocal selection_record
+        internal_gate = evaluate_internal_gate(selection, config["fusion"]["internal_gate"])
+        internal_gate["checks"]["alignment_complete"] = True
+        internal_gate["checks"]["outer_subjects_absent"] = True
+        internal_gate["passed"] = all(internal_gate["checks"].values())
+        internal_gate["required_for_this_fold"] = fold == 0
+        selection_record = {
+            "version": 2,
+            "run_name": experiment_name,
+            "selection_scope": "outer_training_inner_validation_only",
+            "checkpoint_epoch": int(selection["epoch"]),
+            "alpha": float(selection["alpha"]),
+            "beta": float(selection["beta"]),
+            "residual_clip": float(config["fusion"]["residual_clip"]),
+            "probability_epsilon": float(config["fusion"]["probability_epsilon"]),
+            "selection_signature": selection_signature,
+            "baseline_experiment": baseline_name,
+            "baseline_source_commit": source_commit,
+            "baseline_artifact_hashes": baseline_info["artifact_hashes"],
+            "input_hashes": baseline_info["input_hashes"],
+            "validation_metrics": selection["metrics"],
+            "validation_baseline_metrics": selection["baseline_metrics"],
+            "complementarity_diagnostics": selection["diagnostics"],
+            "internal_gate": internal_gate,
+            "outer_fold_gate": {"passed": None, "checks": {}},
+        }
+        _write_selected_fusion(experiment_dir / "selected_fusion.json", selection_record)
+        if fold == 0 and not internal_gate["passed"]:
+            raise FusionGateError(
+                f"Fusion fold {fold} failed the internal validation gate; "
+                "outer prediction is blocked",
+                exit_code=2,
+            )
+
+    print("[2/4] Training causal DTP-SQF and evaluating 9 fixed fusion pairs...", flush=True)
+    try:
+        checkpoint = train_dtp_fold(
+            anchors,
+            segments,
+            events,
+            subject_folds,
+            fold,
+            config["model"],
+            config["training"],
+            config["loss"],
+            config["postprocess"],
+            experiment_dir,
+            resume_path,
+            validation_selector=validator,
+            selection_signature=selection_signature,
+            selection_gate=gate_best_selection,
+            test_predictions_name="dtp_test_predictions.parquet",
+        )
+    except FusionGateError:
+        write_run_manifest(experiment_dir, config, output_root)
+        raise
+
+    print("[3/4] Applying the frozen residual fusion to the held-out fold...", flush=True)
+    dtp_validation = pd.read_parquet(experiment_dir / "best_validation_predictions.parquet")
+    fused_validation = fuse_prediction_frames(
+        baseline_oof,
+        dtp_validation,
+        alpha=float(selection_record["alpha"]),
+        beta=float(selection_record["beta"]),
+        residual_clip=float(config["fusion"]["residual_clip"]),
+        epsilon=float(config["fusion"]["probability_epsilon"]),
+    )
+    if "calibration_fold" in baseline_oof.columns:
+        calibration = baseline_oof.sort_values(["subject_key", "session_id", "timestamp_ms"])[
+            "calibration_fold"
+        ].to_numpy()
+        fused_validation["calibration_fold"] = calibration
+    fused_validation.to_parquet(experiment_dir / "validation_predictions.parquet", index=False)
+    dtp_test = pd.read_parquet(experiment_dir / "dtp_test_predictions.parquet")
+    baseline_test = pd.read_parquet(baseline_dir / "test_predictions.parquet")
+    if set(baseline_test["subject_key"].astype(str).unique()) != test_subjects:
+        raise RuntimeError("Frozen baseline test predictions do not match the outer fold subjects")
+    fused_test = fuse_prediction_frames(
+        baseline_test,
+        dtp_test,
+        alpha=float(selection_record["alpha"]),
+        beta=float(selection_record["beta"]),
+        residual_clip=float(config["fusion"]["residual_clip"]),
+        epsilon=float(config["fusion"]["probability_epsilon"]),
+    )
+    fused_test.to_parquet(experiment_dir / "test_predictions.parquet", index=False)
+    truth, test_ignore = partition_evaluation_events(events, test_subjects)
+    predicted_events, metrics, failures = _evaluate_prediction_file(
+        fused_test, truth, selected_postprocess, test_ignore
+    )
+    predicted_events.to_csv(experiment_dir / "test_events.csv", index=False)
+    failures.to_csv(experiment_dir / "test_failure_cases.csv", index=False)
+    (experiment_dir / "test_metrics.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    print("[4/4] Applying held-out safety gates and writing manifests...", flush=True)
+    candidate_summary = metrics_summary_from_suite(metrics)
+    baseline_metrics = json.loads((baseline_dir / "test_metrics.json").read_text(encoding="utf-8"))
+    baseline_summary = metrics_summary_from_suite(baseline_metrics)
+    if fold == 0:
+        outer_gate = evaluate_fold0_gate(
+            candidate_summary, baseline_summary, config["fusion"]["fold0_gate"]
+        )
+    else:
+        sensitivity = candidate_summary["sensitivity"]
+        outer_gate = {
+            "checks": {"nonzero_recall": sensitivity > 0.0},
+            "passed": sensitivity > 0.0,
+        }
+    selection_record["outer_fold_metrics"] = candidate_summary
+    selection_record["outer_fold_baseline_metrics"] = baseline_summary
+    selection_record["outer_fold_gate"] = outer_gate
+    selection_record["checkpoint"] = checkpoint.name
+    _write_selected_fusion(experiment_dir / "selected_fusion.json", selection_record)
+    write_run_manifest(experiment_dir, config, output_root)
+    if not outer_gate["passed"]:
+        raise FusionGateError(
+            f"Fusion fold {fold} failed its held-out gate; later folds are blocked",
+            exit_code=2,
+        )
+    print(experiment_dir)
 
 
 def command_evaluate(args: argparse.Namespace) -> None:
@@ -1206,9 +1499,7 @@ def command_smoke_model(args: argparse.Namespace) -> None:
             batch_size, motion_block_count, 12, motion_samples, device=device
         ),
         "motion_valid": torch.ones(batch_size, motion_block_count, device=device),
-        "ppg_blocks": torch.randn(
-            batch_size, ppg_block_count, 2, ppg_samples, device=device
-        ),
+        "ppg_blocks": torch.randn(batch_size, ppg_block_count, 2, ppg_samples, device=device),
         "ppg_quality": torch.rand(batch_size, ppg_block_count, 8, device=device),
         "ppg_valid": torch.ones(batch_size, ppg_block_count, device=device),
     }
@@ -1244,4 +1535,3 @@ def command_smoke_model(args: argparse.Namespace) -> None:
         output = model(batch)
     print({key: tuple(value.shape) for key, value in output.items()})
     print({"peak_gpu_memory_bytes": torch.cuda.max_memory_allocated()})
-

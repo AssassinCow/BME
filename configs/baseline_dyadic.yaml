@@ -1,9 +1,11 @@
 extends: baseline.yaml
 
+experiment:
+  status: stopped_after_fold0_event_regression
+
 features:
   window_seconds: 15
   include_dyadic: true
   motion_bucket_seconds: [3, 6, 12, 24, 48, 96, 192]
   ppg_bucket_seconds: [15, 30, 60, 120, 240]
   workers: 8
-
