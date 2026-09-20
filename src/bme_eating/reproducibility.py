@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -51,6 +52,20 @@ def _git_value(project_root: Path, *arguments: str) -> str | None:
     return result.stdout.strip()
 
 
+def require_clean_git_worktree(project_root: Path | None = None) -> str:
+    root = project_root or Path(__file__).resolve().parents[2]
+    commit = _git_value(root, "rev-parse", "HEAD")
+    dirty_output = _git_value(root, "status", "--porcelain")
+    if not commit or dirty_output is None:
+        raise RuntimeError("Cannot verify the Git identity for formal training")
+    if dirty_output:
+        raise RuntimeError(
+            "Formal training requires a clean Git worktree; review, commit, and synchronize "
+            "the current changes first"
+        )
+    return commit
+
+
 def write_run_manifest(
     output_dir: Path,
     config: dict[str, Any],
@@ -76,8 +91,8 @@ def write_run_manifest(
         feature_name = feature_artifact_name(config)
         tracked_inputs["features"] = output_root / "features" / f"{feature_name}.parquet"
     model_files = {
-        path.name: _sha256(path)
-        for path in sorted(output_dir.glob("*model.json"))
+        path.relative_to(output_dir).as_posix(): _sha256(path)
+        for path in sorted(output_dir.rglob("*model.json"))
         if path.is_file()
     }
     artifact_names = (
@@ -86,6 +101,7 @@ def write_run_manifest(
         "best_validation_selection.json",
         "best_validation_predictions.parquet",
         "validation_predictions.parquet",
+        "dtp_oof_predictions.parquet",
         "dtp_test_predictions.parquet",
         "test_predictions.parquet",
         "selected_postprocess.json",
@@ -99,15 +115,28 @@ def write_run_manifest(
         for name in artifact_names
         if (digest := _sha256(output_dir / name)) is not None
     }
+    for partition_dir in sorted(output_dir.glob("crossfit_*")):
+        for name in (
+            "best.pt",
+            "metadata.json",
+            "normalization.json",
+            "best_validation_predictions.parquet",
+            "dtp_test_predictions.parquet",
+        ):
+            path = partition_dir / name
+            if (digest := _sha256(path)) is not None:
+                artifact_hashes[path.relative_to(output_dir).as_posix()] = digest
     try:
         import xgboost
 
         xgboost_version = xgboost.__version__
     except ImportError:  # pragma: no cover - training environment always has XGBoost.
         xgboost_version = None
+    torch_version = None
     try:
         import torch
 
+        torch_version = torch.__version__
         cuda_available = bool(torch.cuda.is_available())
         gpu_name = torch.cuda.get_device_name(0) if cuda_available else None
         cuda_version = torch.version.cuda
@@ -128,8 +157,13 @@ def write_run_manifest(
     safe_command = [
         Path(value).name if Path(value).is_absolute() else value for value in raw_command
     ]
+    fold_match = re.fullmatch(r"fold_(\d+)", output_dir.name)
     payload = {
-        "version": 1,
+        "version": 2,
+        "experiment": {
+            "name": output_dir.parent.name,
+            "fold": int(fold_match.group(1)) if fold_match else None,
+        },
         "git": {
             "commit": _git_value(project_root, "rev-parse", "HEAD"),
             "dirty": bool(dirty_output),
@@ -154,6 +188,7 @@ def write_run_manifest(
             "implementation": platform.python_implementation(),
             "operating_system": platform.platform(),
             "xgboost": xgboost_version,
+            "torch": torch_version,
             "cuda_available": cuda_available,
             "cuda_runtime": cuda_version,
             "gpu": gpu_name,

@@ -4,9 +4,8 @@ import argparse
 import json
 import shutil
 
-import pandas as pd
-
 import _bootstrap  # noqa: F401
+import pandas as pd
 
 from bme_eating.cli import _evaluate_prediction_file, _tune_and_save_postprocess
 from bme_eating.config import load_config, resolve_roots

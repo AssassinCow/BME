@@ -15,8 +15,12 @@ param(
     [ValidateRange(1, 64)]
     [int]$FeatureWorkers = 8,
 
+    [switch]$SkipRuff,
+
     [switch]$SkipFusion
 )
+
+Write-Warning "Deprecated: use docs/clean_retrain_runbook_2026-09-20.md and run each gated step explicitly."
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -75,7 +79,12 @@ try {
 
     Invoke-PythonStep "Environment check" @("scripts/check_environment.py")
     Invoke-PythonStep "Full unit test suite" @("-m", "pytest", "-q")
-    Invoke-PythonStep "Ruff" @("-m", "ruff", "check", ".")
+    if ($SkipRuff) {
+        Write-Warning "Ruff was explicitly skipped; this run has not passed the static-analysis gate."
+    }
+    else {
+        Invoke-PythonStep "Ruff" @("-m", "ruff", "check", ".")
+    }
     Invoke-PythonStep "CUDA model smoke test" @(
         "scripts/smoke_test_model.py",
         "--config", "configs/dtp_fusion.yaml",
@@ -87,6 +96,19 @@ try {
     New-Item -ItemType Directory -Path $privateRoot | Out-Null
     Copy-Item -LiteralPath $saltPath -Destination (Join-Path $privateRoot "subject_salt.hex")
     $env:BME_OUTPUT_ROOT = $cleanRoot
+
+    $preflightJson = @{
+        code_commit = $codeCommit
+        ruff_skipped = [bool]$SkipRuff
+        unit_tests_required = $true
+        cuda_smoke_test_required = $true
+    } | ConvertTo-Json
+    $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllText(
+        (Join-Path $cleanRoot "clean_retrain_preflight.json"),
+        $preflightJson,
+        $utf8WithoutBom
+    )
 
     Write-Host "Clean output root: $cleanRoot"
     Write-Host "Training code commit: $codeCommit"

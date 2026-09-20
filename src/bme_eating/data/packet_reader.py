@@ -14,7 +14,6 @@ import numpy as np
 from bme_eating.constants import ACC_COLUMNS, GYRO_COLUMNS, TIME_COLUMNS
 from bme_eating.types import SensorSeries
 
-
 SENSOR_COLUMNS = (
     list(TIME_COLUMNS)
     + [f"PPG{number}" for number in range(1, 45)]

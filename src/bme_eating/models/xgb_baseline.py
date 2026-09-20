@@ -308,7 +308,7 @@ def _sample_boundary_rows(
     negative = eligible[eligible[target_column] <= 0]
     if positive.empty:
         return eligible.iloc[:0].copy(), negative
-    maximum = min(len(negative), int(math.ceil(len(positive) * random_negative_ratio)))
+    maximum = min(len(negative), math.ceil(len(positive) * random_negative_ratio))
     sampled_negative = negative.sample(n=maximum, random_state=seed) if maximum else negative.iloc[:0]
     selected = pd.concat([positive, sampled_negative]).sort_index()
     remaining = negative.loc[~negative.index.isin(sampled_negative.index)]
@@ -408,11 +408,9 @@ def _fit_boundary_head(
         remaining_x = remaining[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
         hard_count = min(
             len(remaining),
-            int(
-                math.ceil(
-                    (selected[target_column] > 0).sum()
-                    * float(boundary_config.get("hard_negative_to_positive_ratio", 10.0))
-                )
+            math.ceil(
+                (selected[target_column] > 0).sum()
+                * float(boundary_config.get("hard_negative_to_positive_ratio", 10.0))
             ),
         )
         if hard_count:
@@ -765,7 +763,7 @@ def train_xgboost_fold(
         float(config["far_negative_to_positive_ratio"]),
         int(config["random_seed"]),
     )
-    final_estimators = max(1, int(round(float(np.median(best_iterations)))))
+    final_estimators = max(1, round(float(np.median(best_iterations))))
     final_config = dict(config)
     final_config["n_estimators"] = final_estimators
     final_config["early_stopping_rounds"] = 0
@@ -821,13 +819,13 @@ def train_xgboost_fold(
     if boundary_enabled:
         start_estimators = max(
             1,
-            int(round(float(np.median(boundary_iterations["start"]))))
+            round(float(np.median(boundary_iterations["start"])))
             if boundary_iterations["start"]
             else final_estimators,
         )
         end_estimators = max(
             1,
-            int(round(float(np.median(boundary_iterations["end"]))))
+            round(float(np.median(boundary_iterations["end"])))
             if boundary_iterations["end"]
             else final_estimators,
         )

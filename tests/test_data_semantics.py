@@ -9,7 +9,7 @@ import pytest
 
 from bme_eating.data.deep_dataset import SegmentBalancedBatchSampler
 from bme_eating.data.labels import build_anchor_index, classify_event_coverage
-from bme_eating.data.preprocess import _antialias_series, assign_virtual_sessions, _save_segment
+from bme_eating.data.preprocess import _antialias_series, _save_segment, assign_virtual_sessions
 from bme_eating.data.quality import build_quality_report, validate_quality_invariants
 from bme_eating.data.session import SessionWindowReader
 from bme_eating.features.signal import masked_spectral_summary, ppg_quality_features

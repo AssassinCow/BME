@@ -50,7 +50,13 @@ def main() -> None:
             "the expected commit."
         ),
     )
-    parser.add_argument("--resume", help="Resume from this fusion fold's last.pt checkpoint.")
+    parser.add_argument(
+        "--resume",
+        help=(
+            "Resume the whole fusion fold from any crossfit_0..2/last.pt checkpoint; "
+            "completed partitions are verified and skipped automatically."
+        ),
+    )
     args = parser.parse_args()
     try:
         command_train_fusion(args)

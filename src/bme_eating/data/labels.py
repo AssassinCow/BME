@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -30,13 +31,13 @@ def _acc_observed_intervals(segments: pd.DataFrame) -> dict[str, list[tuple[int,
             valid = mask[:, :3].all(axis=1) if mask.ndim == 2 and mask.shape[1] >= 3 else np.zeros(len(timestamps), dtype=bool)
             valid_times = timestamps[valid]
             if len(valid_times):
-                period = int(round(np.median(np.diff(timestamps)))) if len(timestamps) > 1 else 10
+                period = round(np.median(np.diff(timestamps))) if len(timestamps) > 1 else 10
                 period = max(period, 1)
                 split = np.flatnonzero(np.diff(valid_times) > period * 1.5) + 1
                 boundaries = np.concatenate(([0], split, [len(valid_times)]))
                 intervals.extend(
                     (int(valid_times[start]), int(valid_times[end - 1]) + period)
-                    for start, end in zip(boundaries[:-1], boundaries[1:])
+                    for start, end in pairwise(boundaries)
                     if end > start
                 )
         else:

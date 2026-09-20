@@ -26,7 +26,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError(f"Expected a JSON object: {path}")
+        raise TypeError(f"Expected a JSON object: {path}")
     return payload
 
 
@@ -194,7 +194,7 @@ def aggregate_experiment(folds: pd.DataFrame, expected_folds: int = 5) -> dict[s
     complete = folds[folds["status"] == "complete"].copy()
     result: dict[str, Any] = {
         "experiment": str(folds.iloc[0]["experiment"]),
-        "folds_complete": int(len(complete)),
+        "folds_complete": len(complete),
         "folds_expected": expected_folds,
         "is_final": len(complete) == expected_folds,
         "blocked_folds": ",".join(

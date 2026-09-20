@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 import json
 import math
 import random
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -136,6 +136,41 @@ def _postprocess_kwargs(config: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def resolve_focal_positive_alpha(training_config: dict[str, Any]) -> float:
+    positive_fraction = float(training_config["positive_sampling_fraction"])
+    positive_alpha = float(training_config["focal_positive_alpha"])
+    if not 0.0 < positive_fraction < 1.0:
+        raise ValueError("positive_sampling_fraction must be between zero and one")
+    if not 0.0 < positive_alpha < 1.0:
+        raise ValueError("focal_positive_alpha must be between zero and one")
+    if math.isclose(positive_fraction, 0.5) and not math.isclose(positive_alpha, 0.5):
+        raise ValueError(
+            "Balanced 50% positive sampling requires focal_positive_alpha=0.5 "
+            "to avoid double class compensation"
+        )
+    return positive_alpha
+
+
+def checkpoint_selection_rank(
+    selection_metric: str,
+    validation_auprc: float,
+    metrics: dict[str, float],
+    epoch: int,
+) -> tuple[float, ...]:
+    if selection_metric == "window_auprc":
+        score = validation_auprc if math.isfinite(validation_auprc) else -math.inf
+        return (float(score), -float(epoch))
+    if selection_metric != "event_f1":
+        raise ValueError(f"Unsupported checkpoint selection metric: {selection_metric}")
+    boundary_values = [
+        float(metrics[name])
+        for name in ("start_mae_seconds", "end_mae_seconds")
+        if math.isfinite(float(metrics[name]))
+    ]
+    boundary_mae = float(np.mean(boundary_values)) if boundary_values else math.inf
+    return (float(metrics["f1"]), -boundary_mae, -float(epoch))
+
+
 def train_dtp_fold(
     anchors: pd.DataFrame,
     segments: pd.DataFrame,
@@ -152,13 +187,20 @@ def train_dtp_fold(
     selection_signature: str | None = None,
     selection_gate: Callable[[dict[str, Any]], None] | None = None,
     test_predictions_name: str = "test_predictions.parquet",
+    inner_validation_partition: int = 0,
+    checkpoint_selection_metric: str = "event_f1",
 ) -> Path:
     if not torch.cuda.is_available():
         raise RuntimeError("DTP-SQF training requires the RTX 4080 CUDA environment")
     seed = int(training_config["random_seed"])
     seed_everything(seed)
+    if inner_validation_partition not in range(3):
+        raise ValueError("inner_validation_partition must be 0, 1, or 2")
     train_anchors, validation_anchors, test_anchors = assign_train_validation_test(
-        anchors, subject_folds, outer_fold
+        anchors,
+        subject_folds,
+        outer_fold,
+        inner_validation_partition=inner_validation_partition,
     )
     train_anchors = train_anchors.reset_index(drop=True)
     validation_anchors = validation_anchors.reset_index(drop=True)
@@ -217,30 +259,42 @@ def train_dtp_fold(
         positive_fraction=float(training_config["positive_sampling_fraction"]),
         seed=seed,
     )
-    loader_arguments = {
-        "num_workers": int(training_config["num_workers"]),
+    training_workers = int(training_config["num_workers"])
+    inference_workers = int(
+        training_config.get("inference_num_workers", min(training_workers, 2))
+    )
+    if training_workers < 0 or inference_workers < 0:
+        raise ValueError("DataLoader worker counts must be non-negative")
+    training_loader_arguments = {
+        "num_workers": training_workers,
         "pin_memory": True,
-        "persistent_workers": int(training_config["num_workers"]) > 0,
+        "persistent_workers": training_workers > 0,
+    }
+    inference_loader_arguments = {
+        "num_workers": inference_workers,
+        "pin_memory": True,
+        "persistent_workers": False,
     }
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=batch_sampler,
-        **loader_arguments,
+        **training_loader_arguments,
     )
     validation_loader = DataLoader(
         validation_dataset,
         batch_size=int(training_config["inference_batch_size"]),
         shuffle=False,
-        **loader_arguments,
+        **inference_loader_arguments,
     )
     test_loader = DataLoader(
         test_dataset,
         batch_size=int(training_config["inference_batch_size"]),
         shuffle=False,
-        **loader_arguments,
+        **inference_loader_arguments,
     )
 
     device = torch.device("cuda")
+    torch.cuda.reset_peak_memory_stats(device)
     model = DTPSQF(model_config).to(device)
     encoder_parameters = list(model.motion_encoder.parameters()) + list(
         model.ppg_encoder.parameters()
@@ -270,7 +324,7 @@ def train_dtp_fold(
     )
     eligible_train = train_anchors[train_state_mask.fillna(0.0).astype(float) > 0]
     positive_rate = float((eligible_train["state_target"] > 0).mean())
-    positive_alpha = float(np.clip(1.0 - positive_rate, 0.5, 0.95))
+    positive_alpha = resolve_focal_positive_alpha(training_config)
     criterion = DTPLoss(
         positive_alpha=positive_alpha,
         focal_gamma=float(loss_config["focal_gamma"]),
@@ -285,6 +339,7 @@ def train_dtp_fold(
     start_epoch = 0
     best_f1 = -1.0
     best_boundary_mae = float("inf")
+    best_validation_auprc = -math.inf
     patience = 0
     history: list[dict[str, float]] = []
     best_selection: dict[str, Any] | None = None
@@ -300,16 +355,21 @@ def train_dtp_fold(
         start_epoch = int(checkpoint["epoch"]) + 1
         best_f1 = float(checkpoint["best_f1"])
         best_boundary_mae = float(checkpoint["best_boundary_mae"])
+        best_validation_auprc = float(checkpoint.get("best_validation_auprc", -math.inf))
         patience = int(checkpoint.get("patience", 0))
         history = list(checkpoint.get("history", []))
         best_selection = checkpoint.get("best_selection")
         stored_rank = checkpoint.get("best_selection_rank")
         best_selection_rank = tuple(float(value) for value in stored_rank) if stored_rank else None
         stored_signature = checkpoint.get("selection_signature")
-        if validation_selector is not None and stored_signature != selection_signature:
+        if stored_signature != selection_signature:
             raise RuntimeError(
-                "Resume checkpoint fusion signature does not match the active configuration"
+                "Resume checkpoint signature does not match the active cross-fit configuration"
             )
+        if int(checkpoint.get("inner_validation_partition", 0)) != inner_validation_partition:
+            raise RuntimeError("Resume checkpoint belongs to a different inner partition")
+        if checkpoint.get("checkpoint_selection_metric", "event_f1") != checkpoint_selection_metric:
+            raise RuntimeError("Resume checkpoint uses a different checkpoint selection metric")
         tqdm.write(f"Resuming DTP-SQF at epoch {start_epoch + 1}/{max_epochs}")
 
     validation_subjects = set(validation_anchors["subject_key"].unique())
@@ -371,6 +431,7 @@ def train_dtp_fold(
                     "scaler": scaler.state_dict(),
                     "best_f1": best_f1,
                     "best_boundary_mae": best_boundary_mae,
+                    "best_validation_auprc": best_validation_auprc,
                     "patience": patience,
                     "history": history,
                     "best_selection": best_selection,
@@ -379,6 +440,8 @@ def train_dtp_fold(
                     "model_config": model_config,
                     "training_config": training_config,
                     "outer_fold": outer_fold,
+                    "inner_validation_partition": inner_validation_partition,
+                    "checkpoint_selection_metric": checkpoint_selection_metric,
                 },
                 last_checkpoint_path,
             )
@@ -439,12 +502,14 @@ def train_dtp_fold(
         boundary_mae = float(np.mean(boundary_values)) if boundary_values else float("inf")
         if current_selection is not None:
             current_rank = tuple(float(value) for value in current_selection["rank"])
-            improved = best_selection_rank is None or current_rank > best_selection_rank
         else:
-            current_rank = None
-            improved = metrics["f1"] > best_f1 or (
-                math.isclose(metrics["f1"], best_f1) and boundary_mae < best_boundary_mae
+            current_rank = checkpoint_selection_rank(
+                checkpoint_selection_metric,
+                validation_auprc,
+                metrics,
+                epoch,
             )
+        improved = best_selection_rank is None or current_rank > best_selection_rank
         history.append(
             {
                 "epoch": float(epoch),
@@ -458,6 +523,7 @@ def train_dtp_fold(
         if improved:
             best_f1 = metrics["f1"]
             best_boundary_mae = boundary_mae
+            best_validation_auprc = validation_auprc
             best_selection = current_selection
             best_selection_rank = current_rank
             patience = 0
@@ -471,6 +537,7 @@ def train_dtp_fold(
             "scaler": scaler.state_dict(),
             "best_f1": best_f1,
             "best_boundary_mae": best_boundary_mae,
+            "best_validation_auprc": best_validation_auprc,
             "patience": patience,
             "history": history,
             "best_selection": best_selection,
@@ -479,6 +546,8 @@ def train_dtp_fold(
             "model_config": model_config,
             "training_config": training_config,
             "outer_fold": outer_fold,
+            "inner_validation_partition": inner_validation_partition,
+            "checkpoint_selection_metric": checkpoint_selection_metric,
         }
         if improved:
             _save_torch_checkpoint(checkpoint_payload, checkpoint_path)
@@ -515,7 +584,11 @@ def train_dtp_fold(
     test_predictions.to_parquet(output_dir / test_predictions_name, index=False)
     metadata = {
         "outer_fold": outer_fold,
+        "inner_validation_partition": inner_validation_partition,
+        "checkpoint_selection_metric": checkpoint_selection_metric,
+        "best_checkpoint_epoch": int(checkpoint["epoch"]),
         "best_validation_f1": best_f1,
+        "best_validation_auprc": best_validation_auprc,
         "best_validation_boundary_mae_seconds": best_boundary_mae
         if np.isfinite(best_boundary_mae)
         else None,
@@ -524,6 +597,12 @@ def train_dtp_fold(
         "validation_rows": len(validation_anchors),
         "validation_full_timeline_rows": len(validation_anchors),
         "test_rows": len(test_anchors),
+        "train_subjects": sorted(str(value) for value in train_subjects),
+        "validation_subjects": sorted(str(value) for value in validation_subjects),
+        "focal_positive_alpha": positive_alpha,
+        "raw_training_positive_rate": positive_rate,
+        "training_num_workers": training_workers,
+        "inference_num_workers": inference_workers,
         "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()),
         "validation_selection_signature": selection_signature,
     }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 import _bootstrap  # noqa: F401
+
 from bme_eating.cli import command_build_features
 
 

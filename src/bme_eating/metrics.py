@@ -146,9 +146,7 @@ def evaluate_events(
         truth = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
     if prediction.empty and "subject_key" not in prediction.columns:
         prediction = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
-    if ignore is None:
-        ignore = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
-    elif ignore.empty and "subject_key" not in ignore.columns:
+    if ignore is None or ignore.empty and "subject_key" not in ignore.columns:
         ignore = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
     matches_output: list[dict[str, object]] = []
     true_positive = 0

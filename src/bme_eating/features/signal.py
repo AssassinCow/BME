@@ -128,7 +128,7 @@ def ppg_quality_features(
 
     longest = max(contiguous_true_ranges(mask), key=lambda item: item[1] - item[0])
     contiguous = values[longest[0] : longest[1]]
-    minimum_lag = max(1, int(round(0.25 * sampling_hz)))
+    minimum_lag = max(1, round(0.25 * sampling_hz))
     if len(contiguous) <= max(2, minimum_lag):
         autocorrelation_peak = 0.0
     else:
@@ -137,7 +137,7 @@ def ppg_quality_features(
         autocorrelation = signal.fftconvolve(centered, centered[::-1], mode="full")
         autocorrelation = autocorrelation[len(centered) - 1 :]
         autocorrelation /= max(float(autocorrelation[0]), 1e-12)
-        maximum_lag = min(len(autocorrelation), int(round(2.0 * sampling_hz)))
+        maximum_lag = min(len(autocorrelation), round(2.0 * sampling_hz))
         autocorrelation_peak = (
             float(np.clip(np.max(autocorrelation[minimum_lag:maximum_lag]), 0, 1))
             if maximum_lag > minimum_lag

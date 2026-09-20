@@ -17,7 +17,6 @@ import pandas as pd
 
 from bme_eating.data.packet_reader import _SENSOR_HEADER_BYTES, SENSOR_COLUMNS
 
-
 REPEATED_HEADER_ERROR = "standard sensor header occurs more than once"
 EXACT_RECOVERY_CLASSIFICATION = "exact_duplicate_overlap"
 QUARANTINE_CLASSIFICATION = "conflicting_overlap"
@@ -485,7 +484,7 @@ def validate_multisection_preprocess_policy(
         raise RuntimeError(f"records index is missing columns: {sorted(missing)}")
     layouts = schema_audit.get("layouts", [])
     if not isinstance(layouts, list):
-        raise RuntimeError("schema audit layouts must be a list")
+        raise TypeError("schema audit layouts must be a list")
     if "layout_files_inspected" in schema_audit and int(
         schema_audit["layout_files_inspected"]
     ) != len(layouts):
@@ -555,7 +554,7 @@ def validate_multisection_preprocess_policy(
 
     results = multisection_audit.get("results", [])
     if not isinstance(results, list):
-        raise RuntimeError("multisection audit results must be a list")
+        raise TypeError("multisection audit results must be a list")
     if int(multisection_audit.get("attachments_audited", -1)) != len(results):
         raise RuntimeError("multisection audit attachment count does not match its results")
     if multisection_audit.get("automatic_recovery_performed") is not False:

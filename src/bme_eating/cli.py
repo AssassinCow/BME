@@ -41,12 +41,15 @@ from bme_eating.features.baseline import build_segment_features
 from bme_eating.fusion import (
     FusionGateError,
     FusionValidator,
+    align_prediction_frames,
+    assemble_crossfit_predictions,
     evaluate_fold0_gate,
     evaluate_internal_gate,
     fuse_prediction_frames,
     json_safe,
     metrics_summary_from_suite,
     prepare_fusion_run_root,
+    sha256_file,
     validate_clean_baseline_experiment,
     validate_frozen_baseline_fold,
     validate_fusion_run_name,
@@ -59,7 +62,7 @@ from bme_eating.postprocess import (
     probabilities_to_events,
     tune_postprocess_parameters,
 )
-from bme_eating.reproducibility import write_run_manifest
+from bme_eating.reproducibility import require_clean_git_worktree, write_run_manifest
 
 _RECOVERABLE_INPUT_ERRORS = (
     OSError,
@@ -852,7 +855,7 @@ def _evaluate_prediction_file(
                     for row in band_truth.itertuples(index=False)
                 )
                 coverage_summary[str(band)] = {
-                    "truth_events": int(len(band_truth)),
+                    "truth_events": len(band_truth),
                     "matched_events": int(hits),
                     "sensitivity": hits / len(band_truth) if len(band_truth) else None,
                 }
@@ -884,9 +887,9 @@ def _evaluate_prediction_file(
         by_subject[str(subject_key)] = subject_metrics
     output["by_subject"] = by_subject
     output["evaluation_counts"] = {
-        "evaluable_truth": int(len(truth)),
-        "ignored_truth": int(len(ignore)) if ignore is not None else 0,
-        "predicted_events": int(len(events)),
+        "evaluable_truth": len(truth),
+        "ignored_truth": len(ignore) if ignore is not None else 0,
+        "predicted_events": len(events),
     }
     matched_truth = set(
         zip(
@@ -1191,11 +1194,14 @@ def _require_prior_fusion_folds(
 ) -> None:
     if requested_fold <= 0:
         return
+    prior_commits: set[str] = set()
+    prior_config_hashes: set[str] = set()
     for fold in range(requested_fold):
         fold_dir = output_root / "experiments" / experiment_name / f"fold_{fold}"
         metrics_path = fold_dir / "test_metrics.json"
         selection_path = fold_dir / "selected_fusion.json"
-        if not metrics_path.is_file() or not selection_path.is_file():
+        manifest_path = fold_dir / "run_manifest.json"
+        if not metrics_path.is_file() or not selection_path.is_file() or not manifest_path.is_file():
             raise FusionGateError(
                 f"Fusion folds must run serially; fold {fold} is incomplete", exit_code=2
             )
@@ -1204,18 +1210,45 @@ def _require_prior_fusion_folds(
             raise FusionGateError(
                 f"Fusion fold {fold} belongs to a different or legacy run", exit_code=2
             )
-        metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-        method = str(metrics["primary_method"])
-        if float(metrics[method]["sensitivity"]) <= 0:
+        if int(selection.get("version", 0)) < 3 or int(
+            selection.get("crossfit_partitions", 0)
+        ) != 3:
             raise FusionGateError(
-                f"Fusion fold {fold} has zero recall; later folds are blocked", exit_code=2
+                f"Fusion fold {fold} does not use the registered three-way cross-fit protocol",
+                exit_code=2,
             )
-        if fold == 0:
-            if not bool(selection.get("outer_fold_gate", {}).get("passed", False)):
+        signatures = {
+            str(item.get("selection_signature") or "")
+            for item in selection.get("crossfit_models", [])
+            if isinstance(item, dict)
+        }
+        if len(signatures) != 3 or any(
+            re.fullmatch(r"[0-9a-f]{64}", value) is None for value in signatures
+        ):
+            raise FusionGateError(
+                f"Fusion fold {fold} has incomplete cross-fit signatures", exit_code=2
+            )
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if manifest.get("experiment") != {"name": experiment_name, "fold": fold}:
+            raise FusionGateError(
+                f"Fusion fold {fold} manifest identity is inconsistent",
+                exit_code=2,
+            )
+        artifact_hashes = manifest.get("artifact_hashes", {})
+        for name, path in {
+            "test_metrics.json": metrics_path,
+            "selected_fusion.json": selection_path,
+        }.items():
+            if artifact_hashes.get(name) != sha256_file(path):
                 raise FusionGateError(
-                    "Fusion fold 0 did not pass its outer gate; later folds are blocked",
-                    exit_code=2,
+                    f"Fusion fold {fold} {name} changed after manifesting", exit_code=2
                 )
+        prior_commits.add(str(manifest.get("git", {}).get("commit") or ""))
+        prior_config_hashes.add(str(manifest.get("resolved_config_sha256") or ""))
+    if "" in prior_commits or len(prior_commits) != 1:
+        raise FusionGateError("Prior fusion folds mix or omit Git commits", exit_code=2)
+    if "" in prior_config_hashes or len(prior_config_hashes) != 1:
+        raise FusionGateError("Prior fusion folds mix or omit resolved configurations", exit_code=2)
 
 
 def command_train_fusion(args: argparse.Namespace) -> None:
@@ -1223,6 +1256,7 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     from bme_eating.training.dtp_trainer import train_dtp_fold
 
     config = load_config(args.config)
+    require_clean_git_worktree()
     if int(config["model"].get("future_context_seconds", 0)) != 0:
         raise ValueError("The fusion candidate must remain causal (future_context_seconds=0)")
     _, output_root = resolve_roots(config)
@@ -1238,10 +1272,13 @@ def command_train_fusion(args: argparse.Namespace) -> None:
         raise ValueError("--fresh requires --fold 0, --run-name, and no --resume")
     if requested_run_name is not None and fold == 0 and not fresh and not args.resume:
         raise ValueError("A new named fusion run must start with --fresh")
+    crossfit_partitions = int(config["fusion"].get("crossfit_partitions", 3))
+    if crossfit_partitions != 3:
+        raise ValueError("The registered fusion protocol requires exactly three cross-fit models")
     config["experiment"] = {
         **experiment,
         "name": experiment_name,
-        "protocol_version": 2,
+        "protocol_version": 3,
     }
     _require_prior_fusion_folds(output_root, experiment_name, fold)
 
@@ -1256,13 +1293,12 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     config["experiment"]["baseline_source_commit"] = source_commit
     config["experiment"]["require_clean_baseline"] = require_clean_baseline
     if require_clean_baseline and fold == 0:
-        clean_baseline_folds = validate_clean_baseline_experiment(
+        baseline_info = validate_clean_baseline_experiment(
             output_root,
             baseline_name,
             source_commit,
             number_of_folds=int(config["data"]["subject_folds"]),
-        )
-        baseline_info = clean_baseline_folds[fold]
+        )[fold]
     else:
         baseline_info = validate_frozen_baseline_fold(
             output_root,
@@ -1283,59 +1319,190 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     existing_selection_path = experiment_dir / "selected_fusion.json"
     if existing_selection_path.is_file():
         existing_selection = json.loads(existing_selection_path.read_text(encoding="utf-8"))
-        internal = existing_selection.get("internal_gate", {})
-        outer = existing_selection.get("outer_fold_gate", {})
-        if fold == 0 and internal.get("passed") is False:
-            raise FusionGateError(
-                "Fusion fold 0 was already rejected by the internal gate", exit_code=2
+        if existing_selection.get("outer_fold_gate", {}).get("passed") is not None:
+            raise RuntimeError(
+                f"Fusion fold {fold} is already complete; use a new run name for a fresh experiment"
             )
-        if outer.get("passed") is not None:
-            outcome = "passed" if outer.get("passed") else "rejected"
-            raise FusionGateError(
-                f"Fusion fold {fold} already completed and was {outcome}", exit_code=2
-            )
+
     resume_path = Path(args.resume).expanduser().resolve() if args.resume else None
     if resume_path is not None:
-        if resume_path.parent != experiment_dir.resolve():
-            raise ValueError("--resume must point to a checkpoint in the requested fusion fold")
         if not resume_path.is_file():
             raise FileNotFoundError(f"Resume checkpoint does not exist: {resume_path.name}")
-    elif any(
-        (experiment_dir / name).exists() for name in ("last.pt", "best.pt", "fusion_trials.csv")
+        if (
+            resume_path.name != "last.pt"
+            or resume_path.parent.parent != experiment_dir.resolve()
+            or not re.fullmatch(r"crossfit_[0-2]", resume_path.parent.name)
+        ):
+            raise ValueError(
+                "--resume must point to crossfit_0, crossfit_1, or crossfit_2 last.pt "
+                "inside the requested fusion fold"
+            )
+    elif any(experiment_dir.glob("crossfit_*")) or any(
+        (experiment_dir / name).exists()
+        for name in ("fusion_trials.csv", "dtp_oof_predictions.parquet")
     ):
         raise RuntimeError(
-            "Fusion training artifacts already exist; pass --resume with this fold's last.pt"
+            "Fusion training artifacts already exist; pass --resume with any cross-fit last.pt "
+            "to resume the whole fold"
         )
 
-    print("[1/4] Loading frozen baseline OOF predictions and v2 indices...", flush=True)
+    print("[1/5] Loading full baseline OOF predictions and v2 indices...", flush=True)
     anchors = pd.read_parquet(output_root / "indices" / "anchors.parquet")
     segments = pd.read_parquet(output_root / "indices" / "segments.parquet")
     events = pd.read_parquet(output_root / "indices" / "events.parquet")
     subject_folds = load_subject_folds(output_root / "indices" / "subject_folds.json")
-    _, validation_anchors, test_anchors = assign_train_validation_test(anchors, subject_folds, fold)
-    validation_subjects = set(validation_anchors["subject_key"].astype(str).unique())
+    fold_assignment = anchors["subject_key"].map(subject_folds)
+    if fold_assignment.isna().any():
+        missing = sorted(anchors.loc[fold_assignment.isna(), "subject_key"].astype(str).unique())
+        raise ValueError(f"Subjects missing from fold map: {missing}")
+    outer_train_anchors = anchors[fold_assignment != fold]
+    test_anchors = anchors[fold_assignment == fold]
+    outer_train_subjects = set(outer_train_anchors["subject_key"].astype(str).unique())
     test_subjects = set(test_anchors["subject_key"].astype(str).unique())
-    if validation_subjects & test_subjects:
-        raise RuntimeError("Inner validation subjects overlap the outer test fold")
-
-    baseline_oof_all = pd.read_parquet(baseline_dir / "validation_predictions.parquet")
-    baseline_oof_subjects = set(baseline_oof_all["subject_key"].astype(str).unique())
-    if baseline_oof_subjects & test_subjects:
-        raise RuntimeError("Frozen baseline OOF predictions contain outer-fold subjects")
-    baseline_oof = baseline_oof_all[
-        baseline_oof_all["subject_key"].astype(str).isin(validation_subjects)
-    ].copy()
-    if set(baseline_oof["subject_key"].astype(str).unique()) != validation_subjects:
-        raise RuntimeError(
-            "Frozen baseline OOF predictions do not cover every DTP validation subject"
+    if outer_train_subjects & test_subjects:
+        raise RuntimeError("Outer-training subjects overlap the outer test fold")
+    partition_subjects: dict[int, set[str]] = {}
+    for partition in range(crossfit_partitions):
+        _, partition_validation, partition_test = assign_train_validation_test(
+            anchors,
+            subject_folds,
+            fold,
+            inner_validation_partition=partition,
         )
-    validation_truth, validation_ignore = partition_evaluation_events(events, validation_subjects)
+        partition_subjects[partition] = set(
+            partition_validation["subject_key"].astype(str).unique()
+        )
+        if set(partition_test["subject_key"].astype(str).unique()) != test_subjects:
+            raise RuntimeError("Cross-fit split changed the outer test subjects")
+    if set().union(*partition_subjects.values()) != outer_train_subjects:
+        raise RuntimeError("Three inner partitions do not cover every outer-training subject")
+
+    baseline_oof = pd.read_parquet(baseline_dir / "validation_predictions.parquet")
+    baseline_oof_subjects = set(baseline_oof["subject_key"].astype(str).unique())
+    if baseline_oof_subjects != outer_train_subjects:
+        raise RuntimeError(
+            "Frozen baseline OOF predictions do not cover the complete outer-training set"
+        )
+    validation_truth, validation_ignore = partition_evaluation_events(
+        events, outer_train_subjects
+    )
     selected_postprocess = json.loads(
         (baseline_dir / "selected_postprocess.json").read_text(encoding="utf-8")
     )
     (experiment_dir / "selected_postprocess.json").write_text(
         json.dumps(selected_postprocess, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+
+    signature_payload = {
+        "fusion_protocol_version": 3,
+        "epoch_randomness_version": 2,
+        "run_name": experiment_name,
+        "fold": fold,
+        "model": config["model"],
+        "training": config["training"],
+        "loss": config["loss"],
+        "postprocess": config["postprocess"],
+        "fusion": config["fusion"],
+        "baseline_artifact_hashes": baseline_info["artifact_hashes"],
+        "input_hashes": baseline_info["input_hashes"],
+    }
+    partition_signatures: dict[int, str] = {}
+    validation_frames: dict[int, pd.DataFrame] = {}
+    test_frames: dict[int, pd.DataFrame] = {}
+    crossfit_models: list[dict[str, Any]] = []
+    print("[2/5] Training three causal DTP cross-fit models on CUDA...", flush=True)
+    for partition in range(crossfit_partitions):
+        partition_dir = experiment_dir / f"crossfit_{partition}"
+        partition_training = dict(config["training"])
+        partition_training["random_seed"] = int(config["training"]["random_seed"]) + partition
+        partition_signature_payload = {
+            **signature_payload,
+            "inner_validation_partition": partition,
+            "training": partition_training,
+            "checkpoint_selection_metric": "window_auprc",
+        }
+        partition_signature = hashlib.sha256(
+            json.dumps(
+                partition_signature_payload, sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        partition_signatures[partition] = partition_signature
+        metadata_path = partition_dir / "metadata.json"
+        required_outputs = (
+            partition_dir / "best.pt",
+            partition_dir / "best_validation_predictions.parquet",
+            partition_dir / "dtp_test_predictions.parquet",
+            metadata_path,
+        )
+        partition_complete = all(path.is_file() for path in required_outputs)
+        metadata: dict[str, Any] = {}
+        if partition_complete:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            partition_complete = (
+                int(metadata.get("outer_fold", -1)) == fold
+                and int(metadata.get("inner_validation_partition", -1)) == partition
+                and metadata.get("validation_selection_signature") == partition_signature
+                and metadata.get("checkpoint_selection_metric") == "window_auprc"
+            )
+        last_checkpoint = partition_dir / "last.pt"
+        if not partition_complete:
+            partition_artifacts = partition_dir.exists() and any(partition_dir.iterdir())
+            if partition_artifacts and resume_path is None:
+                raise RuntimeError(
+                    f"crossfit_{partition} is incomplete; rerun with --resume pointing to "
+                    "an existing cross-fit last.pt"
+                )
+            partition_resume = last_checkpoint if last_checkpoint.is_file() else None
+            if partition_artifacts and partition_resume is None:
+                raise RuntimeError(
+                    f"crossfit_{partition} is incomplete and has no resumable last.pt"
+                )
+            train_dtp_fold(
+                anchors,
+                segments,
+                events,
+                subject_folds,
+                fold,
+                config["model"],
+                partition_training,
+                config["loss"],
+                config["postprocess"],
+                partition_dir,
+                partition_resume,
+                selection_signature=partition_signature,
+                test_predictions_name="dtp_test_predictions.parquet",
+                inner_validation_partition=partition,
+                checkpoint_selection_metric="window_auprc",
+            )
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        validation_frames[partition] = pd.read_parquet(
+            partition_dir / "best_validation_predictions.parquet"
+        )
+        test_frames[partition] = pd.read_parquet(
+            partition_dir / "dtp_test_predictions.parquet"
+        )
+        crossfit_models.append(
+            {
+                "inner_validation_partition": partition,
+                "random_seed": int(partition_training["random_seed"]),
+                "selection_signature": partition_signature,
+                "best_checkpoint_epoch": int(metadata["best_checkpoint_epoch"]),
+                "best_validation_auprc": float(metadata["best_validation_auprc"]),
+                "checkpoint": f"crossfit_{partition}/best.pt",
+            }
+        )
+
+    dtp_oof, dtp_test = assemble_crossfit_predictions(
+        validation_frames,
+        test_frames,
+        partition_subjects,
+        test_subjects,
+    )
+    baseline_oof, dtp_oof = align_prediction_frames(baseline_oof, dtp_oof)
+    dtp_oof.to_parquet(experiment_dir / "dtp_oof_predictions.parquet", index=False)
+    dtp_test.to_parquet(experiment_dir / "dtp_test_predictions.parquet", index=False)
+
+    print("[3/5] Selecting fusion once on complete cross-fit OOF predictions...", flush=True)
     validator = FusionValidator(
         baseline=baseline_oof,
         truth=validation_truth,
@@ -1345,99 +1512,60 @@ def command_train_fusion(args: argparse.Namespace) -> None:
         output_dir=experiment_dir,
         forbidden_subjects=test_subjects,
     )
-    signature_payload = {
-        "fusion_protocol_version": 2,
-        "epoch_randomness_version": 2,
+    selection = validator(dtp_oof, epoch=0)
+    selection_signature = hashlib.sha256(
+        json.dumps(
+            {
+                **signature_payload,
+                "partition_signatures": partition_signatures,
+                "validator": validator.signature,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    internal_gate = evaluate_internal_gate(selection, config["fusion"]["internal_gate"])
+    internal_gate["checks"]["alignment_complete"] = True
+    internal_gate["checks"]["outer_subjects_absent"] = True
+    internal_gate["checks"]["crossfit_subject_coverage_complete"] = True
+    internal_gate["passed"] = all(internal_gate["checks"].values())
+    internal_gate["required_for_promotion"] = True
+    selection_record: dict[str, Any] = {
+        "version": 3,
         "run_name": experiment_name,
-        "validator": validator.signature,
-        "fold": fold,
-        "model": config["model"],
-        "training": config["training"],
-        "loss": config["loss"],
+        "selection_scope": "complete_outer_training_crossfit_oof",
+        "crossfit_partitions": crossfit_partitions,
+        "crossfit_models": crossfit_models,
+        "alpha": float(selection["alpha"]),
+        "beta": float(selection["beta"]),
+        "beta_only_beta": float(selection["beta_only_beta"]),
+        "residual_clip": float(config["fusion"]["residual_clip"]),
+        "probability_epsilon": float(config["fusion"]["probability_epsilon"]),
+        "selection_signature": selection_signature,
+        "baseline_experiment": baseline_name,
+        "baseline_source_commit": source_commit,
         "baseline_artifact_hashes": baseline_info["artifact_hashes"],
         "input_hashes": baseline_info["input_hashes"],
+        "validation_metrics": selection["metrics"],
+        "validation_beta_only_metrics": selection["beta_only_metrics"],
+        "validation_baseline_metrics": selection["baseline_metrics"],
+        "complementarity_diagnostics": selection["diagnostics"],
+        "internal_gate": internal_gate,
+        "outer_fold_gate": {"passed": None, "checks": {}, "diagnostic_only": True},
     }
-    selection_signature = hashlib.sha256(
-        json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    _write_selected_fusion(experiment_dir / "selected_fusion.json", selection_record)
 
-    selection_record: dict[str, Any] = {}
-
-    def gate_best_selection(selection: dict[str, Any]) -> None:
-        nonlocal selection_record
-        internal_gate = evaluate_internal_gate(selection, config["fusion"]["internal_gate"])
-        internal_gate["checks"]["alignment_complete"] = True
-        internal_gate["checks"]["outer_subjects_absent"] = True
-        internal_gate["passed"] = all(internal_gate["checks"].values())
-        internal_gate["required_for_this_fold"] = fold == 0
-        selection_record = {
-            "version": 2,
-            "run_name": experiment_name,
-            "selection_scope": "outer_training_inner_validation_only",
-            "checkpoint_epoch": int(selection["epoch"]),
-            "alpha": float(selection["alpha"]),
-            "beta": float(selection["beta"]),
-            "residual_clip": float(config["fusion"]["residual_clip"]),
-            "probability_epsilon": float(config["fusion"]["probability_epsilon"]),
-            "selection_signature": selection_signature,
-            "baseline_experiment": baseline_name,
-            "baseline_source_commit": source_commit,
-            "baseline_artifact_hashes": baseline_info["artifact_hashes"],
-            "input_hashes": baseline_info["input_hashes"],
-            "validation_metrics": selection["metrics"],
-            "validation_baseline_metrics": selection["baseline_metrics"],
-            "complementarity_diagnostics": selection["diagnostics"],
-            "internal_gate": internal_gate,
-            "outer_fold_gate": {"passed": None, "checks": {}},
-        }
-        _write_selected_fusion(experiment_dir / "selected_fusion.json", selection_record)
-        if fold == 0 and not internal_gate["passed"]:
-            raise FusionGateError(
-                f"Fusion fold {fold} failed the internal validation gate; "
-                "outer prediction is blocked",
-                exit_code=2,
-            )
-
-    print("[2/4] Training causal DTP-SQF and evaluating 9 fixed fusion pairs...", flush=True)
-    try:
-        checkpoint = train_dtp_fold(
-            anchors,
-            segments,
-            events,
-            subject_folds,
-            fold,
-            config["model"],
-            config["training"],
-            config["loss"],
-            config["postprocess"],
-            experiment_dir,
-            resume_path,
-            validation_selector=validator,
-            selection_signature=selection_signature,
-            selection_gate=gate_best_selection,
-            test_predictions_name="dtp_test_predictions.parquet",
-        )
-    except FusionGateError:
-        write_run_manifest(experiment_dir, config, output_root)
-        raise
-
-    print("[3/4] Applying the frozen residual fusion to the held-out fold...", flush=True)
-    dtp_validation = pd.read_parquet(experiment_dir / "best_validation_predictions.parquet")
+    print("[4/5] Applying the frozen residual fusion to the held-out fold...", flush=True)
     fused_validation = fuse_prediction_frames(
         baseline_oof,
-        dtp_validation,
+        dtp_oof,
         alpha=float(selection_record["alpha"]),
         beta=float(selection_record["beta"]),
         residual_clip=float(config["fusion"]["residual_clip"]),
         epsilon=float(config["fusion"]["probability_epsilon"]),
     )
-    if "calibration_fold" in baseline_oof.columns:
-        calibration = baseline_oof.sort_values(["subject_key", "session_id", "timestamp_ms"])[
-            "calibration_fold"
-        ].to_numpy()
-        fused_validation["calibration_fold"] = calibration
+    fused_validation["calibration_fold"] = dtp_oof["calibration_fold"].to_numpy()
     fused_validation.to_parquet(experiment_dir / "validation_predictions.parquet", index=False)
-    dtp_test = pd.read_parquet(experiment_dir / "dtp_test_predictions.parquet")
     baseline_test = pd.read_parquet(baseline_dir / "test_predictions.parquet")
     if set(baseline_test["subject_key"].astype(str).unique()) != test_subjects:
         raise RuntimeError("Frozen baseline test predictions do not match the outer fold subjects")
@@ -1460,7 +1588,7 @@ def command_train_fusion(args: argparse.Namespace) -> None:
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
 
-    print("[4/4] Applying held-out safety gates and writing manifests...", flush=True)
+    print("[5/5] Recording diagnostic outer-fold checks and manifests...", flush=True)
     candidate_summary = metrics_summary_from_suite(metrics)
     baseline_metrics = json.loads((baseline_dir / "test_metrics.json").read_text(encoding="utf-8"))
     baseline_summary = metrics_summary_from_suite(baseline_metrics)
@@ -1474,16 +1602,23 @@ def command_train_fusion(args: argparse.Namespace) -> None:
             "checks": {"nonzero_recall": sensitivity > 0.0},
             "passed": sensitivity > 0.0,
         }
+    outer_gate["diagnostic_only"] = True
     selection_record["outer_fold_metrics"] = candidate_summary
     selection_record["outer_fold_baseline_metrics"] = baseline_summary
     selection_record["outer_fold_gate"] = outer_gate
-    selection_record["checkpoint"] = checkpoint.name
     _write_selected_fusion(experiment_dir / "selected_fusion.json", selection_record)
     write_run_manifest(experiment_dir, config, output_root)
+    if not internal_gate["passed"]:
+        print(
+            "Internal fusion gate failed; the fold is retained for unbiased five-fold "
+            "comparison but cannot be promoted.",
+            flush=True,
+        )
     if not outer_gate["passed"]:
-        raise FusionGateError(
-            f"Fusion fold {fold} failed its held-out gate; later folds are blocked",
-            exit_code=2,
+        print(
+            "Outer-fold diagnostic failed; later folds remain required and promotion will be "
+            "decided only after all five folds.",
+            flush=True,
         )
     print(experiment_dir)
 

@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import pandas as pd
@@ -25,7 +24,7 @@ def _load_download_state(data_root: Path) -> dict[str, Any]:
     with state_path.open("r", encoding="utf-8") as handle:
         state = json.load(handle)
     if not isinstance(state, dict) or not isinstance(state.get("attachments", []), list):
-        raise ValueError(f"Invalid download state format: {state_path}")
+        raise TypeError(f"Invalid download state format: {state_path}")
     return state
 
 

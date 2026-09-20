@@ -1,0 +1,125 @@
+{
+  "schema_version": 1,
+  "question_id": "BME",
+  "language": "python",
+  "reviewed_files": [
+    "README.md",
+    "configs/base.yaml",
+    "configs/baseline.yaml",
+    "configs/dtp_sqf.yaml",
+    "configs/dtp_fusion.yaml",
+    "scripts/compare_models.py",
+    "src/bme_eating/cli.py",
+    "src/bme_eating/data/deep_dataset.py",
+    "src/bme_eating/data/labels.py",
+    "src/bme_eating/data/quality.py",
+    "src/bme_eating/data/splits.py",
+    "src/bme_eating/fusion.py",
+    "src/bme_eating/metrics.py",
+    "src/bme_eating/models/dtp_sqf.py",
+    "src/bme_eating/models/losses.py",
+    "src/bme_eating/models/xgb_baseline.py",
+    "src/bme_eating/postprocess.py",
+    "src/bme_eating/reproducibility.py",
+    "src/bme_eating/training/dtp_trainer.py"
+  ],
+  "decision_id": "baseline_dtp_fusion_v3_crossfit_candidate",
+  "checks": {
+    "syntax": {
+      "status": "PASS",
+      "evidence": [
+        "bme-model Python 3.11 compileall passed for src and scripts",
+        "full pytest suite passed with 116 tests after the cross-fit and clean-worktree changes",
+        "Ruff passed after the review changes",
+        "DTP fusion CUDA smoke passed on an NVIDIA GeForce RTX 4080 Laptop GPU with 32776192 peak allocated bytes"
+      ]
+    },
+    "input_contract": {
+      "status": "PASS",
+      "evidence": [
+        "quality_report.json records 1112 attachments, 39 subjects, 1078 preprocessed attachments, 34 quarantined attachments, and 161 evaluable events",
+        "quality expectations, subject split fingerprints, source hashes, and schema/multisection counts are enforced before training",
+        "39-versus-40 subject identity and official partial-event scoring remain external UNKNOWNs and are documented as limitations"
+      ]
+    },
+    "method_alignment": {
+      "status": "PASS",
+      "evidence": [
+        "each outer fold now trains three subject-disjoint DTP models, merges their held-out predictions into complete outer-training OOF, and averages their outer-test probabilities",
+        "each DTP checkpoint is selected by masked window AUPRC before fusion is tuned once on the combined cross-fit OOF",
+        "50 percent positive batch sampling requires explicit focal_positive_alpha 0.5 and records the actual alpha in metadata",
+        "fusion selection records the best beta-only comparator and requires incremental DTP F1 with no different-hand recall or FP-per-hour degradation",
+        "outer-fold diagnostics and zero recall no longer stop later folds; five-fold promotion is the only final decision"
+      ]
+    },
+    "reproducibility": {
+      "status": "PASS",
+      "evidence": [
+        "subject-level outer folds, all three inner partitions, per-model seeds, data/config hashes, cross-fit checkpoint hashes, artifact hashes, and resume signatures are recorded or checked",
+        "run manifest schema 2 now records experiment name and fold and the comparator rejects dirty, mixed-commit, mixed-config, mutated-artifact, mutated-input, or duplicate-subject evidence",
+        "formal training remains blocked until the current dirty working tree is reviewed, committed, and synchronized"
+      ]
+    },
+    "output_contract": {
+      "status": "FAIL",
+      "evidence": [
+        "frozen baseline has complete five-fold local metrics with micro F1 0.4701",
+        "baseline_dyadic has only fold 0 and F1 0.4000 versus baseline fold 0 F1 0.4783",
+        "baseline_boundary has no held-out test metrics because postprocessing search hit boundaries",
+        "no real baseline_dtp_fusion experiment output exists, so the new candidate has no empirical improvement evidence"
+      ]
+    }
+  },
+  "findings": [
+    {
+      "id": "BME-P0-001",
+      "severity": "P0",
+      "title": "DTP final model does not use the full outer-training cohort",
+      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
+    },
+    {
+      "id": "BME-P0-002",
+      "severity": "P0",
+      "title": "Balanced sampling and focal alpha double-compensate the positive class",
+      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
+    },
+    {
+      "id": "BME-P0-003",
+      "severity": "P0",
+      "title": "Fusion gate does not prove incremental DTP value over beta-only calibration",
+      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
+    },
+    {
+      "id": "BME-P1-001",
+      "severity": "P1",
+      "title": "Epoch and fusion pair selection reuse one small validation partition",
+      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
+    },
+    {
+      "id": "BME-P1-002",
+      "severity": "P1",
+      "title": "Fold 0 held-out gate conditionally selects the reported five-fold candidate",
+      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
+    },
+    {
+      "id": "BME-P1-003",
+      "severity": "P1",
+      "title": "Baseline OOF and final-model probability calibration may differ",
+      "status": "OPEN_DIAGNOSTIC_NEEDED"
+    },
+    {
+      "id": "BME-P1-004",
+      "severity": "P1",
+      "title": "Final comparison accepted incomplete provenance",
+      "status": "FIXED"
+    },
+    {
+      "id": "BME-P2-001",
+      "severity": "P2",
+      "title": "Training validation and test DataLoaders could retain 24 Windows workers",
+      "status": "FIXED"
+    }
+  ],
+  "verdict": "FAILED",
+  "reviewed_at": "2026-09-20T23:36:51.6609865+08:00"
+}

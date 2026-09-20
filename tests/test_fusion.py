@@ -1,3 +1,4 @@
+import hashlib
 import json
 import math
 
@@ -6,10 +7,13 @@ import pandas as pd
 import pytest
 
 import bme_eating.fusion as fusion_module
+from bme_eating.cli import _require_prior_fusion_folds
 from bme_eating.fusion import (
     FROZEN_BASELINE_FILES,
     FusionValidator,
     align_prediction_frames,
+    assemble_crossfit_predictions,
+    average_prediction_frames,
     evaluate_fold0_gate,
     evaluate_internal_gate,
     fuse_prediction_frames,
@@ -173,6 +177,8 @@ def test_validator_evaluates_exactly_nine_fixed_combinations(tmp_path):
     assert set(trials["beta"]) == {-0.25, 0.0, 0.25}
     assert selection["epoch"] == 2
     assert selection["baseline_metrics"]["f1"] == 0.0
+    assert selection["beta_only_beta"] in {-0.25, 0.0, 0.25}
+    assert "f1" in selection["beta_only_metrics"]
     assert selection["metrics"]["f1"] == 1.0
     assert selection["alpha"] == 0.5
     assert selection["metrics"]["predicted_events"] == 1.0
@@ -249,14 +255,16 @@ def test_internal_and_fold0_gates_are_deterministic():
             "f1": 0.52,
             "different_sensitivity": 0.14,
             "strict_no_ignore_f1": 0.45,
-            "false_positives_per_observed_hour": 0.024,
+            "false_positives_per_observed_hour": 0.02,
         },
         "baseline_metrics": baseline,
+        "beta_only_metrics": baseline,
     }
     internal = evaluate_internal_gate(
         selection,
         {
             "minimum_f1_improvement": 0.015,
+            "minimum_f1_improvement_over_beta_only": 0.005,
             "minimum_different_sensitivity_improvement": 0.03,
             "maximum_fp_per_hour_ratio": 1.2,
         },
@@ -287,6 +295,130 @@ def test_internal_and_fold0_gates_are_deterministic():
         },
     )
     assert outer["passed"]
+
+
+def test_internal_gate_rejects_alpha_candidate_whose_gain_is_only_beta():
+    baseline = {
+        "f1": 0.40,
+        "different_sensitivity": 0.10,
+        "strict_no_ignore_f1": 0.40,
+        "false_positives_per_observed_hour": 0.02,
+    }
+    beta_only = {
+        "f1": 0.52,
+        "different_sensitivity": 0.15,
+        "strict_no_ignore_f1": 0.45,
+        "false_positives_per_observed_hour": 0.021,
+    }
+    selection = {
+        "alpha": 0.25,
+        "metrics": dict(beta_only),
+        "baseline_metrics": baseline,
+        "beta_only_metrics": beta_only,
+    }
+
+    gate = evaluate_internal_gate(
+        selection,
+        {
+            "minimum_f1_improvement": 0.015,
+            "minimum_f1_improvement_over_beta_only": 0.005,
+            "minimum_different_sensitivity_improvement": 0.03,
+            "maximum_fp_per_hour_ratio": 1.2,
+        },
+    )
+
+    assert not gate["passed"]
+    assert not gate["checks"]["f1_improvement_over_beta_only"]
+
+
+def test_crossfit_oof_is_disjoint_and_test_predictions_are_mean_ensemble():
+    validation_frames = {
+        partition: _predictions(
+            tuple([0.1 + 0.1 * partition] * 5),
+            subject=f"subject-{partition}",
+            session=f"session-{partition}",
+        )
+        for partition in range(3)
+    }
+    test_frames = {
+        partition: _predictions(
+            tuple([0.2 + 0.2 * partition] * 5), subject="held-out"
+        )
+        for partition in range(3)
+    }
+
+    oof, ensemble = assemble_crossfit_predictions(
+        validation_frames,
+        test_frames,
+        {partition: {f"subject-{partition}"} for partition in range(3)},
+        {"held-out"},
+    )
+
+    assert set(oof["subject_key"]) == {"subject-0", "subject-1", "subject-2"}
+    assert set(oof.groupby("subject_key")["calibration_fold"].first()) == {0, 1, 2}
+    np.testing.assert_allclose(ensemble["state_probability"], 0.4)
+    pd.testing.assert_frame_equal(
+        ensemble,
+        average_prediction_frames([test_frames[index] for index in range(3)]),
+    )
+
+
+def test_crossfit_rejects_subject_leakage_between_partitions():
+    validation_frames = {partition: _predictions(subject="same") for partition in range(3)}
+    test_frames = {partition: _predictions(subject="held-out") for partition in range(3)}
+
+    with pytest.raises(RuntimeError, match="more than one partition"):
+        assemble_crossfit_predictions(
+            validation_frames,
+            test_frames,
+            {partition: {"same"} for partition in range(3)},
+            {"held-out"},
+        )
+
+
+def test_failed_outer_diagnostics_do_not_block_later_folds(tmp_path):
+    experiment_name = "baseline_dtp_fusion_clean_test"
+    fold_dir = tmp_path / "experiments" / experiment_name / "fold_0"
+    fold_dir.mkdir(parents=True)
+    (fold_dir / "test_metrics.json").write_text(
+        json.dumps({"primary_method": "max_cardinality_iou"}), encoding="utf-8"
+    )
+    selection_path = fold_dir / "selected_fusion.json"
+    selection_path.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "run_name": experiment_name,
+                "crossfit_partitions": 3,
+                "crossfit_models": [
+                    {"selection_signature": str(partition) * 64}
+                    for partition in (1, 2, 3)
+                ],
+                "internal_gate": {"passed": False},
+                "outer_fold_gate": {"passed": False, "diagnostic_only": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    metrics_path = fold_dir / "test_metrics.json"
+    (fold_dir / "run_manifest.json").write_text(
+        json.dumps(
+            {
+                "experiment": {"name": experiment_name, "fold": 0},
+                "git": {"commit": "abc1234"},
+                "resolved_config_sha256": "config-hash",
+                "artifact_hashes": {
+                    "test_metrics.json": hashlib.sha256(metrics_path.read_bytes()).hexdigest(),
+                    "selected_fusion.json": hashlib.sha256(
+                        selection_path.read_bytes()
+                    ).hexdigest(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    _require_prior_fusion_folds(tmp_path, experiment_name, requested_fold=1)
 
 
 def test_frozen_baseline_gate_detects_artifact_changes(tmp_path):

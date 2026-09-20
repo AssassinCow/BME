@@ -5,9 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
-
 import _bootstrap  # noqa: F401
+import pandas as pd
 
 from bme_eating.cli import _evaluate_prediction_file
 from bme_eating.config import load_config, resolve_roots

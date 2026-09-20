@@ -26,7 +26,7 @@ def _subject_fold_digest(index_dir: Path) -> tuple[str, int]:
     manifest_path = index_dir / "subject_folds.manifest.json"
     assignments = json.loads(fold_path.read_text(encoding="utf-8"))
     if not isinstance(assignments, dict):
-        raise RuntimeError("Subject fold assignments must be a JSON object")
+        raise TypeError("Subject fold assignments must be a JSON object")
     canonical = json.dumps(assignments, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = hashlib.sha256(canonical).hexdigest()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -143,11 +143,11 @@ def build_quality_report(output_root: Path) -> dict[str, Any]:
     quarantined_in_segments = quarantine_hash_set & segment_hashes
     report = {
         "artifact_schema_version": "v2",
-        "records": int(len(records)),
+        "records": len(records),
         "subjects": int(records["subject_key"].nunique()),
-        "segments": int(len(segments)),
+        "segments": len(segments),
         "sessions": int(segments["session_id"].nunique()),
-        "events": int(len(events)),
+        "events": len(events),
         "valid_duration_events": int(events["valid_duration"].sum()),
         "evaluable_events": int(events.get("evaluable", pd.Series(False, index=events.index)).sum()),
         "coverage_counts": events["coverage"].value_counts().sort_index().to_dict(),

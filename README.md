@@ -332,14 +332,17 @@ python scripts/train_fusion.py `
   --run-name $run `
   --fold 0 `
   --fresh
-if ($LASTEXITCODE -ne 0) { throw "fusion fold 0 failed its gate" }
+if ($LASTEXITCODE -ne 0) { throw "fusion fold 0 failed to complete" }
 ```
 
 `--fresh` 原子创建全新的实验根目录；目录只要已经存在就拒绝运行，不删除、不覆盖、也不读取
 其中任何旧 DTP checkpoint、预测或 fusion trial。该方案按定义仍只读复用冻结 baseline 概率和
 后处理参数。
 
-fold 0 通过内部验证门禁后才会生成外层预测；通过外层门禁后才允许后续折。后续折必须串行：
+每个 outer fold 训练三个 DTP：各自留出一个 inner partition，以 window AUPRC 选择 checkpoint；
+三份互斥验证预测合并为完整 outer-train OOF，三份 outer-test 概率逐点平均。随后只在完整 OOF
+上执行一次 9 组 `alpha/beta` 搜索。后续折必须串行且全部完成，fold 0 指标、单折零召回或
+单折门禁失败都只记录为诊断，不再阻断 fold 1-4：
 
 ```powershell
 1..4 | ForEach-Object {
@@ -356,36 +359,35 @@ python scripts/compare_models.py `
   --output "$env:BME_OUTPUT_ROOT\v2\experiments\${run}_promotion.json"
 ```
 
-中断后只恢复当前折，不删除 checkpoint：
+中断后只恢复当前折，不删除 checkpoint。`--resume` 可指向该折任一
+`crossfit_0..2\last.pt`；已完整且签名匹配的 partition 会自动跳过：
 
 ```powershell
 python scripts/train_fusion.py `
   --config configs/dtp_fusion.yaml `
   --run-name $run `
   --fold 0 `
-  --resume "$env:BME_OUTPUT_ROOT\v2\experiments\$run\fold_0\last.pt"
+  --resume "$env:BME_OUTPUT_ROOT\v2\experiments\$run\fold_0\crossfit_0\last.pt"
 ```
 
-每次验证只评估 9 个固定的 `alpha/beta` 组合，复用冻结 baseline 后处理与起止概率。
-任一门禁返回退出码 2 时停止，不扩权重、不改 DTP 结构、不重新搜索 CPU 后处理。完整说明见
+50% 正例采样时 focal `positive_alpha` 固定为 `0.5`。融合候选除优于原始 baseline 外，还必须
+比最佳 `alpha=0` beta-only 候选至少高 `0.005` F1，且异侧召回和 FP/h 不得因加入 DTP 变差。
+单折门禁结果写入 `selected_fusion.json`，最终仅由五折 `compare_models.py` 决定是否晋级。
+完整说明见
 [`docs/dtp_fusion_runbook_2026-09-20.md`](docs/dtp_fusion_runbook_2026-09-20.md)。
-fold 0 外层结果被用作继续/停止门禁，因此最终五折汇总是经过 fold 0 条件筛选的本地结果，
-不能解释为完全无偏的独立测试成绩，更不能称为官方分数。
+本地五折不再受 fold 0 条件筛选，但仍不能称为官方分数。
 
 ## 12. 从原始下载数据全量重新运行
 
 第 11 节是复用旧 baseline 的限时路线。需要连审计、预处理、质量快照、特征和 baseline 五折
-全部从零重建时，使用独立输出根目录运行：
+全部从零重建时，按阶段逐条执行，不再使用单一 PowerShell 总脚本。流程分为：clean Git 与
+环境预检、独立输出根目录、全量 schema 审计、重复表头审计、预处理、人工质量冻结、baseline
+特征、五折 baseline、候选模型和最终比较。任一步失败都先保留现场并排查，不自动跨过门禁。
 
-```powershell
-$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-powershell -ExecutionPolicy Bypass -File scripts/run_clean_retrain.ps1 `
-  -OutputRoot "D:\BME2026\outputs_clean_$stamp" `
-  -SubjectSaltFile "D:\BME2026\outputs\private\subject_salt.hex"
-```
-
-新输出目录必须不存在，Git 工作树必须 clean。脚本不会读取任何旧派生数据或训练产物；仅复制
-私有 salt 以保持匿名键和五折划分可比。质量报告打印后必须人工输入 `FREEZE` 才会开始构建
-特征和训练。baseline 五折完成后，fusion 会强制核验它们来自本次同一 clean commit，而不是
-回填的历史 baseline。完整说明见
+新输出目录必须不存在，Git 工作树必须 clean。流程不会读取旧派生数据或训练产物；仅复制私有
+salt 以保持匿名键和五折划分可比。DTP/fusion 已采用三折 cross-fit、neutral focal alpha、
+beta-only 增量门禁和完整五折协议；正式运行前仍必须提交并同步当前代码，使 Git 工作树 clean。
+逐条命令、验收条件和恢复方法见
 [`docs/clean_retrain_runbook_2026-09-20.md`](docs/clean_retrain_runbook_2026-09-20.md)。
+
+`scripts/run_clean_retrain.ps1` 仅保留作历史参考，不作为正式实验入口。

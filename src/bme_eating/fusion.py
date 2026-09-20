@@ -14,7 +14,6 @@ import pandas as pd
 from bme_eating.metrics import evaluate_events
 from bme_eating.postprocess import probabilities_to_events
 
-
 ALIGNMENT_KEYS = ["subject_key", "session_id", "timestamp_ms"]
 PUBLIC_PREDICTION_COLUMNS = [
     "subject_key",
@@ -105,7 +104,7 @@ def sha256_file(path: Path) -> str:
 def _read_json(path: Path) -> dict[str, Any]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError(f"Expected a JSON object: {path.name}")
+        raise TypeError(f"Expected a JSON object: {path.name}")
     return payload
 
 
@@ -120,7 +119,15 @@ def validate_frozen_baseline_fold(
     fold_dir = output_root / "experiments" / baseline_name / f"fold_{fold}"
     missing = [name for name in FROZEN_BASELINE_FILES if not (fold_dir / name).is_file()]
     if missing:
-        raise FileNotFoundError(f"Frozen baseline fold {fold} is incomplete; missing: {missing}")
+        suffix = (
+            "; after committing the reviewed code, run "
+            "python scripts/backfill_baseline_manifests.py --source-commit 3ca55bb"
+            if missing == ["run_manifest.json"]
+            else ""
+        )
+        raise FileNotFoundError(
+            f"Frozen baseline fold {fold} is incomplete; missing: {missing}{suffix}"
+        )
     manifest = _read_json(fold_dir / "run_manifest.json")
     git_record = manifest.get("git", {})
     if require_clean:
@@ -257,6 +264,62 @@ def align_prediction_frames(
             f"missing_from_baseline={missing_from_baseline}"
         )
     return baseline_sorted, dtp_sorted
+
+
+def average_prediction_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    if not frames:
+        raise ValueError("At least one prediction frame is required")
+    reference = frames[0]
+    aligned_frames = [align_prediction_frames(reference, frame)[1] for frame in frames]
+    output = aligned_frames[0][PUBLIC_PREDICTION_COLUMNS].copy()
+    for column in ("state_probability", "start_probability", "end_probability"):
+        values = np.stack(
+            [frame[column].to_numpy(dtype=np.float64) for frame in aligned_frames], axis=0
+        )
+        output[column] = values.mean(axis=0).astype(np.float32)
+    return output
+
+
+def assemble_crossfit_predictions(
+    validation_frames: dict[int, pd.DataFrame],
+    test_frames: dict[int, pd.DataFrame],
+    partition_subjects: dict[int, set[str]],
+    test_subjects: set[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    partitions = set(partition_subjects)
+    if partitions != set(validation_frames) or partitions != set(test_frames):
+        raise ValueError("Cross-fit prediction partitions are incomplete")
+    seen_validation_subjects: set[str] = set()
+    oof_parts: list[pd.DataFrame] = []
+    for partition in sorted(partitions):
+        validation = validation_frames[partition].copy()
+        actual_subjects = set(validation["subject_key"].astype(str).unique())
+        expected_subjects = {str(value) for value in partition_subjects[partition]}
+        if actual_subjects != expected_subjects:
+            raise RuntimeError(
+                f"Cross-fit partition {partition} validation subjects do not match its holdout"
+            )
+        if seen_validation_subjects & actual_subjects:
+            raise RuntimeError("Cross-fit validation subjects appear in more than one partition")
+        if actual_subjects & test_subjects:
+            raise RuntimeError("Cross-fit OOF predictions contain outer-fold test subjects")
+        seen_validation_subjects.update(actual_subjects)
+        validation["calibration_fold"] = partition
+        oof_parts.append(validation)
+        actual_test_subjects = set(test_frames[partition]["subject_key"].astype(str).unique())
+        if actual_test_subjects != test_subjects:
+            raise RuntimeError(
+                f"Cross-fit partition {partition} test predictions do not cover the outer fold"
+            )
+    expected_oof_subjects = {
+        str(value) for subjects in partition_subjects.values() for value in subjects
+    }
+    if seen_validation_subjects != expected_oof_subjects:
+        raise RuntimeError("Cross-fit OOF predictions do not cover all outer-training subjects")
+    oof = pd.concat(oof_parts, ignore_index=True).sort_values(ALIGNMENT_KEYS).reset_index(drop=True)
+    _validate_prediction_frame(oof, "cross-fit OOF")
+    test_ensemble = average_prediction_frames([test_frames[key] for key in sorted(partitions)])
+    return oof, test_ensemble
 
 
 def fuse_prediction_frames(
@@ -538,7 +601,14 @@ class FusionValidator:
                 left, right, rel_tol=0.0, abs_tol=0.0
             ):
                 raise RuntimeError(f"alpha=0,beta=0 did not reproduce baseline metric {name}")
-        selected = max(rows, key=lambda row: _selection_rank(row, epoch))
+        beta_only = max(
+            (row for row in rows if float(row["alpha"]) == 0.0),
+            key=lambda row: _selection_rank(row, epoch),
+        )
+        dtp_candidates = [row for row in rows if float(row["alpha"]) > 0.0]
+        if not dtp_candidates:
+            raise ValueError("Fusion search must contain at least one alpha > 0 candidate")
+        selected = max(dtp_candidates, key=lambda row: _selection_rank(row, epoch))
         selected_frame = candidate_frames[(float(selected["alpha"]), float(selected["beta"]))]
         self._trials.extend(rows)
         trial_frame = (
@@ -559,6 +629,12 @@ class FusionValidator:
                 if key not in {"epoch", "alpha", "beta"}
             },
             "baseline_metrics": self.baseline_metrics,
+            "beta_only_beta": float(beta_only["beta"]),
+            "beta_only_metrics": {
+                key: value
+                for key, value in beta_only.items()
+                if key not in {"epoch", "alpha", "beta"}
+            },
             "rank": list(_selection_rank(selected, epoch)),
             "diagnostics": complementarity_diagnostics(
                 baseline,
@@ -575,11 +651,16 @@ def evaluate_internal_gate(
 ) -> dict[str, Any]:
     candidate = selection["metrics"]
     baseline = selection["baseline_metrics"]
+    beta_only = selection["beta_only_metrics"]
     checks = {
         "alpha_is_positive": float(selection["alpha"]) > 0.0,
         "f1_improvement": (
             float(candidate["f1"]) - float(baseline["f1"])
             >= float(gate_config["minimum_f1_improvement"])
+        ),
+        "f1_improvement_over_beta_only": (
+            float(candidate["f1"]) - float(beta_only["f1"])
+            >= float(gate_config["minimum_f1_improvement_over_beta_only"])
         ),
         "different_sensitivity_improvement": (
             _finite_or(candidate.get("different_sensitivity"), -math.inf)
@@ -588,6 +669,18 @@ def evaluate_internal_gate(
         ),
         "strict_no_ignore_not_lower": (
             float(candidate["strict_no_ignore_f1"]) >= float(baseline["strict_no_ignore_f1"])
+        ),
+        "different_sensitivity_not_lower_than_beta_only": (
+            _finite_or(candidate.get("different_sensitivity"), -math.inf)
+            >= _finite_or(beta_only.get("different_sensitivity"), math.inf)
+        ),
+        "strict_no_ignore_not_lower_than_beta_only": (
+            float(candidate["strict_no_ignore_f1"])
+            >= float(beta_only["strict_no_ignore_f1"])
+        ),
+        "fp_per_hour_not_higher_than_beta_only": (
+            float(candidate["false_positives_per_observed_hour"])
+            <= float(beta_only["false_positives_per_observed_hour"])
         ),
         "fp_per_hour_within_ratio": (
             float(candidate["false_positives_per_observed_hour"])

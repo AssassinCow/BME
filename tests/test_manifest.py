@@ -1,7 +1,6 @@
 from pathlib import Path
 
-from bme_eating.data.manifest import _resolve_attachment_path
-from bme_eating.data.manifest import build_secure_indices
+from bme_eating.data.manifest import _resolve_attachment_path, build_secure_indices
 
 
 def test_resolve_attachment_path_falls_back_to_sensor_attachment_tree(tmp_path: Path) -> None:

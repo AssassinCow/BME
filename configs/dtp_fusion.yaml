@@ -6,12 +6,14 @@ experiment:
   baseline_source_commit: 3ca55bb
 
 fusion:
+  crossfit_partitions: 3
   alpha_candidates: [0.0, 0.25, 0.5]
   beta_candidates: [-0.25, 0.0, 0.25]
   residual_clip: 2.0
   probability_epsilon: 0.000001
   internal_gate:
     minimum_f1_improvement: 0.015
+    minimum_f1_improvement_over_beta_only: 0.005
     minimum_different_sensitivity_improvement: 0.03
     maximum_fp_per_hour_ratio: 1.2
   fold0_gate:

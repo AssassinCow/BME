@@ -3,8 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable
+from itertools import pairwise
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
@@ -36,7 +37,7 @@ def _split_ranges(
     differences = np.diff(timestamp_ms.astype(np.float64))
     split_points = np.flatnonzero((differences <= 0) | (differences > gap_threshold)) + 1
     boundaries = np.concatenate(([0], split_points, [len(timestamp_ms)]))
-    return [(int(start), int(end)) for start, end in zip(boundaries[:-1], boundaries[1:])]
+    return [(int(start), int(end)) for start, end in pairwise(boundaries)]
 
 
 def _collapse_duplicate_timestamps(series: SensorSeries) -> SensorSeries:
@@ -124,7 +125,7 @@ def _antialias_series(
     differences = np.diff(series.timestamp_ms.astype(np.float64))
     split_points = np.flatnonzero((differences <= 0) | (differences > maximum_gap_ms)) + 1
     boundaries = np.concatenate(([0], split_points, [len(series.timestamp_ms)]))
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
+    for start, end in pairwise(boundaries):
         if end - start < 16:
             continue
         try:
@@ -179,7 +180,7 @@ def assign_virtual_sessions(segments: pd.DataFrame, maximum_gap_ms: int) -> pd.D
             session = session.copy().reset_index(drop=True)
             first_segment = str(session.iloc[0]["segment_id"])
             digest = hashlib.sha256(
-                f"session-v2|{subject_key}|{first_segment}".encode("utf-8")
+                f"session-v2|{subject_key}|{first_segment}".encode()
             ).hexdigest()[:20]
             segment_ids = session["segment_id"].astype(str).tolist()
             session["session_id"] = digest
@@ -347,7 +348,7 @@ def write_preprocess_summary(rows: Iterable[dict[str, object]], output_path: Pat
     frame = rows.copy() if isinstance(rows, pd.DataFrame) else pd.DataFrame(rows)
     frame.to_parquet(output_path, index=False)
     summary = {
-        "segments": int(len(frame)),
+        "segments": len(frame),
         "subjects": int(frame["subject_key"].nunique()) if len(frame) else 0,
         "duration_hours": float(frame["duration_seconds"].sum() / 3600) if len(frame) else 0,
         "mean_acc_valid_fraction": float(frame["acc_valid_fraction"].mean())

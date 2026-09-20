@@ -1,27 +1,147 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+REQUIRED_INPUT_FILES = {
+    "quality_report": "quality_report.json",
+    "quality_expectations": "quality_expectations.json",
+    "subject_folds": "subject_folds.json",
+    "subject_folds_manifest": "subject_folds.manifest.json",
+    "events": "events.parquet",
+    "anchors": "anchors.parquet",
+    "segments": "segments.parquet",
+}
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_object(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"Expected a JSON object: {path}")
+    return payload
+
+
+def _validate_hashes(directory: Path, hashes: dict[str, Any], *, label: str) -> None:
+    for name, expected in hashes.items():
+        path = directory / str(name)
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing {label} declared by manifest: {path}")
+        if _sha256(path) != str(expected):
+            raise RuntimeError(f"{label.capitalize()} changed after manifesting: {path}")
+
 
 def _load_folds(root: Path) -> list[dict[str, Any]]:
     rows = []
+    seen_subjects: dict[str, int] = {}
+    indices_root = root.parent.parent / "indices"
     for fold in range(5):
         path = root / f"fold_{fold}" / "test_metrics.json"
         if not path.exists():
             raise FileNotFoundError(f"Missing fold metrics: {path}")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = _read_object(path)
         method = str(payload.get("primary_method", "max_cardinality_iou"))
         manifest_path = root / f"fold_{fold}" / "run_manifest.json"
-        manifest = (
-            json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest_path.exists()
-            else {}
-        )
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"Missing fold manifest: {manifest_path}")
+        manifest = _read_object(manifest_path)
+        if int(manifest.get("version", 0)) < 2:
+            raise RuntimeError(f"Fold {fold} manifest predates the strict comparison schema")
+        git_record = manifest.get("git", {})
+        if git_record.get("dirty") is not False:
+            raise RuntimeError(f"Fold {fold} was produced or backfilled from a dirty working tree")
+        commit = str(git_record.get("commit") or "")
+        config_hash = str(manifest.get("resolved_config_sha256") or "")
+        if not commit or not config_hash:
+            raise RuntimeError(f"Fold {fold} manifest lacks commit or resolved-config identity")
+        experiment = manifest.get("experiment", {})
+        if experiment.get("name") != root.name or experiment.get("fold") != fold:
+            raise RuntimeError(f"Fold {fold} manifest belongs to a different experiment or fold")
+        artifact_hashes = manifest.get("artifact_hashes", {})
+        if not isinstance(artifact_hashes, dict):
+            raise TypeError(f"Fold {fold} artifact_hashes must be a JSON object")
+        _validate_hashes(path.parent, artifact_hashes, label="artifact")
+        model_hashes = manifest.get("model_hashes", {})
+        if not isinstance(model_hashes, dict):
+            raise TypeError(f"Fold {fold} model_hashes must be a JSON object")
+        _validate_hashes(path.parent, model_hashes, label="model artifact")
+        expected_metrics_hash = artifact_hashes.get("test_metrics.json")
+        if not expected_metrics_hash or _sha256(path) != expected_metrics_hash:
+            raise RuntimeError(f"Fold {fold} test_metrics.json is missing or changed after manifesting")
+        selected_fusion_path = root / f"fold_{fold}" / "selected_fusion.json"
+        selection_run_name = None
+        internal_fusion_gate_passed = None
+        if selected_fusion_path.is_file():
+            expected_selection_hash = artifact_hashes.get("selected_fusion.json")
+            if not expected_selection_hash or _sha256(selected_fusion_path) != expected_selection_hash:
+                raise RuntimeError(
+                    f"Fold {fold} selected_fusion.json is missing or changed after manifesting"
+                )
+            selection = _read_object(selected_fusion_path)
+            selection_run_name = str(selection.get("run_name") or "")
+            if selection_run_name != root.name:
+                raise RuntimeError(f"Fold {fold} selected fusion belongs to another run")
+            if int(selection.get("version", 0)) < 3 or int(
+                selection.get("crossfit_partitions", 0)
+            ) != 3:
+                raise RuntimeError(
+                    f"Fold {fold} selected fusion predates the three-way cross-fit protocol"
+                )
+            required_crossfit_artifacts = {
+                "dtp_oof_predictions.parquet",
+                "dtp_test_predictions.parquet",
+                *{
+                    f"crossfit_{partition}/{name}"
+                    for partition in range(3)
+                    for name in (
+                        "best.pt",
+                        "metadata.json",
+                        "normalization.json",
+                        "best_validation_predictions.parquet",
+                        "dtp_test_predictions.parquet",
+                    )
+                },
+            }
+            missing_crossfit_artifacts = sorted(
+                required_crossfit_artifacts - set(artifact_hashes)
+            )
+            if missing_crossfit_artifacts:
+                raise RuntimeError(
+                    f"Fold {fold} manifest lacks cross-fit artifacts: "
+                    f"{missing_crossfit_artifacts}"
+                )
+            internal_fusion_gate_passed = selection.get("internal_gate", {}).get("passed")
+            if not isinstance(internal_fusion_gate_passed, bool):
+                raise RuntimeError(f"Fold {fold} lacks a boolean internal fusion gate result")
+        input_hashes = manifest.get("hashes", {})
+        missing_inputs = sorted(set(REQUIRED_INPUT_FILES) - set(input_hashes))
+        if missing_inputs:
+            raise RuntimeError(f"Fold {fold} manifest lacks input fingerprints: {missing_inputs}")
+        for name, filename in REQUIRED_INPUT_FILES.items():
+            input_path = indices_root / filename
+            if not input_path.is_file() or _sha256(input_path) != str(input_hashes[name]):
+                raise RuntimeError(f"Fold {fold} input changed after manifesting: {name}")
+        subjects = {str(subject) for subject in payload.get("by_subject", {})}
+        if not subjects:
+            raise RuntimeError(f"Fold {fold} metrics do not contain per-subject evidence")
+        duplicates = sorted(subject for subject in subjects if subject in seen_subjects)
+        if duplicates:
+            raise RuntimeError(
+                f"Subjects appear in more than one fold: {duplicates}; first fold map is invalid"
+            )
+        seen_subjects.update({subject: fold for subject in subjects})
         rows.append(
             {
                 "fold": fold,
@@ -30,9 +150,16 @@ def _load_folds(root: Path) -> list[dict[str, Any]]:
                 "same": payload.get("hand_relation", {}).get("same", {}),
                 "strict": payload.get("strict_no_ignore", {}),
                 "by_subject": payload.get("by_subject", {}),
+                "subjects": subjects,
+                "internal_fusion_gate_passed": internal_fusion_gate_passed,
+                "provenance": {
+                    "commit": commit,
+                    "resolved_config_sha256": config_hash,
+                    "selection_run_name": selection_run_name,
+                },
                 "fingerprints": {
                     key: value
-                    for key, value in manifest.get("hashes", {}).items()
+                    for key, value in input_hashes.items()
                     if key
                     in {
                         "quality_report",
@@ -44,6 +171,15 @@ def _load_folds(root: Path) -> list[dict[str, Any]]:
                 },
             }
         )
+    commits = {row["provenance"]["commit"] for row in rows}
+    config_hashes = {row["provenance"]["resolved_config_sha256"] for row in rows}
+    selection_names = {row["provenance"]["selection_run_name"] for row in rows}
+    if len(commits) != 1:
+        raise RuntimeError(f"Experiment folds mix Git commits: {sorted(commits)}")
+    if len(config_hashes) != 1:
+        raise RuntimeError("Experiment folds mix resolved configurations")
+    if selection_names != {None} and selection_names != {root.name}:
+        raise RuntimeError("Experiment folds mix fusion and non-fusion identities")
     return rows
 
 
@@ -146,6 +282,16 @@ def _fingerprints_unchanged(
     return bool(baseline[0]) and all(item == baseline[0] for item in baseline + candidate)
 
 
+def _subject_coverage_matches(
+    baseline_rows: list[dict[str, Any]], candidate_rows: list[dict[str, Any]]
+) -> bool:
+    return all(
+        set(baseline_rows[index].get("by_subject", {}))
+        == set(candidate_rows[index].get("by_subject", {}))
+        for index in range(5)
+    )
+
+
 def evaluate_promotion(
     baseline_rows: list[dict[str, Any]], candidate_rows: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -159,12 +305,19 @@ def evaluate_promotion(
         for index in range(5)
     )
     bootstrap_probability = paired_bootstrap_probability(baseline_rows, candidate_rows)
+    candidate_uses_fusion = any(
+        row.get("provenance", {}).get("selection_run_name") for row in candidate_rows
+    )
     checks = {
         "all_baseline_folds_have_recall": all(
             float(row["metrics"]["sensitivity"]) > 0 for row in baseline_rows
         ),
         "all_candidate_folds_have_recall": all(
             float(row["metrics"]["sensitivity"]) > 0 for row in candidate_rows
+        ),
+        "all_internal_fusion_gates_passed": (
+            not candidate_uses_fusion
+            or all(row.get("internal_fusion_gate_passed") is True for row in candidate_rows)
         ),
         "micro_f1_at_least_0p490": candidate["f1"] >= 0.490,
         "at_least_three_folds_within_0p01": nondegraded_folds >= 3,
@@ -184,10 +337,18 @@ def evaluate_promotion(
         "data_and_fold_fingerprints_unchanged": _fingerprints_unchanged(
             baseline_rows, candidate_rows
         ),
+        "per_fold_subject_coverage_unchanged": _subject_coverage_matches(
+            baseline_rows, candidate_rows
+        ),
     }
     return {
         "baseline": baseline,
         "candidate": candidate,
+        "provenance": {
+            "baseline": baseline_rows[0].get("provenance"),
+            "candidate": candidate_rows[0].get("provenance"),
+            "subjects": len(_subject_counts(baseline_rows)),
+        },
         "nondegraded_folds": nondegraded_folds,
         "paired_bootstrap_iterations": 2000,
         "paired_bootstrap_probability": bootstrap_probability,

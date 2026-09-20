@@ -12,8 +12,8 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, Sampler
 
-from bme_eating.features.signal import ppg_quality_features
 from bme_eating.data.session import SessionWindowReader
+from bme_eating.features.signal import ppg_quality_features
 
 
 @dataclass(frozen=True)
@@ -32,7 +32,7 @@ class Normalization:
         }
 
     @classmethod
-    def from_json(cls, payload: dict[str, Any]) -> "Normalization":
+    def from_json(cls, payload: dict[str, Any]) -> Normalization:
         return cls(
             motion_median=np.asarray(payload["motion_median"], dtype=np.float32),
             motion_iqr=np.asarray(payload["motion_iqr"], dtype=np.float32),
@@ -470,7 +470,7 @@ class SegmentBalancedBatchSampler(Sampler[list[tuple[int, int]]]):
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
-        positive_count = max(1, int(round(self.batch_size * self.positive_fraction)))
+        positive_count = max(1, round(self.batch_size * self.positive_fraction))
         positive_count = min(positive_count, self.batch_size)
         negative_count = self.batch_size - positive_count
         for _ in range(self.steps_per_epoch):

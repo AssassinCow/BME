@@ -7,7 +7,10 @@ import bme_eating.data.deep_dataset as deep_dataset_module
 from bme_eating.data.deep_dataset import DTPDataset, Normalization
 from bme_eating.models.dtp_sqf import DTPSQF, DyadicPool, logits_to_probability_arrays
 from bme_eating.reproducibility import epoch_random_seed, should_validate_epoch
-
+from bme_eating.training.dtp_trainer import (
+    checkpoint_selection_rank,
+    resolve_focal_positive_alpha,
+)
 
 MODEL_CONFIG = {
     "motion_block_seconds": 3,
@@ -145,6 +148,36 @@ def test_epoch_randomness_and_validation_schedule_are_resume_stable():
     assert epoch_random_seed(2026, 0, 4) != epoch_random_seed(2026, 0, 5)
     assert epoch_random_seed(2026, 0, 4) != epoch_random_seed(2026, 1, 4)
     assert [epoch for epoch in range(6) if should_validate_epoch(epoch, 2)] == [0, 1, 3, 5]
+
+
+def test_balanced_sampling_requires_neutral_focal_alpha():
+    assert (
+        resolve_focal_positive_alpha(
+            {"positive_sampling_fraction": 0.5, "focal_positive_alpha": 0.5}
+        )
+        == 0.5
+    )
+    with pytest.raises(ValueError, match="double class compensation"):
+        resolve_focal_positive_alpha(
+            {"positive_sampling_fraction": 0.5, "focal_positive_alpha": 0.94}
+        )
+
+
+def test_crossfit_checkpoint_selection_uses_dtp_only_auprc():
+    low_f1_high_auprc = checkpoint_selection_rank(
+        "window_auprc",
+        0.60,
+        {"f1": 0.1, "start_mae_seconds": 100.0, "end_mae_seconds": 100.0},
+        4,
+    )
+    high_f1_low_auprc = checkpoint_selection_rank(
+        "window_auprc",
+        0.55,
+        {"f1": 0.9, "start_mae_seconds": 1.0, "end_mae_seconds": 1.0},
+        2,
+    )
+
+    assert low_f1_high_auprc > high_f1_low_auprc
 
 
 def test_dtp_output_shapes():

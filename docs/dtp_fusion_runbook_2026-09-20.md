@@ -1,49 +1,50 @@
-# 冻结 baseline + DTP 受限残差融合运行手册
+# 三折 cross-fit DTP 残差融合运行手册
 
 日期：2026-09-20。正式模型冻结日期：2026-09-26。
 
-## 1. 路线冻结
+## 1. 协议冻结
 
-- 保底模型固定为提交 `3ca55bb` 的五折 `baseline`，不重训、不重建特征。
-- `baseline_boundary` 状态为 `rejected_active_search_boundaries`。
-- `baseline_fastslow`、所有 XGBoost dyadic、TCN、future-context DTP 和原 DTP 全量后处理搜索均停止。
-- 唯一候选为因果 DTP 对冻结 baseline 状态概率作受限残差融合。
-- 官方 partial 计分、最终一对一匹配细节和提交接口仍为 `UNKNOWN`；本流程只产生本地评估。
+- 保底模型仍是完整五折 `baseline`；新 fusion 尚无真实五折结果，不能称为优化成功。
+- 每个 outer fold 训练三个因果 DTP，分别留出 inner partition 0、1、2。
+- 每个 DTP checkpoint 只按 masked window AUPRC 选择，不在训练 epoch 内搜索融合权重。
+- 三份互斥验证预测合成完整 outer-train OOF；三份 outer-test 概率逐点平均。
+- 只在完整 cross-fit OOF 上执行一次固定 9 组 `alpha/beta` 搜索。
+- 50% 正例采样固定使用 `focal_positive_alpha=0.5`，不再按原始正例率二次加权。
+- 内部门禁要求含 DTP 候选优于最佳 beta-only 候选；外层单折结果只作诊断。
+- 五个 outer folds 一旦开始就全部完成，最终只由五折比较器决定是否晋级。
+- 官方 partial 计分、最终一对一匹配细节和提交接口仍为 `UNKNOWN`。
 
-## 2. 不会执行的步骤
+## 2. 预检
 
-本流程不调用以下脚本：
-
-```text
-audit_data.py
-audit_multisection.py
-preprocess_data.py
-build_features.py
-train_xgboost.py
-retune_postprocess.py
-```
-
-它只读取已冻结的 v2 indices、预处理 NPZ、baseline OOF/test 预测和 baseline 后处理参数。
-
-## 3. 预检与冻结哈希
-
-在 4080 的 `bme-model` 环境、仓库根目录执行：
+在 RTX 4080 的 `bme-model` 环境、仓库根目录执行：
 
 ```powershell
 python scripts/check_environment.py
 python -m pytest -q
 python -m ruff check .
+python -m compileall -q src scripts
 python scripts/smoke_test_model.py --config configs/dtp_fusion.yaml --batch-size 1
 python scripts/validate_data.py --config configs/base.yaml
-python scripts/backfill_baseline_manifests.py --source-commit 3ca55bb
+git status --short
 ```
 
-最后一条命令只为既有五折 baseline 写入数据、折分、模型、OOF/test 预测、后处理和指标哈希。
-它不训练模型，也不改预测文件。`3ca55bb` 会作为团队声明的原始训练提交单独记录；回填本身
-不能用密码学方法证明历史训练时的代码状态。fusion 启动时会逐文件复核产物哈希和这项声明；
-不一致即停止。
+正式 clean-room 训练要求最后一条没有输出。冻结 baseline 路线可继续用已有 manifest，但历史
+回填只能证明当前文件哈希，不能密码学证明历史训练时的代码状态；报告必须披露这一限制。
 
-## 4. fold 0 门禁
+旧冻结 baseline 尚无 `run_manifest.json` 时，必须在确认 Git clean 后先执行一次：
+
+```powershell
+if ((git status --porcelain).Count -ne 0) {
+  throw "Commit and synchronize reviewed changes before manifest backfill"
+}
+python scripts/backfill_baseline_manifests.py --source-commit 3ca55bb
+if ($LASTEXITCODE -ne 0) { throw "baseline manifest backfill failed" }
+```
+
+回填只记录现有五折文件和当前数据/折分的哈希，不训练模型、不改预测，也不能证明历史训练代码
+确实来自 `3ca55bb`；该提交仅作为团队声明写入 provenance。
+
+## 3. 启动 fold 0
 
 ```powershell
 $run = "baseline_dtp_fusion_clean_20260920a"
@@ -52,34 +53,26 @@ python scripts/train_fusion.py `
   --run-name $run `
   --fold 0 `
   --fresh
-if ($LASTEXITCODE -ne 0) { throw "fusion fold 0 failed; keep frozen baseline" }
+if ($LASTEXITCODE -ne 0) { throw "fusion fold 0 did not complete" }
 ```
 
-`$run` 必须是从未使用过的名字。`--fresh` 只允许用于 fold 0 且不能与 `--resume` 同时使用；
-它会原子创建 `%BME_OUTPUT_ROOT%\v2\experiments\$run`，若目录已经存在则立即停止，绝不删除、
-覆盖或读取其中的旧 DTP checkpoint、预测和 fusion trial。这里的“从零”仅指 DTP/fusion；
-冻结 `3ca55bb` baseline 的 OOF/test 概率与后处理参数仍是当前融合定义的一部分，并会只读复用。
-
-每个验证 epoch 只运行 9 个固定组合：
+`$run` 必须从未使用。 `--fresh` 只允许用于 fold 0，且不能与 `--resume` 同时使用。程序不会
+删除或覆盖旧 checkpoint。单个 outer fold 的目录结构为：
 
 ```text
-alpha = 0.0, 0.25, 0.5
-beta  = -0.25, 0.0, 0.25
-```
-
-`alpha=0,beta=0` 必须逐点和逐事件精确复现 baseline。选择过程只读 baseline OOF 中当前
-DTP 内层验证受试者的预测；外层 test 预测在内部门禁通过前不会用于推理或评估。退出码 2 表示
-预注册门禁失败，应立即停止并保留冻结 baseline，不是程序崩溃。
-
-主要产物：
-
-```text
-%BME_OUTPUT_ROOT%\v2\experiments\<run-name>\fold_0\
-  best.pt
-  last.pt
-  best_validation_predictions.parquet
-  validation_predictions.parquet
+fold_0/
+  crossfit_0/
+    best.pt
+    last.pt
+    metadata.json
+    normalization.json
+    best_validation_predictions.parquet
+    dtp_test_predictions.parquet
+  crossfit_1/
+  crossfit_2/
+  dtp_oof_predictions.parquet
   dtp_test_predictions.parquet
+  validation_predictions.parquet
   test_predictions.parquet
   selected_postprocess.json
   selected_fusion.json
@@ -90,28 +83,50 @@ DTP 内层验证受试者的预测；外层 test 预测在内部门禁通过前�
   run_manifest.json
 ```
 
-`dtp_test_predictions.parquet` 是私有诊断产物；公共候选预测为 `test_predictions.parquet`。
+三个 `crossfit_k` 的验证受试者互斥，合并后必须恰好覆盖全部 outer-train 受试者，且不得含
+outer-test 受试者。根目录 `dtp_test_predictions.parquet` 是三模型逐点平均，不是单个模型结果。
+
+## 4. 固定融合搜索与增量门禁
+
+完整 OOF 只搜索一次：
+
+```text
+alpha = 0.0, 0.25, 0.5
+beta  = -0.25, 0.0, 0.25
+```
+
+`alpha=0,beta=0` 必须逐点、逐事件和逐指标复现原始 baseline。程序从所有 `alpha=0` 行中选择
+最佳 beta-only 对照，再从 `alpha>0` 行中选择最佳含 DTP 候选。含 DTP 候选必须同时满足：
+
+- 相对原始 baseline 的 F1 增量至少 `0.015`；
+- 相对最佳 beta-only 的 F1 增量至少 `0.005`；
+- 相对原始 baseline 的异侧召回增量至少 `0.03`；
+- 相对最佳 beta-only 的异侧召回不降低；
+- 相对最佳 beta-only 的 FP/h 不增加；
+- strict-no-ignore F1 不低于 baseline 和最佳 beta-only。
+
+门禁结果写入 `selected_fusion.json`。失败的 fold 仍生成外层预测并继续完成后续 folds，但最终
+`compare_models.py` 会拒绝晋级；不得因失败而看结果后扩网格。
 
 ## 5. 中断恢复
 
-恢复路径必须属于当前 fold，且配置、固定 9 组合和 baseline 哈希必须保持一致：
+`--resume` 指向当前 outer fold 任一已有的 `crossfit_0..2\last.pt`：
 
 ```powershell
 python scripts/train_fusion.py `
   --config configs/dtp_fusion.yaml `
   --run-name $run `
   --fold 0 `
-  --resume "$env:BME_OUTPUT_ROOT\v2\experiments\$run\fold_0\last.pt"
+  --resume "$env:BME_OUTPUT_ROOT\v2\experiments\$run\fold_0\crossfit_0\last.pt"
 ```
 
-发现既有 `last.pt` 而未显式传 `--resume` 时脚本会停止，避免覆盖可恢复训练。训练 sampler 会把
-epoch 写入每个数据索引，PPG 增强与模型随机过程均由 fold/epoch 确定；从完整 epoch checkpoint
-恢复时不会额外插入验证轮次，因此恢复路径与不中断运行保持同一随机和验证日程。
+该参数恢复整个 outer fold，而不只恢复所指 partition。程序逐一检查三个 partition：完整且签名
+一致的自动跳过；存在 `last.pt` 的从下一 epoch 继续；有残留文件但无完整产物或 `last.pt` 的停止
+并保留现场。签名包含 outer fold、inner partition、模型/训练/损失配置、baseline 哈希和协议版本。
 
-## 6. 后续四折与最终比较
+## 6. 完成其余四折
 
-只有 fold 0 内部和外部门禁均通过，脚本才允许 fold 1 启动。后续折仍记录相同的内部诊断，
-但不重复用 fold 0 的增益阈值阻断；任一外层折零召回时阻止下一折：
+fold 0 的内部或外部诊断结果不再控制后续折。按顺序完成全部 outer folds：
 
 ```powershell
 1..4 | ForEach-Object {
@@ -119,29 +134,30 @@ epoch 写入每个数据索引，PPG 增强与模型随机过程均由 fold/epoc
     --config configs/dtp_fusion.yaml `
     --run-name $run `
     --fold $_
-  if ($LASTEXITCODE -ne 0) { throw "fusion fold $_ failed; keep frozen baseline" }
+  if ($LASTEXITCODE -ne 0) { throw "fusion fold $_ did not complete" }
 }
 ```
 
-五折完成后运行唯一最终比较：
+串行约束只要求前折产物、run name、三折协议和 manifest 身份完整，不检查前折 F1 或召回。
+
+## 7. 唯一最终比较
 
 ```powershell
 python scripts/compare_models.py `
   --baseline "$env:BME_OUTPUT_ROOT\v2\experiments\baseline" `
   --candidate "$env:BME_OUTPUT_ROOT\v2\experiments\$run" `
-  --output "$env:BME_OUTPUT_ROOT\v2\experiments\${run}_promotion.json"
-if ($LASTEXITCODE -ne 0) { throw "fusion rejected; keep frozen baseline" }
+  --output "$env:BME_OUTPUT_ROOT\v2\experiments\RUN_PROMOTION.json"
+if ($LASTEXITCODE -ne 0) { throw "fusion rejected; keep baseline" }
 ```
 
-比较器执行预注册的五折 F1、同侧/异侧召回、strict-no-ignore、FP/h、起止 MAE、折间稳定性、
-数据/折分指纹和 2000 次受试者级配对 bootstrap 门禁。失败后不调 alpha/beta、不扩模型、
-不启用未来上下文，也不重新搜索后处理。
+将上面的 `RUN_PROMOTION.json` 替换为 `${run}_promotion.json`。比较器复核五折指标、每折内部
+增量门禁、同侧/异侧召回、strict-no-ignore、FP/h、起止 MAE、折间稳定性、受试者级配对
+bootstrap、Git/config 身份、输入哈希、三份 checkpoint 和预测哈希。任何一项失败都保留
+baseline，不调 alpha/beta、不扩模型、不启用未来上下文。
 
-fold 0 外层门禁决定是否继续 fold 1-4，所以最终五折结果是经过 fold 0 条件筛选后的本地比较，
-不是完全无偏的独立测试估计。报告中必须披露该限制；官方计分接口到达前不得称为官方分数。
-
-## 7. 隐私与交付边界
+## 8. 隐私与证据边界
 
 - 原始数据、受试者信息、凭据、NPZ、模型权重和私有失败案例不进入公开 Git 或提交包。
 - `selected_fusion.json` 和 `run_manifest.json` 只记录匿名指标、哈希、版本、环境和参数。
-- 获得官方测试接口前，不把当前输入输出格式或本地分数称为官方接口或官方分数。
+- 当前改动只有单元、静态和 smoke 验证，没有正式 fusion 五折实测结果。
+- 获得官方测试接口前，不把本地输入输出格式或本地分数称为官方接口或官方分数。
