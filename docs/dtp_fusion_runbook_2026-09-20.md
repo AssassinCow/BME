@@ -7,6 +7,8 @@
 - 保底模型仍是完整五折 `baseline`；新 fusion 尚无真实五折结果，不能称为优化成功。
 - 每个 outer fold 训练三个因果 DTP，分别留出 inner partition 0、1、2。
 - 每个 DTP checkpoint 只按 masked window AUPRC 选择，不在训练 epoch 内搜索融合权重。
+- checkpoint 选择固定使用可复现的 32,768 行分层验证子集；最佳 checkpoint 确定后再对
+  完整 inner-validation 时间线推理一次，写入完整 OOF，最终覆盖不缩减。
 - 三份互斥验证预测合成完整 outer-train OOF；三份 outer-test 概率逐点平均。
 - 只在完整 cross-fit OOF 上执行一次固定 9 组 `alpha/beta` 搜索。
 - 50% 正例采样固定使用 `focal_positive_alpha=0.5`，不再按原始正例率二次加权。
@@ -85,6 +87,8 @@ fold_0/
 
 三个 `crossfit_k` 的验证受试者互斥，合并后必须恰好覆盖全部 outer-train 受试者，且不得含
 outer-test 受试者。根目录 `dtp_test_predictions.parquet` 是三模型逐点平均，不是单个模型结果。
+训练期间的 `best_checkpoint_validation_predictions.parquet` 仅用于 checkpoint 诊断；
+`best_validation_predictions.parquet` 始终是在最佳权重上重新生成的完整 partition 预测。
 
 ## 4. 固定融合搜索与增量门禁
 

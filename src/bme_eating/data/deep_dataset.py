@@ -166,6 +166,15 @@ def _corrupt_ppg(
 ) -> tuple[np.ndarray, np.ndarray]:
     values = values.copy()
     mask = mask.copy()
+
+    def valid_scale() -> float:
+        valid_values = values[mask]
+        valid_values = valid_values[np.isfinite(valid_values)]
+        if len(valid_values) < 2:
+            return 1.0
+        scale = float(np.std(valid_values))
+        return max(scale, 1.0) if np.isfinite(scale) else 1.0
+
     corruption = int(rng.integers(0, 6))
     length = len(values)
     if corruption == 0:
@@ -174,7 +183,7 @@ def _corrupt_ppg(
         mask[start : min(length, start + width)] = False
         values[~mask] = 0.0
     elif corruption == 1:
-        scale = max(float(np.std(values[mask])), 1.0)
+        scale = valid_scale()
         values += rng.normal(0.0, scale * rng.uniform(0.5, 2.0), size=length)
     elif corruption == 2:
         lower, upper = np.percentile(values[mask], [10, 90]) if mask.any() else (-1.0, 1.0)
@@ -182,14 +191,17 @@ def _corrupt_ppg(
     elif corruption == 3:
         spike_count = max(1, length // 100)
         indices = rng.choice(length, size=spike_count, replace=False)
-        scale = max(float(np.std(values[mask])), 1.0)
+        scale = valid_scale()
         values[indices] += rng.normal(0.0, 10.0 * scale, size=spike_count)
     elif corruption == 4:
-        scale = max(float(np.std(values[mask])), 1.0)
+        scale = valid_scale()
         values += np.linspace(0.0, rng.uniform(-5.0, 5.0) * scale, length)
     else:
         values[:] = 0.0
         mask[:] = False
+    values[~mask] = 0.0
+    if not np.isfinite(values).all():
+        raise ValueError("PPG corruption produced NaN or infinite values")
     return values.astype(np.float32), mask
 
 
@@ -282,6 +294,11 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         )
         normalized[~valid] = 0.0
         blocks = np.stack((normalized, valid.astype(np.float32)), axis=1).astype(np.float32)
+        if not all(
+            np.isfinite(array).all()
+            for array in (blocks, quality_features, quality_target)
+        ):
+            raise ValueError("PPG preprocessing produced NaN or infinite model inputs")
         return blocks, quality_features, quality_target
 
     def __getitem__(

@@ -5,6 +5,11 @@ experiment:
   baseline_name: baseline
   baseline_source_commit: 3ca55bb
 
+training:
+  inference_batch_size: 32
+  inference_num_workers: 8
+  checkpoint_validation_max_rows: 32768
+
 fusion:
   crossfit_partitions: 3
   alpha_candidates: [0.0, 0.25, 0.5]

@@ -1,15 +1,18 @@
+import warnings
+
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 
 import bme_eating.data.deep_dataset as deep_dataset_module
-from bme_eating.data.deep_dataset import DTPDataset, Normalization
+from bme_eating.data.deep_dataset import DTPDataset, Normalization, _corrupt_ppg
 from bme_eating.models.dtp_sqf import DTPSQF, DyadicPool, logits_to_probability_arrays
 from bme_eating.reproducibility import epoch_random_seed, should_validate_epoch
 from bme_eating.training.dtp_trainer import (
     checkpoint_selection_rank,
     resolve_focal_positive_alpha,
+    select_checkpoint_validation_anchors,
 )
 
 MODEL_CONFIG = {
@@ -141,6 +144,45 @@ def test_dtp_dataset_shapes_follow_configured_history(tmp_path, monkeypatch):
 
     torch.testing.assert_close(epoch_two_first, epoch_two_second)
     assert not torch.equal(epoch_two_first, epoch_three)
+
+
+def test_ppg_corruption_keeps_fully_missing_blocks_finite_without_warnings():
+    values = np.zeros(750, dtype=np.float32)
+    mask = np.zeros(750, dtype=bool)
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        outputs = [
+            _corrupt_ppg(values, mask, np.random.default_rng(seed))
+            for seed in range(60)
+        ]
+
+    assert not caught
+    assert all(np.isfinite(corrupted).all() for corrupted, _ in outputs)
+    assert all(not corrupted_mask.any() for _, corrupted_mask in outputs)
+    assert all(not corrupted.any() for corrupted, _ in outputs)
+
+
+def test_checkpoint_validation_subset_is_deterministic_stratified_and_evaluable():
+    anchors = pd.DataFrame(
+        {
+            "timestamp_ms": np.arange(1000),
+            "state_target": [1.0] * 100 + [0.0] * 900,
+            "state_loss_mask": [1.0] * 950 + [0.0] * 50,
+        }
+    )
+
+    first = select_checkpoint_validation_anchors(anchors, maximum_rows=100, seed=2026)
+    second = select_checkpoint_validation_anchors(anchors, maximum_rows=100, seed=2026)
+    different_seed = select_checkpoint_validation_anchors(
+        anchors, maximum_rows=100, seed=2027
+    )
+
+    pd.testing.assert_frame_equal(first, second)
+    assert len(first) == 100
+    assert first["state_loss_mask"].eq(1.0).all()
+    assert first["state_target"].sum() == 11.0
+    assert not first.equals(different_seed)
 
 
 def test_epoch_randomness_and_validation_schedule_are_resume_stable():

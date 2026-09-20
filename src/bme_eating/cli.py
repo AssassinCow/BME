@@ -1396,6 +1396,7 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     signature_payload = {
         "fusion_protocol_version": 3,
         "epoch_randomness_version": 2,
+        "checkpoint_validation_protocol_version": 1,
         "run_name": experiment_name,
         "fold": fold,
         "model": config["model"],

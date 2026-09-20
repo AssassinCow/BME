@@ -79,6 +79,10 @@ def _prediction_frame(
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
                 output = model(moved)
             state, start, end = logits_to_probability_arrays(output)
+            if not all(np.isfinite(values).all() for values in (state, start, end)):
+                raise FloatingPointError(
+                    f"{description} produced NaN or infinite probabilities"
+                )
             target = batch["state_target"].numpy()
             state_mask = batch.get("state_loss_mask", torch.ones_like(batch["state_target"]))
             targets.extend(target.tolist())
@@ -104,6 +108,41 @@ def _prediction_frame(
         if column in frame:
             frame[column] = frame[column].astype(np.float32)
     return frame, float(auprc)
+
+
+def select_checkpoint_validation_anchors(
+    anchors: pd.DataFrame,
+    maximum_rows: int,
+    seed: int,
+) -> pd.DataFrame:
+    if maximum_rows <= 0:
+        raise ValueError("checkpoint_validation_max_rows must be positive")
+    state_mask = anchors.get("state_loss_mask", pd.Series(1.0, index=anchors.index))
+    eligible = anchors[state_mask.fillna(0.0).astype(float) > 0].reset_index(drop=True)
+    if eligible.empty:
+        raise ValueError("Checkpoint validation has no evaluable anchors")
+    if len(eligible) <= maximum_rows:
+        return eligible
+
+    positive = np.flatnonzero(eligible["state_target"].to_numpy(dtype=float) > 0)
+    negative = np.flatnonzero(eligible["state_target"].to_numpy(dtype=float) <= 0)
+    rng = np.random.default_rng(seed)
+    if len(positive) == 0 or len(negative) == 0 or maximum_rows == 1:
+        positions = rng.choice(len(eligible), size=maximum_rows, replace=False)
+    else:
+        positive_rows = round(maximum_rows * len(positive) / len(eligible))
+        positive_rows = min(max(1, positive_rows), len(positive), maximum_rows - 1)
+        negative_rows = maximum_rows - positive_rows
+        if negative_rows > len(negative):
+            negative_rows = len(negative)
+            positive_rows = maximum_rows - negative_rows
+        positions = np.concatenate(
+            (
+                rng.choice(positive, size=positive_rows, replace=False),
+                rng.choice(negative, size=negative_rows, replace=False),
+            )
+        )
+    return eligible.iloc[np.sort(positions)].reset_index(drop=True)
 
 
 def _save_torch_checkpoint(payload: dict[str, Any], path: Path) -> None:
@@ -228,8 +267,19 @@ def train_dtp_fold(
         motion_bucket_counts=model_config["motion_bucket_counts"],
         ppg_bucket_counts=model_config["ppg_bucket_counts"],
     )
-    validation_dataset = DTPDataset(
-        validation_anchors,
+    use_checkpoint_subset = (
+        checkpoint_selection_metric == "window_auprc" and validation_selector is None
+    )
+    if use_checkpoint_subset:
+        checkpoint_validation_anchors = select_checkpoint_validation_anchors(
+            validation_anchors,
+            int(training_config.get("checkpoint_validation_max_rows", len(validation_anchors))),
+            seed,
+        )
+    else:
+        checkpoint_validation_anchors = validation_anchors
+    checkpoint_validation_dataset = DTPDataset(
+        checkpoint_validation_anchors,
         segments,
         normalization,
         future_context_seconds=future_seconds,
@@ -280,8 +330,8 @@ def train_dtp_fold(
         batch_sampler=batch_sampler,
         **training_loader_arguments,
     )
-    validation_loader = DataLoader(
-        validation_dataset,
+    checkpoint_validation_loader = DataLoader(
+        checkpoint_validation_dataset,
         batch_size=int(training_config["inference_batch_size"]),
         shuffle=False,
         **inference_loader_arguments,
@@ -377,6 +427,11 @@ def train_dtp_fold(
     validation_interval = int(training_config["validation_every_epochs"])
     if validation_interval <= 0:
         raise ValueError("validation_every_epochs must be positive")
+    if use_checkpoint_subset:
+        tqdm.write(
+            "Checkpoint selection validation: "
+            f"{len(checkpoint_validation_anchors)}/{len(validation_anchors)} evaluable anchors"
+        )
     for epoch in range(start_epoch, max_epochs):
         batch_sampler.set_epoch(epoch)
         # Deriving randomness from fold and epoch makes end-of-epoch resume equivalent
@@ -397,8 +452,13 @@ def train_dtp_fold(
                 output = model(moved)
                 loss, _ = criterion(output, moved)
                 scaled_loss = loss / accumulation
+            loss_value = float(loss.detach().cpu())
+            if not math.isfinite(loss_value):
+                raise FloatingPointError(
+                    f"Non-finite training loss at epoch {epoch + 1}, batch {batch_index + 1}"
+                )
             scaler.scale(scaled_loss).backward()
-            running_loss += float(loss.detach().cpu())
+            running_loss += loss_value
             train_progress.set_postfix(loss=f"{running_loss / (batch_index + 1):.4f}")
             if (batch_index + 1) % accumulation == 0 or batch_index + 1 == len(train_loader):
                 scaler.unscale_(optimizer)
@@ -453,13 +513,19 @@ def train_dtp_fold(
 
         validation_predictions, validation_auprc = _prediction_frame(
             model,
-            validation_loader,
+            checkpoint_validation_loader,
             device,
             amp_dtype,
             description=f"Validating epoch {epoch + 1}",
         )
         current_selection: dict[str, Any] | None = None
-        if validation_selector is not None:
+        if checkpoint_selection_metric == "window_auprc" and validation_selector is None:
+            metrics = {
+                "f1": float("nan"),
+                "start_mae_seconds": float("nan"),
+                "end_mae_seconds": float("nan"),
+            }
+        elif validation_selector is not None:
             current_selection = validation_selector(validation_predictions, epoch)
             selected_metrics = current_selection["metrics"]
             metrics = {
@@ -486,7 +552,7 @@ def train_dtp_fold(
             validation_events = probabilities_to_events(
                 validation_predictions, **_postprocess_kwargs(postprocess_config)
             )
-        if current_selection is None:
+        if current_selection is None and checkpoint_selection_metric != "window_auprc":
             metrics, _ = evaluate_events(
                 validation_truth,
                 validation_events,
@@ -552,7 +618,13 @@ def train_dtp_fold(
         if improved:
             _save_torch_checkpoint(checkpoint_payload, checkpoint_path)
             validation_predictions.to_parquet(
-                output_dir / "best_validation_predictions.parquet", index=False
+                output_dir
+                / (
+                    "best_checkpoint_validation_predictions.parquet"
+                    if use_checkpoint_subset
+                    else "best_validation_predictions.parquet"
+                ),
+                index=False,
             )
         _save_torch_checkpoint(checkpoint_payload, last_checkpoint_path)
         tqdm.write(
@@ -578,6 +650,37 @@ def train_dtp_fold(
             selection_gate(best_selection)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     model.load_state_dict(checkpoint["model"])
+    if use_checkpoint_subset:
+        full_validation_dataset = DTPDataset(
+            validation_anchors,
+            segments,
+            normalization,
+            future_context_seconds=future_seconds,
+            training=False,
+            seed=seed,
+            motion_block_seconds=int(model_config.get("motion_block_seconds", 3)),
+            ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
+            motion_bucket_counts=model_config["motion_bucket_counts"],
+            ppg_bucket_counts=model_config["ppg_bucket_counts"],
+        )
+        full_validation_loader = DataLoader(
+            full_validation_dataset,
+            batch_size=int(training_config["inference_batch_size"]),
+            shuffle=False,
+            **inference_loader_arguments,
+        )
+        full_validation_predictions, full_validation_auprc = _prediction_frame(
+            model,
+            full_validation_loader,
+            device,
+            amp_dtype,
+            description="Predicting full validation partition",
+        )
+        full_validation_predictions.to_parquet(
+            output_dir / "best_validation_predictions.parquet", index=False
+        )
+    else:
+        full_validation_auprc = best_validation_auprc
     test_predictions, test_auprc = _prediction_frame(
         model, test_loader, device, amp_dtype, description="Predicting test fold"
     )
@@ -589,6 +692,7 @@ def train_dtp_fold(
         "best_checkpoint_epoch": int(checkpoint["epoch"]),
         "best_validation_f1": best_f1,
         "best_validation_auprc": best_validation_auprc,
+        "full_validation_auprc": full_validation_auprc,
         "best_validation_boundary_mae_seconds": best_boundary_mae
         if np.isfinite(best_boundary_mae)
         else None,
@@ -596,6 +700,14 @@ def train_dtp_fold(
         "train_rows": len(train_anchors),
         "validation_rows": len(validation_anchors),
         "validation_full_timeline_rows": len(validation_anchors),
+        "checkpoint_validation_rows": len(checkpoint_validation_anchors),
+        "checkpoint_validation_strategy": "deterministic_stratified_evaluable"
+        if use_checkpoint_subset
+        else "full_timeline",
+        "checkpoint_validation_seed": seed,
+        "checkpoint_validation_positive_rate": float(
+            (checkpoint_validation_anchors["state_target"] > 0).mean()
+        ),
         "test_rows": len(test_anchors),
         "train_subjects": sorted(str(value) for value in train_subjects),
         "validation_subjects": sorted(str(value) for value in validation_subjects),
@@ -607,6 +719,6 @@ def train_dtp_fold(
         "validation_selection_signature": selection_signature,
     }
     (output_dir / "metadata.json").write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(_json_safe(metadata), ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return checkpoint_path
