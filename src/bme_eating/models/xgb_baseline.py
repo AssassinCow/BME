@@ -275,7 +275,7 @@ def _make_model(config: dict[str, Any], parameters: dict[str, Any]) -> XGBClassi
         tree_method="hist",
         device=str(config["device"]),
         random_state=int(config["random_seed"]),
-        n_jobs=-1,
+        n_jobs=int(config.get("n_jobs", -1)),
         **parameters,
     )
 
@@ -504,7 +504,7 @@ def train_xgboost_fold(
         tree_method="hist",
         device=str(final_config["device"]),
         random_state=int(final_config["random_seed"]),
-        n_jobs=-1,
+        n_jobs=int(final_config.get("n_jobs", -1)),
         **best_parameters,
     )
     train_x = selected_train[columns].replace([np.inf, -np.inf], np.nan).fillna(0.0)
@@ -533,7 +533,7 @@ def train_xgboost_fold(
             tree_method="hist",
             device=str(final_config["device"]),
             random_state=int(final_config["random_seed"]),
-            n_jobs=-1,
+            n_jobs=int(final_config.get("n_jobs", -1)),
             **best_parameters,
         )
         best_model.fit(

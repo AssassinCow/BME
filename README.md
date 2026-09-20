@@ -59,20 +59,20 @@ nvidia-smi > nvidia-smi.txt
 ### 3.1 全量安全审计
 
 ```powershell
-python scripts/audit_data.py --config configs/base.yaml --schema-zips all --maximum-rows 1000000000
+python scripts/audit_data.py --config configs/base.yaml --schema-zips all --maximum-rows 1000000000 --workers 8
 ```
 
-审计严格检查标准 53 列表头。对于带不透明二进制前缀的附件，只允许找到一次完整标准表头，并从该偏移开始按 UTF-8 TSV 严格解析。不会猜测或输出前缀内容。
+审计严格检查标准 53 列表头。`--workers` 使用多进程并行扫描 ZIP；主进程仍在每个附件完成后原子更新 checkpoint，因此中断后可续跑。对于带不透明二进制前缀的附件，只允许找到一次完整标准表头，并从该偏移开始按 UTF-8 TSV 严格解析。不会猜测或输出前缀内容。
 
-当前严格审计确认 1112 个附件中有 1096 个 `documented_text`、4 个单表头 `recovered_text_suffix` 和 12 个重复表头附件。重复表头附件不得直接跳过表头拼接，先运行专项审计：
+当前严格审计确认 1112 个附件中有 1029 个 `documented_text`、4 个单表头 `recovered_text_suffix` 和 79 个重复表头附件。重复表头既可能位于二进制前缀之后，也可能出现在一个正常文本段的中途；不得直接跳过表头拼接，先运行专项审计：
 
 ```powershell
-python scripts/audit_multisection.py --config configs/base.yaml
+python scripts/audit_multisection.py --config configs/base.yaml --workers 8
 ```
 
-专项审计只保存包级指纹、相对持续时间和冲突计数，不保存原始传感器值、文件名、受试者 ID 或绝对时间戳，也不会修改原始数据。当前已复核结果固定为 1 个 `exact_duplicate_overlap` 和 11 个 `conflicting_overlap`。由于存在冲突附件，命令会以非零状态结束，这是数据门禁生效，不是脚本崩溃；只要已生成完整的 `indices\multisection_audit.json`，即可继续执行下一步预处理。
+专项审计只保存包级指纹、相对持续时间和冲突计数，不保存原始传感器值、文件名、受试者 ID 或绝对时间戳，也不会修改原始数据。当前已复核结果固定为 45 个 `exact_duplicate_overlap`、17 个 `conflicting_overlap` 和 17 个 `nonmonotonic_section`。由于存在不安全附件，命令会以非零状态结束，这是数据门禁生效，不是脚本崩溃；只要已生成完整的 `indices\multisection_audit.json`，即可继续执行下一步预处理。
 
-预处理不会任意选择冲突段：1 个精确重复附件按展开后的样本时间戳做确定性去重，只有时间戳相同且数值完全一致才合并；11 个冲突附件显式隔离。隔离清单 `indices\quarantined_attachments.json` 只保存 ZIP SHA-256、分类和状态，不含文件名、路径、受试者或原始值。任何审计哈希、数量或分类变化都会在读取原始附件前停止。官方确认疑似误写 ID 后，应同时修改显式 alias 和期望值。
+预处理不会任意选择冲突段：45 个精确重复附件先按原始包时间戳、样本数和包内数值严格去重，再统一展开采样时间；17 个数值冲突附件和 17 个时序回退附件显式隔离。隔离清单 `indices\quarantined_attachments.json` 只保存 ZIP SHA-256、实际分类和状态，不含文件名、路径、受试者或原始值。任何审计哈希、数量或分类变化都会在读取原始附件前停止。官方确认疑似误写 ID 后，应同时修改显式 alias 和期望值。
 
 ### 3.2 预处理、session 和 coverage
 
@@ -91,7 +91,7 @@ python scripts/preprocess_data.py --config configs/base.yaml --workers 8 --overw
 
 本次 schema 增加了分模态有效率、PPG 槽位、折分指纹和真实历史可用时长。已有 v2 产物不能增量复用，第一次验收必须带 `--overwrite` 全量重建。
 
-任意允许附件仍无法解析、出现 session 时间重叠、数量不符或恢复/隔离计数不符时，流程停止。质量门禁要求 `1112 = 1101 已预处理 + 11 已隔离`，并要求 1096 个 `documented_text`、4 个 `recovered_text_suffix` 和 1 个 `recovered_multisection_deduplicated`。预处理会删除这 11 个隔离哈希对应的旧派生 NPZ，但不会修改或删除原始 ZIP。
+任意允许附件仍无法解析、出现 session 时间重叠、数量不符或恢复/隔离计数不符时，流程停止。质量门禁要求 `1112 = 1078 已预处理 + 34 已隔离`，并要求 1029 个 `documented_text`、4 个 `recovered_text_suffix` 和 45 个 `recovered_multisection_deduplicated`。预处理会删除这 34 个隔离哈希对应的旧派生 NPZ，但不会修改或删除原始 ZIP。
 
 主要产物位于 `%BME_OUTPUT_ROOT%\v2`：
 
@@ -132,9 +132,19 @@ fold 0 通过后运行五折：
 
 ```powershell
 0..4 | ForEach-Object {
-    python scripts/train_xgboost.py --config configs/baseline.yaml --fold $_
+  python scripts/train_xgboost.py --config configs/baseline.yaml --fold $_
 }
 ```
+
+五折保持串行，以免多个训练进程争用同一张 GPU。每折内部的 XGBoost CPU 辅助线程由 `xgboost.n_jobs` 控制，后处理网格搜索由 `postprocess_search.workers` 多进程并行；当前分别为 12 和 16。高阈值网格覆盖到概率域上限 `1.0`，并补充 0.99、0.995 和 0.999 自适应分位点，使常见的验证最优阈值保持在搜索区间内部。后处理 worker 会各自持有一份验证预测，若内存压力明显应先降低 `postprocess_search.workers`。
+
+训练期间或五折完成后，可生成本地结果仪表板：
+
+```powershell
+python scripts/summarize_results.py --config configs/baseline.yaml --experiments baseline
+```
+
+输出位于 `outputs\v2\reports\baseline\`，包括 HTML 仪表板、总体/逐折/逐受试者/佩戴关系 CSV 和可追溯 JSON。未完成的折会标为临时结果，不会混充完整五折结论。比较基线与 dyadic 时使用 `--experiments baseline baseline_dyadic`。逐受试者文件属于私有实验诊断，不进入公开提交包。
 
 训练规则：
 
@@ -213,8 +223,8 @@ python scripts/compare_models.py `
 ```powershell
 python scripts/check_environment.py
 python -m pytest -q
-python scripts/audit_data.py --config configs/base.yaml --schema-zips all --maximum-rows 1000000000
-python scripts/audit_multisection.py --config configs/base.yaml
+python scripts/audit_data.py --config configs/base.yaml --schema-zips all --maximum-rows 1000000000 --workers 8
+python scripts/audit_multisection.py --config configs/base.yaml --workers 8
 python scripts/preprocess_data.py --config configs/base.yaml --workers 8 --overwrite
 python scripts/validate_data.py --config configs/base.yaml
 # 人工确认后：

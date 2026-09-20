@@ -130,6 +130,40 @@ def test_postprocess_search_resumes_from_matching_checkpoint(tmp_path, monkeypat
     pd.testing.assert_frame_equal(first_trials, third_trials)
 
 
+def test_parallel_postprocess_search_matches_serial_results():
+    predictions = pd.DataFrame(
+        {
+            "subject_key": ["s"] * 4,
+            "session_id": ["session"] * 4,
+            "timestamp_ms": [0, 3000, 6000, 9000],
+            "state_probability": [0.0, 0.9, 0.8, 0.0],
+            "start_probability": [0.0, 1.0, 0.0, 0.0],
+            "end_probability": [0.0, 0.0, 0.0, 1.0],
+        }
+    )
+    truth = pd.DataFrame(
+        {"subject_key": ["s"], "start_ms": [3000], "end_ms": [9000]}
+    )
+    search = {
+        "ema_half_life_seconds": [0.1],
+        "high_threshold": [0.6, 0.7],
+        "low_threshold": [0.3],
+        "minimum_event_seconds": [0],
+        "merge_gap_seconds": [0],
+        "boundary_lookback_seconds": [3],
+    }
+
+    serial_best, serial_trials = tune_postprocess_parameters(
+        predictions, truth, search, 0.25, show_progress=False, workers=1
+    )
+    parallel_best, parallel_trials = tune_postprocess_parameters(
+        predictions, truth, search, 0.25, show_progress=False, workers=2
+    )
+
+    assert serial_best == parallel_best
+    pd.testing.assert_frame_equal(serial_trials, parallel_trials)
+
+
 def test_postprocess_merges_predictions_across_segments_in_one_session():
     frame = pd.DataFrame(
         {

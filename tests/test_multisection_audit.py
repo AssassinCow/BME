@@ -31,9 +31,9 @@ def _section(rows):
     return buffer.getvalue().encode("utf-8")
 
 
-def _write_multisection_zip(path, sections):
+def _write_multisection_zip(path, sections, prefix=b"\x00\xffopaque-prefix"):
     with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("sensor.txt", b"\x00\xffopaque-prefix" + b"".join(sections))
+        archive.writestr("sensor.txt", prefix + b"".join(sections))
 
 
 def test_multisection_audit_recognizes_exact_duplicate_overlap(tmp_path):
@@ -141,6 +141,24 @@ def test_multisection_report_omits_paths_names_subjects_and_raw_values(tmp_path)
     assert "source_zip_sha256" in report["results"][0]
 
 
+def test_multisection_report_includes_header_at_byte_zero(tmp_path):
+    path = tmp_path / "documented-prefix.zip"
+    rows = [_row(1000), _row(1100, 2.0)]
+    _write_multisection_zip(path, [_section(rows), _section(rows)], prefix=b"")
+    records = pd.DataFrame(
+        [{"zip_path": str(path), "zip_sha256": "a" * 64}]
+    )
+    schema_audit = {
+        "layouts": [{"zip_name": path.name, "status": "repeated_header"}]
+    }
+
+    report = audit_repeated_header_attachments(records, schema_audit, 20, workers=2)
+
+    assert report["attachments_audited"] == 1
+    assert report["classification_counts"] == {"exact_duplicate_overlap": 1}
+    assert report["results"][0]["binary_prefix_bytes"] == 0
+
+
 def test_multisection_parser_deduplicates_exact_expanded_samples(tmp_path):
     path = tmp_path / "duplicate.zip"
     rows = [_row(1000, 1.0), _row(1100, 2.0)]
@@ -155,6 +173,21 @@ def test_multisection_parser_deduplicates_exact_expanded_samples(tmp_path):
     assert len(parsed.ppg.timestamp_ms) == 4
     assert len(set(parsed.acc.timestamp_ms.tolist())) == 2
     assert len(set(parsed.ppg.timestamp_ms.tolist())) == 4
+
+
+def test_multisection_parser_deduplicates_packets_before_timestamp_expansion(tmp_path):
+    path = tmp_path / "submillisecond-packets.zip"
+    first = _row(1000, 1.0)
+    first[4] = 2.0
+    second = _row(1001, 3.0)
+    second[4] = 4.0
+    rows = [first, second]
+    _write_multisection_zip(path, [_section(rows), _section(rows)], prefix=b"")
+
+    parsed = parse_multisection_sensor_zip(path, ppg_samples_per_row=2)
+
+    assert parsed.ppg.timestamp_ms.tolist() == [1000, 1000, 1001, 1002]
+    assert parsed.ppg.values[:, 0].tolist() == [1.0, 2.0, 3.0, 4.0]
 
 
 def test_multisection_parser_rejects_conflicting_expanded_samples(tmp_path):
@@ -181,11 +214,11 @@ def _policy_inputs(tmp_path):
     )
     schema = {
         "layout_files_inspected": 12,
-        "layout_status_counts": {"unsupported_binary": 12},
+        "layout_status_counts": {"repeated_header": 12},
         "layouts": [
             {
                 "zip_name": f"attachment-{index}.zip",
-                "status": "unsupported_binary",
+                "status": "repeated_header",
                 "error": "standard sensor header occurs more than once",
             }
             for index in range(12)
@@ -218,7 +251,7 @@ def test_multisection_policy_requires_exact_hash_and_classification_set(tmp_path
     exact, quarantined = validate_multisection_preprocess_policy(records, schema, audit)
 
     assert exact == {hashes[0]}
-    assert quarantined == set(hashes[1:])
+    assert quarantined == {digest: "conflicting_overlap" for digest in hashes[1:]}
 
     changed = json.loads(json.dumps(audit))
     changed["results"][0]["source_zip_sha256"] = "f" * 64
@@ -232,8 +265,28 @@ def test_multisection_policy_requires_exact_hash_and_classification_set(tmp_path
         validate_multisection_preprocess_policy(records, schema, changed)
 
 
+def test_multisection_policy_quarantines_nonmonotonic_sections(tmp_path):
+    records, schema, audit, hashes = _policy_inputs(tmp_path)
+    audit["results"][-1]["classification"] = "nonmonotonic_section"
+    audit["classification_counts"] = {
+        "conflicting_overlap": 10,
+        "exact_duplicate_overlap": 1,
+        "nonmonotonic_section": 1,
+    }
+
+    exact, quarantined = validate_multisection_preprocess_policy(
+        records, schema, audit, expected_exact=1, expected_quarantined=11
+    )
+
+    assert exact == {hashes[0]}
+    assert quarantined[hashes[-1]] == "nonmonotonic_section"
+
+
 def test_quarantine_manifest_contains_no_identity_or_path(tmp_path):
-    quarantined = {"a" * 64, "b" * 64}
+    quarantined = {
+        "a" * 64: "conflicting_overlap",
+        "b" * 64: "nonmonotonic_section",
+    }
     path = write_quarantine_manifest(tmp_path, quarantined)
     payload = json.loads(path.read_text(encoding="utf-8"))
 
@@ -241,12 +294,12 @@ def test_quarantine_manifest_contains_no_identity_or_path(tmp_path):
         {
             "source_zip_sha256": "a" * 64,
             "classification": "conflicting_overlap",
-            "status": "quarantined_conflicting_multisection",
+            "status": "quarantined_unsafe_multisection",
         },
         {
             "source_zip_sha256": "b" * 64,
-            "classification": "conflicting_overlap",
-            "status": "quarantined_conflicting_multisection",
+            "classification": "nonmonotonic_section",
+            "status": "quarantined_unsafe_multisection",
         },
     ]
     serialized = json.dumps(payload)

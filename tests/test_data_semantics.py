@@ -295,7 +295,7 @@ def _valid_quarantine_quality_report():
         "schema_layout_status_counts": {
             "documented_text": 1096,
             "recovered_text_suffix": 4,
-            "unsupported_binary": 12,
+            "repeated_header": 12,
         },
         "multisection_attachments_audited": 12,
         "multisection_classification_counts": {

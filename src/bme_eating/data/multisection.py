@@ -6,6 +6,7 @@ import io
 import json
 import math
 import zipfile
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from itertools import combinations
 from pathlib import Path
@@ -14,13 +15,26 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from bme_eating.data.packet_reader import SENSOR_COLUMNS, _SENSOR_HEADER_BYTES
+from bme_eating.data.packet_reader import _SENSOR_HEADER_BYTES, SENSOR_COLUMNS
 
 
 REPEATED_HEADER_ERROR = "standard sensor header occurs more than once"
 EXACT_RECOVERY_CLASSIFICATION = "exact_duplicate_overlap"
 QUARANTINE_CLASSIFICATION = "conflicting_overlap"
-QUARANTINE_STATUS = "quarantined_conflicting_multisection"
+QUARANTINE_CLASSIFICATIONS = frozenset(
+    {QUARANTINE_CLASSIFICATION, "nonmonotonic_section"}
+)
+QUARANTINE_STATUS = "quarantined_unsafe_multisection"
+
+
+def _is_repeated_header_layout(layout: dict[str, Any]) -> bool:
+    return (
+        layout.get("status") == "repeated_header"
+        or (
+            layout.get("status") == "unsupported_binary"
+            and layout.get("error") == REPEATED_HEADER_ERROR
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -347,13 +361,13 @@ def audit_repeated_header_attachments(
     schema_audit: dict[str, Any],
     ppg_samples_per_row: int,
     show_progress: bool = False,
+    workers: int = 1,
 ) -> dict[str, Any]:
     layouts = schema_audit.get("layouts", [])
     repeated_names = {
         str(layout.get("zip_name", ""))
         for layout in layouts
-        if layout.get("status") == "unsupported_binary"
-        and layout.get("error") == REPEATED_HEADER_ERROR
+        if _is_repeated_header_layout(layout)
     }
     if not repeated_names:
         raise ValueError("schema audit contains no repeated-header attachments")
@@ -374,34 +388,73 @@ def audit_repeated_header_attachments(
         selected.append(matches[0])
     selected.sort(key=lambda row: str(row["zip_sha256"]))
 
-    results: list[dict[str, Any]] = []
-    iterator: Any = enumerate(selected, start=1)
-    if show_progress:
-        from tqdm import tqdm
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    jobs = [
+        (index, str(record["zip_path"]), str(record["zip_sha256"]))
+        for index, record in enumerate(selected, start=1)
+    ]
 
-        iterator = tqdm(
-            iterator,
-            total=len(selected),
-            desc="Auditing repeated-header attachments",
-            unit="attachment",
-        )
-    for attachment_index, record in iterator:
-        try:
-            result = audit_multisection_zip(
-                record["zip_path"],
-                str(record["zip_sha256"]),
-                ppg_samples_per_row,
+    def invalid_result(digest: str, error: Exception) -> dict[str, Any]:
+        message = str(error) if isinstance(error, ValueError) else "attachment could not be read"
+        return {
+            "source_zip_sha256": digest,
+            "classification": "invalid",
+            "error_type": type(error).__name__,
+            "error": message,
+        }
+
+    ordered_results: dict[int, dict[str, Any]] = {}
+    iterator: Any
+    if workers == 1:
+        iterator = jobs
+        if show_progress:
+            from tqdm import tqdm
+
+            iterator = tqdm(
+                iterator,
+                total=len(jobs),
+                desc="Auditing repeated-header attachments",
+                unit="attachment",
             )
-        except (OSError, ValueError, zipfile.BadZipFile, csv.Error) as error:
-            message = str(error) if isinstance(error, ValueError) else "attachment could not be read"
-            result = {
-                "source_zip_sha256": str(record["zip_sha256"]),
-                "classification": "invalid",
-                "error_type": type(error).__name__,
-                "error": message,
+        for attachment_index, zip_path, digest in iterator:
+            try:
+                result = audit_multisection_zip(zip_path, digest, ppg_samples_per_row)
+            except (OSError, ValueError, zipfile.BadZipFile, csv.Error) as error:
+                result = invalid_result(digest, error)
+            result["attachment_index"] = attachment_index
+            ordered_results[attachment_index] = result
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    audit_multisection_zip,
+                    zip_path,
+                    digest,
+                    ppg_samples_per_row,
+                ): (attachment_index, digest)
+                for attachment_index, zip_path, digest in jobs
             }
-        result["attachment_index"] = attachment_index
-        results.append(result)
+            iterator = as_completed(futures)
+            if show_progress:
+                from tqdm import tqdm
+
+                iterator = tqdm(
+                    iterator,
+                    total=len(futures),
+                    desc="Auditing repeated-header attachments",
+                    unit="attachment",
+                )
+            for future in iterator:
+                attachment_index, digest = futures[future]
+                try:
+                    result = future.result()
+                except Exception as error:  # noqa: BLE001 - preserve per-attachment audit result
+                    result = invalid_result(digest, error)
+                result["attachment_index"] = attachment_index
+                ordered_results[attachment_index] = result
+
+    results = [ordered_results[index] for index in range(1, len(jobs) + 1)]
 
     classification_counts: dict[str, int] = {}
     for result in results:
@@ -424,7 +477,7 @@ def validate_multisection_preprocess_policy(
     expected_quarantined: int = 11,
     expected_documented: int | None = None,
     expected_text_suffix: int | None = None,
-) -> tuple[set[str], set[str]]:
+) -> tuple[set[str], dict[str, str]]:
     """Bind preprocessing decisions to the audited repeated-header attachment hashes."""
     required = {"zip_path", "zip_sha256"}
     missing = required - set(records.columns)
@@ -450,16 +503,22 @@ def validate_multisection_preprocess_policy(
         }
         if derived_status_counts != reported_status_counts:
             raise RuntimeError("schema audit status counts do not match its layouts")
-    allowed_statuses = {"documented_text", "recovered_text_suffix", "unsupported_binary"}
+    allowed_statuses = {
+        "documented_text",
+        "recovered_text_suffix",
+        "repeated_header",
+        "unsupported_binary",
+    }
     if set(derived_status_counts) - allowed_statuses:
         raise RuntimeError("schema audit contains an unexpected attachment status")
     unsupported_layouts = [
-        layout for layout in layouts if layout.get("status") == "unsupported_binary"
+        layout
+        for layout in layouts
+        if layout.get("status") == "unsupported_binary"
+        and not _is_repeated_header_layout(layout)
     ]
-    if len(unsupported_layouts) != expected_exact + expected_quarantined or any(
-        layout.get("error") != REPEATED_HEADER_ERROR for layout in unsupported_layouts
-    ):
-        raise RuntimeError("schema audit unsupported attachments changed")
+    if unsupported_layouts:
+        raise RuntimeError("schema audit contains unsupported non-multisection attachments")
     if expected_documented is not None and derived_status_counts.get("documented_text", 0) != int(
         expected_documented
     ):
@@ -471,8 +530,7 @@ def validate_multisection_preprocess_policy(
     repeated_names = [
         str(layout.get("zip_name", ""))
         for layout in layouts
-        if layout.get("status") == "unsupported_binary"
-        and layout.get("error") == REPEATED_HEADER_ERROR
+        if _is_repeated_header_layout(layout)
     ]
     if len(repeated_names) != expected_exact + expected_quarantined:
         raise RuntimeError("schema audit repeated-header attachment count changed")
@@ -519,35 +577,48 @@ def validate_multisection_preprocess_policy(
         raise RuntimeError("multisection audit classification counts do not match its results")
     if set(result_by_hash) != schema_hashes:
         raise RuntimeError("multisection audit hashes do not match repeated-header schema attachments")
-    expected_counts = {
-        EXACT_RECOVERY_CLASSIFICATION: expected_exact,
-        QUARANTINE_CLASSIFICATION: expected_quarantined,
-    }
-    if derived_counts != expected_counts:
+    unexpected_classifications = set(derived_counts) - (
+        {EXACT_RECOVERY_CLASSIFICATION} | QUARANTINE_CLASSIFICATIONS
+    )
+    recovered_count = int(derived_counts.get(EXACT_RECOVERY_CLASSIFICATION, 0))
+    quarantined_count = sum(
+        int(derived_counts.get(classification, 0))
+        for classification in QUARANTINE_CLASSIFICATIONS
+    )
+    if (
+        unexpected_classifications
+        or recovered_count != expected_exact
+        or quarantined_count != expected_quarantined
+    ):
         raise RuntimeError(
-            f"multisection classifications changed: observed={derived_counts} expected={expected_counts}"
+            "multisection classifications changed: "
+            f"observed={derived_counts} expected_recovered={expected_exact} "
+            f"expected_quarantined={expected_quarantined}"
         )
     exact = {
         digest for digest, classification in result_by_hash.items()
         if classification == EXACT_RECOVERY_CLASSIFICATION
     }
     quarantined = {
-        digest for digest, classification in result_by_hash.items()
-        if classification == QUARANTINE_CLASSIFICATION
+        digest: classification
+        for digest, classification in result_by_hash.items()
+        if classification in QUARANTINE_CLASSIFICATIONS
     }
     return exact, quarantined
 
 
-def write_quarantine_manifest(index_dir: Path, quarantined_hashes: set[str]) -> Path:
+def write_quarantine_manifest(
+    index_dir: Path, quarantined: dict[str, str]
+) -> Path:
     payload = {
         "version": 1,
         "attachments": [
             {
                 "source_zip_sha256": digest,
-                "classification": QUARANTINE_CLASSIFICATION,
+                "classification": quarantined[digest],
                 "status": QUARANTINE_STATUS,
             }
-            for digest in sorted(quarantined_hashes)
+            for digest in sorted(quarantined)
         ],
     }
     output_path = index_dir / "quarantined_attachments.json"

@@ -155,6 +155,76 @@ def _audit_layout_issue(zip_path: str, error: Exception) -> dict[str, object]:
     }
 
 
+def _audit_layout_job(zip_path: str, maximum_rows: int) -> tuple[str, dict[str, object]]:
+    try:
+        layout = inspect_ppg_layout(zip_path, maximum_rows=maximum_rows)
+    except _RECOVERABLE_INPUT_ERRORS as error:
+        layout = _audit_layout_issue(zip_path, error)
+    except Exception as error:  # noqa: BLE001 - worker boundary must preserve diagnostics
+        layout = _audit_layout_issue(zip_path, error)
+    return zip_path, layout
+
+
+def _inspect_selected_layouts(
+    selected_fingerprints: list[dict[str, object]],
+    maximum_rows: int,
+    workers: int,
+    checkpoint_path: Path,
+    schema_zips: str,
+    completed: dict[str, dict[str, object]],
+) -> list[dict[str, object]]:
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
+    pending = [
+        str(fingerprint["zip_path"])
+        for fingerprint in selected_fingerprints
+        if str(fingerprint["zip_path"]) not in completed
+    ]
+    progress = tqdm(
+        total=len(selected_fingerprints),
+        initial=len(selected_fingerprints) - len(pending),
+        desc=f"Inspecting PPG layout ({workers} workers)",
+    )
+
+    def save_result(zip_path: str, layout: dict[str, object]) -> None:
+        completed[zip_path] = layout
+        _write_audit_checkpoint(
+            checkpoint_path,
+            schema_zips,
+            maximum_rows,
+            selected_fingerprints,
+            completed,
+        )
+        progress.update(1)
+
+    try:
+        if workers == 1:
+            for zip_path in pending:
+                result_path, layout = _audit_layout_job(zip_path, maximum_rows)
+                save_result(result_path, layout)
+        elif pending:
+            with ProcessPoolExecutor(max_workers=min(workers, len(pending))) as executor:
+                futures = {
+                    executor.submit(_audit_layout_job, zip_path, maximum_rows): zip_path
+                    for zip_path in pending
+                }
+                for future in as_completed(futures):
+                    zip_path = futures[future]
+                    try:
+                        result_path, layout = future.result()
+                    except Exception as error:
+                        raise RuntimeError(
+                            f"Schema audit worker failed while processing {zip_path}"
+                        ) from error
+                    save_result(result_path, layout)
+    finally:
+        progress.close()
+    return [
+        completed[str(fingerprint["zip_path"])]
+        for fingerprint in selected_fingerprints
+    ]
+
+
 def command_environment(_: argparse.Namespace) -> None:
     try:
         import xgboost
@@ -198,22 +268,20 @@ def command_audit(args: argparse.Namespace) -> None:
         maximum_rows,
         selected_fingerprints,
     )
-    for fingerprint in tqdm(selected_fingerprints, desc="Inspecting PPG layout"):
-        zip_path = str(fingerprint["zip_path"])
-        if zip_path in completed:
-            continue
-        try:
-            completed[zip_path] = inspect_ppg_layout(zip_path, maximum_rows=maximum_rows)
-        except _RECOVERABLE_INPUT_ERRORS as error:
-            completed[zip_path] = _audit_layout_issue(zip_path, error)
-        _write_audit_checkpoint(
-            checkpoint_path,
-            str(args.schema_zips),
-            maximum_rows,
-            selected_fingerprints,
-            completed,
-        )
-    layouts = [completed[str(fingerprint["zip_path"])] for fingerprint in selected_fingerprints]
+    requested_workers = getattr(args, "workers", None)
+    workers = int(
+        config.get("audit", {}).get("workers", 1)
+        if requested_workers is None
+        else requested_workers
+    )
+    layouts = _inspect_selected_layouts(
+        selected_fingerprints,
+        maximum_rows,
+        workers,
+        checkpoint_path,
+        str(args.schema_zips),
+        completed,
+    )
     active_slots = 0
     for layout in layouts:
         fractions = layout["nonzero_fraction_by_slot"]
@@ -240,7 +308,7 @@ def command_audit(args: argparse.Namespace) -> None:
     audit_path.write_text(json.dumps(audit, ensure_ascii=False, indent=2), encoding="utf-8")
     checkpoint_path.unlink(missing_ok=True)
     print(audit_path)
-    allowed_statuses = {"documented_text", "recovered_text_suffix"}
+    allowed_statuses = {"documented_text", "recovered_text_suffix", "repeated_header"}
     bad_statuses = {
         status: count
         for status, count in layout_status_counts.items()
@@ -274,6 +342,7 @@ def command_audit_multisection(args: argparse.Namespace) -> None:
         schema_audit,
         int(config["data"]["ppg_samples_per_row"]),
         show_progress=True,
+        workers=int(getattr(args, "workers", None) or config["preprocess"]["workers"]),
     )
     output_path = index_dir / "multisection_audit.json"
     temporary_path = output_path.with_name(output_path.name + ".tmp")
@@ -291,7 +360,7 @@ def command_audit_multisection(args: argparse.Namespace) -> None:
     blocking = {
         key: value
         for key, value in report["classification_counts"].items()
-        if key not in {"exact_duplicate_overlap", "disjoint_sections"} and int(value) > 0
+        if key != "exact_duplicate_overlap" and int(value) > 0
     }
     if blocking:
         raise SystemExit(
@@ -366,7 +435,7 @@ def command_preprocess(args: argparse.Namespace) -> None:
     multisection_audit = json.loads(
         multisection_audit_path.read_text(encoding="utf-8")
     )
-    exact_hashes, quarantined_hashes = validate_multisection_preprocess_policy(
+    exact_hashes, quarantined = validate_multisection_preprocess_policy(
         records,
         schema_audit,
         multisection_audit,
@@ -374,14 +443,15 @@ def command_preprocess(args: argparse.Namespace) -> None:
             config["quality_gates"]["expected_recovered_multisection_deduplicated"]
         ),
         expected_quarantined=int(
-            config["quality_gates"]["expected_quarantined_conflicting_multisection"]
+            config["quality_gates"]["expected_quarantined_multisection"]
         ),
         expected_documented=int(config["quality_gates"]["expected_documented_text"]),
         expected_text_suffix=int(
             config["quality_gates"]["expected_recovered_text_suffix"]
         ),
     )
-    write_quarantine_manifest(index_dir, quarantined_hashes)
+    write_quarantine_manifest(index_dir, quarantined)
+    quarantined_hashes = set(quarantined)
     segment_dir = output_root / "segments"
     for digest in quarantined_hashes:
         token = digest[:20]
@@ -863,6 +933,7 @@ def _tune_and_save_postprocess(
         matching_method=str(
             config["postprocess"].get("matching_method", "max_cardinality_iou")
         ),
+        workers=int(config["postprocess_search"].get("workers", 1)),
     )
     best["iou_threshold"] = float(config["postprocess"]["iou_threshold"])
     best["matching_method"] = str(
@@ -919,7 +990,11 @@ def command_train_xgb(args: argparse.Namespace) -> None:
     validation_truth, validation_ignore = partition_evaluation_events(
         events, validation_subjects
     )
-    print("[4/5] Tuning event postprocessing on CPU...", flush=True)
+    print(
+        "[4/5] Tuning event postprocessing on CPU "
+        f"({int(config['postprocess_search'].get('workers', 1))} workers)...",
+        flush=True,
+    )
     selected_postprocess = _tune_and_save_postprocess(
         validation_predictions,
         validation_truth,
@@ -979,7 +1054,11 @@ def command_train_dtp(args: argparse.Namespace) -> None:
     validation_truth, validation_ignore = partition_evaluation_events(
         events, validation_subjects
     )
-    print("[3/4] Tuning event postprocessing on CPU...", flush=True)
+    print(
+        "[3/4] Tuning event postprocessing on CPU "
+        f"({int(config['postprocess_search'].get('workers', 1))} workers)...",
+        flush=True,
+    )
     selected_postprocess = _tune_and_save_postprocess(
         validation_predictions,
         validation_truth,

@@ -5,10 +5,11 @@ features:
   include_dyadic: false
   motion_bucket_seconds: [3, 6, 12, 24, 48, 96, 192]
   ppg_bucket_seconds: [15, 30, 60, 120, 240]
-  workers: 8
+  workers: 16
 
 xgboost:
   device: cuda
+  n_jobs: 12
   objective: binary:logistic
   eval_metric: aucpr
   n_estimators: 3000
@@ -18,4 +19,9 @@ xgboost:
   far_negative_to_positive_ratio: 5
   hard_negative_to_positive_ratio: 2
   random_seed: 2026
+
+postprocess_search:
+  workers: 16
+  high_threshold: [0.03, 0.05, 0.08, 0.12, 0.2, 0.3, 0.5, 0.6, 0.75, 0.9, 0.99, 1.0]
+  high_threshold_quantiles: [0.7, 0.8, 0.9, 0.95, 0.98, 0.99, 0.995, 0.999]
 

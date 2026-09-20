@@ -27,14 +27,17 @@ preprocess:
   workers: 8
   overwrite: false
 
+audit:
+  workers: 8
+
 quality_gates:
   expected_records: 1112
   expected_subjects: 39
-  expected_documented_text: 1096
+  expected_documented_text: 1029
   expected_recovered_text_suffix: 4
-  expected_recovered_multisection_deduplicated: 1
-  expected_quarantined_conflicting_multisection: 11
-  expected_preprocessed_attachments: 1101
+  expected_recovered_multisection_deduplicated: 45
+  expected_quarantined_multisection: 34
+  expected_preprocessed_attachments: 1078
   expected_ppg_samples_per_row: 20
   expected_ppg_available_columns: 44
   expected_maximum_observed_nonzero_ppg_slot: 20

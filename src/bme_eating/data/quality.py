@@ -9,7 +9,7 @@ import pandas as pd
 
 from bme_eating.data.multisection import (
     EXACT_RECOVERY_CLASSIFICATION,
-    QUARANTINE_CLASSIFICATION,
+    QUARANTINE_CLASSIFICATIONS,
     QUARANTINE_STATUS,
     validate_multisection_preprocess_policy,
 )
@@ -43,24 +43,34 @@ def build_quality_report(output_root: Path) -> dict[str, Any]:
     segments = pd.read_parquet(index_dir / "segments.parquet")
     events = pd.read_parquet(index_dir / "events.parquet")
     schema_audit = json.loads((index_dir / "schema_audit.json").read_text(encoding="utf-8"))
-    unsupported_count = int(
-        schema_audit.get("layout_status_counts", {}).get("unsupported_binary", 0)
-    )
+    layout_status_counts = schema_audit.get("layout_status_counts", {})
+    repeated_header_count = int(layout_status_counts.get("repeated_header", 0))
+    unsupported_count = int(layout_status_counts.get("unsupported_binary", 0))
+    multisection_count = repeated_header_count + unsupported_count
     exact_hashes: set[str] = set()
     quarantine_hash_set: set[str] = set()
     multisection_audit: dict[str, Any] = {
         "attachments_audited": 0,
         "classification_counts": {},
     }
-    if unsupported_count:
+    if multisection_count:
         multisection_audit = json.loads(
             (index_dir / "multisection_audit.json").read_text(encoding="utf-8")
         )
         quarantine_manifest = json.loads(
             (index_dir / "quarantined_attachments.json").read_text(encoding="utf-8")
         )
-        exact_hashes, policy_quarantined_hashes = validate_multisection_preprocess_policy(
-            records, schema_audit, multisection_audit
+        classification_counts = multisection_audit.get("classification_counts", {})
+        expected_quarantined = sum(
+            int(classification_counts.get(classification, 0))
+            for classification in QUARANTINE_CLASSIFICATIONS
+        )
+        exact_hashes, policy_quarantined = validate_multisection_preprocess_policy(
+            records,
+            schema_audit,
+            multisection_audit,
+            expected_exact=int(classification_counts.get(EXACT_RECOVERY_CLASSIFICATION, 0)),
+            expected_quarantined=expected_quarantined,
         )
         quarantine_entries = quarantine_manifest.get("attachments", [])
         if not isinstance(quarantine_entries, list):
@@ -69,7 +79,7 @@ def build_quality_report(output_root: Path) -> dict[str, Any]:
         for entry in quarantine_entries:
             if set(entry) != {"source_zip_sha256", "classification", "status"}:
                 raise RuntimeError("quarantine manifest contains unexpected or missing fields")
-            if entry["classification"] != QUARANTINE_CLASSIFICATION:
+            if entry["classification"] not in QUARANTINE_CLASSIFICATIONS:
                 raise RuntimeError("quarantine manifest contains an unexpected classification")
             if entry["status"] != QUARANTINE_STATUS:
                 raise RuntimeError("quarantine manifest contains an unexpected status")
@@ -77,8 +87,12 @@ def build_quality_report(output_root: Path) -> dict[str, Any]:
         if len(set(quarantine_hashes)) != len(quarantine_hashes):
             raise RuntimeError("quarantine manifest contains duplicate source ZIP hashes")
         quarantine_hash_set = set(quarantine_hashes)
-        if quarantine_hash_set != policy_quarantined_hashes:
+        if quarantine_hash_set != set(policy_quarantined):
             raise RuntimeError("quarantine manifest hashes do not match the audited policy")
+        for entry in quarantine_entries:
+            digest = str(entry["source_zip_sha256"]).lower()
+            if entry["classification"] != policy_quarantined[digest]:
+                raise RuntimeError("quarantine manifest classification does not match the audit")
     fold_digest, fold_subjects = _subject_fold_digest(index_dir)
     required_segment_columns = {
         "acc_valid_fraction",
@@ -220,7 +234,12 @@ def validate_quality_invariants(report: dict[str, Any]) -> None:
         failures.append("subject fold assignments do not cover all subjects")
     if int(report["schema_layout_files_inspected"]) != int(report["records"]):
         failures.append("schema audit did not inspect every attachment")
-    allowed_statuses = {"documented_text", "recovered_text_suffix", "unsupported_binary"}
+    allowed_statuses = {
+        "documented_text",
+        "recovered_text_suffix",
+        "repeated_header",
+        "unsupported_binary",
+    }
     unexpected_statuses = {
         key: value
         for key, value in report["schema_layout_status_counts"].items()
@@ -228,18 +247,27 @@ def validate_quality_invariants(report: dict[str, Any]) -> None:
     }
     if unexpected_statuses:
         failures.append("schema audit contains unsupported attachment statuses")
-    if int(report["schema_layout_status_counts"].get("unsupported_binary", 0)) != int(
-        report["multisection_attachments_audited"]
-    ):
-        failures.append("unsupported schema attachments are not fully accounted for")
-    if int(report["schema_layout_status_counts"].get("unsupported_binary", 0)):
-        if report["multisection_classification_counts"] != {
-            EXACT_RECOVERY_CLASSIFICATION: 1,
-            QUARANTINE_CLASSIFICATION: 11,
-        }:
-            failures.append("multisection classification policy changed")
-        if int(report["quarantined_attachments"]) != 11:
-            failures.append("quarantined attachment count changed")
+    multisection_count = int(
+        report["schema_layout_status_counts"].get("repeated_header", 0)
+    ) + int(report["schema_layout_status_counts"].get("unsupported_binary", 0))
+    if multisection_count != int(report["multisection_attachments_audited"]):
+        failures.append("repeated-header attachments are not fully accounted for")
+    if multisection_count:
+        classifications = report["multisection_classification_counts"]
+        quarantined_count = sum(
+            int(classifications.get(classification, 0))
+            for classification in QUARANTINE_CLASSIFICATIONS
+        )
+        classified_count = (
+            int(classifications.get(EXACT_RECOVERY_CLASSIFICATION, 0))
+            + quarantined_count
+        )
+        if classified_count != multisection_count or set(classifications) - (
+            {EXACT_RECOVERY_CLASSIFICATION} | QUARANTINE_CLASSIFICATIONS
+        ):
+            failures.append("multisection audit contains an unsupported classification")
+        if int(report["quarantined_attachments"]) != quarantined_count:
+            failures.append("quarantined attachment count does not match the audit")
     if failures:
         raise RuntimeError("Data quality invariants failed: " + "; ".join(failures))
 
@@ -261,7 +289,7 @@ def validate_configured_expectations(
         "subjects": int(expectations["expected_subjects"]),
         "preprocessed_attachments": int(expectations["expected_preprocessed_attachments"]),
         "quarantined_attachments": int(
-            expectations["expected_quarantined_conflicting_multisection"]
+            expectations["expected_quarantined_multisection"]
         ),
     }
     mismatches = [

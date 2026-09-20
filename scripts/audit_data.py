@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 import _bootstrap  # noqa: F401
+
 from bme_eating.cli import command_audit
 
 
@@ -24,6 +25,12 @@ def main() -> None:
         "--no-resume",
         action="store_true",
         help="Ignore any schema audit checkpoint and start from the first ZIP.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Parallel worker processes. Defaults to audit.workers from the config.",
     )
     command_audit(parser.parse_args())
 

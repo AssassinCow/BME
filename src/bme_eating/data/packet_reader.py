@@ -284,6 +284,10 @@ def parse_sensor_zip(
                     raise ValueError(f"Missing configured PPG columns: {missing_ppg}")
 
                 for row_number, row in enumerate(reader, start=2):
+                    if [value.strip() for value in row] == SENSOR_COLUMNS:
+                        raise UnsupportedSensorFormatError(
+                            zip_path, text_entries[0], "standard sensor header occurs more than once"
+                        )
                     if len(row) != len(header):
                         raise UnsupportedSensorFormatError(
                             zip_path,
@@ -334,44 +338,83 @@ def parse_sensor_zip(
     )
 
 
-def _merge_exact_sensor_series(
-    series_list: list[SensorSeries],
-    zip_path: Path,
-    modality: str,
-) -> SensorSeries:
-    nonempty = [series for series in series_list if len(series.timestamp_ms)]
-    if not nonempty:
-        dimensions = series_list[0].values.shape[1] if series_list else 1
-        return SensorSeries(
-            timestamp_ms=np.empty(0, dtype=np.int64),
-            values=np.empty((0, dimensions), dtype=np.float32),
-        )
-    timestamps = np.concatenate([series.timestamp_ms for series in nonempty])
-    values = np.concatenate([series.values for series in nonempty], axis=0)
-    order = np.argsort(timestamps, kind="stable")
-    timestamps = timestamps[order]
-    values = values[order]
-    unique_timestamps: list[int] = []
-    unique_values: list[np.ndarray] = []
-    start = 0
-    while start < len(timestamps):
-        end = start + 1
-        while end < len(timestamps) and timestamps[end] == timestamps[start]:
-            end += 1
-        reference = values[start]
-        if not np.all(values[start:end] == reference):
+class _PacketCollector:
+    def __init__(
+        self,
+        dimensions: int,
+        zip_path: Path,
+        member_name: str,
+        modality: str,
+    ) -> None:
+        self.dimensions = dimensions
+        self.zip_path = zip_path
+        self.member_name = member_name
+        self.modality = modality
+        self.current_timestamp: int | None = None
+        self.current_values: list[np.ndarray] = []
+        self.packets: dict[int, np.ndarray] = {}
+
+    def add(self, timestamp: int, values: np.ndarray) -> None:
+        if timestamp <= 0:
+            return
+        values = np.asarray(values, dtype=np.float32).reshape(-1, self.dimensions)
+        if self.current_timestamp is None:
+            self.current_timestamp = timestamp
+        elif timestamp < self.current_timestamp:
             raise UnsupportedSensorFormatError(
-                zip_path,
-                modality,
-                f"multisection {modality} samples conflict at an expanded timestamp",
+                self.zip_path,
+                self.member_name,
+                f"multisection {self.modality} packet timestamps are nonmonotonic",
             )
-        unique_timestamps.append(int(timestamps[start]))
-        unique_values.append(reference)
-        start = end
-    return SensorSeries(
-        timestamp_ms=np.asarray(unique_timestamps, dtype=np.int64),
-        values=np.asarray(unique_values, dtype=np.float32),
-    )
+        elif timestamp != self.current_timestamp:
+            self._flush()
+            self.current_timestamp = timestamp
+        self.current_values.append(values)
+
+    def _flush(self) -> None:
+        if self.current_timestamp is None or not self.current_values:
+            self.current_values = []
+            return
+        packet = np.concatenate(self.current_values, axis=0)
+        previous = self.packets.get(self.current_timestamp)
+        if previous is not None and not np.array_equal(previous, packet):
+            raise UnsupportedSensorFormatError(
+                self.zip_path,
+                self.member_name,
+                f"multisection {self.modality} samples conflict at a packet timestamp",
+            )
+        self.packets[self.current_timestamp] = packet
+        self.current_timestamp = None
+        self.current_values = []
+
+    def finish(self) -> dict[int, np.ndarray]:
+        self._flush()
+        return self.packets
+
+
+def _merge_exact_packets(
+    packet_maps: list[dict[int, np.ndarray]],
+    zip_path: Path,
+    member_name: str,
+    modality: str,
+    dimensions: int,
+    timestamp_anchor: str,
+) -> SensorSeries:
+    merged: dict[int, np.ndarray] = {}
+    for packets in packet_maps:
+        for timestamp, values in packets.items():
+            previous = merged.get(timestamp)
+            if previous is not None and not np.array_equal(previous, values):
+                raise UnsupportedSensorFormatError(
+                    zip_path,
+                    member_name,
+                    f"multisection {modality} samples conflict at a packet timestamp",
+                )
+            merged[timestamp] = values
+    expander = _PacketExpander(dimensions, timestamp_anchor)
+    for timestamp in sorted(merged):
+        expander.add(timestamp, merged[timestamp])
+    return expander.finish()
 
 
 def parse_multisection_sensor_zip(
@@ -401,25 +444,29 @@ def parse_multisection_sensor_zip(
             )
 
         raw_handle = archive.open(member_name)
-        section_series: list[tuple[SensorSeries, SensorSeries, SensorSeries]] = []
+        section_packets: list[
+            tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[int, np.ndarray]]
+        ] = []
         try:
             raw_handle.seek(header_offsets[0])
             text_handle = io.TextIOWrapper(raw_handle, encoding="utf-8", errors="strict", newline="")
             reader = csv.reader(text_handle, delimiter="\t")
-            expanders: tuple[_PacketExpander, _PacketExpander, _PacketExpander] | None = None
+            collectors: tuple[_PacketCollector, _PacketCollector, _PacketCollector] | None = None
             section_count = 0
             for row_number, row in enumerate(reader, start=1):
                 if [value.strip() for value in row] == SENSOR_COLUMNS:
-                    if expanders is not None:
-                        section_series.append(tuple(expander.finish() for expander in expanders))
-                    expanders = (
-                        _PacketExpander(3, timestamp_anchor),
-                        _PacketExpander(3, timestamp_anchor),
-                        _PacketExpander(1, timestamp_anchor),
+                    if collectors is not None:
+                        section_packets.append(
+                            tuple(collector.finish() for collector in collectors)
+                        )
+                    collectors = (
+                        _PacketCollector(3, zip_path, member_name, "acc"),
+                        _PacketCollector(3, zip_path, member_name, "gyro"),
+                        _PacketCollector(1, zip_path, member_name, "ppg"),
                     )
                     section_count += 1
                     continue
-                if expanders is None:
+                if collectors is None:
                     raise UnsupportedSensorFormatError(
                         zip_path, member_name, "text suffix does not start with the standard header"
                     )
@@ -429,8 +476,8 @@ def parse_multisection_sensor_zip(
                         member_name,
                         f"row {row_number} has {len(row)} columns; expected {len(SENSOR_COLUMNS)}",
                     )
-                acc_expander, gyro_expander, ppg_expander = expanders
-                acc_expander.add(
+                acc_collector, gyro_collector, ppg_collector = collectors
+                acc_collector.add(
                     _parse_timestamp(row[0], row_number, "ACC_TIME"),
                     np.asarray(
                         [_parse_sensor_value(row[index], row_number, SENSOR_COLUMNS[index])
@@ -438,7 +485,7 @@ def parse_multisection_sensor_zip(
                         dtype=np.float32,
                     ),
                 )
-                gyro_expander.add(
+                gyro_collector.add(
                     _parse_timestamp(row[2], row_number, "GYRO_TIME"),
                     np.asarray(
                         [_parse_sensor_value(row[index], row_number, SENSOR_COLUMNS[index])
@@ -448,7 +495,7 @@ def parse_multisection_sensor_zip(
                 )
                 ppg_timestamp = _parse_timestamp(row[1], row_number, "PPG_TIME")
                 if ppg_timestamp > 0:
-                    ppg_expander.add(
+                    ppg_collector.add(
                         ppg_timestamp,
                         np.asarray(
                             [_parse_sensor_value(row[index], row_number, SENSOR_COLUMNS[index])
@@ -456,23 +503,46 @@ def parse_multisection_sensor_zip(
                             dtype=np.float32,
                         ).reshape(-1, 1),
                     )
-            if expanders is not None:
-                section_series.append(tuple(expander.finish() for expander in expanders))
+            if collectors is not None:
+                section_packets.append(
+                    tuple(collector.finish() for collector in collectors)
+                )
         except (UnicodeDecodeError, csv.Error) as error:
             raise UnsupportedSensorFormatError(
                 zip_path, member_name, "multisection text is not valid UTF-8 TSV"
             ) from error
         finally:
             raw_handle.close()
-        if section_count != len(header_offsets) or len(section_series) != len(header_offsets):
+        if section_count != len(header_offsets) or len(section_packets) != len(header_offsets):
             raise UnsupportedSensorFormatError(
                 zip_path, member_name, "not every repeated-header section was parsed"
             )
 
     return ParsedAttachment(
-        acc=_merge_exact_sensor_series([item[0] for item in section_series], zip_path, "acc"),
-        gyro=_merge_exact_sensor_series([item[1] for item in section_series], zip_path, "gyro"),
-        ppg=_merge_exact_sensor_series([item[2] for item in section_series], zip_path, "ppg"),
+        acc=_merge_exact_packets(
+            [item[0] for item in section_packets],
+            zip_path,
+            member_name,
+            "acc",
+            3,
+            timestamp_anchor,
+        ),
+        gyro=_merge_exact_packets(
+            [item[1] for item in section_packets],
+            zip_path,
+            member_name,
+            "gyro",
+            3,
+            timestamp_anchor,
+        ),
+        ppg=_merge_exact_packets(
+            [item[2] for item in section_packets],
+            zip_path,
+            member_name,
+            "ppg",
+            1,
+            timestamp_anchor,
+        ),
         source_name=member_name,
         info=info,
         parser_status="recovered_multisection_deduplicated",
@@ -498,9 +568,14 @@ def inspect_ppg_layout(zip_path: str | Path, maximum_rows: int = 100_000) -> dic
                 | {f"PPG{number}" for number in range(1, 45)},
             )
         except UnsupportedSensorFormatError as error:
+            status = (
+                "repeated_header"
+                if error.reason == "standard sensor header occurs more than once"
+                else "unsupported_binary"
+            )
             return {
                 "zip_name": zip_path.name,
-                "status": "unsupported_binary",
+                "status": status,
                 "text_member": text_name,
                 "error": error.reason,
                 "rows_scanned": 0,
@@ -513,6 +588,19 @@ def inspect_ppg_layout(zip_path: str | Path, maximum_rows: int = 100_000) -> dic
                 for row_number, row in enumerate(reader):
                     if row_number >= maximum_rows:
                         break
+                    if [value.strip() for value in row] == SENSOR_COLUMNS:
+                        return {
+                            "zip_name": zip_path.name,
+                            "status": "repeated_header",
+                            "text_member": text_name,
+                            "error": "standard sensor header occurs more than once",
+                            "text_offset_bytes": text_offset,
+                            "rows_scanned": row_number + 1,
+                            "ppg_rows": ppg_rows,
+                            "nonzero_fraction_by_slot": (
+                                nonzero_counts / max(ppg_rows, 1)
+                            ).round(6).tolist(),
+                        }
                     if len(row) != len(header):
                         raise UnsupportedSensorFormatError(
                             zip_path,

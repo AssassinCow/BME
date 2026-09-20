@@ -90,6 +90,23 @@ def test_recovery_rejects_repeated_standard_header(tmp_path):
         parse_sensor_zip(path)
 
 
+def test_repeated_header_after_documented_header_is_detected(tmp_path):
+    header = "\t".join(SENSOR_COLUMNS) + "\n"
+    data_row = "\t".join(str(value) for value in (
+        [1000, 1000, 1000] + list(range(1, 45)) + [1, 2, 3, 4, 5, 6]
+    )) + "\n"
+    path = tmp_path / "documented-then-repeated.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("sensor.txt", header + data_row + header + data_row)
+
+    layout = inspect_ppg_layout(path)
+
+    assert layout["status"] == "repeated_header"
+    assert layout["error"] == "standard sensor header occurs more than once"
+    with pytest.raises(UnsupportedSensorFormatError, match="more than once"):
+        parse_sensor_zip(path)
+
+
 def test_sensor_parser_rejects_invalid_numeric_value(tmp_path):
     row = [1000, 1000, 1000] + list(range(1, 21)) + [0] * 24 + [1, 2, 3, 4, 5, 6]
     row[-6] = "not-a-number"

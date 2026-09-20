@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import product
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,14 @@ _POSTPROCESS_PARAMETER_NAMES = (
     "merge_gap_seconds",
     "boundary_lookback_seconds",
 )
+
+_POSTPROCESS_WORKER_CONTEXT: tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.DataFrame,
+    float,
+    str,
+] | None = None
 
 
 def _frame_digest(frame: pd.DataFrame, columns: list[str]) -> str:
@@ -50,7 +59,7 @@ def _postprocess_search_signature(
     truth_columns = ["subject_key", "start_ms", "end_ms"]
     payload = {
         "version": 2,
-        "search": search,
+        "search": {key: value for key, value in search.items() if key != "workers"},
         "iou_threshold": float(iou_threshold),
         "predictions": _frame_digest(predictions, prediction_columns),
         "truth": _frame_digest(truth, truth_columns),
@@ -253,6 +262,62 @@ def probabilities_to_events(
     return pd.DataFrame(events, columns=["subject_key", "session_id", "start_ms", "end_ms", "score"])
 
 
+def _evaluate_postprocess_combination(
+    combination: tuple[float, ...],
+    predictions: pd.DataFrame,
+    truth: pd.DataFrame,
+    ignore: pd.DataFrame,
+    iou_threshold: float,
+    matching_method: str,
+) -> dict[str, float]:
+    parameters = dict(zip(_POSTPROCESS_PARAMETER_NAMES, combination))
+    events = probabilities_to_events(predictions, **parameters)
+    metrics, _ = evaluate_events(
+        truth,
+        events,
+        iou_threshold=iou_threshold,
+        method=matching_method,
+        ignore=ignore,
+    )
+    boundary_values = [
+        value
+        for value in (metrics["start_mae_seconds"], metrics["end_mae_seconds"])
+        if np.isfinite(value)
+    ]
+    boundary_mae = float(np.mean(boundary_values)) if boundary_values else float("inf")
+    return {
+        **parameters,
+        **{name: float(value) for name, value in metrics.items()},
+        "boundary_mae_seconds": boundary_mae,
+    }
+
+
+def _initialize_postprocess_worker(
+    predictions: pd.DataFrame,
+    truth: pd.DataFrame,
+    ignore: pd.DataFrame,
+    iou_threshold: float,
+    matching_method: str,
+) -> None:
+    global _POSTPROCESS_WORKER_CONTEXT
+    _POSTPROCESS_WORKER_CONTEXT = (
+        predictions,
+        truth,
+        ignore,
+        iou_threshold,
+        matching_method,
+    )
+
+
+def _postprocess_worker(combination: tuple[float, ...]) -> dict[str, float]:
+    if _POSTPROCESS_WORKER_CONTEXT is None:
+        raise RuntimeError("postprocess worker was not initialized")
+    return _evaluate_postprocess_combination(
+        combination,
+        *_POSTPROCESS_WORKER_CONTEXT,
+    )
+
+
 def tune_postprocess_parameters(
     predictions: pd.DataFrame,
     truth: pd.DataFrame,
@@ -262,7 +327,10 @@ def tune_postprocess_parameters(
     show_progress: bool = True,
     ignore: pd.DataFrame | None = None,
     matching_method: str = "max_cardinality_iou",
+    workers: int = 1,
 ) -> tuple[dict[str, float], pd.DataFrame]:
+    if workers < 1:
+        raise ValueError("workers must be at least 1")
     if ignore is None:
         ignore = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
     high_values = [float(value) for value in search.get("high_threshold", [])]
@@ -303,35 +371,40 @@ def tune_postprocess_parameters(
         unit="combination",
         disable=not show_progress,
     )
-    for combination in combinations:
-        if combination in completed:
-            continue
-        parameters = dict(zip(_POSTPROCESS_PARAMETER_NAMES, combination))
-        events = probabilities_to_events(predictions, **parameters)
-        metrics, _ = evaluate_events(
-            truth,
-            events,
-            iou_threshold=iou_threshold,
-            method=matching_method,
-            ignore=ignore,
-        )
-        boundary_values = [
-            value
-            for value in (metrics["start_mae_seconds"], metrics["end_mae_seconds"])
-            if np.isfinite(value)
-        ]
-        boundary_mae = float(np.mean(boundary_values)) if boundary_values else float("inf")
-        row = {
-            **parameters,
-            **{name: float(value) for name, value in metrics.items()},
-            "boundary_mae_seconds": boundary_mae,
-        }
+    pending = [combination for combination in combinations if combination not in completed]
+
+    def record_result(combination: tuple[float, ...], row: dict[str, float]) -> None:
         rows.append(row)
         completed.add(combination)
         if checkpoint_path is not None:
             _append_search_checkpoint(checkpoint_path, row)
         progress.update(1)
-        progress.set_postfix(f1=f"{metrics['f1']:.4f}")
+        progress.set_postfix(f1=f"{row['f1']:.4f}")
+
+    if workers == 1:
+        for combination in pending:
+            row = _evaluate_postprocess_combination(
+                combination,
+                predictions,
+                truth,
+                ignore,
+                iou_threshold,
+                matching_method,
+            )
+            record_result(combination, row)
+    elif pending:
+        with ProcessPoolExecutor(
+            max_workers=min(workers, len(pending)),
+            initializer=_initialize_postprocess_worker,
+            initargs=(predictions, truth, ignore, iou_threshold, matching_method),
+        ) as executor:
+            futures = {
+                executor.submit(_postprocess_worker, combination): combination
+                for combination in pending
+            }
+            for future in as_completed(futures):
+                combination = futures[future]
+                record_result(combination, future.result())
     progress.close()
 
     if not rows:
@@ -340,8 +413,8 @@ def tune_postprocess_parameters(
         subset=list(_POSTPROCESS_PARAMETER_NAMES), keep="last"
     )
     trials = trials.sort_values(
-        ["f1", "boundary_mae_seconds", "precision"],
-        ascending=[False, True, False],
+        ["f1", "boundary_mae_seconds", "precision", *_POSTPROCESS_PARAMETER_NAMES],
+        ascending=[False, True, False, *([True] * len(_POSTPROCESS_PARAMETER_NAMES))],
     ).reset_index(drop=True)
     best_parameters = {
         name: float(trials.iloc[0][name]) for name in _POSTPROCESS_PARAMETER_NAMES

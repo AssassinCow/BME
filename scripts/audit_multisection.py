@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 import _bootstrap  # noqa: F401
+
 from bme_eating.cli import command_audit_multisection
 
 
@@ -11,6 +12,7 @@ def main() -> None:
         description="Audit repeated-header sensor attachments without modifying raw data."
     )
     parser.add_argument("--config", default="configs/base.yaml", help="YAML configuration path.")
+    parser.add_argument("--workers", type=int, default=None, help="Parallel worker processes.")
     command_audit_multisection(parser.parse_args())
 
 
