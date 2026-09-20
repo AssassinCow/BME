@@ -15,6 +15,7 @@ from bme_eating.fusion import (
     fuse_prediction_frames,
     prepare_fusion_run_root,
     sha256_file,
+    validate_clean_baseline_experiment,
     validate_frozen_baseline_fold,
     validate_fusion_run_name,
 )
@@ -321,11 +322,29 @@ def test_frozen_baseline_gate_detects_artifact_changes(tmp_path):
         },
         "hashes": {name: sha256_file(path) for name, path in tracked.items()},
         "artifact_hashes": artifact_hashes,
+        "resolved_config_sha256": "config-hash",
     }
     (fold_dir / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
 
     validate_frozen_baseline_fold(output_root, "baseline", 0, "3ca55bb")
+    with pytest.raises(RuntimeError, match="backfilled provenance"):
+        validate_frozen_baseline_fold(
+            output_root, "baseline", 0, "3ca55bb", require_clean=True
+        )
+
+    manifest.pop("artifact_provenance")
+    manifest["git"] = {"commit": "3ca55bb", "dirty": False}
+    (fold_dir / "run_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    validate_frozen_baseline_fold(
+        output_root, "baseline", 0, "3ca55bb", require_clean=True
+    )
+    clean = validate_clean_baseline_experiment(
+        output_root, "baseline", "3ca55bb", number_of_folds=1
+    )
+    assert set(clean) == {0}
     (fold_dir / "test_predictions.parquet").write_bytes(b"changed")
 
     with pytest.raises(RuntimeError, match="artifact hash changed"):
-        validate_frozen_baseline_fold(output_root, "baseline", 0, "3ca55bb")
+        validate_frozen_baseline_fold(
+            output_root, "baseline", 0, "3ca55bb", require_clean=True
+        )

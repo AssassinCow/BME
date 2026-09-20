@@ -35,6 +35,21 @@ def main() -> None:
             "directory already exists."
         ),
     )
+    parser.add_argument(
+        "--baseline-source-commit",
+        help=(
+            "Expected Git commit recorded by the baseline manifests. Use the commit "
+            "that produced a newly retrained baseline."
+        ),
+    )
+    parser.add_argument(
+        "--require-clean-baseline",
+        action="store_true",
+        help=(
+            "Require baseline manifests from a clean, non-backfilled working tree at "
+            "the expected commit."
+        ),
+    )
     parser.add_argument("--resume", help="Resume from this fusion fold's last.pt checkpoint.")
     args = parser.parse_args()
     try:

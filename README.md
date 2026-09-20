@@ -371,3 +371,21 @@ python scripts/train_fusion.py `
 [`docs/dtp_fusion_runbook_2026-09-20.md`](docs/dtp_fusion_runbook_2026-09-20.md)。
 fold 0 外层结果被用作继续/停止门禁，因此最终五折汇总是经过 fold 0 条件筛选的本地结果，
 不能解释为完全无偏的独立测试成绩，更不能称为官方分数。
+
+## 12. 从原始下载数据全量重新运行
+
+第 11 节是复用旧 baseline 的限时路线。需要连审计、预处理、质量快照、特征和 baseline 五折
+全部从零重建时，使用独立输出根目录运行：
+
+```powershell
+$stamp = Get-Date -Format "yyyyMMdd_HHmmss"
+powershell -ExecutionPolicy Bypass -File scripts/run_clean_retrain.ps1 `
+  -OutputRoot "D:\BME2026\outputs_clean_$stamp" `
+  -SubjectSaltFile "D:\BME2026\outputs\private\subject_salt.hex"
+```
+
+新输出目录必须不存在，Git 工作树必须 clean。脚本不会读取任何旧派生数据或训练产物；仅复制
+私有 salt 以保持匿名键和五折划分可比。质量报告打印后必须人工输入 `FREEZE` 才会开始构建
+特征和训练。baseline 五折完成后，fusion 会强制核验它们来自本次同一 clean commit，而不是
+回填的历史 baseline。完整说明见
+[`docs/clean_retrain_runbook_2026-09-20.md`](docs/clean_retrain_runbook_2026-09-20.md)。

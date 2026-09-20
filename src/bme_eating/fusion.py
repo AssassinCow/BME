@@ -114,15 +114,31 @@ def validate_frozen_baseline_fold(
     baseline_name: str,
     fold: int,
     source_commit: str,
+    *,
+    require_clean: bool = False,
 ) -> dict[str, Any]:
     fold_dir = output_root / "experiments" / baseline_name / f"fold_{fold}"
     missing = [name for name in FROZEN_BASELINE_FILES if not (fold_dir / name).is_file()]
     if missing:
         raise FileNotFoundError(f"Frozen baseline fold {fold} is incomplete; missing: {missing}")
     manifest = _read_json(fold_dir / "run_manifest.json")
+    git_record = manifest.get("git", {})
+    if require_clean:
+        if manifest.get("backfilled") or "artifact_provenance" in manifest:
+            raise RuntimeError(
+                f"Baseline fold {fold} uses a backfilled provenance record; "
+                "a clean retrained baseline is required"
+            )
+        if git_record.get("dirty") is not False:
+            raise RuntimeError(f"Baseline fold {fold} was produced from a dirty working tree")
+        if str(git_record.get("commit", "")) != source_commit:
+            raise RuntimeError(
+                f"Baseline fold {fold} Git commit is "
+                f"{git_record.get('commit')!r}, expected {source_commit!r}"
+            )
     declared_commit = str(
         manifest.get("artifact_provenance", {}).get(
-            "claimed_source_commit", manifest.get("git", {}).get("commit", "")
+            "claimed_source_commit", git_record.get("commit", "")
         )
     )
     if declared_commit != source_commit:
@@ -165,6 +181,40 @@ def validate_frozen_baseline_fold(
         "artifact_hashes": {name: artifact_hashes[name] for name in required_artifacts},
         "input_hashes": {name: input_hashes[name] for name in FROZEN_INPUT_HASHES},
     }
+
+
+def validate_clean_baseline_experiment(
+    output_root: Path,
+    baseline_name: str,
+    source_commit: str,
+    *,
+    number_of_folds: int = 5,
+) -> dict[int, dict[str, Any]]:
+    if number_of_folds <= 0:
+        raise ValueError("number_of_folds must be positive")
+    folds = {
+        fold: validate_frozen_baseline_fold(
+            output_root,
+            baseline_name,
+            fold,
+            source_commit,
+            require_clean=True,
+        )
+        for fold in range(number_of_folds)
+    }
+    config_hashes = {
+        str(info["manifest"].get("resolved_config_sha256", ""))
+        for info in folds.values()
+    }
+    if "" in config_hashes or len(config_hashes) != 1:
+        raise RuntimeError("Clean baseline folds do not share one resolved configuration hash")
+    input_fingerprints = {
+        json.dumps(info["input_hashes"], sort_keys=True, separators=(",", ":"))
+        for info in folds.values()
+    }
+    if len(input_fingerprints) != 1:
+        raise RuntimeError("Clean baseline folds do not share one data and split fingerprint")
+    return folds
 
 
 def _validate_prediction_frame(frame: pd.DataFrame, name: str) -> None:

@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import platform
+import re
 import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -46,6 +47,7 @@ from bme_eating.fusion import (
     json_safe,
     metrics_summary_from_suite,
     prepare_fusion_run_root,
+    validate_clean_baseline_experiment,
     validate_frozen_baseline_fold,
     validate_fusion_run_name,
 )
@@ -1244,8 +1246,31 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     _require_prior_fusion_folds(output_root, experiment_name, fold)
 
     baseline_name = str(experiment.get("baseline_name", "baseline"))
-    source_commit = str(experiment.get("baseline_source_commit", "3ca55bb"))
-    baseline_info = validate_frozen_baseline_fold(output_root, baseline_name, fold, source_commit)
+    source_commit = str(
+        getattr(args, "baseline_source_commit", None)
+        or experiment.get("baseline_source_commit", "3ca55bb")
+    ).strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{7,40}", source_commit):
+        raise ValueError("Baseline source commit must be a 7-40 character hexadecimal Git hash")
+    require_clean_baseline = bool(getattr(args, "require_clean_baseline", False))
+    config["experiment"]["baseline_source_commit"] = source_commit
+    config["experiment"]["require_clean_baseline"] = require_clean_baseline
+    if require_clean_baseline and fold == 0:
+        clean_baseline_folds = validate_clean_baseline_experiment(
+            output_root,
+            baseline_name,
+            source_commit,
+            number_of_folds=int(config["data"]["subject_folds"]),
+        )
+        baseline_info = clean_baseline_folds[fold]
+    else:
+        baseline_info = validate_frozen_baseline_fold(
+            output_root,
+            baseline_name,
+            fold,
+            source_commit,
+            require_clean=require_clean_baseline,
+        )
     baseline_dir = Path(baseline_info["directory"])
     experiment_root = prepare_fusion_run_root(
         output_root / "experiments",
