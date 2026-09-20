@@ -25,8 +25,13 @@ def main() -> None:
 
     config = load_config(args.config)
     _, output_root = resolve_roots(config)
-    default_experiment = (
-        "baseline_dyadic" if config.get("features", {}).get("include_dyadic") else "baseline"
+    default_experiment = str(
+        config.get("experiment", {}).get(
+            "name",
+            "baseline_dyadic"
+            if config.get("features", {}).get("include_dyadic")
+            else "baseline",
+        )
     )
     experiments = args.experiments or [default_experiment]
     experiment_roots = {

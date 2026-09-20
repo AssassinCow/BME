@@ -37,6 +37,25 @@ def test_compact_motion_bucket_keeps_terminal_value_and_real_time_trend():
     assert np.isclose(features["bucket_acc_slope"], expected_slope)
 
 
+def test_compact_motion_bucket_can_select_nonredundant_statistics():
+    values = np.ones((4, 6), dtype=np.float32)
+    mask = np.ones((4, 6), dtype=bool)
+
+    features = _compact_motion_bucket_features(
+        values,
+        mask,
+        "bucket",
+        ["mean", "std", "slope", "last", "valid_fraction"],
+    )
+
+    assert set(features) == {
+        f"bucket_{sensor}_{statistic}"
+        for sensor in ("acc", "gyro")
+        for statistic in ("mean", "std", "slope", "last", "valid_fraction")
+    }
+    assert not any(name.endswith(("_rms", "_maximum")) for name in features)
+
+
 def test_compact_ppg_bucket_reports_validity_terminal_and_zero_runs():
     values = np.array([4.0, 0.0, 0.0, 99.0, 8.0], dtype=np.float32)
     mask = np.array([True, True, True, False, True])

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from bme_eating.data.deep_dataset import DTPDataset, Normalization
-from bme_eating.models.dtp_sqf import DTPSQF, DyadicPool
+from bme_eating.models.dtp_sqf import DTPSQF, DyadicPool, logits_to_probability_arrays
 
 
 MODEL_CONFIG = {
@@ -145,3 +145,15 @@ def test_causal_model_ignores_unprovided_future():
         first = model(batch)["state_logit"]
         second = model({key: value.clone() for key, value in batch.items()})["state_logit"]
     torch.testing.assert_close(first, second)
+
+
+def test_bfloat16_logits_are_converted_before_numpy():
+    logits = torch.zeros(2, dtype=torch.bfloat16)
+    state, start, end = logits_to_probability_arrays(
+        {"state_logit": logits, "start_logit": logits, "end_logit": logits}
+    )
+
+    assert state.dtype == np.float32
+    assert state.tolist() == [0.5, 0.5]
+    assert start.tolist() == [0.5, 0.5]
+    assert end.tolist() == [0.5, 0.5]

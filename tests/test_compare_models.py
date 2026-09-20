@@ -16,23 +16,39 @@ def _rows(true_positive: int, false_positive: int, false_negative: int, fp_hour:
                 "sensitivity": sensitivity,
                 "f1": f1,
                 "false_positives_per_observed_hour": fp_hour,
+                "start_mae_seconds": 100.0,
+                "end_mae_seconds": 50.0,
             },
             "different": {"truth_events": 10, "matched_events": 8},
+            "same": {"truth_events": 10, "matched_events": 8},
+            "strict": {
+                "true_positive": true_positive,
+                "false_positive": false_positive,
+                "false_negative": false_negative,
+            },
+            "by_subject": {
+                f"subject-{fold}": {
+                    "true_positive": true_positive,
+                    "false_positive": false_positive,
+                    "false_negative": false_negative,
+                }
+            },
+            "fingerprints": {"subject_folds": "same", "events": "same"},
         }
         for fold in range(5)
     ]
 
 
 def test_model_promotion_accepts_candidate_meeting_all_gates():
-    baseline = _rows(70, 30, 30, 1.0)
-    candidate = _rows(76, 24, 24, 1.1)
+    baseline = _rows(45, 35, 55, 0.02)
+    candidate = _rows(76, 24, 24, 0.025)
     decision = evaluate_promotion(baseline, candidate)
     assert decision["promote"]
 
 
 def test_model_promotion_rejects_any_zero_recall_fold():
-    baseline = _rows(70, 30, 30, 1.0)
-    candidate = _rows(76, 24, 24, 1.1)
+    baseline = _rows(45, 35, 55, 0.02)
+    candidate = _rows(76, 24, 24, 0.025)
     candidate[2]["metrics"].update(
         {"true_positive": 0, "false_negative": 100, "sensitivity": 0.0, "f1": 0.0}
     )

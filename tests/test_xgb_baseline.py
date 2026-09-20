@@ -1,7 +1,14 @@
 import numpy as np
 import pandas as pd
 
-from bme_eating.models.xgb_baseline import _event_balanced_weights, train_xgboost_fold
+from bme_eating.models.xgb_baseline import (
+    _event_balanced_weights,
+    _sample_boundary_rows,
+    feature_columns,
+    load_xgboost_fold,
+    predict_xgboost,
+    train_xgboost_fold,
+)
 
 
 def test_positive_sample_weights_are_balanced_by_event():
@@ -14,6 +21,35 @@ def test_positive_sample_weights_are_balanced_by_event():
     weights = _event_balanced_weights(frame)
     assert np.isclose(weights[:3].sum(), weights[3])
     assert weights[4] == 1.0
+
+
+def test_different_hand_weight_is_normalized_and_never_a_feature():
+    frame = pd.DataFrame(
+        {
+            "state_target": [1.0, 1.0, 1.0, 0.0],
+            "event_id": ["same", "different", "different", ""],
+            "hand_relation": ["same", "different", "different", "background"],
+            "feature_a": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+    weights = _event_balanced_weights(frame, different_hand_weight=2.0)
+    assert np.isclose(weights[:3].sum(), 3.0)
+    assert weights[1:3].sum() > weights[0]
+    assert "hand_relation" not in feature_columns(frame)
+
+
+def test_censored_boundaries_are_excluded_from_boundary_training():
+    frame = pd.DataFrame(
+        {
+            "start_target": [1.0, 1.0, 0.0, 0.0],
+            "start_loss_mask": [1.0, 0.0, 1.0, 0.0],
+        }
+    )
+    selected, remaining = _sample_boundary_rows(
+        frame, "start_target", "start_loss_mask", 20.0, 2026
+    )
+    assert set(selected.index) == {0, 2}
+    assert remaining.empty
 
 
 def test_xgboost_search_checkpoint_resumes_completed_trials(tmp_path):
@@ -64,3 +100,14 @@ def test_xgboost_search_checkpoint_resumes_completed_trials(tmp_path):
 
     assert checkpoint.read_text(encoding="utf-8").startswith(first_checkpoint)
     assert len(pd.read_csv(tmp_path / "trials.csv")) == 2
+    loaded, columns = load_xgboost_fold(tmp_path)
+    predictions = predict_xgboost(loaded, features.iloc[:2], columns)
+    assert list(predictions.columns) == [
+        "subject_key",
+        "segment_id",
+        "session_id",
+        "timestamp_ms",
+        "state_probability",
+        "start_probability",
+        "end_probability",
+    ]

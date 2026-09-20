@@ -242,3 +242,69 @@ python scripts/train_xgboost.py --config configs/baseline.yaml --fold 0
 - 不根据外层测试折手工调阈值或选择模型。
 - 官方接口到达后只新增输入/输出适配层，不修改已冻结的折分和证据链。
 - 官网提交、提前测评邮件或代表队伍联系组委会，必须由参赛者最终人工确认和执行。
+
+## 10. 9 月 20 日冻结基线与限时核心候选
+
+当前冻结基线提交为 `3ca55bb`，完整五折本地评估为：Micro F1 `0.4701`、
+strict-no-ignore macro F1 `0.4350`、同侧/异侧召回 `0.6429/0.1538`、
+平均 FP/h `0.023703`、加权起止 MAE `232.72/92.98` 秒。这些都是本地口径，
+不得称为官方分数。当前 v2 数据状态是 1112 个附件中 1078 个预处理、45 个精确
+多段恢复、34 个隔离，生成 2125 个 segment、1153 个 session 和 267 个事件，
+其中 161 个可评估事件。
+
+冻结 `baseline` 不覆盖。限时候选使用独立配置和目录：
+
+```powershell
+# 旧 baseline 产物没有 run_manifest 时，先补录当前质量/数据/折分指纹
+python scripts/backfill_baseline_manifests.py --source-commit 3ca55bb
+
+# 只复用已有 baseline OOF/test 概率，搜索快慢双 EMA 后处理
+0..4 | ForEach-Object {
+  python scripts/retune_postprocess.py --config configs/baseline_fastslow.yaml --fold $_
+}
+
+# 独立起止边界头 + OOF 异侧权重选择
+0..4 | ForEach-Object {
+  python scripts/train_xgboost.py --config configs/baseline_boundary.yaml --fold $_
+}
+
+# 最后一次精简指数桶实验：只生成 OOF，不查看 fold 0 外层结果
+python scripts/build_features.py --config configs/baseline_dyadic_lite.yaml --workers 8
+python scripts/train_xgboost.py --config configs/baseline_dyadic_lite.yaml --fold 0 --oof-only
+python scripts/screen_dyadic_oof.py --config configs/baseline_dyadic_lite.yaml
+```
+
+`screen_dyadic_oof.py` 只读取 fold 0 外层训练受试者的三折 OOF 预测；不会读取 fold 0
+test 预测。`baseline_dyadic_lite` 保留局部 PPG 特征，但只增加
+`3/6/12/24/48/96` 秒互不重叠的运动历史桶；每个 ACC/GYRO 桶只保留
+`mean/std/slope/last/valid_fraction`。旧版 192 秒运动桶、全部 PPG 历史桶和
+`rms/maximum` 冗余桶统计不再使用。特征写到独立的
+`features\baseline_dyadic_lite.parquet`，不会覆盖旧 dyadic 产物。
+
+只有 OOF 同时达到 F1 `+0.015`、异侧召回 `+0.03`、FP/h 不超过新 baseline
+`1.2x`，且所有后处理参数均未触碰搜索边界，才运行外层 fold 0 和后续四折。未通过
+即永久停止指数桶路线，不再换桶长或扩大搜索。每折生成 `run_manifest.json`，记录
+提交、dirty 状态、配置/数据/模型哈希、环境、GPU、命令和随机种子，但不记录原始
+数据、身份、凭据或本机绝对路径。
+
+完整的 4080 命令顺序见
+[`docs/baseline_and_dyadic_runbook_2026-09-20.md`](docs/baseline_and_dyadic_runbook_2026-09-20.md)。
+
+最终统一比较：
+
+```powershell
+python scripts/compare_models.py `
+  --baseline "$env:BME_OUTPUT_ROOT\v2\experiments\baseline_boundary" `
+  --candidate "$env:BME_OUTPUT_ROOT\v2\experiments\baseline_dyadic_lite" `
+  --output "$env:BME_OUTPUT_ROOT\v2\experiments\baseline_dyadic_lite_promotion.json"
+
+python scripts/compare_models.py `
+  --baseline "$env:BME_OUTPUT_ROOT\v2\experiments\baseline" `
+  --candidate "$env:BME_OUTPUT_ROOT\v2\experiments\baseline_dyadic_lite" `
+  --output "$env:BME_OUTPUT_ROOT\v2\experiments\baseline_dyadic_lite_vs_frozen.json"
+```
+
+比较器执行计划中的全部硬门禁和 2000 次受试者级配对 bootstrap；数据、折分或质量
+指纹变化会直接阻止晋级。官方 partial 计分、一对一匹配细节、提交字段和测试执行接口
+仍为 `UNKNOWN`，因此继续同时保留本地 max-cardinality、旧 Hungarian、greedy 和
+strict-no-ignore 结果。

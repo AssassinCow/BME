@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -66,3 +67,14 @@ def resolve_roots(config: dict[str, Any]) -> tuple[Path, Path]:
     config["_output_base_path"] = str(output_base)
     output_root.mkdir(parents=True, exist_ok=True)
     return data_root, output_root
+
+
+def feature_artifact_name(config: dict[str, Any]) -> str:
+    """Return the configured feature artifact stem without allowing path traversal."""
+
+    features = config.get("features", {})
+    default = "baseline_dyadic" if features.get("include_dyadic", False) else "baseline"
+    name = str(features.get("artifact_name", default)).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise ValueError(f"Invalid features.artifact_name: {name!r}")
+    return name

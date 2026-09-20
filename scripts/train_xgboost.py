@@ -12,7 +12,10 @@ def main() -> None:
     parser.add_argument(
         "--config",
         default="configs/baseline.yaml",
-        help="Model configuration path. Use baseline_dyadic.yaml for dyadic features.",
+        help=(
+            "Model configuration path. Use baseline_boundary.yaml for the new baseline "
+            "or baseline_dyadic_lite.yaml for the gated dyadic candidate."
+        ),
     )
     parser.add_argument(
         "--fold",
@@ -25,6 +28,17 @@ def main() -> None:
         "--no-resume",
         action="store_true",
         help="Ignore the XGBoost trial checkpoint and start the search from scratch.",
+    )
+    parser.add_argument(
+        "--feature-ablation",
+        choices=("fused", "motion_only", "ppg_only"),
+        default=None,
+        help="Optional dyadic feature ablation; non-fused runs use a suffixed experiment name.",
+    )
+    parser.add_argument(
+        "--oof-only",
+        action="store_true",
+        help="Stop after validation OOF calibration; do not evaluate the outer fold.",
     )
     command_train_xgb(parser.parse_args())
 

@@ -1,0 +1,16 @@
+extends: baseline_fastslow.yaml
+
+experiment:
+  name: baseline_boundary
+
+xgboost:
+  different_hand_weight_candidates: [1.0, 1.5, 2.0]
+  boundary_heads:
+    enabled: true
+    version: xgb_boundary_v1
+    positive_weight: 20
+    random_negative_to_positive_ratio: 20
+    hard_negative_to_positive_ratio: 10
+
+postprocess_search:
+  boundary_model_version: xgb_boundary_v1

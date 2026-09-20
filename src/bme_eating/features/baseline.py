@@ -138,17 +138,33 @@ def _compact_motion_bucket_features(
     motion_values: np.ndarray,
     motion_mask: np.ndarray,
     prefix: str,
+    statistics: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, float]:
+    selected = tuple(
+        statistics
+        or ("mean", "std", "rms", "maximum", "slope", "last", "valid_fraction")
+    )
+    supported = {"mean", "std", "rms", "maximum", "slope", "last", "valid_fraction"}
+    unknown = sorted(set(selected) - supported)
+    if unknown:
+        raise ValueError(f"Unsupported motion bucket statistics: {unknown}")
     output: dict[str, float] = {}
     for start, name in ((0, "acc"), (3, "gyro")):
         valid = motion_mask[:, start : start + 3].all(axis=1)
         magnitude = np.linalg.norm(motion_values[:, start : start + 3], axis=1)
         stats = robust_statistics(magnitude[valid])
-        for statistic in ("mean", "std", "rms", "maximum", "slope"):
-            output[f"{prefix}_{name}_{statistic}"] = stats[statistic]
-        output[f"{prefix}_{name}_slope"] = _masked_slope(magnitude, valid)
-        output[f"{prefix}_{name}_last"] = float(magnitude[np.flatnonzero(valid)[-1]]) if valid.any() else 0.0
-        output[f"{prefix}_{name}_valid_fraction"] = float(valid.mean()) if len(valid) else 0.0
+        for statistic in selected:
+            if statistic == "slope":
+                value = _masked_slope(magnitude, valid)
+            elif statistic == "last":
+                value = (
+                    float(magnitude[np.flatnonzero(valid)[-1]]) if valid.any() else 0.0
+                )
+            elif statistic == "valid_fraction":
+                value = float(valid.mean()) if len(valid) else 0.0
+            else:
+                value = float(stats[statistic])
+            output[f"{prefix}_{name}_{statistic}"] = value
     return output
 
 
@@ -189,6 +205,7 @@ def build_segment_features(
     motion_bucket_seconds: list[int],
     ppg_bucket_seconds: list[int],
     context_segments: pd.DataFrame | None = None,
+    motion_bucket_statistics: list[str] | None = None,
 ) -> pd.DataFrame:
     if context_segments is None:
         payload = _load_segment_archive(segment_path)
@@ -244,6 +261,7 @@ def build_segment_features(
                         motion_values[motion_bucket],
                         motion_mask[motion_bucket],
                         f"motion_bucket_{bucket_index}",
+                        motion_bucket_statistics,
                     )
                 )
                 motion_cursor_ms = bucket_start_ms

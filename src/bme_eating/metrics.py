@@ -208,6 +208,12 @@ def evaluate_events(
                     "end_absolute_error_ms": abs(
                         int(prediction_row.end_ms) - int(truth_row.end_ms)
                     ),
+                    "start_signed_error_ms": (
+                        int(prediction_row.start_ms) - int(truth_row.start_ms)
+                    ),
+                    "end_signed_error_ms": (
+                        int(prediction_row.end_ms) - int(truth_row.end_ms)
+                    ),
                 }
             )
     false_positive = total_prediction - true_positive
@@ -232,6 +238,12 @@ def evaluate_events(
         if len(matched)
         else float("nan"),
         "end_mae_seconds": float(matched["end_absolute_error_ms"].mean() / 1000.0)
+        if len(matched)
+        else float("nan"),
+        "start_signed_error_seconds": float(matched["start_signed_error_ms"].mean() / 1000.0)
+        if len(matched)
+        else float("nan"),
+        "end_signed_error_seconds": float(matched["end_signed_error_ms"].mean() / 1000.0)
         if len(matched)
         else float("nan"),
     }

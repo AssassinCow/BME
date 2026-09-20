@@ -96,6 +96,15 @@ def collect_experiment_results(
             "test_rows": _optional_int((metadata or {}).get("test_rows")),
             "high_threshold": _number((postprocess or {}).get("high_threshold")),
             "low_threshold": _number((postprocess or {}).get("low_threshold")),
+            "detector_mode": str(
+                (postprocess or {}).get("detector_mode", "hysteresis_v1")
+            ),
+            "fast_high_threshold": _number(
+                (postprocess or {}).get("fast_high_threshold")
+            ),
+            "slow_high_threshold": _number(
+                (postprocess or {}).get("slow_high_threshold")
+            ),
             "threshold_at_search_boundary": bool(
                 (postprocess or {}).get("threshold_at_search_boundary", False)
             ),

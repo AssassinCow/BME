@@ -25,7 +25,7 @@ from bme_eating.metrics import (
     masked_average_precision,
     partition_evaluation_events,
 )
-from bme_eating.models.dtp_sqf import DTPSQF
+from bme_eating.models.dtp_sqf import DTPSQF, logits_to_probability_arrays
 from bme_eating.models.losses import DTPLoss
 from bme_eating.models.xgb_baseline import assign_train_validation_test
 from bme_eating.postprocess import probabilities_to_events, tune_postprocess_parameters
@@ -76,9 +76,7 @@ def _prediction_frame(
             moved = _move_batch(batch, device)
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=device.type == "cuda"):
                 output = model(moved)
-            state = torch.sigmoid(output["state_logit"]).cpu().numpy()
-            start = torch.sigmoid(output["start_logit"]).cpu().numpy()
-            end = torch.sigmoid(output["end_logit"]).cpu().numpy()
+            state, start, end = logits_to_probability_arrays(output)
             target = batch["state_target"].numpy()
             state_mask = batch.get("state_loss_mask", torch.ones_like(batch["state_target"]))
             targets.extend(target.tolist())

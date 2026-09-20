@@ -2,8 +2,20 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+import numpy as np
 import torch
 from torch import nn
+
+
+def logits_to_probability_arrays(
+    output: dict[str, torch.Tensor],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert autocast logits to NumPy-compatible float32 probabilities."""
+
+    return tuple(
+        torch.sigmoid(output[name].float()).cpu().numpy()
+        for name in ("state_logit", "start_logit", "end_logit")
+    )
 
 
 def _group_count(channels: int) -> int:

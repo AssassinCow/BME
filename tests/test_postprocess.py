@@ -2,7 +2,11 @@ import pandas as pd
 import pytest
 
 import bme_eating.postprocess as postprocess_module
-from bme_eating.postprocess import probabilities_to_events, tune_postprocess_parameters
+from bme_eating.postprocess import (
+    parameters_at_search_boundary,
+    probabilities_to_events,
+    tune_postprocess_parameters,
+)
 
 
 def test_hysteresis_creates_one_event():
@@ -179,4 +183,73 @@ def test_postprocess_merges_predictions_across_segments_in_one_session():
     events = probabilities_to_events(frame, 0.1, 0.6, 0.3, 0, 0, 3)
     assert len(events) == 1
     assert events.iloc[0].session_id == "session"
+
+
+def _dual_frame(values, sessions=None):
+    sessions = sessions or ["session"] * len(values)
+    return pd.DataFrame(
+        {
+            "subject_key": ["s"] * len(values),
+            "segment_id": ["x"] * len(values),
+            "session_id": sessions,
+            "timestamp_ms": [index * 3000 for index in range(len(values))],
+            "state_probability": values,
+            "start_probability": values,
+            "end_probability": [1.0 - value for value in values],
+        }
+    )
+
+
+def _dual_events(frame, **overrides):
+    parameters = {
+        "fast_ema_half_life_seconds": 0.1,
+        "slow_ema_half_life_seconds": 60.0,
+        "fast_high_threshold": 0.6,
+        "slow_high_threshold": 0.95,
+        "exit_threshold_ratio": 0.5,
+        "off_duration_seconds": 6,
+        "minimum_event_seconds": 0,
+        "merge_gap_seconds": 0,
+        "boundary_lookback_seconds": 3,
+    }
+    parameters.update(overrides)
+    return probabilities_to_events(frame, detector_mode="dual_ema", **parameters)
+
+
+def test_dual_ema_rejects_one_spike_and_accepts_short_sustained_burst():
+    assert _dual_events(_dual_frame([0.0, 0.9, 0.0, 0.0, 0.0])).empty
+    assert _dual_events(_dual_frame([0.9, 0.0, 0.0, 0.0])).empty
+    events = _dual_events(_dual_frame([0.0, 0.9, 0.9, 0.0, 0.0]))
+    assert len(events) == 1
+
+
+def test_dual_ema_requires_persistent_exit_and_resets_at_session_boundary():
+    events = _dual_events(_dual_frame([0.8, 0.8, 0.0, 0.8, 0.0, 0.0]))
+    assert len(events) == 1
+    assert events.iloc[0].end_ms >= 12000
+    split = _dual_frame(
+        [0.8, 0.8, 0.8, 0.8], sessions=["first", "first", "second", "second"]
+    )
+    events = _dual_events(split)
+    assert len(events) == 2
+    assert set(events["session_id"]) == {"first", "second"}
+
+
+def test_every_searched_postprocess_parameter_can_trigger_boundary_gate():
+    trials = pd.DataFrame(
+        {
+            "high_threshold": [0.2, 0.4, 0.6],
+            "low_threshold": [0.1, 0.2, 0.3],
+            "merge_gap_seconds": [15, 30, 60],
+            "f1": [0.1, 0.2, 0.3],
+        }
+    )
+    flags = parameters_at_search_boundary(
+        {"high_threshold": 0.4, "low_threshold": 0.1, "merge_gap_seconds": 60}, trials
+    )
+    assert flags == {
+        "high_threshold": False,
+        "low_threshold": True,
+        "merge_gap_seconds": True,
+    }
 

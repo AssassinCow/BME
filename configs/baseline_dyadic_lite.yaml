@@ -1,0 +1,16 @@
+extends: baseline_boundary.yaml
+
+experiment:
+  name: baseline_dyadic_lite
+
+features:
+  artifact_name: baseline_dyadic_lite
+  window_seconds: 15
+  include_dyadic: true
+  motion_bucket_seconds: [3, 6, 12, 24, 48, 96]
+  motion_bucket_statistics: [mean, std, slope, last, valid_fraction]
+  ppg_bucket_seconds: []
+  workers: 8
+
+xgboost:
+  feature_ablation: fused

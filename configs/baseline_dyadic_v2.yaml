@@ -1,0 +1,14 @@
+extends: baseline_boundary.yaml
+
+experiment:
+  name: baseline_dyadic_v2
+
+features:
+  window_seconds: 15
+  include_dyadic: true
+  motion_bucket_seconds: [3, 6, 12, 24, 48, 96, 192]
+  ppg_bucket_seconds: [15, 30, 60, 120, 240]
+  workers: 8
+
+xgboost:
+  feature_ablation: fused

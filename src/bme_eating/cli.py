@@ -15,7 +15,7 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 
-from bme_eating.config import load_config, resolve_roots
+from bme_eating.config import feature_artifact_name, load_config, resolve_roots
 from bme_eating.data.labels import build_anchor_index, classify_event_coverage
 from bme_eating.data.manifest import build_secure_indices
 from bme_eating.data.multisection import (
@@ -39,7 +39,13 @@ from bme_eating.data.splits import create_subject_folds, load_subject_folds
 from bme_eating.features.baseline import build_segment_features
 from bme_eating.metrics import evaluate_events, partition_evaluation_events
 from bme_eating.models.dtp_sqf import DTPSQF
-from bme_eating.postprocess import probabilities_to_events, tune_postprocess_parameters
+from bme_eating.postprocess import (
+    causal_ema,
+    parameters_at_search_boundary,
+    probabilities_to_events,
+    tune_postprocess_parameters,
+)
+from bme_eating.reproducibility import write_run_manifest
 
 _RECOVERABLE_INPUT_ERRORS = (
     OSError,
@@ -584,6 +590,11 @@ def _feature_job(
             [int(value) for value in feature_config["motion_bucket_seconds"]],
             [int(value) for value in feature_config["ppg_bucket_seconds"]],
             context_segments=context_segments,
+            motion_bucket_statistics=[
+                str(value)
+                for value in feature_config.get("motion_bucket_statistics", [])
+            ]
+            or None,
         )
         if cache_path is not None:
             target = Path(cache_path)
@@ -644,7 +655,7 @@ def command_build_features(args: argparse.Namespace) -> None:
     segments = pd.read_parquet(output_root / "indices" / "segments.parquet")
     grouped = list(anchors.groupby("segment_id", sort=False))
     workers = int(args.workers or config["features"]["workers"])
-    feature_name = "baseline_dyadic" if config["features"]["include_dyadic"] else "baseline"
+    feature_name = feature_artifact_name(config)
     cache_dir = output_root / "features" / ".cache" / feature_name
     jobs = []
     for _, group in grouped:
@@ -725,14 +736,34 @@ def _evaluate_prediction_file(
     postprocess_config: dict[str, Any],
     ignore: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict[str, object], pd.DataFrame]:
+    detector_mode = str(postprocess_config.get("detector_mode", "hysteresis_v1"))
+    parameter_names = (
+        (
+            "fast_ema_half_life_seconds",
+            "slow_ema_half_life_seconds",
+            "fast_high_threshold",
+            "slow_high_threshold",
+            "exit_threshold_ratio",
+            "off_duration_seconds",
+            "minimum_event_seconds",
+            "merge_gap_seconds",
+            "boundary_lookback_seconds",
+        )
+        if detector_mode == "dual_ema"
+        else (
+            "ema_half_life_seconds",
+            "high_threshold",
+            "low_threshold",
+            "minimum_event_seconds",
+            "merge_gap_seconds",
+            "boundary_lookback_seconds",
+        )
+    )
+    event_parameters = {
+        name: float(postprocess_config[name]) for name in parameter_names
+    }
     events = probabilities_to_events(
-        predictions,
-        ema_half_life_seconds=float(postprocess_config["ema_half_life_seconds"]),
-        high_threshold=float(postprocess_config["high_threshold"]),
-        low_threshold=float(postprocess_config["low_threshold"]),
-        minimum_event_seconds=float(postprocess_config["minimum_event_seconds"]),
-        merge_gap_seconds=float(postprocess_config["merge_gap_seconds"]),
-        boundary_lookback_seconds=float(postprocess_config["boundary_lookback_seconds"]),
+        predictions, detector_mode=detector_mode, **event_parameters
     )
     output: dict[str, object] = {}
     primary_method = str(
@@ -865,6 +896,39 @@ def _evaluate_prediction_file(
     for row in truth.itertuples(index=False):
         key = (str(row.subject_key), int(row.start_ms), int(row.end_ms))
         if key not in matched_truth:
+            event_predictions = predictions[
+                (predictions["subject_key"] == row.subject_key)
+                & (predictions["timestamp_ms"] >= int(row.start_ms))
+                & (predictions["timestamp_ms"] <= int(row.end_ms))
+            ].sort_values("timestamp_ms")
+            raw_peak = float(event_predictions["state_probability"].max()) if len(event_predictions) else 0.0
+            smoothed_peak = raw_peak
+            trigger_threshold = float(
+                postprocess_config.get(
+                    "fast_high_threshold", postprocess_config.get("high_threshold", 1.0)
+                )
+            )
+            if len(event_predictions):
+                timestamps = event_predictions["timestamp_ms"].to_numpy(dtype=np.int64)
+                step = float(np.median(np.diff(timestamps)) / 1000.0) if len(timestamps) > 1 else 3.0
+                half_life = float(
+                    postprocess_config.get(
+                        "fast_ema_half_life_seconds",
+                        postprocess_config.get("ema_half_life_seconds", 12.0),
+                    )
+                )
+                smoothed_peak = float(
+                    causal_ema(
+                        event_predictions["state_probability"].to_numpy(), step, half_life
+                    ).max()
+                )
+            failure_cause = (
+                "raw_below_trigger"
+                if raw_peak < trigger_threshold
+                else "smoothing_suppressed"
+                if smoothed_peak < trigger_threshold
+                else "event_matching_or_boundary"
+            )
             failures.append(
                 {
                     "failure_type": "false_negative",
@@ -874,6 +938,9 @@ def _evaluate_prediction_file(
                     "score": np.nan,
                     "hand_relation": str(getattr(row, "hand_relation", "unknown")),
                     "coverage_ratio": float(getattr(row, "coverage_ratio", np.nan)),
+                    "raw_peak": raw_peak,
+                    "smoothed_peak": smoothed_peak,
+                    "failure_cause": failure_cause,
                 }
             )
     ignore_frame = (
@@ -902,6 +969,9 @@ def _evaluate_prediction_file(
                     "score": float(row.score),
                     "hand_relation": "background",
                     "coverage_ratio": np.nan,
+                    "raw_peak": np.nan,
+                    "smoothed_peak": np.nan,
+                    "failure_cause": "background_false_alarm",
                 }
             )
     failure_columns = [
@@ -912,6 +982,9 @@ def _evaluate_prediction_file(
         "score",
         "hand_relation",
         "coverage_ratio",
+        "raw_peak",
+        "smoothed_peak",
+        "failure_cause",
     ]
     return events, output, pd.DataFrame(failures, columns=failure_columns)
 
@@ -939,22 +1012,21 @@ def _tune_and_save_postprocess(
     best["matching_method"] = str(
         config["postprocess"].get("matching_method", "max_cardinality_iou")
     )
-    high_values = sorted(float(value) for value in trials["high_threshold"].unique())
-    threshold_at_boundary = len(high_values) < 3 or float(best["high_threshold"]) in {
-        high_values[0],
-        high_values[-1],
-    }
-    best["threshold_at_search_boundary"] = threshold_at_boundary
+    boundary_flags = parameters_at_search_boundary(best, trials)
+    parameter_at_boundary = any(boundary_flags.values())
+    best["search_boundary_flags"] = boundary_flags
+    best["threshold_at_search_boundary"] = parameter_at_boundary
     (output_dir / "selected_postprocess.json").write_text(
         json.dumps(best, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     trials.to_csv(output_dir / "postprocess_trials.csv", index=False)
     if (
         bool(config["postprocess_search"].get("require_interior_threshold", True))
-        and threshold_at_boundary
+        and parameter_at_boundary
     ):
         raise RuntimeError(
-            "Best high threshold is on the search boundary; expand the validation-only grid"
+            "Selected postprocess parameter is on a search boundary; "
+            f"expand the validation-only grid: {boundary_flags}"
         )
     return best
 
@@ -963,13 +1035,20 @@ def command_train_xgb(args: argparse.Namespace) -> None:
     from bme_eating.models.xgb_baseline import predict_xgboost, train_xgboost_fold
 
     config = load_config(args.config)
+    feature_ablation = getattr(args, "feature_ablation", None)
+    if feature_ablation is not None:
+        config.setdefault("xgboost", {})["feature_ablation"] = feature_ablation
+        if feature_ablation != "fused":
+            base_name = str(config.get("experiment", {}).get("name", "baseline"))
+            config.setdefault("experiment", {})["name"] = f"{base_name}_{feature_ablation}"
     _, output_root = resolve_roots(config)
     validate_quality_gate(output_root)
-    feature_name = "baseline_dyadic" if config["features"]["include_dyadic"] else "baseline"
+    feature_name = feature_artifact_name(config)
+    experiment_name = str(config.get("experiment", {}).get("name", feature_name))
     print("[1/5] Loading features and subject folds...", flush=True)
     features = pd.read_parquet(output_root / "features" / f"{feature_name}.parquet")
     subject_folds = load_subject_folds(output_root / "indices" / "subject_folds.json")
-    experiment_dir = output_root / "experiments" / feature_name / f"fold_{args.fold}"
+    experiment_dir = output_root / "experiments" / experiment_name / f"fold_{args.fold}"
     print("[2/5] Tuning and fitting XGBoost...", flush=True)
     model, columns, validation_predictions, test = train_xgboost_fold(
         features,
@@ -979,14 +1058,16 @@ def command_train_xgb(args: argparse.Namespace) -> None:
         experiment_dir,
         resume_search=not bool(getattr(args, "no_resume", False)),
     )
-    print("[3/5] Predicting validation and test windows...", flush=True)
+    print("[3/5] Saving inner-fold OOF predictions...", flush=True)
     validation_predictions.to_parquet(
         experiment_dir / "validation_predictions.parquet", index=False
     )
-    predictions = predict_xgboost(model, test, columns)
-    predictions.to_parquet(experiment_dir / "test_predictions.parquet", index=False)
+    validation_subjects = set(validation_predictions["subject_key"].astype(str).unique())
+    test_subjects = set(test["subject_key"].astype(str).unique())
+    if validation_subjects & test_subjects:
+        raise RuntimeError("OOF predictions overlap the held-out outer-fold subjects")
+    write_run_manifest(experiment_dir, config, output_root)
     events = pd.read_parquet(output_root / "indices" / "events.parquet")
-    validation_subjects = set(validation_predictions["subject_key"].unique())
     validation_truth, validation_ignore = partition_evaluation_events(
         events, validation_subjects
     )
@@ -1002,7 +1083,11 @@ def command_train_xgb(args: argparse.Namespace) -> None:
         experiment_dir,
         validation_ignore,
     )
-    test_subjects = set(test["subject_key"].unique())
+    if bool(getattr(args, "oof_only", False)):
+        print(f"OOF screening artifacts saved to {experiment_dir}")
+        return
+    predictions = predict_xgboost(model, test, columns)
+    predictions.to_parquet(experiment_dir / "test_predictions.parquet", index=False)
     truth, test_ignore = partition_evaluation_events(events, test_subjects)
     print("[5/5] Evaluating the held-out fold...", flush=True)
     predicted_events, metrics, failures = _evaluate_prediction_file(
@@ -1013,6 +1098,7 @@ def command_train_xgb(args: argparse.Namespace) -> None:
     (experiment_dir / "test_metrics.json").write_text(
         json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    write_run_manifest(experiment_dir, config, output_root)
     if float(metrics[str(metrics["primary_method"])]["sensitivity"]) <= 0:
         raise RuntimeError("Held-out fold has zero event recall; model upgrade is blocked")
     print(experiment_dir)
