@@ -10,9 +10,15 @@ from bme_eating.data.deep_dataset import DTPDataset, Normalization, _corrupt_ppg
 from bme_eating.models.dtp_sqf import DTPSQF, DyadicPool, logits_to_probability_arrays
 from bme_eating.reproducibility import epoch_random_seed, should_validate_epoch
 from bme_eating.training.dtp_trainer import (
+    _load_prediction_cache,
+    _prediction_cache_identity,
+    _save_prediction_frame,
+    _write_prediction_cache_manifest,
     checkpoint_selection_rank,
     resolve_focal_positive_alpha,
+    resume_training_is_complete,
     select_checkpoint_validation_anchors,
+    validate_prediction_frame,
 )
 
 MODEL_CONFIG = {
@@ -183,6 +189,68 @@ def test_checkpoint_validation_subset_is_deterministic_stratified_and_evaluable(
     assert first["state_loss_mask"].eq(1.0).all()
     assert first["state_target"].sum() == 11.0
     assert not first.equals(different_seed)
+
+
+@pytest.mark.parametrize(
+    ("start_epoch", "max_epochs", "patience", "early_stopping_epochs", "expected"),
+    [
+        (56, 80, 12, 12, True),
+        (80, 80, 0, 12, True),
+        (56, 80, 11, 12, False),
+        (0, 80, 0, 12, False),
+    ],
+)
+def test_resume_training_completion_is_detected(
+    start_epoch, max_epochs, patience, early_stopping_epochs, expected
+):
+    assert (
+        resume_training_is_complete(
+            start_epoch, max_epochs, patience, early_stopping_epochs
+        )
+        is expected
+    )
+
+
+def test_prediction_cache_is_reused_and_invalidated_when_tampered(tmp_path):
+    anchors = pd.DataFrame(
+        {
+            "subject_key": ["subject", "subject"],
+            "segment_id": ["segment", "segment"],
+            "session_id": ["session", "session"],
+            "timestamp_ms": [1000, 2000],
+            "state_target": [0.0, 1.0],
+            "state_loss_mask": [1.0, 1.0],
+        }
+    )
+    predictions = pd.DataFrame(
+        {
+            "subject_key": ["subject", "subject"],
+            "segment_id": ["segment", "segment"],
+            "session_id": ["session", "session"],
+            "timestamp_ms": [1000, 2000],
+            "state_probability": [0.1, 0.9],
+            "start_probability": [0.1, 0.2],
+            "end_probability": [0.1, 0.2],
+        }
+    )
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    prediction_path = tmp_path / "predictions.parquet"
+    _save_prediction_frame(predictions, prediction_path)
+    auprc = validate_prediction_frame(predictions, anchors, "test cache")
+    identity = _prediction_cache_identity(checkpoint, "signature", 0, 0)
+    _write_prediction_cache_manifest(prediction_path, predictions, auprc, identity)
+
+    loaded = _load_prediction_cache(
+        prediction_path, anchors, checkpoint, identity, "test cache"
+    )
+    assert loaded is not None
+    pd.testing.assert_frame_equal(loaded[0], predictions)
+
+    tampered = predictions.copy()
+    tampered.loc[1, "state_probability"] = 0.8
+    tampered.to_parquet(prediction_path, index=False)
+    assert _load_prediction_cache(prediction_path, anchors, checkpoint, identity, "test cache") is None
 
 
 def test_epoch_randomness_and_validation_schedule_are_resume_stable():

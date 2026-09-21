@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -9,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -31,6 +33,17 @@ from bme_eating.models.losses import DTPLoss
 from bme_eating.models.xgb_baseline import assign_train_validation_test
 from bme_eating.postprocess import probabilities_to_events, tune_postprocess_parameters
 from bme_eating.reproducibility import epoch_random_seed, should_validate_epoch
+
+PREDICTION_COLUMNS = (
+    "subject_key",
+    "segment_id",
+    "session_id",
+    "timestamp_ms",
+    "state_probability",
+    "start_probability",
+    "end_probability",
+)
+PREDICTION_KEYS = ("subject_key", "segment_id", "session_id", "timestamp_ms")
 
 
 def seed_everything(seed: int) -> None:
@@ -149,6 +162,171 @@ def _save_torch_checkpoint(payload: dict[str, Any], path: Path) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     torch.save(payload, temporary_path)
     temporary_path.replace(path)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_json_atomic(payload: dict[str, Any], path: Path) -> None:
+    temporary_path = path.with_name(path.name + ".tmp")
+    temporary_path.write_text(
+        json.dumps(_json_safe(payload), ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    temporary_path.replace(path)
+
+
+def _save_prediction_frame(frame: pd.DataFrame, path: Path) -> None:
+    temporary_path = path.with_name(path.name + ".tmp")
+    frame.to_parquet(temporary_path, index=False)
+    temporary_path.replace(path)
+
+
+def _prediction_manifest_path(path: Path) -> Path:
+    return path.with_name(path.name + ".manifest.json")
+
+
+def _expected_prediction_rows(anchors: pd.DataFrame) -> pd.DataFrame:
+    expected = anchors.copy()
+    if "session_id" not in expected:
+        expected["session_id"] = expected["segment_id"]
+    required = set(PREDICTION_KEYS) | {"state_target"}
+    missing = sorted(required - set(expected.columns))
+    if missing:
+        raise ValueError(f"Prediction anchors are missing columns: {missing}")
+    if "state_loss_mask" not in expected:
+        expected["state_loss_mask"] = 1.0
+    return expected[
+        [*PREDICTION_KEYS, "state_target", "state_loss_mask"]
+    ].sort_values(list(PREDICTION_KEYS)).reset_index(drop=True)
+
+
+def validate_prediction_frame(
+    predictions: pd.DataFrame,
+    anchors: pd.DataFrame,
+    description: str,
+) -> float:
+    missing = sorted(set(PREDICTION_COLUMNS) - set(predictions.columns))
+    if missing:
+        raise ValueError(f"{description} is missing columns: {missing}")
+    if predictions.duplicated(list(PREDICTION_KEYS)).any():
+        raise ValueError(f"{description} contains duplicate timeline keys")
+    probabilities = predictions[
+        ["state_probability", "start_probability", "end_probability"]
+    ].to_numpy(dtype=np.float64)
+    if not np.isfinite(probabilities).all():
+        raise ValueError(f"{description} contains NaN or infinite probabilities")
+    if ((probabilities < 0.0) | (probabilities > 1.0)).any():
+        raise ValueError(f"{description} contains probabilities outside [0, 1]")
+
+    actual = predictions[list(PREDICTION_KEYS)].copy()
+    actual["subject_key"] = actual["subject_key"].astype(str)
+    actual["segment_id"] = actual["segment_id"].astype(str)
+    actual["session_id"] = actual["session_id"].astype(str)
+    actual["timestamp_ms"] = actual["timestamp_ms"].astype(np.int64)
+    actual = actual.sort_values(list(PREDICTION_KEYS)).reset_index(drop=True)
+    expected = _expected_prediction_rows(anchors)
+    for column in ("subject_key", "segment_id", "session_id"):
+        expected[column] = expected[column].astype(str)
+    expected["timestamp_ms"] = expected["timestamp_ms"].astype(np.int64)
+    if not actual.equals(expected[list(PREDICTION_KEYS)]):
+        raise ValueError(f"{description} does not exactly match the expected timeline")
+
+    ordered_predictions = predictions.sort_values(list(PREDICTION_KEYS)).reset_index(drop=True)
+    return float(
+        masked_average_precision(
+            expected["state_target"].to_numpy(dtype=np.float64),
+            ordered_predictions["state_probability"].to_numpy(dtype=np.float64),
+            expected["state_loss_mask"].fillna(0.0).to_numpy(dtype=np.float64),
+        )
+    )
+
+
+def _prediction_cache_identity(
+    checkpoint_path: Path,
+    selection_signature: str | None,
+    outer_fold: int,
+    inner_validation_partition: int,
+) -> dict[str, Any]:
+    return {
+        "version": 1,
+        "best_checkpoint_sha256": _sha256(checkpoint_path),
+        "selection_signature": selection_signature,
+        "outer_fold": int(outer_fold),
+        "inner_validation_partition": int(inner_validation_partition),
+    }
+
+
+def _write_prediction_cache_manifest(
+    path: Path,
+    predictions: pd.DataFrame,
+    auprc: float,
+    identity: dict[str, Any],
+) -> None:
+    _write_json_atomic(
+        {
+            **identity,
+            "prediction_file": path.name,
+            "prediction_sha256": _sha256(path),
+            "rows": len(predictions),
+            "window_auprc": auprc,
+        },
+        _prediction_manifest_path(path),
+    )
+
+
+def _load_prediction_cache(
+    path: Path,
+    anchors: pd.DataFrame,
+    checkpoint_path: Path,
+    identity: dict[str, Any],
+    description: str,
+    *,
+    allow_legacy_manifest: bool = False,
+) -> tuple[pd.DataFrame, float] | None:
+    if not path.is_file():
+        return None
+    try:
+        predictions = pd.read_parquet(path)
+        auprc = validate_prediction_frame(predictions, anchors, description)
+        manifest_path = _prediction_manifest_path(path)
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for key, value in identity.items():
+                if manifest.get(key) != value:
+                    raise ValueError(f"{description} manifest mismatch for {key}")
+            if manifest.get("prediction_sha256") != _sha256(path):
+                raise ValueError(f"{description} file hash does not match its manifest")
+            if int(manifest.get("rows", -1)) != len(predictions):
+                raise ValueError(f"{description} row count does not match its manifest")
+            manifest_auprc = float(manifest.get("window_auprc"))
+            if not math.isfinite(manifest_auprc) or not math.isclose(
+                manifest_auprc, auprc, rel_tol=1e-7, abs_tol=1e-9
+            ):
+                raise ValueError(f"{description} AUPRC does not match its manifest")
+        else:
+            if not allow_legacy_manifest:
+                raise ValueError(f"{description} has no cache manifest")
+            if path.stat().st_mtime_ns < checkpoint_path.stat().st_mtime_ns:
+                raise ValueError(f"{description} predates the selected checkpoint")
+            _write_prediction_cache_manifest(path, predictions, auprc, identity)
+        return predictions, auprc
+    except (OSError, ValueError, KeyError, TypeError, pa.ArrowException) as error:
+        tqdm.write(f"Ignoring invalid {description} cache: {error}")
+        return None
+
+
+def resume_training_is_complete(
+    start_epoch: int,
+    max_epochs: int,
+    patience: int,
+    early_stopping_epochs: int,
+) -> bool:
+    return start_epoch >= max_epochs or patience >= early_stopping_epochs
 
 
 def _json_safe(value: Any) -> Any:
@@ -420,19 +598,28 @@ def train_dtp_fold(
             raise RuntimeError("Resume checkpoint belongs to a different inner partition")
         if checkpoint.get("checkpoint_selection_metric", "event_f1") != checkpoint_selection_metric:
             raise RuntimeError("Resume checkpoint uses a different checkpoint selection metric")
-        tqdm.write(f"Resuming DTP-SQF at epoch {start_epoch + 1}/{max_epochs}")
+        tqdm.write(f"Loaded DTP-SQF resume checkpoint after epoch {start_epoch}/{max_epochs}")
 
     validation_subjects = set(validation_anchors["subject_key"].unique())
     validation_truth, validation_ignore = partition_evaluation_events(events, validation_subjects)
     validation_interval = int(training_config["validation_every_epochs"])
     if validation_interval <= 0:
         raise ValueError("validation_every_epochs must be positive")
+    early_stopping_epochs = int(training_config["early_stopping_epochs"])
+    if early_stopping_epochs <= 0:
+        raise ValueError("early_stopping_epochs must be positive")
+    training_complete = resume_training_is_complete(
+        start_epoch, max_epochs, patience, early_stopping_epochs
+    )
+    if resume_path is not None and training_complete:
+        tqdm.write("Training was already complete; resuming post-training inference only.")
     if use_checkpoint_subset:
         tqdm.write(
             "Checkpoint selection validation: "
             f"{len(checkpoint_validation_anchors)}/{len(validation_anchors)} evaluable anchors"
         )
-    for epoch in range(start_epoch, max_epochs):
+    epoch_range = range(0) if training_complete else range(start_epoch, max_epochs)
+    for epoch in epoch_range:
         batch_sampler.set_epoch(epoch)
         # Deriving randomness from fold and epoch makes end-of-epoch resume equivalent
         # to an uninterrupted run, including dropout and CUDA stochastic operations.
@@ -617,14 +804,14 @@ def train_dtp_fold(
         }
         if improved:
             _save_torch_checkpoint(checkpoint_payload, checkpoint_path)
-            validation_predictions.to_parquet(
+            _save_prediction_frame(
+                validation_predictions,
                 output_dir
                 / (
                     "best_checkpoint_validation_predictions.parquet"
                     if use_checkpoint_subset
                     else "best_validation_predictions.parquet"
                 ),
-                index=False,
             )
         _save_torch_checkpoint(checkpoint_payload, last_checkpoint_path)
         tqdm.write(
@@ -633,7 +820,7 @@ def train_dtp_fold(
             f"validation_auprc={validation_auprc:.4f}, "
             f"validation_f1={metrics['f1']:.4f}, patience={patience}"
         )
-        if patience >= int(training_config["early_stopping_epochs"]):
+        if patience >= early_stopping_epochs:
             tqdm.write("Early stopping threshold reached.")
             break
 
@@ -642,53 +829,104 @@ def train_dtp_fold(
     if validation_selector is not None:
         if best_selection is None:
             raise RuntimeError("Fusion training ended without a selected validation candidate")
-        (output_dir / "best_validation_selection.json").write_text(
-            json.dumps(_json_safe(best_selection), ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        _write_json_atomic(
+            best_selection,
+            output_dir / "best_validation_selection.json",
         )
         if selection_gate is not None:
             selection_gate(best_selection)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    if checkpoint.get("selection_signature") != selection_signature:
+        raise RuntimeError("Best checkpoint signature does not match the active configuration")
+    if int(checkpoint.get("inner_validation_partition", 0)) != inner_validation_partition:
+        raise RuntimeError("Best checkpoint belongs to a different inner partition")
+    if checkpoint.get("checkpoint_selection_metric", "event_f1") != checkpoint_selection_metric:
+        raise RuntimeError("Best checkpoint uses a different checkpoint selection metric")
     model.load_state_dict(checkpoint["model"])
+    cache_identity = _prediction_cache_identity(
+        checkpoint_path,
+        selection_signature,
+        outer_fold,
+        inner_validation_partition,
+    )
     if use_checkpoint_subset:
-        full_validation_dataset = DTPDataset(
+        validation_path = output_dir / "best_validation_predictions.parquet"
+        validation_cache = _load_prediction_cache(
+            validation_path,
             validation_anchors,
-            segments,
-            normalization,
-            future_context_seconds=future_seconds,
-            training=False,
-            seed=seed,
-            motion_block_seconds=int(model_config.get("motion_block_seconds", 3)),
-            ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
-            motion_bucket_counts=model_config["motion_bucket_counts"],
-            ppg_bucket_counts=model_config["ppg_bucket_counts"],
+            checkpoint_path,
+            cache_identity,
+            "full validation predictions",
+            allow_legacy_manifest=True,
         )
-        full_validation_loader = DataLoader(
-            full_validation_dataset,
-            batch_size=int(training_config["inference_batch_size"]),
-            shuffle=False,
-            **inference_loader_arguments,
-        )
-        full_validation_predictions, full_validation_auprc = _prediction_frame(
-            model,
-            full_validation_loader,
-            device,
-            amp_dtype,
-            description="Predicting full validation partition",
-        )
-        full_validation_predictions.to_parquet(
-            output_dir / "best_validation_predictions.parquet", index=False
-        )
+        if validation_cache is None:
+            full_validation_dataset = DTPDataset(
+                validation_anchors,
+                segments,
+                normalization,
+                future_context_seconds=future_seconds,
+                training=False,
+                seed=seed,
+                motion_block_seconds=int(model_config.get("motion_block_seconds", 3)),
+                ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
+                motion_bucket_counts=model_config["motion_bucket_counts"],
+                ppg_bucket_counts=model_config["ppg_bucket_counts"],
+            )
+            full_validation_loader = DataLoader(
+                full_validation_dataset,
+                batch_size=int(training_config["inference_batch_size"]),
+                shuffle=False,
+                **inference_loader_arguments,
+            )
+            full_validation_predictions, full_validation_auprc = _prediction_frame(
+                model,
+                full_validation_loader,
+                device,
+                amp_dtype,
+                description="Predicting full validation partition",
+            )
+            validate_prediction_frame(
+                full_validation_predictions,
+                validation_anchors,
+                "full validation predictions",
+            )
+            _save_prediction_frame(full_validation_predictions, validation_path)
+            _write_prediction_cache_manifest(
+                validation_path,
+                full_validation_predictions,
+                full_validation_auprc,
+                cache_identity,
+            )
+        else:
+            _, full_validation_auprc = validation_cache
+            tqdm.write("Reusing verified full validation predictions.")
     else:
         full_validation_auprc = best_validation_auprc
-    test_predictions, test_auprc = _prediction_frame(
-        model, test_loader, device, amp_dtype, description="Predicting test fold"
+    test_path = output_dir / test_predictions_name
+    test_cache = _load_prediction_cache(
+        test_path,
+        test_anchors,
+        checkpoint_path,
+        cache_identity,
+        "test predictions",
     )
-    test_predictions.to_parquet(output_dir / test_predictions_name, index=False)
+    if test_cache is None:
+        test_predictions, test_auprc = _prediction_frame(
+            model, test_loader, device, amp_dtype, description="Predicting test fold"
+        )
+        validate_prediction_frame(test_predictions, test_anchors, "test predictions")
+        _save_prediction_frame(test_predictions, test_path)
+        _write_prediction_cache_manifest(
+            test_path, test_predictions, test_auprc, cache_identity
+        )
+    else:
+        _, test_auprc = test_cache
+        tqdm.write("Reusing verified test predictions.")
     metadata = {
         "outer_fold": outer_fold,
         "inner_validation_partition": inner_validation_partition,
         "checkpoint_selection_metric": checkpoint_selection_metric,
+        "training_complete_before_resume": training_complete if resume_path is not None else False,
         "best_checkpoint_epoch": int(checkpoint["epoch"]),
         "best_validation_f1": best_f1,
         "best_validation_auprc": best_validation_auprc,
@@ -718,7 +956,5 @@ def train_dtp_fold(
         "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()),
         "validation_selection_signature": selection_signature,
     }
-    (output_dir / "metadata.json").write_text(
-        json.dumps(_json_safe(metadata), ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_json_atomic(metadata, output_dir / "metadata.json")
     return checkpoint_path
