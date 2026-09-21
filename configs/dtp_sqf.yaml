@@ -23,8 +23,9 @@ training:
   validation_every_epochs: 2
   num_workers: 8
   inference_num_workers: 2
-  max_epochs: 80
-  early_stopping_epochs: 12
+  max_epochs: 32
+  early_stopping_patience_checks: 4
+  early_stopping_min_delta: 0.003
   learning_rate: 0.0003
   encoder_learning_rate: 0.0001
   weight_decay: 0.01

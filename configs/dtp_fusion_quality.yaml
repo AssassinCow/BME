@@ -1,0 +1,8 @@
+extends: dtp_fusion.yaml
+
+experiment:
+  name: baseline_dtp_fusion
+
+fusion:
+  gated_residual:
+    quality_weighting_candidates: [false, true]

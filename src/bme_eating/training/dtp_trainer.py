@@ -21,6 +21,7 @@ from bme_eating.data.deep_dataset import (
     DTPDataset,
     SegmentBalancedBatchSampler,
     compute_normalization,
+    load_normalization,
     save_normalization,
 )
 from bme_eating.metrics import (
@@ -101,6 +102,14 @@ def _prediction_frame(
             targets.extend(target.tolist())
             probabilities.extend(state.tolist())
             state_masks.extend(state_mask.numpy().tolist())
+            ppg_gate = output["ppg_gate"].detach().float().cpu().numpy()
+            ppg_valid = batch["ppg_valid"].numpy().astype(np.float64)
+            motion_valid = batch["motion_valid"].numpy().astype(np.float64)
+            valid_gate_count = np.maximum(ppg_valid.sum(axis=1), 1.0)
+            ppg_gate_mean = (ppg_gate * ppg_valid).sum(axis=1) / valid_gate_count
+            ppg_gate_recent = ppg_gate[:, -1]
+            ppg_valid_fraction = ppg_valid.mean(axis=1)
+            motion_valid_fraction = motion_valid.mean(axis=1)
             for index in range(len(state)):
                 rows.append(
                     {
@@ -111,13 +120,25 @@ def _prediction_frame(
                         "state_probability": float(state[index]),
                         "start_probability": float(start[index]),
                         "end_probability": float(end[index]),
+                        "ppg_gate_mean": float(ppg_gate_mean[index]),
+                        "ppg_gate_recent": float(ppg_gate_recent[index]),
+                        "ppg_valid_fraction": float(ppg_valid_fraction[index]),
+                        "motion_valid_fraction": float(motion_valid_fraction[index]),
                     }
                 )
     auprc = masked_average_precision(
         np.asarray(targets), np.asarray(probabilities), np.asarray(state_masks)
     )
     frame = pd.DataFrame(rows)
-    for column in ("state_probability", "start_probability", "end_probability"):
+    for column in (
+        "state_probability",
+        "start_probability",
+        "end_probability",
+        "ppg_gate_mean",
+        "ppg_gate_recent",
+        "ppg_valid_fraction",
+        "motion_valid_fraction",
+    ):
         if column in frame:
             frame[column] = frame[column].astype(np.float32)
     return frame, float(auprc)
@@ -253,7 +274,7 @@ def _prediction_cache_identity(
     inner_validation_partition: int,
 ) -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "best_checkpoint_sha256": _sha256(checkpoint_path),
         "selection_signature": selection_signature,
         "outer_fold": int(outer_fold),
@@ -324,9 +345,182 @@ def resume_training_is_complete(
     start_epoch: int,
     max_epochs: int,
     patience: int,
-    early_stopping_epochs: int,
+    early_stopping_patience_checks: int,
 ) -> bool:
-    return start_epoch >= max_epochs or patience >= early_stopping_epochs
+    return start_epoch >= max_epochs or patience >= early_stopping_patience_checks
+
+
+def resolve_early_stopping_config(training_config: dict[str, Any]) -> tuple[int, float]:
+    patience_key = "early_stopping_patience_checks"
+    legacy_key = "early_stopping_epochs"
+    if patience_key in training_config and legacy_key in training_config:
+        raise ValueError(
+            f"Use only {patience_key}; {legacy_key} counted validation checks despite its name"
+        )
+    if patience_key in training_config:
+        patience_checks = int(training_config[patience_key])
+    elif legacy_key in training_config:
+        patience_checks = int(training_config[legacy_key])
+    else:
+        raise ValueError(f"Missing training setting: {patience_key}")
+    minimum_delta = float(training_config.get("early_stopping_min_delta", 0.0))
+    if patience_checks <= 0:
+        raise ValueError("early_stopping_patience_checks must be positive")
+    if not math.isfinite(minimum_delta) or minimum_delta < 0.0:
+        raise ValueError("early_stopping_min_delta must be finite and non-negative")
+    return patience_checks, minimum_delta
+
+
+def update_early_stopping(
+    reference_score: float | None,
+    current_score: float,
+    patience: int,
+    minimum_delta: float,
+) -> tuple[float | None, int, bool]:
+    if patience < 0:
+        raise ValueError("Early-stopping patience cannot be negative")
+    if not math.isfinite(minimum_delta) or minimum_delta < 0.0:
+        raise ValueError("early_stopping_min_delta must be finite and non-negative")
+    if not math.isfinite(current_score):
+        return reference_score, patience + 1, False
+    if reference_score is None or not math.isfinite(reference_score):
+        return float(current_score), 0, True
+    improvement = float(current_score) - float(reference_score)
+    if improvement > 0.0 and improvement >= minimum_delta:
+        return float(current_score), 0, True
+    return reference_score, patience + 1, False
+
+
+def export_dtp_quality_predictions(
+    anchors: pd.DataFrame,
+    segments: pd.DataFrame,
+    subject_folds: dict[str, int],
+    outer_fold: int,
+    inner_validation_partition: int,
+    checkpoint_path: Path,
+    normalization_path: Path,
+    output_dir: Path,
+    *,
+    selection_signature: str,
+    inference_batch_size: int | None = None,
+    inference_num_workers: int | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    if not checkpoint_path.is_file() or not normalization_path.is_file():
+        raise FileNotFoundError("DTP quality re-inference requires best.pt and normalization.json")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    if int(checkpoint.get("outer_fold", -1)) != outer_fold:
+        raise RuntimeError("DTP checkpoint belongs to a different outer fold")
+    if int(checkpoint.get("inner_validation_partition", -1)) != inner_validation_partition:
+        raise RuntimeError("DTP checkpoint belongs to a different inner partition")
+    if checkpoint.get("selection_signature") != selection_signature:
+        raise RuntimeError("DTP checkpoint selection signature does not match its source record")
+    model_config = dict(checkpoint["model_config"])
+    training_config = dict(checkpoint["training_config"])
+    if int(model_config.get("future_context_seconds", 0)) != 0:
+        raise ValueError("Quality re-inference only supports causal DTP checkpoints")
+    _, validation_anchors, test_anchors = assign_train_validation_test(
+        anchors,
+        subject_folds,
+        outer_fold,
+        inner_validation_partition=inner_validation_partition,
+    )
+    validation_anchors = validation_anchors.reset_index(drop=True)
+    test_anchors = test_anchors.reset_index(drop=True)
+    if validation_anchors.empty or test_anchors.empty:
+        raise ValueError("Quality re-inference requires non-empty validation and test anchors")
+    normalization = load_normalization(normalization_path)
+    seed = int(training_config["random_seed"])
+    seed_everything(seed)
+    dataset_arguments = {
+        "future_context_seconds": 0,
+        "training": False,
+        "seed": seed,
+        "motion_block_seconds": int(model_config.get("motion_block_seconds", 3)),
+        "ppg_block_seconds": int(model_config.get("ppg_block_seconds", 15)),
+        "motion_bucket_counts": model_config["motion_bucket_counts"],
+        "ppg_bucket_counts": model_config["ppg_bucket_counts"],
+    }
+    validation_dataset = DTPDataset(
+        validation_anchors,
+        segments,
+        normalization,
+        **dataset_arguments,
+    )
+    test_dataset = DTPDataset(test_anchors, segments, normalization, **dataset_arguments)
+    batch_size = int(
+        inference_batch_size
+        if inference_batch_size is not None
+        else training_config["inference_batch_size"]
+    )
+    workers = int(
+        inference_num_workers
+        if inference_num_workers is not None
+        else training_config.get("inference_num_workers", 2)
+    )
+    if batch_size <= 0 or workers < 0:
+        raise ValueError("Inference batch size must be positive and workers non-negative")
+    loader_arguments = {
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": workers,
+        "pin_memory": True,
+        "persistent_workers": False,
+    }
+    validation_loader = DataLoader(validation_dataset, **loader_arguments)
+    test_loader = DataLoader(test_dataset, **loader_arguments)
+    if not torch.cuda.is_available():
+        raise RuntimeError("DTP quality re-inference requires CUDA")
+    device = torch.device("cuda")
+    model = DTPSQF(model_config).to(device)
+    model.load_state_dict(checkpoint["model"])
+    amp_name = str(training_config.get("amp_dtype", "bfloat16")).lower()
+    amp_dtype = torch.bfloat16 if amp_name == "bfloat16" else torch.float16
+    validation_predictions, validation_auprc = _prediction_frame(
+        model,
+        validation_loader,
+        device,
+        amp_dtype,
+        description=f"Re-inferring quality validation partition {inner_validation_partition}",
+    )
+    test_predictions, test_auprc = _prediction_frame(
+        model,
+        test_loader,
+        device,
+        amp_dtype,
+        description=f"Re-inferring quality test partition {inner_validation_partition}",
+    )
+    validate_prediction_frame(
+        validation_predictions, validation_anchors, "quality validation predictions"
+    )
+    validate_prediction_frame(test_predictions, test_anchors, "quality test predictions")
+    output_dir.mkdir(parents=True, exist_ok=False)
+    save_normalization(normalization, output_dir / "normalization.json")
+    validation_path = output_dir / "best_validation_predictions.parquet"
+    test_path = output_dir / "dtp_test_predictions.parquet"
+    _save_prediction_frame(validation_predictions, validation_path)
+    _save_prediction_frame(test_predictions, test_path)
+    identity = _prediction_cache_identity(
+        checkpoint_path,
+        selection_signature,
+        outer_fold,
+        inner_validation_partition,
+    )
+    _write_prediction_cache_manifest(
+        validation_path, validation_predictions, validation_auprc, identity
+    )
+    _write_prediction_cache_manifest(test_path, test_predictions, test_auprc, identity)
+    record = {
+        "inner_validation_partition": inner_validation_partition,
+        "selection_signature": selection_signature,
+        "source_checkpoint_sha256": _sha256(checkpoint_path),
+        "source_normalization_sha256": _sha256(normalization_path),
+        "best_checkpoint_epoch": int(checkpoint["epoch"]),
+        "validation_window_auprc": validation_auprc,
+        "test_window_auprc": test_auprc,
+        "validation_rows": len(validation_predictions),
+        "test_rows": len(test_predictions),
+    }
+    return validation_predictions, test_predictions, record
 
 
 def _json_safe(value: Any) -> Any:
@@ -540,6 +734,9 @@ def train_dtp_fold(
     )
     accumulation = int(training_config["gradient_accumulation"])
     max_epochs = int(training_config["max_epochs"])
+    early_stopping_patience_checks, early_stopping_min_delta = (
+        resolve_early_stopping_config(training_config)
+    )
     if accumulation <= 0 or max_epochs <= 0:
         raise ValueError("gradient_accumulation and max_epochs must be positive")
     total_steps = math.ceil(len(train_loader) / accumulation) * max_epochs
@@ -569,6 +766,7 @@ def train_dtp_fold(
     best_boundary_mae = float("inf")
     best_validation_auprc = -math.inf
     patience = 0
+    early_stopping_reference_score: float | None = None
     history: list[dict[str, float]] = []
     best_selection: dict[str, Any] | None = None
     best_selection_rank: tuple[float, ...] | None = None
@@ -589,6 +787,11 @@ def train_dtp_fold(
         best_selection = checkpoint.get("best_selection")
         stored_rank = checkpoint.get("best_selection_rank")
         best_selection_rank = tuple(float(value) for value in stored_rank) if stored_rank else None
+        stored_reference = checkpoint.get("early_stopping_reference_score")
+        if stored_reference is not None:
+            early_stopping_reference_score = float(stored_reference)
+        elif best_selection_rank is not None and math.isfinite(best_selection_rank[0]):
+            early_stopping_reference_score = float(best_selection_rank[0])
         stored_signature = checkpoint.get("selection_signature")
         if stored_signature != selection_signature:
             raise RuntimeError(
@@ -605,11 +808,8 @@ def train_dtp_fold(
     validation_interval = int(training_config["validation_every_epochs"])
     if validation_interval <= 0:
         raise ValueError("validation_every_epochs must be positive")
-    early_stopping_epochs = int(training_config["early_stopping_epochs"])
-    if early_stopping_epochs <= 0:
-        raise ValueError("early_stopping_epochs must be positive")
     training_complete = resume_training_is_complete(
-        start_epoch, max_epochs, patience, early_stopping_epochs
+        start_epoch, max_epochs, patience, early_stopping_patience_checks
     )
     if resume_path is not None and training_complete:
         tqdm.write("Training was already complete; resuming post-training inference only.")
@@ -666,6 +866,8 @@ def train_dtp_fold(
                     "validation_auprc": float("nan"),
                     "validation_f1": float("nan"),
                     "validation_boundary_mae_seconds": float("nan"),
+                    "early_stopping_patience": float(patience),
+                    "early_stopping_reference_score": early_stopping_reference_score,
                 }
             )
             pd.DataFrame(history).to_csv(output_dir / "history.csv", index=False)
@@ -680,6 +882,7 @@ def train_dtp_fold(
                     "best_boundary_mae": best_boundary_mae,
                     "best_validation_auprc": best_validation_auprc,
                     "patience": patience,
+                    "early_stopping_reference_score": early_stopping_reference_score,
                     "history": history,
                     "best_selection": best_selection,
                     "best_selection_rank": best_selection_rank,
@@ -762,7 +965,16 @@ def train_dtp_fold(
                 metrics,
                 epoch,
             )
-        improved = best_selection_rank is None or current_rank > best_selection_rank
+        checkpoint_improved = best_selection_rank is None or current_rank > best_selection_rank
+        current_primary_score = float(current_rank[0])
+        early_stopping_reference_score, patience, meaningful_improvement = (
+            update_early_stopping(
+                early_stopping_reference_score,
+                current_primary_score,
+                patience,
+                early_stopping_min_delta,
+            )
+        )
         history.append(
             {
                 "epoch": float(epoch),
@@ -770,18 +982,17 @@ def train_dtp_fold(
                 "validation_auprc": validation_auprc,
                 "validation_f1": metrics["f1"],
                 "validation_boundary_mae_seconds": boundary_mae,
+                "early_stopping_patience": float(patience),
+                "early_stopping_reference_score": early_stopping_reference_score,
             }
         )
         pd.DataFrame(history).to_csv(output_dir / "history.csv", index=False)
-        if improved:
+        if checkpoint_improved:
             best_f1 = metrics["f1"]
             best_boundary_mae = boundary_mae
             best_validation_auprc = validation_auprc
             best_selection = current_selection
             best_selection_rank = current_rank
-            patience = 0
-        else:
-            patience += 1
         checkpoint_payload = {
             "epoch": epoch,
             "model": model.state_dict(),
@@ -792,6 +1003,7 @@ def train_dtp_fold(
             "best_boundary_mae": best_boundary_mae,
             "best_validation_auprc": best_validation_auprc,
             "patience": patience,
+            "early_stopping_reference_score": early_stopping_reference_score,
             "history": history,
             "best_selection": best_selection,
             "best_selection_rank": best_selection_rank,
@@ -802,7 +1014,7 @@ def train_dtp_fold(
             "inner_validation_partition": inner_validation_partition,
             "checkpoint_selection_metric": checkpoint_selection_metric,
         }
-        if improved:
+        if checkpoint_improved:
             _save_torch_checkpoint(checkpoint_payload, checkpoint_path)
             _save_prediction_frame(
                 validation_predictions,
@@ -818,9 +1030,10 @@ def train_dtp_fold(
             f"Epoch {epoch + 1}/{max_epochs}: "
             f"train_loss={history[-1]['train_loss']:.4f}, "
             f"validation_auprc={validation_auprc:.4f}, "
-            f"validation_f1={metrics['f1']:.4f}, patience={patience}"
+            f"validation_f1={metrics['f1']:.4f}, patience={patience}, "
+            f"meaningful_improvement={meaningful_improvement}"
         )
-        if patience >= early_stopping_epochs:
+        if patience >= early_stopping_patience_checks:
             tqdm.write("Early stopping threshold reached.")
             break
 
@@ -953,6 +1166,8 @@ def train_dtp_fold(
         "raw_training_positive_rate": positive_rate,
         "training_num_workers": training_workers,
         "inference_num_workers": inference_workers,
+        "early_stopping_patience_checks": early_stopping_patience_checks,
+        "early_stopping_min_delta": early_stopping_min_delta,
         "peak_gpu_memory_bytes": int(torch.cuda.max_memory_allocated()),
         "validation_selection_signature": selection_signature,
     }

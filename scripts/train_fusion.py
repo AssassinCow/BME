@@ -10,7 +10,10 @@ from bme_eating.fusion import FusionGateError
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train one causal DTP fold with frozen-baseline residual fusion."
+        description=(
+            "Train one causal DTP cross-fit source. Under protocol v4 this command stops "
+            "after frozen predictions; tune_fusion.py and evaluate_fusion.py are separate."
+        )
     )
     parser.add_argument("--config", default="configs/dtp_fusion.yaml")
     parser.add_argument(
@@ -55,6 +58,13 @@ def main() -> None:
         help=(
             "Resume the whole fusion fold from any crossfit_0..2/last.pt checkpoint; "
             "completed partitions are verified and skipped automatically."
+        ),
+    )
+    parser.add_argument(
+        "--confirmation-run",
+        help=(
+            "Protocol-v4 result run whose fold 1 gate authorizes source training for "
+            "folds 2-4."
         ),
     )
     args = parser.parse_args()

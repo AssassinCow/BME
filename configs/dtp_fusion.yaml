@@ -11,18 +11,53 @@ training:
   checkpoint_validation_max_rows: 32768
 
 fusion:
+  protocol_version: 4
   crossfit_partitions: 3
-  alpha_candidates: [0.0, 0.25, 0.5]
-  beta_candidates: [-0.25, 0.0, 0.25]
   residual_clip: 2.0
   probability_epsilon: 0.000001
-  internal_gate:
-    minimum_f1_improvement: 0.015
-    minimum_f1_improvement_over_beta_only: 0.005
+  calibration:
+    method: positive_slope_platt
+    regularization: 0.0001
+    maximum_slope: 20.0
+  gated_residual:
+    alpha_positive_candidates: [0.25, 0.5]
+    alpha_negative_candidates: [0.0, 0.25]
+    baseline_support_min_candidates: [0.05, 0.10]
+    baseline_support_max: 0.50
+    dtp_on_threshold_candidates: [0.55, 0.65]
+    dtp_off_threshold_candidates: [0.10, 0.20]
+    persistence_seconds_candidates: [12, 24]
+    gate_ema_half_life_seconds: 12
+    quality_weighting_candidates: [false]
+  meta_selection:
+    top_fusion_candidates: 3
+    bootstrap_replicates: 1000
+    bootstrap_seed: 2026
+    show_progress: true
+  postprocess_search:
+    detector_mode: dual_ema
+    boundary_model_version: derivative_v1
+    stage1_keep: 8
+    fast_ema_half_life_seconds: [6, 12]
+    slow_ema_half_life_seconds: [24, 36]
+    fast_high_threshold: [0.45, 0.55]
+    slow_high_threshold: [0.20, 0.30]
+    exit_threshold_ratio: [0.25, 0.50]
+    off_duration_seconds: [18, 30, 60]
+    minimum_event_seconds: [15, 30]
+    merge_gap_seconds: [30, 60]
+    boundary_lookback_seconds: [30, 60]
+  promotion_gate:
+    minimum_f1_improvement: 0.02
     minimum_different_sensitivity_improvement: 0.03
     maximum_fp_per_hour_ratio: 1.2
-  fold0_gate:
+    maximum_boundary_mae_ratio: 1.1
+    maximum_partition_f1_drop: 0.01
+    maximum_partition_strict_f1_drop: 0.01
+  final_promotion_gate:
     minimum_f1_improvement: 0.02
     maximum_fp_per_hour_ratio: 1.2
     maximum_boundary_mae_ratio: 1.1
+    minimum_nondegraded_folds: 3
+    maximum_fold_f1_drop: 0.03
 

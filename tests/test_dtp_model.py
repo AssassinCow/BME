@@ -15,9 +15,11 @@ from bme_eating.training.dtp_trainer import (
     _save_prediction_frame,
     _write_prediction_cache_manifest,
     checkpoint_selection_rank,
+    resolve_early_stopping_config,
     resolve_focal_positive_alpha,
     resume_training_is_complete,
     select_checkpoint_validation_anchors,
+    update_early_stopping,
     validate_prediction_frame,
 )
 
@@ -192,7 +194,7 @@ def test_checkpoint_validation_subset_is_deterministic_stratified_and_evaluable(
 
 
 @pytest.mark.parametrize(
-    ("start_epoch", "max_epochs", "patience", "early_stopping_epochs", "expected"),
+    ("start_epoch", "max_epochs", "patience", "patience_checks", "expected"),
     [
         (56, 80, 12, 12, True),
         (80, 80, 0, 12, True),
@@ -201,14 +203,42 @@ def test_checkpoint_validation_subset_is_deterministic_stratified_and_evaluable(
     ],
 )
 def test_resume_training_completion_is_detected(
-    start_epoch, max_epochs, patience, early_stopping_epochs, expected
+    start_epoch, max_epochs, patience, patience_checks, expected
 ):
     assert (
         resume_training_is_complete(
-            start_epoch, max_epochs, patience, early_stopping_epochs
+            start_epoch, max_epochs, patience, patience_checks
         )
         is expected
     )
+
+
+def test_early_stopping_ignores_small_metric_fluctuations():
+    reference, patience, improved = update_early_stopping(None, 0.4, 0, 0.003)
+    assert (reference, patience, improved) == (0.4, 0, True)
+
+    reference, patience, improved = update_early_stopping(reference, 0.402, patience, 0.003)
+    assert (reference, patience, improved) == (0.4, 1, False)
+
+    reference, patience, improved = update_early_stopping(reference, 0.404, patience, 0.003)
+    assert (reference, patience, improved) == (0.404, 0, True)
+
+
+def test_early_stopping_configuration_uses_validation_check_semantics():
+    assert resolve_early_stopping_config(
+        {
+            "early_stopping_patience_checks": 4,
+            "early_stopping_min_delta": 0.003,
+        }
+    ) == (4, 0.003)
+    assert resolve_early_stopping_config({"early_stopping_epochs": 12}) == (12, 0.0)
+    with pytest.raises(ValueError, match="Use only"):
+        resolve_early_stopping_config(
+            {
+                "early_stopping_patience_checks": 4,
+                "early_stopping_epochs": 12,
+            }
+        )
 
 
 def test_prediction_cache_is_reused_and_invalidated_when_tampered(tmp_path):

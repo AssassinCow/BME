@@ -24,6 +24,12 @@ PUBLIC_PREDICTION_COLUMNS = [
     "start_probability",
     "end_probability",
 ]
+AUXILIARY_PREDICTION_COLUMNS = [
+    "ppg_gate_mean",
+    "ppg_gate_recent",
+    "ppg_valid_fraction",
+    "motion_valid_fraction",
+]
 FROZEN_BASELINE_FILES = (
     "model.json",
     "metadata.json",
@@ -238,6 +244,13 @@ def _validate_prediction_frame(frame: pd.DataFrame, name: str) -> None:
         raise ValueError(f"{name} predictions contain NaN or infinite values")
     if ((numeric[:, 1:] < 0.0) | (numeric[:, 1:] > 1.0)).any():
         raise ValueError(f"{name} probabilities must be in [0, 1]")
+    auxiliary = [column for column in AUXILIARY_PREDICTION_COLUMNS if column in frame]
+    if auxiliary:
+        values = frame[auxiliary].to_numpy(dtype=np.float64)
+        if not np.isfinite(values).all():
+            raise ValueError(f"{name} quality diagnostics contain NaN or infinite values")
+        if ((values < 0.0) | (values > 1.0)).any():
+            raise ValueError(f"{name} quality diagnostics must be in [0, 1]")
 
 
 def align_prediction_frames(
@@ -271,8 +284,18 @@ def average_prediction_frames(frames: list[pd.DataFrame]) -> pd.DataFrame:
         raise ValueError("At least one prediction frame is required")
     reference = frames[0]
     aligned_frames = [align_prediction_frames(reference, frame)[1] for frame in frames]
-    output = aligned_frames[0][PUBLIC_PREDICTION_COLUMNS].copy()
-    for column in ("state_probability", "start_probability", "end_probability"):
+    auxiliary = [
+        column
+        for column in AUXILIARY_PREDICTION_COLUMNS
+        if all(column in frame.columns for frame in aligned_frames)
+    ]
+    output = aligned_frames[0][[*PUBLIC_PREDICTION_COLUMNS, *auxiliary]].copy()
+    for column in (
+        "state_probability",
+        "start_probability",
+        "end_probability",
+        *auxiliary,
+    ):
         values = np.stack(
             [frame[column].to_numpy(dtype=np.float64) for frame in aligned_frames], axis=0
         )

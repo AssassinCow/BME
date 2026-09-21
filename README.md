@@ -314,68 +314,63 @@ strict-no-ignore 结果。
 
 ## 11. 冻结 baseline + DTP 受限残差融合
 
-不重新训练 `3ca55bb` baseline，不重新运行审计、预处理或 `build_features.py`。先更新代码、
-激活 4080 的 `bme-model` 环境，然后执行：
+当前注册协议是 v4。fold 0 是已观察开发折；参数只能由三块 meta-OOF 产生，不能根据 fold 0
+outer 指标人工改参。训练有效 batch 固定为 `batch_size=4 × gradient_accumulation=8 = 32`，
+不因为显存尚有余量而增大。
 
 ```powershell
 python scripts/check_environment.py
 python -m pytest -q
+python -m ruff check src scripts tests
 python scripts/smoke_test_model.py --config configs/dtp_fusion.yaml --batch-size 1
 python scripts/validate_data.py --config configs/base.yaml
+git status --short
+```
 
-# 只补录冻结产物哈希和团队声明的来源提交，不训练模型、不改预测。
-python scripts/backfill_baseline_manifests.py --source-commit 3ca55bb
+正式实验要求最后一条无输出。使用两个不同 run name：source run 只保存 DTP cross-fit 预测，
+result run 只保存 meta 调参与 outer 评价。原目录只读：
 
-$run = "baseline_dtp_fusion_clean_20260920a"
+```powershell
+$sourceRun = "baseline_dtp_fusion_source_20260922a"
+$resultRun = "baseline_dtp_fusion_v4_20260922a"
+
+# 仅在没有可复用冻结 DTP 预测时运行。
 python scripts/train_fusion.py `
   --config configs/dtp_fusion.yaml `
-  --run-name $run `
+  --run-name $sourceRun `
   --fold 0 `
   --fresh
-if ($LASTEXITCODE -ne 0) { throw "fusion fold 0 failed to complete" }
-```
 
-`--fresh` 原子创建全新的实验根目录；目录只要已经存在就拒绝运行，不删除、不覆盖、也不读取
-其中任何旧 DTP checkpoint、预测或 fusion trial。该方案按定义仍只读复用冻结 baseline 概率和
-后处理参数。
-
-每个 outer fold 训练三个 DTP：各自留出一个 inner partition，以 window AUPRC 选择 checkpoint；
-三份互斥验证预测合并为完整 outer-train OOF，三份 outer-test 概率逐点平均。随后只在完整 OOF
-上执行一次 9 组 `alpha/beta` 搜索。后续折必须串行且全部完成，fold 0 指标、单折零召回或
-单折门禁失败都只记录为诊断，不再阻断 fold 1-4：
-
-```powershell
-1..4 | ForEach-Object {
-  python scripts/train_fusion.py `
-    --config configs/dtp_fusion.yaml `
-    --run-name $run `
-    --fold $_
-  if ($LASTEXITCODE -ne 0) { throw "fusion fold $_ failed" }
-}
-
-python scripts/compare_models.py `
-  --baseline "$env:BME_OUTPUT_ROOT\v2\experiments\baseline" `
-  --candidate "$env:BME_OUTPUT_ROOT\v2\experiments\$run" `
-  --output "$env:BME_OUTPUT_ROOT\v2\experiments\${run}_promotion.json"
-```
-
-中断后只恢复当前折，不删除 checkpoint。`--resume` 可指向该折任一
-`crossfit_0..2\last.pt`；已完整且签名匹配的 partition 会自动跳过：
-
-```powershell
-python scripts/train_fusion.py `
+# 只读取冻结 OOF，执行三折 level-2 meta-crossfit 和融合专属双 EMA。
+python scripts/tune_fusion.py `
   --config configs/dtp_fusion.yaml `
-  --run-name $run `
+  --source-run $sourceRun `
+  --run-name $resultRun `
   --fold 0 `
-  --resume "$env:BME_OUTPUT_ROOT\v2\experiments\$run\fold_0\crossfit_0\last.pt"
+  --workers 16 `
+  --fresh
+
+# 只有 meta-OOF 硬门禁通过才允许读取 fold 0 outer 标签。
+python scripts/evaluate_fusion.py `
+  --config configs/dtp_fusion.yaml `
+  --run-name $resultRun `
+  --fold 0
 ```
 
-50% 正例采样时 focal `positive_alpha` 固定为 `0.5`。融合候选除优于原始 baseline 外，还必须
-比最佳 `alpha=0` beta-only 候选至少高 `0.005` F1，且异侧召回和 FP/h 不得因加入 DTP 变差。
-单折门禁结果写入 `selected_fusion.json`，最终仅由五折 `compare_models.py` 决定是否晋级。
-完整说明见
-[`docs/dtp_fusion_runbook_2026-09-20.md`](docs/dtp_fusion_runbook_2026-09-20.md)。
-本地五折不再受 fold 0 条件筛选，但仍不能称为官方分数。
+若普通概率门控未通过，先用 `export_dtp_quality.py` 从原 checkpoint 重推理诊断字段，再使用
+`configs/dtp_fusion_quality.yaml` 开新 source/result run；该命令不训练模型。fold 1 是首个未观察
+确认折，失败时不得继续 folds 2–4。最终只聚合 folds 1–4：
+
+```powershell
+python scripts/promote_fusion_v4.py `
+  --config configs/dtp_fusion.yaml `
+  --candidate-run $resultRun
+```
+
+完整分步命令、失败退出码和质量重推理方法见
+[`docs/dtp_fusion_v4_runbook_2026-09-22.md`](docs/dtp_fusion_v4_runbook_2026-09-22.md)。
+旧的 [`docs/dtp_fusion_runbook_2026-09-20.md`](docs/dtp_fusion_runbook_2026-09-20.md)
+只用于解释历史 v3 结果，不再用于新实验。
 
 ## 12. 从原始下载数据全量重新运行
 

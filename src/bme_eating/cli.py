@@ -54,6 +54,12 @@ from bme_eating.fusion import (
     validate_frozen_baseline_fold,
     validate_fusion_run_name,
 )
+from bme_eating.fusion_v4 import (
+    apply_v4_selection,
+    evaluate_v4_gate,
+    run_meta_crossfit_selection,
+    write_json_atomic,
+)
 from bme_eating.metrics import evaluate_events, partition_evaluation_events
 from bme_eating.models.dtp_sqf import DTPSQF
 from bme_eating.postprocess import (
@@ -1189,6 +1195,37 @@ def _write_selected_fusion(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _finalize_v4_prediction_source(
+    experiment_dir: Path,
+    config: dict[str, Any],
+    output_root: Path,
+    *,
+    protocol_version: int,
+    experiment_name: str,
+    fold: int,
+    crossfit_models: list[dict[str, Any]],
+    baseline_name: str,
+    baseline_source_commit: str,
+    baseline_info: dict[str, Any],
+) -> None:
+    write_json_atomic(
+        experiment_dir / "dtp_source.json",
+        {
+            "version": 1,
+            "protocol_version": protocol_version,
+            "run_name": experiment_name,
+            "fold": fold,
+            "selection_scope": "frozen_crossfit_predictions_only",
+            "crossfit_models": crossfit_models,
+            "baseline_experiment": baseline_name,
+            "baseline_source_commit": baseline_source_commit,
+            "baseline_artifact_hashes": baseline_info["artifact_hashes"],
+            "input_hashes": baseline_info["input_hashes"],
+        },
+    )
+    write_run_manifest(experiment_dir, config, output_root)
+
+
 def _require_prior_fusion_folds(
     output_root: Path, experiment_name: str, requested_fold: int
 ) -> None:
@@ -1275,12 +1312,22 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     crossfit_partitions = int(config["fusion"].get("crossfit_partitions", 3))
     if crossfit_partitions != 3:
         raise ValueError("The registered fusion protocol requires exactly three cross-fit models")
+    protocol_version = int(config["fusion"].get("protocol_version", 3))
     config["experiment"] = {
         **experiment,
         "name": experiment_name,
-        "protocol_version": 3,
+        "protocol_version": protocol_version,
     }
-    _require_prior_fusion_folds(output_root, experiment_name, fold)
+    if protocol_version < 4:
+        _require_prior_fusion_folds(output_root, experiment_name, fold)
+    elif fold >= 2:
+        confirmation_run = getattr(args, "confirmation_run", None)
+        if not confirmation_run:
+            raise ValueError("Protocol-v4 source folds 2-4 require --confirmation-run")
+        confirmation_run = validate_fusion_run_name(
+            str(experiment.get("name", "baseline_dtp_fusion")), confirmation_run
+        )
+        _require_v4_confirmation_sequence(output_root, confirmation_run, fold)
 
     baseline_name = str(experiment.get("baseline_name", "baseline"))
     source_commit = str(
@@ -1346,7 +1393,11 @@ def command_train_fusion(args: argparse.Namespace) -> None:
             "to resume the whole fold"
         )
 
-    print("[1/5] Loading full baseline OOF predictions and v2 indices...", flush=True)
+    total_steps = 3 if protocol_version >= 4 else 5
+    print(
+        f"[1/{total_steps}] Loading full baseline OOF predictions and v2 indices...",
+        flush=True,
+    )
     anchors = pd.read_parquet(output_root / "indices" / "anchors.parquet")
     segments = pd.read_parquet(output_root / "indices" / "segments.parquet")
     events = pd.read_parquet(output_root / "indices" / "events.parquet")
@@ -1383,18 +1434,19 @@ def command_train_fusion(args: argparse.Namespace) -> None:
         raise RuntimeError(
             "Frozen baseline OOF predictions do not cover the complete outer-training set"
         )
-    validation_truth, validation_ignore = partition_evaluation_events(
-        events, outer_train_subjects
-    )
-    selected_postprocess = json.loads(
-        (baseline_dir / "selected_postprocess.json").read_text(encoding="utf-8")
-    )
-    (experiment_dir / "selected_postprocess.json").write_text(
-        json.dumps(selected_postprocess, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    if protocol_version < 4:
+        validation_truth, validation_ignore = partition_evaluation_events(
+            events, outer_train_subjects
+        )
+        selected_postprocess = json.loads(
+            (baseline_dir / "selected_postprocess.json").read_text(encoding="utf-8")
+        )
+        (experiment_dir / "selected_postprocess.json").write_text(
+            json.dumps(selected_postprocess, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     signature_payload = {
-        "fusion_protocol_version": 3,
+        "fusion_protocol_version": protocol_version,
         "epoch_randomness_version": 2,
         "checkpoint_validation_protocol_version": 1,
         "run_name": experiment_name,
@@ -1411,7 +1463,10 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     validation_frames: dict[int, pd.DataFrame] = {}
     test_frames: dict[int, pd.DataFrame] = {}
     crossfit_models: list[dict[str, Any]] = []
-    print("[2/5] Training three causal DTP cross-fit models on CUDA...", flush=True)
+    print(
+        f"[2/{total_steps}] Training three causal DTP cross-fit models on CUDA...",
+        flush=True,
+    )
     for partition in range(crossfit_partitions):
         partition_dir = experiment_dir / f"crossfit_{partition}"
         partition_training = dict(config["training"])
@@ -1502,6 +1557,27 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     baseline_oof, dtp_oof = align_prediction_frames(baseline_oof, dtp_oof)
     dtp_oof.to_parquet(experiment_dir / "dtp_oof_predictions.parquet", index=False)
     dtp_test.to_parquet(experiment_dir / "dtp_test_predictions.parquet", index=False)
+
+    if protocol_version >= 4:
+        _finalize_v4_prediction_source(
+            experiment_dir,
+            config,
+            output_root,
+            protocol_version=protocol_version,
+            experiment_name=experiment_name,
+            fold=fold,
+            crossfit_models=crossfit_models,
+            baseline_name=baseline_name,
+            baseline_source_commit=source_commit,
+            baseline_info=baseline_info,
+        )
+        print(
+            "[3/3] Frozen DTP predictions are complete. Run scripts/tune_fusion.py next; "
+            "the outer fold has not been evaluated.",
+            flush=True,
+        )
+        print(experiment_dir)
+        return
 
     print("[3/5] Selecting fusion once on complete cross-fit OOF predictions...", flush=True)
     validator = FusionValidator(
@@ -1622,6 +1698,446 @@ def command_train_fusion(args: argparse.Namespace) -> None:
             flush=True,
         )
     print(experiment_dir)
+
+
+def command_export_dtp_quality(args: argparse.Namespace) -> None:
+    from bme_eating.models.xgb_baseline import assign_train_validation_test
+    from bme_eating.training.dtp_trainer import export_dtp_quality_predictions
+
+    config = load_config(args.config)
+    if int(config["fusion"].get("protocol_version", 0)) != 4:
+        raise ValueError("export_dtp_quality.py requires fusion.protocol_version=4")
+    quality_candidates = config["fusion"]["gated_residual"].get(
+        "quality_weighting_candidates", []
+    )
+    if True not in quality_candidates:
+        raise ValueError("Quality re-inference config must enable quality weighting candidates")
+    require_clean_git_worktree()
+    _, output_root = resolve_roots(config)
+    validate_quality_gate(output_root)
+    fold = int(args.fold)
+    source_run = str(args.source_run)
+    run_name = validate_fusion_run_name(
+        str(config["experiment"].get("name", "baseline_dtp_fusion")), args.run_name
+    )
+    validate_fusion_run_name("baseline_dtp_fusion", source_run)
+    if run_name == source_run:
+        raise ValueError("Quality re-inference requires a new --run-name")
+    fresh = bool(args.fresh)
+    if (fold == 0) != fresh:
+        raise ValueError("Use --fresh exactly for fold 0 of a new quality source run")
+    source_dir, source_prediction_hashes = _validate_v4_prediction_source(
+        output_root, source_run, fold
+    )
+    source_manifest = json.loads(
+        (source_dir / "run_manifest.json").read_text(encoding="utf-8")
+    )
+    baseline_name = str(config["experiment"].get("baseline_name", "baseline"))
+    baseline_source_commit = str(
+        config["experiment"].get("baseline_source_commit", "3ca55bb")
+    )
+    baseline_info = validate_frozen_baseline_fold(
+        output_root, baseline_name, fold, baseline_source_commit
+    )
+    source_input_hashes = source_manifest.get("hashes", {})
+    if any(
+        source_input_hashes.get(name) != digest
+        for name, digest in baseline_info["input_hashes"].items()
+    ):
+        raise RuntimeError("Source checkpoints use different data or split fingerprints")
+
+    source_record_path = source_dir / "dtp_source.json"
+    if not source_record_path.is_file():
+        source_record_path = source_dir / "selected_fusion.json"
+    if not source_record_path.is_file():
+        raise FileNotFoundError("Source run lacks DTP cross-fit checkpoint metadata")
+    relative_source_record = source_record_path.name
+    expected_record_hash = source_manifest.get("artifact_hashes", {}).get(
+        relative_source_record
+    )
+    if expected_record_hash != sha256_file(source_record_path):
+        raise RuntimeError("Source DTP checkpoint metadata changed after manifesting")
+    source_record = json.loads(source_record_path.read_text(encoding="utf-8"))
+    model_records = source_record.get("crossfit_models", [])
+    if len(model_records) != 3:
+        raise RuntimeError("Quality re-inference requires three source cross-fit models")
+
+    experiment_root = prepare_fusion_run_root(
+        output_root / "experiments",
+        run_name,
+        fresh=fresh,
+        named_run=True,
+    )
+    experiment_dir = experiment_root / f"fold_{fold}"
+    if experiment_dir.exists():
+        raise RuntimeError("Quality re-inference fold already exists and will not be overwritten")
+    anchors = pd.read_parquet(output_root / "indices" / "anchors.parquet")
+    segments = pd.read_parquet(output_root / "indices" / "segments.parquet")
+    subject_folds = load_subject_folds(output_root / "indices" / "subject_folds.json")
+    fold_assignment = anchors["subject_key"].map(subject_folds)
+    if fold_assignment.isna().any():
+        raise ValueError("Quality re-inference found subjects missing from the fold map")
+    test_subjects = set(
+        anchors.loc[fold_assignment == fold, "subject_key"].astype(str).unique()
+    )
+    partition_subjects: dict[int, set[str]] = {}
+    validation_frames: dict[int, pd.DataFrame] = {}
+    test_frames: dict[int, pd.DataFrame] = {}
+    exported_models: list[dict[str, Any]] = []
+    source_artifact_hashes = source_manifest.get("artifact_hashes", {})
+    for model_record in sorted(
+        model_records, key=lambda item: int(item["inner_validation_partition"])
+    ):
+        partition = int(model_record["inner_validation_partition"])
+        if partition not in range(3):
+            raise RuntimeError("Source cross-fit partition must be 0, 1, or 2")
+        _, partition_validation, partition_test = assign_train_validation_test(
+            anchors,
+            subject_folds,
+            fold,
+            inner_validation_partition=partition,
+        )
+        partition_subjects[partition] = set(
+            partition_validation["subject_key"].astype(str).unique()
+        )
+        if set(partition_test["subject_key"].astype(str).unique()) != test_subjects:
+            raise RuntimeError("Quality re-inference changed the outer test subjects")
+        source_partition = source_dir / f"crossfit_{partition}"
+        checkpoint_path = source_partition / "best.pt"
+        normalization_path = source_partition / "normalization.json"
+        for path in (checkpoint_path, normalization_path):
+            relative = path.relative_to(source_dir).as_posix()
+            if source_artifact_hashes.get(relative) != sha256_file(path):
+                raise RuntimeError(f"Source DTP artifact changed after manifesting: {relative}")
+        validation, test, export_record = export_dtp_quality_predictions(
+            anchors,
+            segments,
+            subject_folds,
+            fold,
+            partition,
+            checkpoint_path,
+            normalization_path,
+            experiment_dir / f"crossfit_{partition}",
+            selection_signature=str(model_record["selection_signature"]),
+            inference_batch_size=args.batch_size,
+            inference_num_workers=args.workers,
+        )
+        validation_frames[partition] = validation
+        test_frames[partition] = test
+        exported_models.append(export_record)
+    dtp_oof, dtp_test = assemble_crossfit_predictions(
+        validation_frames,
+        test_frames,
+        partition_subjects,
+        test_subjects,
+    )
+    diagnostics = {
+        "ppg_gate_mean",
+        "ppg_gate_recent",
+        "ppg_valid_fraction",
+        "motion_valid_fraction",
+    }
+    if not diagnostics.issubset(dtp_oof.columns) or not diagnostics.issubset(
+        dtp_test.columns
+    ):
+        raise RuntimeError("Quality re-inference did not export every diagnostic field")
+    dtp_oof.to_parquet(experiment_dir / "dtp_oof_predictions.parquet", index=False)
+    dtp_test.to_parquet(experiment_dir / "dtp_test_predictions.parquet", index=False)
+    write_json_atomic(
+        experiment_dir / "dtp_source.json",
+        {
+            "version": 1,
+            "protocol_version": 4,
+            "run_name": run_name,
+            "fold": fold,
+            "selection_scope": "checkpoint_quality_reinference_only",
+            "source_run": source_run,
+            "source_record": relative_source_record,
+            "source_record_sha256": expected_record_hash,
+            "source_prediction_hashes": source_prediction_hashes,
+            "quality_diagnostics": sorted(diagnostics),
+            "crossfit_models": exported_models,
+            "baseline_experiment": baseline_name,
+            "baseline_source_commit": baseline_source_commit,
+            "baseline_artifact_hashes": baseline_info["artifact_hashes"],
+            "input_hashes": baseline_info["input_hashes"],
+        },
+    )
+    config["experiment"] = {
+        **config["experiment"],
+        "name": run_name,
+        "protocol_version": 4,
+        "quality_reinference_source": source_run,
+    }
+    write_run_manifest(experiment_dir, config, output_root)
+    print("Quality diagnostics exported without DTP retraining.", flush=True)
+    print(experiment_dir)
+
+
+def _validate_v4_prediction_source(
+    output_root: Path,
+    source_run: str,
+    fold: int,
+) -> tuple[Path, dict[str, str]]:
+    validate_fusion_run_name("baseline_dtp_fusion", source_run)
+    source_dir = output_root / "experiments" / source_run / f"fold_{fold}"
+    manifest_path = source_dir / "run_manifest.json"
+    required = ("dtp_oof_predictions.parquet", "dtp_test_predictions.parquet")
+    missing = [name for name in (*required, "run_manifest.json") if not (source_dir / name).is_file()]
+    if missing:
+        raise FileNotFoundError(f"Frozen DTP source fold is incomplete; missing: {missing}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    identity = manifest.get("experiment", {})
+    if identity != {"name": source_run, "fold": fold}:
+        raise RuntimeError("Frozen DTP source manifest identity is inconsistent")
+    if manifest.get("git", {}).get("dirty") is not False:
+        raise RuntimeError("Frozen DTP source was produced from a dirty worktree")
+    artifact_hashes = manifest.get("artifact_hashes", {})
+    hashes: dict[str, str] = {}
+    for name in required:
+        expected = artifact_hashes.get(name)
+        actual = sha256_file(source_dir / name)
+        if expected != actual:
+            raise RuntimeError(f"Frozen DTP source artifact changed: {name}")
+        hashes[name] = actual
+    return source_dir, hashes
+
+
+def _load_manifested_v4_selection(
+    output_root: Path,
+    run_name: str,
+    fold: int,
+) -> dict[str, Any]:
+    fold_dir = output_root / "experiments" / run_name / f"fold_{fold}"
+    selection_path = fold_dir / "selected_fusion.json"
+    manifest_path = fold_dir / "run_manifest.json"
+    if not selection_path.is_file() or not manifest_path.is_file():
+        raise FusionGateError(
+            f"Fold {fold} must have a manifested protocol-v4 selection", exit_code=2
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("experiment") != {"name": run_name, "fold": fold}:
+        raise RuntimeError(f"Fold {fold} manifest identity is inconsistent")
+    expected_hash = manifest.get("artifact_hashes", {}).get("selected_fusion.json")
+    if expected_hash != sha256_file(selection_path):
+        raise RuntimeError(f"Fold {fold} selected fusion changed after manifesting")
+    selection = json.loads(selection_path.read_text(encoding="utf-8"))
+    if (
+        int(selection.get("protocol_version", 0)) != 4
+        or selection.get("run_name") != run_name
+        or int(selection.get("fold", -1)) != fold
+    ):
+        raise RuntimeError(f"Fold {fold} selected fusion identity is inconsistent")
+    return selection
+
+
+def _require_v4_confirmation_sequence(
+    output_root: Path,
+    run_name: str,
+    fold: int,
+) -> None:
+    if fold < 2:
+        return
+    confirmation = _load_manifested_v4_selection(output_root, run_name, 1)
+    if confirmation.get("outer_fold_gate", {}).get("passed") is not True:
+        raise FusionGateError(
+            "Fold 1 confirmation did not pass; folds 2-4 are blocked", exit_code=2
+        )
+    for prior_fold in range(2, fold):
+        prior = _load_manifested_v4_selection(output_root, run_name, prior_fold)
+        if not isinstance(prior.get("outer_fold_gate", {}).get("passed"), bool):
+            raise FusionGateError(
+                f"Fold {prior_fold} must be evaluated before fold {fold}", exit_code=2
+            )
+
+
+def command_tune_fusion_v4(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    if int(config["fusion"].get("protocol_version", 0)) != 4:
+        raise ValueError("tune_fusion.py requires fusion.protocol_version=4")
+    require_clean_git_worktree()
+    _, output_root = resolve_roots(config)
+    validate_quality_gate(output_root)
+    fold = int(args.fold)
+    run_name = validate_fusion_run_name(
+        str(config["experiment"].get("name", "baseline_dtp_fusion")), args.run_name
+    )
+    if args.run_name is None:
+        raise ValueError("Protocol v4 tuning requires an isolated --run-name")
+    if bool(args.fresh) == bool(args.resume):
+        raise ValueError("Choose exactly one of --fresh or --resume")
+    _require_v4_confirmation_sequence(output_root, run_name, fold)
+    source_dir, source_hashes = _validate_v4_prediction_source(
+        output_root, str(args.source_run), fold
+    )
+    baseline_name = str(config["experiment"].get("baseline_name", "baseline"))
+    source_commit = str(config["experiment"].get("baseline_source_commit", "3ca55bb"))
+    baseline_info = validate_frozen_baseline_fold(
+        output_root, baseline_name, fold, source_commit
+    )
+    baseline_dir = Path(baseline_info["directory"])
+    experiment_root = prepare_fusion_run_root(
+        output_root / "experiments",
+        run_name,
+        fresh=bool(args.fresh),
+        named_run=True,
+    )
+    experiment_dir = experiment_root / f"fold_{fold}"
+    experiment_dir.mkdir(parents=True, exist_ok=True)
+    selected_path = experiment_dir / "selected_fusion.json"
+    if selected_path.is_file():
+        raise RuntimeError("Protocol v4 tuning is already complete for this fold")
+
+    print("[1/4] Loading frozen baseline, DTP OOF predictions, and labels...", flush=True)
+    baseline_oof = pd.read_parquet(baseline_dir / "validation_predictions.parquet")
+    dtp_oof = pd.read_parquet(source_dir / "dtp_oof_predictions.parquet")
+    anchors = pd.read_parquet(output_root / "indices" / "anchors.parquet")
+    events = pd.read_parquet(output_root / "indices" / "events.parquet")
+    baseline_test = pd.read_parquet(baseline_dir / "test_predictions.parquet")
+    outer_subjects = set(baseline_test["subject_key"].astype(str).unique())
+    if set(dtp_oof["subject_key"].astype(str).unique()) & outer_subjects:
+        raise RuntimeError("DTP OOF predictions contain outer-fold subjects")
+    baseline_postprocess = json.loads(
+        (baseline_dir / "selected_postprocess.json").read_text(encoding="utf-8")
+    )
+
+    print("[2/4] Running leakage-safe level-2 meta cross-validation...", flush=True)
+    selection, meta_predictions, meta_events, trials = run_meta_crossfit_selection(
+        baseline_oof,
+        dtp_oof,
+        anchors,
+        events,
+        baseline_postprocess,
+        config["fusion"],
+        experiment_dir,
+        workers=int(args.workers),
+    )
+    selection.update(
+        {
+            "run_name": run_name,
+            "fold": fold,
+            "development_fold": fold == 0,
+            "source_run": str(args.source_run),
+            "source_artifact_hashes": source_hashes,
+            "baseline_experiment": baseline_name,
+            "baseline_source_commit": source_commit,
+            "baseline_artifact_hashes": baseline_info["artifact_hashes"],
+            "input_hashes": baseline_info["input_hashes"],
+        }
+    )
+    signature_payload = {
+        "protocol_version": 4,
+        "fusion": config["fusion"],
+        "source_artifact_hashes": source_hashes,
+        "baseline_artifact_hashes": baseline_info["artifact_hashes"],
+        "input_hashes": baseline_info["input_hashes"],
+    }
+    selection["selection_signature"] = hashlib.sha256(
+        json.dumps(signature_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    print("[3/4] Saving meta-OOF evidence and frozen final parameters...", flush=True)
+    meta_predictions.to_parquet(experiment_dir / "validation_predictions.parquet", index=False)
+    meta_events.to_csv(experiment_dir / "meta_oof_events.csv", index=False)
+    trials.to_csv(experiment_dir / "fusion_trials.csv", index=False)
+    write_json_atomic(
+        experiment_dir / "meta_oof_metrics.json",
+        {
+            "candidate": selection["meta_oof_metrics"],
+            "baseline": selection["meta_oof_baseline_metrics"],
+            "gate": selection["meta_oof_gate"],
+            "paired_subject_bootstrap": selection["paired_subject_bootstrap"],
+        },
+    )
+    write_json_atomic(
+        experiment_dir / "selected_postprocess.json", selection["final_postprocess"]
+    )
+    write_json_atomic(selected_path, selection)
+    config["experiment"] = {**config["experiment"], "name": run_name, "protocol_version": 4}
+    write_run_manifest(experiment_dir, config, output_root)
+    print("[4/4] Meta-OOF tuning complete; no outer predictions were read by selection.", flush=True)
+    print(json.dumps(selection["meta_oof_gate"], ensure_ascii=False, indent=2))
+    print(experiment_dir)
+
+
+def command_evaluate_fusion_v4(args: argparse.Namespace) -> None:
+    config = load_config(args.config)
+    if int(config["fusion"].get("protocol_version", 0)) != 4:
+        raise ValueError("evaluate_fusion.py requires fusion.protocol_version=4")
+    require_clean_git_worktree()
+    _, output_root = resolve_roots(config)
+    validate_quality_gate(output_root)
+    fold = int(args.fold)
+    run_name = validate_fusion_run_name(
+        str(config["experiment"].get("name", "baseline_dtp_fusion")), args.run_name
+    )
+    if args.run_name is None:
+        raise ValueError("Protocol v4 evaluation requires --run-name")
+    experiment_dir = output_root / "experiments" / run_name / f"fold_{fold}"
+    selected_path = experiment_dir / "selected_fusion.json"
+    selection = _load_manifested_v4_selection(output_root, run_name, fold)
+    if selection.get("outer_fold_gate", {}).get("passed") is not None:
+        raise RuntimeError("Outer evaluation is already complete for this fold")
+    if selection.get("meta_oof_gate", {}).get("passed") is not True:
+        raise FusionGateError(
+            "Meta-OOF promotion gate failed; outer evaluation is blocked", exit_code=2
+        )
+    source_dir, source_hashes = _validate_v4_prediction_source(
+        output_root, str(selection["source_run"]), fold
+    )
+    if source_hashes != selection.get("source_artifact_hashes"):
+        raise RuntimeError("Frozen DTP source hashes changed after tuning")
+    baseline_name = str(selection["baseline_experiment"])
+    baseline_info = validate_frozen_baseline_fold(
+        output_root,
+        baseline_name,
+        fold,
+        str(selection["baseline_source_commit"]),
+    )
+    baseline_dir = Path(baseline_info["directory"])
+    baseline_test = pd.read_parquet(baseline_dir / "test_predictions.parquet")
+    dtp_test = pd.read_parquet(source_dir / "dtp_test_predictions.parquet")
+    events = pd.read_parquet(output_root / "indices" / "events.parquet")
+
+    print("[1/3] Applying parameters frozen by meta-OOF selection...", flush=True)
+    fused_test, selected_postprocess = apply_v4_selection(
+        baseline_test, dtp_test, selection, config["fusion"]
+    )
+    fused_test.to_parquet(experiment_dir / "test_predictions.parquet", index=False)
+    test_subjects = set(fused_test["subject_key"].astype(str).unique())
+    truth, test_ignore = partition_evaluation_events(events, test_subjects)
+    predicted_events, metrics, failures = _evaluate_prediction_file(
+        fused_test, truth, selected_postprocess, test_ignore
+    )
+    predicted_events.to_csv(experiment_dir / "test_events.csv", index=False)
+    failures.to_csv(experiment_dir / "test_failure_cases.csv", index=False)
+    (experiment_dir / "test_metrics.json").write_text(
+        json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+    print("[2/3] Applying the balanced outer-fold promotion gate...", flush=True)
+    candidate_summary = metrics_summary_from_suite(metrics)
+    baseline_metrics = json.loads(
+        (baseline_dir / "test_metrics.json").read_text(encoding="utf-8")
+    )
+    baseline_summary = metrics_summary_from_suite(baseline_metrics)
+    outer_gate = evaluate_v4_gate(
+        candidate_summary,
+        baseline_summary,
+        config["fusion"]["promotion_gate"],
+    )
+    outer_gate["diagnostic_only"] = fold == 0
+    selection["outer_fold_metrics"] = candidate_summary
+    selection["outer_fold_baseline_metrics"] = baseline_summary
+    selection["outer_fold_gate"] = outer_gate
+    write_json_atomic(selected_path, selection)
+    config["experiment"] = {**config["experiment"], "name": run_name, "protocol_version": 4}
+    write_run_manifest(experiment_dir, config, output_root)
+    print("[3/3] Outer-fold evaluation and manifests recorded.", flush=True)
+    print(json.dumps(outer_gate, ensure_ascii=False, indent=2))
+    print(experiment_dir)
+    if not outer_gate["passed"]:
+        raise FusionGateError("Outer-fold balanced promotion gate failed", exit_code=2)
 
 
 def command_evaluate(args: argparse.Namespace) -> None:

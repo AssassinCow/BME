@@ -103,10 +103,15 @@ def write_run_manifest(
         "validation_predictions.parquet",
         "dtp_oof_predictions.parquet",
         "dtp_test_predictions.parquet",
+        "dtp_source.json",
         "test_predictions.parquet",
+        "meta_oof_events.csv",
+        "meta_oof_metrics.json",
         "selected_postprocess.json",
         "selected_fusion.json",
         "fusion_trials.csv",
+        "test_events.csv",
+        "test_failure_cases.csv",
         "test_metrics.json",
         "best.pt",
     )
@@ -121,10 +126,17 @@ def write_run_manifest(
             "metadata.json",
             "normalization.json",
             "best_validation_predictions.parquet",
+            "best_validation_predictions.parquet.manifest.json",
             "dtp_test_predictions.parquet",
+            "dtp_test_predictions.parquet.manifest.json",
         ):
             path = partition_dir / name
             if (digest := _sha256(path)) is not None:
+                artifact_hashes[path.relative_to(output_dir).as_posix()] = digest
+    postprocess_trials = output_dir / "postprocess_trials"
+    if postprocess_trials.is_dir():
+        for path in sorted(postprocess_trials.rglob("*")):
+            if path.is_file() and (digest := _sha256(path)) is not None:
                 artifact_hashes[path.relative_to(output_dir).as_posix()] = digest
     try:
         import xgboost
