@@ -10,7 +10,8 @@
 - `start_probability`、`end_probability` 始终来自 XGBoost。
 - 先用 baseline hysteresis 筛选三个非 identity 融合候选，再分别搜索融合专属双 EMA。
 - 训练、调参、outer 评价和最终聚合是四个独立命令。
-- 训练有效 batch 固定为 `4 × 8 = 32`；显存空闲不是增大 batch 的理由。
+- 训练采用 `16 × 2 = 32`，`steps_per_epoch=1250`；只提高 micro-batch 吞吐，不改变
+  有效 batch、每轮样本量或每轮更新次数。
 
 ## 2. 正式运行前
 

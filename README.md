@@ -315,8 +315,8 @@ strict-no-ignore 结果。
 ## 11. 冻结 baseline + DTP 受限残差融合
 
 当前注册协议是 v4。fold 0 是已观察开发折；参数只能由三块 meta-OOF 产生，不能根据 fold 0
-outer 指标人工改参。训练有效 batch 固定为 `batch_size=4 × gradient_accumulation=8 = 32`，
-不因为显存尚有余量而增大。
+outer 指标人工改参。训练采用 `batch_size=16 × gradient_accumulation=2 = 32`；同时把
+`steps_per_epoch` 调为 `1250`，保持每轮样本量和更新次数不变。
 
 ```powershell
 python scripts/check_environment.py
