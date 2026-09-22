@@ -39,6 +39,14 @@ CORE_COLUMNS = [
 KEYS = ["subject_key", "session_id", "timestamp_ms"]
 RUN_PATTERN = re.compile(r"dtp_postprocess_[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
+# Exact signature of the development search that completed before JSON
+# serialization failed on a NumPy boolean. This is intentionally narrow and
+# never acts as a general reproducibility bypass.
+SERIALIZATION_FAILURE_SIGNATURE = (
+    "355a3add917f743cb82c526c9da4cc7355b1bcebc5f52c312155c23e833703ae"
+)
+SERIALIZATION_FAILURE_COMMIT = "53aec2293684de6ddb7f6b51c689b4d54bf2c9a4"
+
 
 @dataclass(frozen=True)
 class Decoder:
@@ -385,6 +393,37 @@ def _save_json(path: Path, payload: Any) -> None:
         json.dumps(json_safe(payload), ensure_ascii=False, indent=2, allow_nan=False),
         encoding="utf-8",
     )
+
+
+def _validate_serialization_recovery(output_dir: Path, saved_signature: str) -> None:
+    """Validate the one-time migration for the completed pre-fix search."""
+    if saved_signature != SERIALIZATION_FAILURE_SIGNATURE:
+        raise RuntimeError("Cannot resume search after prediction, label, config or code changes")
+    if not output_dir.is_dir():
+        raise RuntimeError("Serialization recovery requires the existing search directory")
+    if (output_dir / "selected_dtp_postprocess.json").exists():
+        raise RuntimeError("Serialization recovery is only valid before selection is frozen")
+    required = [
+        output_dir / "search_trials.csv",
+        output_dir / "meta_oof_metrics.json",
+        output_dir / "module_ablations.csv",
+    ]
+    checkpoints = [
+        output_dir / f"search.heldout_{fold}.checkpoint.jsonl" for fold in range(3)
+    ]
+    if any(not path.is_file() for path in required + checkpoints):
+        raise RuntimeError("Serialization recovery requires complete search artifacts")
+    for checkpoint in checkpoints:
+        lines = checkpoint.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            raise RuntimeError(f"Search checkpoint is empty: {checkpoint.name}")
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise RuntimeError(f"Search checkpoint is corrupt: {checkpoint.name}") from error
+            if not isinstance(row, dict) or "scope" not in row or "key" not in row:
+                raise RuntimeError(f"Search checkpoint has an invalid row: {checkpoint.name}")
 
 
 def _score_series(predictions: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame:
@@ -1592,9 +1631,15 @@ def tune_dtp_postprocess(args: Any) -> Path:
     if signature_path.exists():
         saved = json.loads(signature_path.read_text(encoding="utf-8"))
         if saved.get("signature") != signature:
-            raise RuntimeError(
-                "Cannot resume search after prediction, label, config or code changes"
-            )
+            _validate_serialization_recovery(output_dir, str(saved.get("signature", "")))
+            migration = {
+                "resumed_from_signature": saved["signature"],
+                "resumed_from_commit": SERIALIZATION_FAILURE_COMMIT,
+                "migration": "numpy_bool_json_serialization_failure",
+                "new_signature": signature,
+            }
+            _save_json(output_dir / "search_signature_migration.json", migration)
+            _save_json(signature_path, {"signature": signature, **migration})
     else:
         if output_dir.exists():
             raise FileExistsError("Existing directory has no trusted search signature")

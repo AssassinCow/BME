@@ -6,14 +6,17 @@ import pandas as pd
 import pytest
 
 from bme_eating.dtp_postprocess import (
+    SERIALIZATION_FAILURE_SIGNATURE,
     Decoder,
     _crossfit,
     _event_diagnostics,
     _legacy_control,
     _metrics,
     _observed_hours,
+    _save_json,
     _search_scope,
     _validate_selection,
+    _validate_serialization_recovery,
     correct_boundaries,
     evaluate_dtp_postprocess,
     event_gate,
@@ -23,7 +26,7 @@ from bme_eating.dtp_postprocess import (
     module_gate,
     weighted_quantile,
 )
-from bme_eating.fusion import sha256_file
+from bme_eating.fusion import json_safe, sha256_file
 from bme_eating.fusion_v4 import PlattCalibrator, fuse_gated_prediction_frames
 from bme_eating.postprocess import probabilities_to_events
 
@@ -46,6 +49,41 @@ def _decoder(mode="fast_persistent", persistence=6):
     return Decoder(
         "raw_control", 0.1, 1000, mode, 0.9, 0.9, persistence, exit_ratio=0.5, off_duration=6
     )
+
+
+def test_json_safe_recursively_converts_numpy_boolean(tmp_path):
+    payload = {"nested": [np.bool_(True), {"flag": np.bool_(False)}]}
+    assert json_safe(payload) == {"nested": [True, {"flag": False}]}
+    output = tmp_path / "payload.json"
+    _save_json(output, payload)
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "nested": [True, {"flag": False}]
+    }
+
+
+def test_serialization_recovery_requires_exact_signature_and_complete_checkpoints(tmp_path):
+    (tmp_path / "search_trials.csv").write_text("scope,key\n", encoding="utf-8")
+    (tmp_path / "meta_oof_metrics.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "module_ablations.csv").write_text("", encoding="utf-8")
+    for fold in range(3):
+        (tmp_path / f"search.heldout_{fold}.checkpoint.jsonl").write_text(
+            json.dumps({"scope": f"heldout_{fold}", "key": "one"}) + "\n",
+            encoding="utf-8",
+        )
+    _validate_serialization_recovery(tmp_path, SERIALIZATION_FAILURE_SIGNATURE)
+    with pytest.raises(RuntimeError, match="Cannot resume"):
+        _validate_serialization_recovery(tmp_path, "wrong-signature")
+
+
+def test_serialization_recovery_rejects_corrupt_checkpoint(tmp_path):
+    (tmp_path / "search_trials.csv").write_text("scope,key\n", encoding="utf-8")
+    (tmp_path / "meta_oof_metrics.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "module_ablations.csv").write_text("", encoding="utf-8")
+    for fold in range(3):
+        text = "{" if fold == 1 else json.dumps({"scope": "x", "key": "y"})
+        (tmp_path / f"search.heldout_{fold}.checkpoint.jsonl").write_text(text, encoding="utf-8")
+    with pytest.raises(RuntimeError, match="checkpoint is corrupt"):
+        _validate_serialization_recovery(tmp_path, SERIALIZATION_FAILURE_SIGNATURE)
 
 
 def test_subject_equal_weight_quantile():

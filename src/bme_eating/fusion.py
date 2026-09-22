@@ -771,6 +771,8 @@ def json_safe(value: Any) -> Any:
         return {str(key): json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [json_safe(item) for item in value]
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
     if isinstance(value, (np.integer,)):
         return int(value)
     if isinstance(value, (np.floating, float)):
