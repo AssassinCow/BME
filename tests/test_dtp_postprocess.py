@@ -327,6 +327,40 @@ def test_event_gate_only_changes_positive_fusion_residual():
         fuse_gated_prediction_frames(baseline, dtp, calibrator, parameters, event_gate=gate)
 
 
+def test_additive_event_rescue_can_open_low_baseline_support():
+    baseline = _predictions([0.01])
+    dtp = _predictions([0.9])
+    calibrator = PlattCalibrator(1, 0, 0, 1, 1)
+    parameters = {
+        "alpha_positive": 0.25,
+        "alpha_negative": 0.0,
+        "baseline_support_min": 0.05,
+        "baseline_support_max": 0.5,
+        "dtp_on_threshold": 0.55,
+        "dtp_off_threshold": 0.1,
+        "persistence_seconds": 3,
+    }
+    gate = baseline[["subject_key", "session_id", "timestamp_ms"]].copy()
+    gate["event_gate"] = 1.0
+    original = fuse_gated_prediction_frames(baseline, dtp, calibrator, parameters)
+    restricted = fuse_gated_prediction_frames(
+        baseline, dtp, calibrator, parameters, event_gate=gate
+    )
+    rescued = fuse_gated_prediction_frames(
+        baseline,
+        dtp,
+        calibrator,
+        parameters,
+        event_gate=gate,
+        restrict_positive_with_event_gate=False,
+        event_rescue_alpha=1.0,
+    )
+    assert restricted.state_probability.tolist() == pytest.approx(
+        original.state_probability.tolist()
+    )
+    assert rescued.state_probability.iloc[0] > original.state_probability.iloc[0]
+
+
 def test_manifest_hash_blocks_tampered_selection(tmp_path, monkeypatch):
     import bme_eating.dtp_postprocess as module
 

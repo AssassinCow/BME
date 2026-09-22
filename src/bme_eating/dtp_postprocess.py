@@ -287,7 +287,7 @@ def filter_and_merge(core: pd.DataFrame, threshold: float | None, merge_gap: flo
 def event_gate(
     predictions: pd.DataFrame, events: pd.DataFrame, training_scores: pd.DataFrame
 ) -> pd.DataFrame:
-    gate = predictions[KEYS].copy()
+    gate = predictions[KEYS].reset_index(drop=True).copy()
     gate["event_gate"] = 0.0
     if len(events) and not len(training_scores):
         raise ValueError("Event gate needs train-only event score reference")
@@ -295,14 +295,30 @@ def event_gate(
     subjects = training_scores.subject_key.astype(str).to_numpy()
     counts = pd.Series(subjects).value_counts()
     weights = np.asarray([1.0 / counts[subject] for subject in subjects])
+    order = np.argsort(values, kind="stable")
+    sorted_values = values[order]
+    cumulative_weights = np.cumsum(weights[order])
+    indices = {
+        key: group.sort_values("timestamp_ms", kind="stable")
+        for key, group in gate.groupby(["subject_key", "session_id"], sort=False)
+    }
     for event in events.itertuples(index=False):
-        mask = (
-            (gate.subject_key == event.subject_key)
-            & (gate.session_id == event.session_id)
-            & gate.timestamp_ms.between(event.start_ms, event.end_ms)
+        group = indices.get((event.subject_key, event.session_id))
+        if group is None:
+            continue
+        timestamps = group.timestamp_ms.to_numpy(dtype=np.int64)
+        first = int(np.searchsorted(timestamps, event.start_ms, side="left"))
+        last = int(np.searchsorted(timestamps, event.end_ms, side="right"))
+        score_position = int(np.searchsorted(sorted_values, event.score, side="right"))
+        percentile = (
+            float(cumulative_weights[score_position - 1] / cumulative_weights[-1])
+            if score_position
+            else 0.0
         )
-        percentile = float(weights[values <= event.score].sum() / weights.sum())
-        gate.loc[mask, "event_gate"] = np.maximum(gate.loc[mask, "event_gate"], percentile)
+        selected = group.index[first:last]
+        gate.loc[selected, "event_gate"] = np.maximum(
+            gate.loc[selected, "event_gate"], percentile
+        )
     return gate
 
 
@@ -1597,6 +1613,10 @@ def tune_dtp_postprocess(args: Any) -> Path:
         raise ValueError("--workers must be positive")
     config = load_config(args.config)
     settings = config["dtp_postprocess"]
+    if str(settings["protocol_version"]) == "2.1":
+        from bme_eating.dtp_postprocess_21 import tune_legacy_crossfit
+
+        return tune_legacy_crossfit(args, config)
     if int(settings["protocol_version"]) != 2:
         raise ValueError("Expected pure DTP postprocessing protocol 2")
     require_clean_git_worktree()
@@ -1760,6 +1780,10 @@ def tune_dtp_postprocess(args: Any) -> Path:
 
 def evaluate_dtp_postprocess(args: Any) -> Path:
     config = load_config(args.config)
+    if str(config["dtp_postprocess"].get("protocol_version")) == "2.1":
+        from bme_eating.dtp_postprocess_21 import evaluate_legacy_frozen
+
+        return evaluate_legacy_frozen(args, config)
     require_clean_git_worktree()
     _, output_root = resolve_roots(config)
     fold = int(args.fold)

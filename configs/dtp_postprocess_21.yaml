@@ -1,0 +1,21 @@
+extends: dtp_postprocess.yaml
+
+dtp_postprocess:
+  protocol_version: '2.1'
+  comparison_run: dtp_postprocess_v2_20260922a
+  legacy_generator:
+    detector_mode: dual_ema
+    fast_ema_half_life_seconds: 12
+    slow_ema_half_life_seconds: 36
+    fast_high_threshold: 0.55
+    slow_high_threshold: 0.30
+    exit_threshold_ratio: 0.25
+    off_duration_seconds: 60
+    minimum_event_seconds: 30
+    merge_gap_seconds: 60
+    boundary_lookback_seconds: 60
+  legacy_score_quantiles: [0.80, 0.825, 0.85, 0.875, 0.90, 0.925]
+  minimum_unique_rescues: 3
+  minimum_different_hand_rescues: 3
+  minimum_partition_rescues: 1
+  maximum_standalone_false_positives_per_rescue: 5.0

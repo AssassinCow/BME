@@ -447,3 +447,46 @@ OOF 重新拟合、fold 1 的留出预测只读取一次。正式 v2 不评价 f
 独立晋级；要做真正独立确认须有完全不参与 fold 0 调参的新受试者数据。未通过门禁时
 保留冻结 XGBoost 作为提交候选。`dtp_event_gate.parquet` 仅在完成上述诊断后，作为
 融合 v4 的正残差门控接口进行另一个独立消融；默认 v4 路径不变。
+### DTP 互补性与融合消融（协议 2.1，开发阶段）
+
+协议 2.1 恢复旧双 EMA 高召回生成器，按受试者不交叉的三个分区，仅在另两个训练分区拟合
+事件分数阈值。它统计与 XGBoost 的共同 TP、两者各自独有 TP、DTP 救回的异侧事件，及
+DTP 单独运行的 FP/每个救援。组件筛选**不要求纯 DTP F1 超过 XGBoost**；纯 DTP 的 FP
+也不能直接等同融合 FP。两个冻结候选分别侧重救援和较低误报，它们还不是提交方案。
+
+```powershell
+$sourceRun = "baseline_dtp_fusion_clean_20260920a"
+$selectionRun = "dtp_postprocess_21_20260922a"
+
+python scripts/tune_dtp_postprocess.py `
+  --config configs/dtp_postprocess_21.yaml `
+  --source-run $sourceRun `
+  --run-name $selectionRun `
+  --fold 0 `
+  --workers 16
+```
+
+完成后单独比较冻结 v4、原有乘法事件门控和受限加法救援分支：
+
+```powershell
+python scripts/compare_fusion_event_gates.py `
+  --config configs/dtp_fusion_event_ablation.yaml `
+  --fusion-run baseline_dtp_fusion_v4_20260922a `
+  --component-run $selectionRun `
+  --run-name fusion_event_ablation_20260922a `
+  --fold 0
+```
+
+以上命令均要求先将代码提交到 clean Git 状态；新目录不能已存在。消融仅读取 fold 0
+outer-train OOF，不读取 outer holdout，报告在 `fusion_event_gate_ablation.json`。受限加法
+分支固定原 v4 校准器、权重及后处理，仅在 XGBoost 概率不超过 0.5、DTP 事件门控有效
+且校准残差为正时额外补强，救援权重只在另外两个 meta 分区选择。原有正负残差不变。
+
+当前开发探针表明单纯乘法门控不改变原 v4 事件；加法救援的三块训练侧选择可把
+F1 `0.5597→0.5811`、异侧召回 `0.4167→0.4861`，但 End MAE `99.65s` 高于
+XGBoost `82.06s × 1.1 = 90.27s`，故**原融合晋级门禁仍未通过**。
+这不是未见数据的增益证明，不能据此运行 fold 1 或放宽门禁。协议 2.1 的纯 DTP
+outer 评价入口已锁定；必须先修复失败项、预先冻结融合策略，再另行确认。搜索、标签、
+bootstrap 都是离线操作；部署时只需要因果双 EMA、固定阈值和一次前向推理，不执行搜索。
+本地只读计时：`339652` 个冻结 DTP 测试窗口，双 EMA 事件生成、固定阈值过滤和事件门控
+映射共约 `0.75s`（不含 XGBoost / DTP 模型前向推理，机器与数据规模变化时需重测）。

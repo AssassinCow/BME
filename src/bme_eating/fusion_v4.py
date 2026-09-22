@@ -340,12 +340,15 @@ def fuse_gated_prediction_frames(
     epsilon: float = 1e-6,
     gate_ema_half_life_seconds: float = 12.0,
     event_gate: pd.DataFrame | None = None,
+    restrict_positive_with_event_gate: bool = True,
+    event_rescue_alpha: float = 0.0,
+    event_rescue_baseline_max: float = 0.5,
 ) -> pd.DataFrame:
     baseline_sorted, dtp_sorted = align_prediction_frames(baseline, dtp)
     output = baseline_sorted[PUBLIC_PREDICTION_COLUMNS].copy()
     alpha_positive = float(parameters["alpha_positive"])
     alpha_negative = float(parameters["alpha_negative"])
-    if alpha_positive == 0.0 and alpha_negative == 0.0:
+    if alpha_positive == 0.0 and alpha_negative == 0.0 and event_rescue_alpha == 0.0:
         return output
     if alpha_positive < 0 or alpha_negative < 0 or residual_clip <= 0:
         raise ValueError("Fusion weights must be non-negative and residual_clip must be positive")
@@ -397,10 +400,28 @@ def fuse_gated_prediction_frames(
             or ((event_multiplier < 0) | (event_multiplier > 1)).any()
         ):
             raise ValueError("DTP event gate values must lie in [0, 1]")
+    positive_multiplier = (
+        event_multiplier
+        if event_gate is not None and restrict_positive_with_event_gate
+        else np.ones(len(dtp_sorted), dtype=np.float64)
+    )
     fused_logit += (
-        alpha_positive * quality * positive_gate * event_multiplier * np.maximum(residual, 0.0)
+        alpha_positive * quality * positive_gate * positive_multiplier * np.maximum(residual, 0.0)
     )
     fused_logit += alpha_negative * quality * negative_gate * np.minimum(residual, 0.0)
+    if event_rescue_alpha:
+        if event_gate is None:
+            raise ValueError("An additive event rescue branch requires a DTP event gate")
+        if event_rescue_alpha < 0 or not 0 <= event_rescue_baseline_max <= 1:
+            raise ValueError("Event rescue parameters are outside their valid ranges")
+        rescue_support = base_probability <= float(event_rescue_baseline_max)
+        fused_logit += (
+            float(event_rescue_alpha)
+            * quality
+            * rescue_support
+            * event_multiplier
+            * np.maximum(residual, 0.0)
+        )
     output["state_probability"] = _sigmoid(fused_logit).astype(np.float32)
     return output
 

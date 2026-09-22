@@ -1,0 +1,7 @@
+extends: dtp_fusion.yaml
+
+fusion:
+  event_rescue:
+    alpha_candidates: [0.5, 1.0]
+    quantile_candidates: [0.80, 0.825, 0.85, 0.875, 0.90, 0.925]
+    baseline_max: 0.50
