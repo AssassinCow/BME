@@ -490,3 +490,37 @@ outer 评价入口已锁定；必须先修复失败项、预先冻结融合策�
 bootstrap 都是离线操作；部署时只需要因果双 EMA、固定阈值和一次前向推理，不执行搜索。
 本地只读计时：`339652` 个冻结 DTP 测试窗口，双 EMA 事件生成、固定阈值过滤和事件门控
 映射共约 `0.75s`（不含 XGBoost / DTP 模型前向推理，机器与数据规模变化时需重测）。
+
+### 加法救援的结束边界保留（开发消融）
+
+冻结预测只读、Git 工作树干净后，使用全新 run name 单独运行；该步骤仅使用 fold 0 的
+outer-train 三块 meta-OOF，不读取 outer holdout，也不重训 DTP：
+
+```powershell
+python scripts/compare_fusion_end_preservation.py `
+  --config configs/dtp_fusion_end_preservation.yaml `
+  --fusion-run baseline_dtp_fusion_v4_20260922a `
+  --component-run dtp_postprocess_21_20260922a `
+  --ablation-run fusion_event_ablation_20260922a `
+  --run-name fusion_end_preservation_20260922a `
+  --fold 0
+```
+
+先断言旧报告各块和汇总的 TP、FP、FN、F1、起止 MAE 与 strict F1 完全重放，之后才执行
+同受试者、同 session 内 IoU 严格大于 `0.25` 的一对一无标签事件匹配。仅复制匹配事件的
+原 v4 结束点，若新边界无效或产生相邻事件重叠则跳过；起点、分数、事件数不变。
+`paired_errors.csv`、`paired_summary.csv`、`alignment.csv` 记录手别、逐折配对误差和
+对齐/跳过原因；三路事件与 `end_preservation_report.json`、`run_manifest.json` 保留
+哈希、参数、门禁、1000 次受试者配对 bootstrap 和固定 `339652` 窗离线后处理计时。
+
+模块门禁需 End MAE 相对未修正救援改善至少 `5%`、各块不恶化、F1 与 strict F1 不降，
+再按原 v4 融合门禁相对 XGBoost 判断。均通过时才在完整 outer-train OOF 按既有
+训练侧选择规则冻结唯一部署阈值；`apply_frozen_end_preservation` 推理接口只用
+冻结数值参数和预测，执行既有 DTP 门控生成、两次固定融合事件解码及一次事件对齐，
+不读取标签、不搜索、不 bootstrap，且必须声明推理范围；`outer`
+范围会拒绝与拟合受试者重叠的预测。fold 0 已被观察，结果属于
+开发假设，不是独立确认。fold 1 必须使用自身无泄漏的冻结 DTP 预测；因其受试者与
+fold 0 开发 OOF 重合，不能直接拿 fold 0 拟合的部署参数评估 fold 1；先在 fold 1
+自己的 outer-train OOF 重做同一冻结协议，再对其 outer 留出作跨折压力测试。
+失败即停止后续折并保留 XGBoost。
+目前没有自动 outer 评价入口，不得把本次开发门禁通过当作可提交证明。

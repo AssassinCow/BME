@@ -1,0 +1,6 @@
+extends: dtp_fusion_event_ablation.yaml
+
+fusion:
+  end_preservation:
+    iou_threshold: 0.25
+    minimum_end_mae_improvement: 0.05
