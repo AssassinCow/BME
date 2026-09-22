@@ -1,0 +1,30 @@
+extends: dtp_fusion.yaml
+
+dtp_postprocess:
+  protocol_version: 2
+  output_step_seconds: 3
+  probability_spaces: [raw_control, positive_slope_platt]
+  fast_ema_half_life_seconds: [6, 12]
+  slow_ema_half_life_seconds: [36, 60]
+  start_modes: [legacy_or, fast_persistent, fast_persistent_with_slow_support]
+  fast_background_quantiles: [0.975, 0.99]
+  slow_background_quantiles: [0.95, 0.975]
+  persistence_seconds: [6, 12]
+  exit_ratios: [0.35, 0.50, 0.65]
+  off_duration_seconds: [30, 60, 90]
+  minimum_event_seconds: 30
+  score_quantiles: [null, 0.50, 0.60, 0.70, 0.80, 0.85, 0.90]
+  merge_gap_seconds: [0, 30, 60]
+  stage1_keep: 6
+  final_keep: 8
+  bootstrap_replicates: 1000
+  bootstrap_seed: 2026
+  minimum_f1_improvement: 0.02
+  module_minimum_f1_improvement: 0.01
+  module_minimum_fp_reduction: 0.15
+  module_minimum_large_f1_improvement: 0.02
+  module_maximum_different_sensitivity_drop: 0.10
+  module_maximum_strict_f1_drop: 0.01
+  module_maximum_partition_f1_drop: 0.02
+  maximum_xgb_fp_ratio: 1.2
+  minimum_different_sensitivity_gain: 0.03

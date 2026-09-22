@@ -386,3 +386,64 @@ beta-only 增量门禁和完整五折协议；正式运行前仍必须提交并�
 [`docs/clean_retrain_runbook_2026-09-20.md`](docs/clean_retrain_runbook_2026-09-20.md)。
 
 `scripts/run_clean_retrain.ps1` 仅保留作历史参考，不作为正式实验入口。
+
+## 13. 纯 DTP 留出集诊断（不参与融合门禁）
+
+使用已有的三折 cross-fit DTP 预测，无需重训。仅在外层训练集 OOF 上选择 DTP 自己的双 EMA
+后处理，然后对 fold 0 留出集评价一次；原 source/baseline 目录保持只读。
+
+```powershell
+python scripts/evaluate_pure_dtp.py `
+  --config configs/dtp_fusion.yaml `
+  --source-run baseline_dtp_fusion_clean_20260920a `
+  --run-name pure_dtp_fold0_20260921a `
+  --fold 0 `
+  --workers 4
+```
+
+新目录的 `diagnostics.json` 包含事件 F1、precision/recall、FP/h、起止 MAE、佩戴手关系、
+coverage、strict-no-ignore、受试者分项和窗口 AUPRC/AUROC；`test_events.csv` 与
+`test_failure_cases.csv` 供逐事件复核。`selected_postprocess.json`、搜索试验与
+`run_manifest.json` 记录选择、参数、源文件及输入哈希。诊断必须使用新的 run name，
+不可借 fold 0 留出结果重新选择阈值。fold 0 已在历史融合实验中被观察，故本报告仅作
+开发诊断，不替代 v4 的 meta-OOF 门禁，也不能称为新的独立确认折。
+
+## 14. 纯 DTP 后处理 v2（分步开发）
+
+v2 将概率校准、候选事件生成、事件分数过滤、合并及边界修正拆为可否决的消融模块。
+`evaluate_pure_dtp.py` 只保留为历史诊断；正式 v2 须先在 clean Git 状态下使用新 run name
+运行 OOF 搜索，审阅 `selected_dtp_postprocess.json` 和 `module_ablations.csv`，
+且仅在 `meta_gate_passed=true` 时执行外层评价：
+
+```powershell
+$sourceRun = "baseline_dtp_fusion_clean_20260920a"
+$selectionRun = "dtp_postprocess_v2_20260922a"
+python scripts/tune_dtp_postprocess.py `
+  --config configs/dtp_postprocess.yaml `
+  --source-run $sourceRun --run-name $selectionRun --fold 0 --workers 16
+```
+
+`--workers` 最多并行三个 meta 搜索；每个分区有独立签名断点，不能在代码、配置、
+预测或标签哈希改变后续跑。搜索对候选的统一部署参数重新做三块 heldout 检查；若没有
+单一参数组通过门禁，禁止外层评价。`meta_oof_events.csv`、
+`meta_oof_per_subject_metrics.csv`、`meta_oof_hand_relation_metrics.json` 和
+`meta_oof_failure_cases.csv` 可用于审阅训练侧表现；通过的边界消融会同步更新事件和门控。
+评价使用另一全新目录，且需要该外折对应的冻结 DTP 预测：
+
+```powershell
+$fold1Source = "baseline_dtp_fusion_source_fold1_20260922a"
+python scripts/evaluate_dtp_postprocess.py `
+  --config configs/dtp_postprocess.yaml `
+  --source-run $fold1Source `
+  --selection-run $selectionRun `
+  --run-name dtp_postprocess_eval_20260922a `
+  --fold 1
+```
+
+上述 `$fold1Source` 仅是待实际训练并核验的示例名称。fold 1 参数由 fold 1 的 outer-train
+OOF 重新拟合、fold 1 的留出预测只读取一次。正式 v2 不评价 fold 0；任一 fold 已有 v2
+外层评价记录时不能换 run 名再次评价。但 fold 0 的开发 OOF 曾包含 fold 1 受试者，
+因此这仍是**受试者重用的跨折诊断**，不是未见受试者的独立确认。不得据此宣称无偏泛化或
+独立晋级；要做真正独立确认须有完全不参与 fold 0 调参的新受试者数据。未通过门禁时
+保留冻结 XGBoost 作为提交候选。`dtp_event_gate.parquet` 仅在完成上述诊断后，作为
+融合 v4 的正残差门控接口进行另一个独立消融；默认 v4 路径不变。

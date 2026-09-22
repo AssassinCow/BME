@@ -339,6 +339,7 @@ def fuse_gated_prediction_frames(
     residual_clip: float = 2.0,
     epsilon: float = 1e-6,
     gate_ema_half_life_seconds: float = 12.0,
+    event_gate: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     baseline_sorted, dtp_sorted = align_prediction_frames(baseline, dtp)
     output = baseline_sorted[PUBLIC_PREDICTION_COLUMNS].copy()
@@ -377,7 +378,28 @@ def fuse_gated_prediction_frames(
     dtp_logit = _logit(calibrated_dtp, epsilon)
     residual = np.clip(dtp_logit - base_logit, -residual_clip, residual_clip)
     fused_logit = base_logit.copy()
-    fused_logit += alpha_positive * quality * positive_gate * np.maximum(residual, 0.0)
+    event_multiplier = np.ones(len(dtp_sorted), dtype=np.float64)
+    if event_gate is not None:
+        if event_gate.duplicated(TARGET_KEYS).any() or len(event_gate) != len(dtp_sorted):
+            raise ValueError("DTP event gate must align one-to-one with the prediction timeline")
+        aligned_gate = dtp_sorted[TARGET_KEYS].merge(
+            event_gate[[*TARGET_KEYS, "event_gate"]],
+            on=TARGET_KEYS,
+            how="left",
+            validate="one_to_one",
+            sort=False,
+        )
+        if aligned_gate.event_gate.isna().any():
+            raise ValueError("DTP event gate is missing prediction timestamps")
+        event_multiplier = aligned_gate.event_gate.to_numpy(dtype=np.float64)
+        if (
+            not np.isfinite(event_multiplier).all()
+            or ((event_multiplier < 0) | (event_multiplier > 1)).any()
+        ):
+            raise ValueError("DTP event gate values must lie in [0, 1]")
+    fused_logit += (
+        alpha_positive * quality * positive_gate * event_multiplier * np.maximum(residual, 0.0)
+    )
     fused_logit += alpha_negative * quality * negative_gate * np.minimum(residual, 0.0)
     output["state_probability"] = _sigmoid(fused_logit).astype(np.float32)
     return output
@@ -641,6 +663,7 @@ def summarize_event_predictions(
     *,
     iou_threshold: float,
     matching_method: str,
+    observed_hours: float | None = None,
 ) -> dict[str, float]:
     metrics, matches = evaluate_events(
         truth,
@@ -655,13 +678,15 @@ def summarize_event_predictions(
         iou_threshold=iou_threshold,
         method=matching_method,
     )
-    exposure_hours = 0.0
-    for _, group in predictions.groupby(["subject_key", "session_id"], sort=False):
-        exposure_hours += max(
-            0.0,
-            (float(group["timestamp_ms"].max()) - float(group["timestamp_ms"].min()) + 3000.0)
-            / 3_600_000.0,
-        )
+    exposure_hours = observed_hours
+    if exposure_hours is None:
+        exposure_hours = 0.0
+        for _, group in predictions.groupby(["subject_key", "session_id"], sort=False):
+            exposure_hours += max(
+                0.0,
+                (float(group["timestamp_ms"].max()) - float(group["timestamp_ms"].min()) + 3000.0)
+                / 3_600_000.0,
+            )
     truth_relation = truth.get(
         "hand_relation", pd.Series("unknown", index=truth.index, dtype=object)
     )
