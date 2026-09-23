@@ -1302,6 +1302,17 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     experiment = config["experiment"]
     requested_run_name = getattr(args, "run_name", None)
     fresh = bool(getattr(args, "fresh", False))
+    if int(config["fusion"].get("protocol_version", 3)) == 5:
+        from bme_eating.fusion_event_rescue import require_registration
+
+        rescue_run = getattr(args, "event_rescue_run", None)
+        if fold not in (2, 3, 4) or not rescue_run or not requested_run_name:
+            raise ValueError("Protocol-v5 training requires fold 2-4 and --event-rescue-run")
+        if getattr(args, "baseline_source_commit", None) not in (
+            None, config["experiment"]["baseline_source_commit"]
+        ):
+            raise ValueError("Protocol-v5 cannot override its registered baseline source commit")
+        require_registration(output_root, rescue_run, config, requested_run_name)
     experiment_name = validate_fusion_run_name(
         str(experiment.get("name", "baseline_dtp_fusion")), requested_run_name
     )
@@ -1320,7 +1331,7 @@ def command_train_fusion(args: argparse.Namespace) -> None:
     }
     if protocol_version < 4:
         _require_prior_fusion_folds(output_root, experiment_name, fold)
-    elif fold >= 2:
+    elif protocol_version != 5 and fold >= 2:
         confirmation_run = getattr(args, "confirmation_run", None)
         if not confirmation_run:
             raise ValueError("Protocol-v4 source folds 2-4 require --confirmation-run")

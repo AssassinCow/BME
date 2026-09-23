@@ -1,0 +1,33 @@
+extends: dtp_fusion.yaml
+
+fusion:
+  protocol_version: 5
+
+# Fixed protocol: these values are checked, never searched or overridden at inference.
+event_rescue:
+  protocol_version: 5
+  score_quantile: 0.90
+  exclusion_seconds: 120
+  generator:
+    detector_mode: dual_ema
+    fast_ema_half_life_seconds: 12
+    slow_ema_half_life_seconds: 36
+    fast_high_threshold: 0.55
+    slow_high_threshold: 0.30
+    exit_threshold_ratio: 0.25
+    off_duration_seconds: 60
+    minimum_event_seconds: 30
+    merge_gap_seconds: 60
+    boundary_lookback_seconds: 60
+  bootstrap_replicates: 1000
+  bootstrap_seed: 2026
+  stress_folds: [2, 3, 4]
+  minimum_nondegraded_folds: 2
+  maximum_fold_f1_drop: 0.03
+  gate:
+    minimum_f1_improvement: 0.02
+    minimum_different_sensitivity_improvement: 0.03
+    maximum_fp_per_hour_ratio: 1.2
+    maximum_boundary_mae_ratio: 1.1
+    maximum_partition_f1_drop: 0.01
+    maximum_partition_strict_f1_drop: 0.01

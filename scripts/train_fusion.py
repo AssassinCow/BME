@@ -67,6 +67,10 @@ def main() -> None:
             "folds 2-4."
         ),
     )
+    parser.add_argument(
+        "--event-rescue-run",
+        help="Protocol-v5 registration authorizing the fixed folds 2-4 stress experiment.",
+    )
     args = parser.parse_args()
     try:
         command_train_fusion(args)
