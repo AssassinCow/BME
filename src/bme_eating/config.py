@@ -69,6 +69,29 @@ def resolve_roots(config: dict[str, Any]) -> tuple[Path, Path]:
     return data_root, output_root
 
 
+def resolve_artifact_roots(config: dict[str, Any]) -> tuple[Path, Path, Path]:
+    """Resolve raw data, immutable input artifacts, and writable output artifacts."""
+
+    _load_project_dotenv(config)
+    data_root = require_environment_path(config, "data_root_env")
+    output_base = require_environment_path(config, "output_root_env")
+    project = config["project"]
+    input_version = str(project.get("input_artifact_schema_version", "")).strip()
+    output_version = str(project.get("artifact_schema_version", "")).strip()
+    if not input_version or not output_version:
+        raise ValueError("Both input and output artifact schema versions are required")
+    if input_version == output_version:
+        raise ValueError("Hierarchical runs require distinct input and output artifact versions")
+    input_root = output_base / input_version
+    output_root = output_base / output_version
+    if not input_root.is_dir():
+        raise FileNotFoundError(f"Input artifact root does not exist: {input_root}")
+    output_root.mkdir(parents=True, exist_ok=True)
+    config["_output_base_path"] = str(output_base)
+    config["_input_artifact_root"] = str(input_root)
+    return data_root, input_root, output_root
+
+
 def feature_artifact_name(config: dict[str, Any]) -> str:
     """Return the configured feature artifact stem without allowing path traversal."""
 

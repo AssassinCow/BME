@@ -1,5 +1,10 @@
 # 2026 生医工进食检测建模工程
 
+当前 v3 主线已改为“状态识别 → 候选事件 → 事件验证 → 边界精修”的分层架构；
+实现、无泄漏门禁和逐阶段命令见
+[`docs/hierarchical_v3_runbook_2026-09-23.md`](docs/hierarchical_v3_runbook_2026-09-23.md)。
+v2 产物保持只读，新实验只写入 `%BME_OUTPUT_ROOT%\v3`。
+
 当前 XGBoost + DTP 实验路线见 [事件级救援 v5 分步骤运行说明](docs/fusion_event_rescue_v5.md)。
 该路线保留冻结 XGBoost 事件，固定 DTP 分位数与 120 秒排除规则，依次进行
 OOF 拟合、协议登记、预测生成、一次性评价和统一汇总；下文 v4/历史消融作为历史记录保留。
@@ -40,7 +45,7 @@ BME_DATA_ROOT=D:\BME2026\BME_Data_2026
 BME_OUTPUT_ROOT=D:\BME2026\outputs
 ```
 
-所有新版产物写入 `%BME_OUTPUT_ROOT%\v2`。旧输出不会被覆盖，也不得与 v2 混用。受试者 salt 仍保存在 `%BME_OUTPUT_ROOT%\private\subject_salt.hex`；必须随私有实验产物备份，不能提交到 Git。
+历史 v2 流程的产物写入 `%BME_OUTPUT_ROOT%\v2`；当前 v3 分层主线只写入 `%BME_OUTPUT_ROOT%\v3`。旧输出不会被覆盖，也不得跨代混用。受试者 salt 仍保存在 `%BME_OUTPUT_ROOT%\private\subject_salt.hex`；必须随私有实验产物备份，不能提交到 Git。
 
 安装：
 

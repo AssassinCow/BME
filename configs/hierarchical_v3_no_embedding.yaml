@@ -1,0 +1,7 @@
+extends: hierarchical_v3.yaml
+
+experiment:
+  name: hierarchical_v3_no_embedding
+
+verifier:
+  use_state_embedding: false

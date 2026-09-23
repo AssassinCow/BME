@@ -1,0 +1,7 @@
+extends: hierarchical_v3_state_xgb.yaml
+
+experiment:
+  name: hierarchical_v3_state_xgb_no_embedding
+
+verifier:
+  use_state_embedding: false

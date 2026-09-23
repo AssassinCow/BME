@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 import pyarrow as pa
 import torch
+from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader
@@ -30,7 +31,8 @@ from bme_eating.metrics import (
     partition_evaluation_events,
 )
 from bme_eating.models.dtp_sqf import DTPSQF, logits_to_probability_arrays
-from bme_eating.models.losses import DTPLoss
+from bme_eating.models.factory import build_state_model
+from bme_eating.models.losses import DTPLoss, HierarchicalStateLoss
 from bme_eating.models.xgb_baseline import assign_train_validation_test
 from bme_eating.postprocess import probabilities_to_events, tune_postprocess_parameters
 from bme_eating.reproducibility import epoch_random_seed, should_validate_epoch
@@ -56,6 +58,12 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.deterministic = True
 
 
+def configured_state_feature_columns(model_config: dict[str, Any]) -> tuple[str, ...]:
+    if not bool(model_config.get("use_stable_state_features", False)):
+        return ()
+    return tuple(str(value) for value in model_config.get("stable_feature_columns", ()))
+
+
 def _move_batch(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
     return {
         key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
@@ -76,7 +84,7 @@ def _learning_rate_schedule(warmup_fraction: float, total_steps: int):
 
 
 def _prediction_frame(
-    model: DTPSQF,
+    model: nn.Module,
     loader: DataLoader,
     device: torch.device,
     amp_dtype: torch.dtype,
@@ -110,9 +118,21 @@ def _prediction_frame(
             ppg_gate_recent = ppg_gate[:, -1]
             ppg_valid_fraction = ppg_valid.mean(axis=1)
             motion_valid_fraction = motion_valid.mean(axis=1)
+            state_logit = output["state_logit"].detach().float().cpu().numpy()
+            start_logit = output["start_logit"].detach().float().cpu().numpy()
+            end_logit = output["end_logit"].detach().float().cpu().numpy()
+            embedding = output.get("state_embedding")
+            embedding_array = (
+                embedding.detach().float().cpu().numpy() if embedding is not None else None
+            )
+            missing = output.get("missing_fraction")
+            missing_array = (
+                missing.detach().float().cpu().numpy().reshape(-1)
+                if missing is not None
+                else 1.0 - 0.5 * (ppg_valid_fraction + motion_valid_fraction)
+            )
             for index in range(len(state)):
-                rows.append(
-                    {
+                row: dict[str, object] = {
                         "subject_key": batch["subject_key"][index],
                         "segment_id": batch["segment_id"][index],
                         "session_id": batch["session_id"][index],
@@ -124,8 +144,19 @@ def _prediction_frame(
                         "ppg_gate_recent": float(ppg_gate_recent[index]),
                         "ppg_valid_fraction": float(ppg_valid_fraction[index]),
                         "motion_valid_fraction": float(motion_valid_fraction[index]),
+                        "missing_fraction": float(missing_array[index]),
+                        "state_logit": float(state_logit[index]),
+                        "start_logit": float(start_logit[index]),
+                        "end_logit": float(end_logit[index]),
                     }
-                )
+                if embedding_array is not None:
+                    row.update(
+                        {
+                            f"state_embedding_{dimension:02d}": float(value)
+                            for dimension, value in enumerate(embedding_array[index])
+                        }
+                    )
+                rows.append(row)
     auprc = masked_average_precision(
         np.asarray(targets), np.asarray(probabilities), np.asarray(state_masks)
     )
@@ -138,10 +169,48 @@ def _prediction_frame(
         "ppg_gate_recent",
         "ppg_valid_fraction",
         "motion_valid_fraction",
+        "missing_fraction",
+        "state_logit",
+        "start_logit",
+        "end_logit",
     ):
         if column in frame:
             frame[column] = frame[column].astype(np.float32)
     return frame, float(auprc)
+
+
+def _prepare_stable_features(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    test: pd.DataFrame,
+    columns: tuple[str, ...],
+    output_dir: Path,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if not columns:
+        return train, validation, test
+    missing = sorted(set(columns) - set(train.columns))
+    if missing:
+        raise ValueError(f"Training anchors are missing stable features: {missing}")
+    values = train.loc[:, columns].to_numpy(dtype=np.float64)
+    median = np.nanmedian(values, axis=0)
+    upper = np.nanpercentile(values, 75, axis=0)
+    lower = np.nanpercentile(values, 25, axis=0)
+    scale = np.where(upper - lower > 1e-6, upper - lower, 1.0)
+    if not np.isfinite(median).all() or not np.isfinite(scale).all():
+        raise ValueError("Stable feature normalization is not finite")
+
+    def transform(frame: pd.DataFrame) -> pd.DataFrame:
+        transformed = frame.copy()
+        array = transformed.loc[:, columns].to_numpy(dtype=np.float64)
+        array = np.nan_to_num(array, nan=median, posinf=median, neginf=median)
+        transformed.loc[:, columns] = np.clip((array - median) / scale, -10.0, 10.0)
+        return transformed
+
+    _write_json_atomic(
+        {"columns": list(columns), "median": median.tolist(), "iqr": scale.tolist()},
+        output_dir / "stable_feature_normalization.json",
+    )
+    return transform(train), transform(validation), transform(test)
 
 
 def select_checkpoint_validation_anchors(
@@ -204,6 +273,12 @@ def _write_json_atomic(payload: dict[str, Any], path: Path) -> None:
 def _save_prediction_frame(frame: pd.DataFrame, path: Path) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     frame.to_parquet(temporary_path, index=False)
+    temporary_path.replace(path)
+
+
+def _save_csv_frame(frame: pd.DataFrame, path: Path) -> None:
+    temporary_path = path.with_name(path.name + ".tmp")
+    frame.to_csv(temporary_path, index=False)
     temporary_path.replace(path)
 
 
@@ -624,6 +699,14 @@ def train_dtp_fold(
     normalization = compute_normalization(segments, train_subjects)
     output_dir.mkdir(parents=True, exist_ok=True)
     save_normalization(normalization, output_dir / "normalization.json")
+    stable_feature_columns = configured_state_feature_columns(model_config)
+    train_anchors, validation_anchors, test_anchors = _prepare_stable_features(
+        train_anchors,
+        validation_anchors,
+        test_anchors,
+        stable_feature_columns,
+        output_dir,
+    )
 
     future_seconds = int(model_config.get("future_context_seconds", 0))
     train_dataset = DTPDataset(
@@ -638,6 +721,7 @@ def train_dtp_fold(
         ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
         motion_bucket_counts=model_config["motion_bucket_counts"],
         ppg_bucket_counts=model_config["ppg_bucket_counts"],
+        stable_feature_columns=stable_feature_columns,
     )
     use_checkpoint_subset = (
         checkpoint_selection_metric == "window_auprc" and validation_selector is None
@@ -661,6 +745,7 @@ def train_dtp_fold(
         ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
         motion_bucket_counts=model_config["motion_bucket_counts"],
         ppg_bucket_counts=model_config["ppg_bucket_counts"],
+        stable_feature_columns=stable_feature_columns,
     )
     test_dataset = DTPDataset(
         test_anchors,
@@ -673,6 +758,7 @@ def train_dtp_fold(
         ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
         motion_bucket_counts=model_config["motion_bucket_counts"],
         ppg_bucket_counts=model_config["ppg_bucket_counts"],
+        stable_feature_columns=stable_feature_columns,
     )
     batch_sampler = SegmentBalancedBatchSampler(
         train_anchors,
@@ -717,7 +803,7 @@ def train_dtp_fold(
 
     device = torch.device("cuda")
     torch.cuda.reset_peak_memory_stats(device)
-    model = DTPSQF(model_config).to(device)
+    model = build_state_model(model_config).to(device)
     encoder_parameters = list(model.motion_encoder.parameters()) + list(
         model.ppg_encoder.parameters()
     )
@@ -750,14 +836,22 @@ def train_dtp_fold(
     eligible_train = train_anchors[train_state_mask.fillna(0.0).astype(float) > 0]
     positive_rate = float((eligible_train["state_target"] > 0).mean())
     positive_alpha = resolve_focal_positive_alpha(training_config)
-    criterion = DTPLoss(
-        positive_alpha=positive_alpha,
-        focal_gamma=float(loss_config["focal_gamma"]),
-        dice_weight=float(loss_config["dice_weight"]),
-        boundary_weight=float(loss_config["boundary_weight"]),
-        sqi_weight=float(loss_config["sqi_weight"]),
-        boundary_positive_weight=float(training_config["boundary_positive_weight"]),
-    ).to(device)
+    loss_arguments = {
+        "positive_alpha": positive_alpha,
+        "focal_gamma": float(loss_config["focal_gamma"]),
+        "dice_weight": float(loss_config["dice_weight"]),
+        "boundary_weight": float(loss_config["boundary_weight"]),
+        "sqi_weight": float(loss_config["sqi_weight"]),
+        "boundary_positive_weight": float(training_config["boundary_positive_weight"]),
+    }
+    if str(model_config.get("architecture", "dtp_sqf")) == "hierarchical_state":
+        criterion = HierarchicalStateLoss(
+            **loss_arguments,
+            smooth_weight=float(loss_config.get("smooth_weight", 0.05)),
+            smooth_tau=float(loss_config.get("smooth_tau", 0.25)),
+        ).to(device)
+    else:
+        criterion = DTPLoss(**loss_arguments).to(device)
     amp_name = str(training_config["amp_dtype"]).lower()
     amp_dtype = torch.bfloat16 if amp_name == "bfloat16" else torch.float16
     scaler = torch.amp.GradScaler("cuda", enabled=amp_dtype == torch.float16)
@@ -870,7 +964,7 @@ def train_dtp_fold(
                     "early_stopping_reference_score": early_stopping_reference_score,
                 }
             )
-            pd.DataFrame(history).to_csv(output_dir / "history.csv", index=False)
+            _save_csv_frame(pd.DataFrame(history), output_dir / "history.csv")
             _save_torch_checkpoint(
                 {
                     "epoch": epoch,
@@ -986,7 +1080,7 @@ def train_dtp_fold(
                 "early_stopping_reference_score": early_stopping_reference_score,
             }
         )
-        pd.DataFrame(history).to_csv(output_dir / "history.csv", index=False)
+        _save_csv_frame(pd.DataFrame(history), output_dir / "history.csv")
         if checkpoint_improved:
             best_f1 = metrics["f1"]
             best_boundary_mae = boundary_mae
@@ -1084,6 +1178,7 @@ def train_dtp_fold(
                 ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
                 motion_bucket_counts=model_config["motion_bucket_counts"],
                 ppg_bucket_counts=model_config["ppg_bucket_counts"],
+                stable_feature_columns=stable_feature_columns,
             )
             full_validation_loader = DataLoader(
                 full_validation_dataset,

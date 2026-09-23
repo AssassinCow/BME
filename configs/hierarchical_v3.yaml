@@ -1,0 +1,155 @@
+extends: base.yaml
+
+project:
+  input_artifact_schema_version: v2
+  artifact_schema_version: v3
+
+experiment:
+  name: hierarchical_v3
+  protocol_version: 3
+
+features:
+  artifact_name: baseline
+
+model:
+  architecture: hierarchical_state
+  motion_block_seconds: 3
+  ppg_block_seconds: 15
+  motion_bucket_counts: [1, 2, 4, 8, 16, 32, 64]
+  ppg_bucket_counts: [1, 2, 4, 8, 16]
+  motion_dilations: [1, 2, 4, 8, 16, 32]
+  ppg_dilations: [1, 2, 4, 8]
+  local_embedding_dim: 64
+  tcn_channels: 64
+  state_embedding_dim: 32
+  dropout: 0.1
+  future_context_seconds: 0
+  use_stable_state_features: false
+  stable_feature_columns: &stable_features
+    - local_acc_y_mean
+    - local_acc_z_zero_crossing_rate
+    - local_gyro_z_mad
+    - local_acc_mag_std
+    - local_gyro_z_zero_crossing_rate
+    - local_acc_mag_iqr
+    - local_acc_mag_jerk_rms
+    - local_gyro_y_mad
+    - local_acc_y_median
+    - local_ppg_valid_fraction
+    - local_gyro_mag_jerk_p95
+    - local_acc_x_median
+
+training:
+  device: cuda
+  amp_dtype: bfloat16
+  batch_size: 16
+  gradient_accumulation: 2
+  steps_per_epoch: 1250
+  inference_batch_size: 16
+  validation_every_epochs: 2
+  num_workers: 8
+  inference_num_workers: 2
+  max_epochs: 32
+  early_stopping_patience_checks: 4
+  early_stopping_min_delta: 0.003
+  learning_rate: 0.0003
+  encoder_learning_rate: 0.0001
+  weight_decay: 0.01
+  warmup_fraction: 0.05
+  gradient_clip_norm: 1.0
+  positive_sampling_fraction: 0.5
+  focal_positive_alpha: 0.5
+  ppg_augmentation_probability: 0.35
+  boundary_positive_weight: 20.0
+  random_seed: 2026
+
+loss:
+  focal_gamma: 2.0
+  dice_weight: 0.3
+  boundary_weight: 0.5
+  sqi_weight: 0.1
+  smooth_weight: 0.05
+  smooth_tau: 0.25
+
+hierarchical:
+  xgb_mode: verifier_only
+  maximum_event_latency_seconds: 60
+  state_embedding_dim: 32
+  verifier_crossfit_partitions: 3
+  boundary_crossfit_partitions: 3
+  stable_feature_columns: *stable_features
+
+proposals:
+  high_threshold: 0.35
+  low_threshold: 0.15
+  hint_threshold: 0.35
+  jitter_seconds: [-30, -15, 0, 15, 30]
+  maximum_variants_per_event: 12
+  maximum_candidates_per_hour: 20
+  deduplication_iou: 0.9
+  minimum_duration_floor_seconds: 15
+  maximum_duration_ceiling_seconds: 14400
+  duration_lower_quantile: 0.005
+  duration_upper_quantile: 0.995
+
+verifier:
+  left_context_seconds: 60
+  right_context_seconds: 60
+  left_bins: 4
+  event_bins: 16
+  right_bins: 4
+  hidden_channels: 64
+  hidden_dim: 128
+  dropout: 0.1
+  use_state_embedding: true
+  batch_size: 128
+  batch_composition:
+    positive: 0.32
+    near_miss: 0.24
+    hard_false_positive: 0.24
+    random_background: 0.20
+  max_epochs: 80
+  patience: 10
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  seeds: [2026, 2027, 2028]
+
+boundary:
+  start_range_seconds: 600
+  end_range_seconds: 360
+  coarse_bin_seconds: 30
+  fine_range_seconds: 15
+  entropy_thresholds: [0.55, 0.65, 0.75, 0.85]
+  safety_gap_seconds: 3
+  hidden_dim: 128
+  dropout: 0.1
+  batch_size: 128
+  max_epochs: 80
+  patience: 10
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  seeds: [2026, 2027, 2028]
+
+calibration:
+  nms_iou_thresholds: [0.3, 0.5, 0.7]
+  acceptance_quantiles: [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+
+historical_baselines:
+  hard_dyadic_experiment: pure_dtp_fold0_20260921a
+  hard_dyadic_metrics_file: diagnostics.json
+
+promotion_gate:
+  minimum_mean_f1_improvement: 0.015
+  maximum_fp_per_hour_ratio: 1.05
+  maximum_different_sensitivity_drop: 0.03
+  minimum_positive_bootstrap_probability: 0.8
+  minimum_boundary_mae_improvement: 0.10
+  maximum_boundary_f1_drop: 0.005
+  maximum_tp_to_fp_fraction: 0.01
+
+final_training:
+  state_seeds: [2026, 2027, 2028]
+  primary_representation_seed: 2026
+  xgboost_source_experiment: baseline
+  xgboost_parameter_source_fold: 0
+  xgboost_n_jobs: 12

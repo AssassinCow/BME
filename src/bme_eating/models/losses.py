@@ -105,3 +105,29 @@ class DTPLoss(nn.Module):
             + self.sqi_weight * sqi
         )
         return total, {"focal": focal, "dice": dice, "boundary": boundary, "sqi": sqi}
+
+
+class HierarchicalStateLoss(DTPLoss):
+    def __init__(self, *args, smooth_weight: float, smooth_tau: float, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.smooth_weight = float(smooth_weight)
+        self.smooth_tau = float(smooth_tau)
+
+    def forward(
+        self,
+        output: dict[str, torch.Tensor],
+        batch: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        total, components = super().forward(output, batch)
+        history = output["state_history_logit"]
+        difference = torch.diff(torch.logsigmoid(history), dim=1).square()
+        per_sample = difference.clamp_max(self.smooth_tau).mean(dim=1)
+        boundary_neighborhood_weight = 1.0 - torch.maximum(
+            batch["start_target"], batch["end_target"]
+        ).clamp(0.0, 1.0)
+        boundary_neighborhood_weight = boundary_neighborhood_weight.clamp_min(0.1)
+        state_mask = batch.get("state_loss_mask", torch.ones_like(per_sample))
+        smooth_weight = boundary_neighborhood_weight * state_mask
+        smooth = (per_sample * smooth_weight).sum() / smooth_weight.sum().clamp_min(1.0)
+        total = total + self.smooth_weight * smooth
+        return total, {**components, "smooth": smooth}

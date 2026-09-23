@@ -199,6 +199,7 @@ def evaluate_events(
                     "truth_end_ms": int(truth_row.end_ms),
                     "prediction_start_ms": int(prediction_row.start_ms),
                     "prediction_end_ms": int(prediction_row.end_ms),
+                    "prediction_event_id": prediction_row.get("proposal_id", ""),
                     "iou": match.iou,
                     "start_absolute_error_ms": abs(
                         int(prediction_row.start_ms) - int(truth_row.start_ms)

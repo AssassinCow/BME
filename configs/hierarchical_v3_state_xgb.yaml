@@ -1,0 +1,10 @@
+extends: hierarchical_v3.yaml
+
+experiment:
+  name: hierarchical_v3_state_xgb
+
+model:
+  use_stable_state_features: true
+
+hierarchical:
+  xgb_mode: state_and_verifier

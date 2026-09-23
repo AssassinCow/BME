@@ -122,7 +122,12 @@ def compute_normalization(
 
 
 def save_normalization(normalization: Normalization, path: Path) -> None:
-    path.write_text(json.dumps(normalization.to_json(), indent=2), encoding="utf-8")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(normalization.to_json(), indent=2), encoding="utf-8"
+    )
+    temporary.replace(path)
 
 
 def load_normalization(path: Path) -> Normalization:
@@ -219,6 +224,7 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         ppg_block_seconds: int = 15,
         motion_bucket_counts: Sequence[int] = (1, 2, 4, 8, 16, 32, 64),
         ppg_bucket_counts: Sequence[int] = (1, 2, 4, 8, 16),
+        stable_feature_columns: Sequence[str] = (),
     ) -> None:
         self.anchors = anchors.reset_index(drop=True)
         self.session_reader = SessionWindowReader(segments, cache_size=8)
@@ -231,6 +237,10 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         self.ppg_block_seconds = int(ppg_block_seconds)
         self.motion_bucket_counts = tuple(int(value) for value in motion_bucket_counts)
         self.ppg_bucket_counts = tuple(int(value) for value in ppg_bucket_counts)
+        self.stable_feature_columns = tuple(str(value) for value in stable_feature_columns)
+        missing_stable = sorted(set(self.stable_feature_columns) - set(self.anchors.columns))
+        if missing_stable:
+            raise ValueError(f"Anchors are missing stable features: {missing_stable}")
         if self.motion_block_seconds <= 0 or self.ppg_block_seconds <= 0:
             raise ValueError("DTP block durations must be positive")
         if not self.motion_bucket_counts or min(self.motion_bucket_counts) <= 0:
@@ -382,6 +392,11 @@ class DTPDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             "session_id": session_id,
             "timestamp_ms": int(timestamp_ms),
         }
+        if self.stable_feature_columns:
+            stable = anchor.loc[list(self.stable_feature_columns)].to_numpy(dtype=np.float32)
+            if not np.isfinite(stable).all():
+                raise ValueError("Stable features contain NaN or infinite values")
+            result["stable_features"] = torch.from_numpy(stable)
         if self.future_context_seconds > 0:
             future_motion, future_motion_mask = _sample_grid(
                 payload["motion_timestamp_ms"],
