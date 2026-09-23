@@ -50,6 +50,15 @@ python scripts/evaluate_hierarchical.py --config $config --run-name $run --fold 
 状态、verifier、boundary 都有原子 checkpoint。阶段中断后使用相同命令和 `--resume`；
 manifest 会拒绝修改后的上游文件、配置或 v2 输入。正式训练不要并行争用同一张 GPU。
 
+状态模型在 epoch 间隔验证时使用 `event_stratified_complete_sessions`：默认目标为
+32768 个 anchor，但采样原子是完整 session，不会随机删除 session 内时间点。采样器先
+覆盖配置要求的受试者和可评估事件，再补充背景 session；由于完整 session 约束，实际行数
+可能超过目标。若当前分区可用事件少于下限，下限按可用事件数折减，并在
+`metadata.json` 的 `checkpoint_validation_metadata` 中记录实际覆盖情况。checkpoint
+选择器只使用被采样 session 对应的 truth/ignore，避免把未采样事件错误计为 FN。最佳
+checkpoint 产生后，训练流程仍会对完整 validation partition 做一次推理，并将完整预测
+写入 `best_validation_predictions.parquet`，供后续 OOF 使用。
+
 ## 4. fold 0 模式和消融
 
 先分别运行以下两条主线到 `SELECTED`，不要提前读取 outer 标签：

@@ -49,6 +49,10 @@ training:
   validation_every_epochs: 2
   num_workers: 8
   inference_num_workers: 2
+  checkpoint_validation_max_rows: 32768
+  checkpoint_validation_strategy: event_stratified_complete_sessions
+  checkpoint_validation_min_subjects: 8
+  checkpoint_validation_min_events: 40
   max_epochs: 32
   early_stopping_patience_checks: 4
   early_stopping_min_delta: 0.003

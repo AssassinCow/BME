@@ -19,6 +19,7 @@ from bme_eating.training.dtp_trainer import (
     resolve_focal_positive_alpha,
     resume_training_is_complete,
     select_checkpoint_validation_anchors,
+    select_checkpoint_validation_sessions,
     update_early_stopping,
     validate_prediction_frame,
 )
@@ -191,6 +192,60 @@ def test_checkpoint_validation_subset_is_deterministic_stratified_and_evaluable(
     assert first["state_loss_mask"].eq(1.0).all()
     assert first["state_target"].sum() == 11.0
     assert not first.equals(different_seed)
+
+
+def test_checkpoint_validation_session_sampling_keeps_sessions_and_events():
+    rows = []
+    for subject_index, subject in enumerate(("s1", "s2", "s3")):
+        for session_index in range(2):
+            session = f"{subject}-session-{session_index}"
+            start = subject_index * 10_000 + session_index * 1_000
+            for offset in range(4):
+                rows.append(
+                    {
+                        "subject_key": subject,
+                        "session_id": session,
+                        "timestamp_ms": start + offset * 100,
+                        "state_target": float(offset == 1),
+                        "state_loss_mask": 1.0,
+                    }
+                )
+    anchors = pd.DataFrame(rows)
+    truth = pd.DataFrame(
+        [
+            {"subject_key": "s1", "event_id": "e1", "start_ms": 100, "end_ms": 250},
+            {"subject_key": "s2", "event_id": "e2", "start_ms": 10_100, "end_ms": 10_250},
+            {"subject_key": "s3", "event_id": "e3", "start_ms": 20_100, "end_ms": 20_250},
+        ]
+    )
+    ignore = pd.DataFrame(columns=["subject_key", "start_ms", "end_ms"])
+
+    first = select_checkpoint_validation_sessions(
+        anchors,
+        truth,
+        ignore,
+        maximum_rows=16,
+        seed=2026,
+        minimum_subjects=3,
+        minimum_events=3,
+    )
+    second = select_checkpoint_validation_sessions(
+        anchors,
+        truth,
+        ignore,
+        maximum_rows=16,
+        seed=2026,
+        minimum_subjects=3,
+        minimum_events=3,
+    )
+    selected, selected_truth, _, metadata = first
+
+    pd.testing.assert_frame_equal(selected, second[0])
+    pd.testing.assert_frame_equal(selected_truth, second[1])
+    assert metadata["selected_subjects"] == 3
+    assert metadata["selected_events"] == 3
+    assert set(selected.groupby(["subject_key", "session_id"]).size()) == {4}
+    assert len(selected) <= 16
 
 
 @pytest.mark.parametrize(

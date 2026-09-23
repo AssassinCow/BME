@@ -54,7 +54,11 @@ from bme_eating.proposals import (
     generate_event_candidates,
     label_event_candidates,
 )
-from bme_eating.training.dtp_trainer import seed_everything, train_dtp_fold
+from bme_eating.training.dtp_trainer import (
+    events_overlapping_sessions,
+    seed_everything,
+    train_dtp_fold,
+)
 
 ALIGNMENT_KEYS = ["subject_key", "session_id", "timestamp_ms"]
 
@@ -211,6 +215,8 @@ def _state_checkpoint_selector(
     config: dict[str, Any],
 ):
     def select(predictions: pd.DataFrame, epoch: int) -> dict[str, Any]:
+        selected_truth = events_overlapping_sessions(validation_truth, predictions)
+        selected_ignore = events_overlapping_sessions(validation_ignore, predictions)
         proposals = generate_event_candidates(
             predictions,
             config["proposals"],
@@ -219,7 +225,7 @@ def _state_checkpoint_selector(
         )
         proposals = label_event_candidates(
             proposals,
-            validation_truth,
+            selected_truth,
             float(config["postprocess"]["iou_threshold"]),
         )
         matched = set(
@@ -227,7 +233,7 @@ def _state_checkpoint_selector(
             .dropna()
             .astype(str)
         )
-        candidate_recall = len(matched) / max(len(validation_truth), 1)
+        candidate_recall = len(matched) / max(len(selected_truth), 1)
         if proposals.empty:
             metrics = {
                 "f1": 0.0,
@@ -248,11 +254,11 @@ def _state_checkpoint_selector(
                 )
                 events = _events_from_proposals(accepted, refined=False)
                 current, _ = evaluate_events(
-                    validation_truth,
+                    selected_truth,
                     events,
                     iou_threshold=float(config["postprocess"]["iou_threshold"]),
                     method=str(config["postprocess"]["matching_method"]),
-                    ignore=validation_ignore,
+                    ignore=selected_ignore,
                 )
                 boundary_values = [
                     float(current[name])

@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-from pathlib import Path
 import subprocess
 import sys
 import zipfile
+from pathlib import Path
 
 from bme_eating.hierarchical_export import MODEL_FILES, export_hierarchical_bundle
 

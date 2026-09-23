@@ -248,6 +248,264 @@ def select_checkpoint_validation_anchors(
     return eligible.iloc[np.sort(positions)].reset_index(drop=True)
 
 
+def _session_bounds(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return deterministic timestamp bounds for each subject/session pair."""
+
+    required = {"subject_key", "session_id", "timestamp_ms"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"Session sampling requires columns: {sorted(missing)}")
+    normalized = frame.loc[:, ["subject_key", "session_id", "timestamp_ms"]].copy()
+    normalized["_subject_key"] = normalized["subject_key"].astype(str)
+    normalized["_session_id"] = normalized["session_id"].astype(str)
+    bounds = (
+        normalized.groupby(["_subject_key", "_session_id"], sort=True, dropna=False)[
+            "timestamp_ms"
+        ]
+        .agg(start_ms="min", end_ms="max", row_count="size")
+        .reset_index()
+        .rename(columns={"_subject_key": "subject_norm", "_session_id": "session_norm"})
+    )
+    return bounds
+
+
+def _attach_event_sessions(events: pd.DataFrame, anchors: pd.DataFrame) -> pd.DataFrame:
+    """Map event intervals to the anchor session they overlap most strongly."""
+
+    if events.empty:
+        output = events.copy()
+        output["_checkpoint_session_key"] = pd.Series(dtype=object, index=output.index)
+        return output
+    required = {"subject_key", "start_ms", "end_ms"}
+    missing = required - set(events.columns)
+    if missing:
+        raise ValueError(f"Event session mapping requires columns: {sorted(missing)}")
+    bounds = _session_bounds(anchors)
+    by_subject: dict[str, list[tuple[str, int, int]]] = {}
+    known_keys: set[tuple[str, str]] = set()
+    for row in bounds.itertuples(index=False):
+        subject = str(row.subject_norm)
+        session = str(row.session_norm)
+        item = (session, int(row.start_ms), int(row.end_ms))
+        by_subject.setdefault(subject, []).append(item)
+        known_keys.add((subject, session))
+
+    assignments: list[tuple[str, str] | None] = []
+    for event in events.itertuples(index=False):
+        subject = str(event.subject_key)
+        try:
+            start = int(event.start_ms)
+            end = int(event.end_ms)
+        except (TypeError, ValueError):
+            assignments.append(None)
+            continue
+        if end <= start or subject not in by_subject:
+            assignments.append(None)
+            continue
+        explicit_session = getattr(event, "session_id", None)
+        if explicit_session is not None and not pd.isna(explicit_session):
+            explicit_key = (subject, str(explicit_session))
+            if explicit_key in known_keys:
+                assignments.append(explicit_key)
+                continue
+        candidates = []
+        for session, session_start, session_end in by_subject[subject]:
+            overlap = min(end, session_end) - max(start, session_start)
+            if overlap > 0:
+                candidates.append((overlap, session_start, session))
+        if not candidates:
+            assignments.append(None)
+            continue
+        _, _, session = max(candidates, key=lambda value: (value[0], -value[1], value[2]))
+        assignments.append((subject, session))
+    output = events.copy()
+    output["_checkpoint_session_key"] = assignments
+    return output
+
+
+def events_overlapping_sessions(events: pd.DataFrame, session_frame: pd.DataFrame) -> pd.DataFrame:
+    """Keep events that overlap at least one session represented by ``session_frame``."""
+
+    if events.empty or session_frame.empty:
+        return events.iloc[0:0].copy()
+    mapped = _attach_event_sessions(events, session_frame)
+    selected_keys = set(zip(
+        session_frame["subject_key"].astype(str),
+        session_frame["session_id"].astype(str),
+    ))
+    mask = mapped["_checkpoint_session_key"].map(
+        lambda value: value in selected_keys if value is not None else False
+    )
+    return mapped.loc[mask].drop(columns=["_checkpoint_session_key"]).reset_index(drop=True)
+
+
+def select_checkpoint_validation_sessions(
+    anchors: pd.DataFrame,
+    validation_truth: pd.DataFrame,
+    validation_ignore: pd.DataFrame,
+    maximum_rows: int,
+    seed: int,
+    *,
+    minimum_subjects: int = 8,
+    minimum_events: int = 40,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    """Select complete sessions for frequent validation checkpoints.
+
+    Sessions are the atomic sampling unit: no timestamp is removed from a selected
+    session.  Evaluable event sessions and subject coverage are selected first,
+    followed by background sessions until the row budget is reached.
+    """
+
+    if maximum_rows <= 0:
+        raise ValueError("checkpoint_validation_max_rows must be positive")
+    if minimum_subjects < 0 or minimum_events < 0:
+        raise ValueError("Checkpoint validation coverage minima must be non-negative")
+    required = {"subject_key", "session_id", "timestamp_ms"}
+    missing = required - set(anchors.columns)
+    if missing:
+        raise ValueError(f"Checkpoint session sampling requires columns: {sorted(missing)}")
+    state_mask = anchors.get("state_loss_mask", pd.Series(1.0, index=anchors.index))
+    eligible_mask = state_mask.fillna(0.0).astype(float) > 0
+    if not eligible_mask.any():
+        raise ValueError("Checkpoint validation has no evaluable anchors")
+
+    normalized = anchors.copy()
+    normalized["_subject_key"] = normalized["subject_key"].astype(str)
+    normalized["_session_id"] = normalized["session_id"].astype(str)
+    eligible_sessions = set(
+        zip(
+            normalized.loc[eligible_mask, "_subject_key"],
+            normalized.loc[eligible_mask, "_session_id"],
+        )
+    )
+    mapped_truth = _attach_event_sessions(validation_truth, anchors)
+    mapped_truth = mapped_truth[mapped_truth["_checkpoint_session_key"].notna()].copy()
+    event_counts = mapped_truth["_checkpoint_session_key"].value_counts().to_dict()
+
+    records: list[dict[str, Any]] = []
+    for (subject, session), group in normalized.groupby(
+        ["_subject_key", "_session_id"], sort=True, dropna=False
+    ):
+        key = (str(subject), str(session))
+        if key not in eligible_sessions:
+            continue
+        records.append(
+            {
+                "key": key,
+                "subject": str(subject),
+                "rows": len(group),
+                "events": int(event_counts.get(key, 0)),
+            }
+        )
+    if not records:
+        raise ValueError("Checkpoint validation has no complete eligible sessions")
+
+    rng = np.random.default_rng(seed)
+    tie_order = {
+        records[int(index)]["key"]: int(rank)
+        for rank, index in enumerate(rng.permutation(len(records)))
+    }
+    available_subjects = {record["subject"] for record in records}
+    available_events = int(sum(record["events"] for record in records))
+    target_subjects = min(int(minimum_subjects), len(available_subjects))
+    target_events = min(int(minimum_events), available_events)
+    selected_set: set[tuple[str, str]] = set()
+    selected_rows = 0
+
+    def add(record: dict[str, Any]) -> None:
+        nonlocal selected_rows
+        key = record["key"]
+        if key not in selected_set:
+            selected_set.add(key)
+            selected_rows += int(record["rows"])
+
+    by_subject: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        by_subject.setdefault(record["subject"], []).append(record)
+    event_subjects = {record["subject"] for record in records if record["events"] > 0}
+    if len(event_subjects) < target_subjects:
+        for subject in sorted(by_subject):
+            if len({item[0] for item in selected_set}) >= target_subjects:
+                break
+            candidates = sorted(
+                by_subject[subject],
+                key=lambda item: (-item["events"], item["rows"], tie_order[item["key"]]),
+            )
+            if candidates:
+                add(candidates[0])
+
+    event_candidates = sorted(
+        records,
+        key=lambda item: (-item["events"], item["rows"], tie_order[item["key"]]),
+    )
+    for record in event_candidates:
+        selected_subjects = {item[0] for item in selected_set}
+        selected_events = sum(item["events"] for item in records if item["key"] in selected_set)
+        if selected_events >= target_events and len(selected_subjects) >= target_subjects:
+            break
+        add(record)
+
+    selected_subjects = {item[0] for item in selected_set}
+    for subject in sorted(available_subjects - selected_subjects):
+        if len(selected_subjects) >= target_subjects:
+            break
+        candidates = sorted(by_subject[subject], key=lambda item: (item["rows"], tie_order[item["key"]]))
+        if candidates:
+            add(candidates[0])
+            selected_subjects.add(subject)
+
+    remaining = [record for record in records if record["key"] not in selected_set]
+    remaining.sort(key=lambda item: (item["events"] == 0, item["rows"], tie_order[item["key"]]))
+    for record in remaining:
+        if selected_rows >= maximum_rows:
+            break
+        if selected_rows + int(record["rows"]) <= maximum_rows:
+            add(record)
+
+    selected_frame = normalized[
+        normalized.apply(lambda row: (row["_subject_key"], row["_session_id"]) in selected_set, axis=1)
+    ].drop(columns=["_subject_key", "_session_id"])
+    selected_frame = selected_frame.reset_index(drop=True)
+    selected_truth = events_overlapping_sessions(validation_truth, selected_frame)
+    selected_ignore = events_overlapping_sessions(validation_ignore, selected_frame)
+    selected_subject_count = int(selected_frame[["subject_key"]].astype(str).nunique().iloc[0])
+    selected_event_count = len(selected_truth)
+
+    coverage_satisfied = (
+        selected_subject_count >= target_subjects and selected_event_count >= target_events
+    )
+    if not coverage_satisfied:
+        selected_frame = anchors.reset_index(drop=True).copy()
+        selected_truth = validation_truth.reset_index(drop=True).copy()
+        selected_ignore = validation_ignore.reset_index(drop=True).copy()
+        selected_set = set(zip(
+            selected_frame["subject_key"].astype(str),
+            selected_frame["session_id"].astype(str),
+        ))
+        selected_subject_count = int(selected_frame["subject_key"].astype(str).nunique())
+        selected_event_count = len(selected_truth)
+
+    metadata = {
+        "target_rows": int(maximum_rows),
+        "selected_rows": len(selected_frame),
+        "available_rows": len(anchors),
+        "selected_sessions": len(selected_set),
+        "available_sessions": len(records),
+        "selected_subjects": selected_subject_count,
+        "available_subjects": len(available_subjects),
+        "selected_events": selected_event_count,
+        "available_events": available_events,
+        "minimum_subjects": int(minimum_subjects),
+        "minimum_events": int(minimum_events),
+        "effective_minimum_subjects": target_subjects,
+        "effective_minimum_events": target_events,
+        "coverage_satisfied": bool(coverage_satisfied),
+        "seed": int(seed),
+        "strategy": "event_stratified_complete_sessions",
+    }
+    return selected_frame, selected_truth, selected_ignore, metadata
+
+
 def _save_torch_checkpoint(payload: dict[str, Any], path: Path) -> None:
     temporary_path = path.with_name(path.name + ".tmp")
     torch.save(payload, temporary_path)
@@ -695,6 +953,8 @@ def train_dtp_fold(
         raise ValueError(
             f"Fold {outer_fold} must have non-empty train, validation, and test anchors"
         )
+    validation_subjects = set(validation_anchors["subject_key"].unique())
+    validation_truth, validation_ignore = partition_evaluation_events(events, validation_subjects)
     train_subjects = set(train_anchors["subject_key"].unique())
     normalization = compute_normalization(segments, train_subjects)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -723,15 +983,43 @@ def train_dtp_fold(
         ppg_bucket_counts=model_config["ppg_bucket_counts"],
         stable_feature_columns=stable_feature_columns,
     )
-    use_checkpoint_subset = (
-        checkpoint_selection_metric == "window_auprc" and validation_selector is None
+    checkpoint_strategy = str(
+        training_config.get("checkpoint_validation_strategy", "full_timeline")
     )
-    if use_checkpoint_subset:
+    checkpoint_metadata: dict[str, Any] = {
+        "strategy": "full_timeline",
+        "selected_rows": len(validation_anchors),
+        "available_rows": len(validation_anchors),
+    }
+    use_checkpoint_subset = False
+    if checkpoint_strategy == "event_stratified_complete_sessions":
+        (
+            checkpoint_validation_anchors,
+            _checkpoint_truth,
+            _checkpoint_ignore,
+            checkpoint_metadata,
+        ) = select_checkpoint_validation_sessions(
+            validation_anchors,
+            validation_truth,
+            validation_ignore,
+            int(training_config.get("checkpoint_validation_max_rows", len(validation_anchors))),
+            seed,
+            minimum_subjects=int(training_config.get("checkpoint_validation_min_subjects", 0)),
+            minimum_events=int(training_config.get("checkpoint_validation_min_events", 0)),
+        )
+        use_checkpoint_subset = len(checkpoint_validation_anchors) < len(validation_anchors)
+    elif checkpoint_selection_metric == "window_auprc" and validation_selector is None:
         checkpoint_validation_anchors = select_checkpoint_validation_anchors(
             validation_anchors,
             int(training_config.get("checkpoint_validation_max_rows", len(validation_anchors))),
             seed,
         )
+        use_checkpoint_subset = len(checkpoint_validation_anchors) < len(validation_anchors)
+        checkpoint_metadata = {
+            "strategy": "deterministic_stratified_evaluable",
+            "selected_rows": len(checkpoint_validation_anchors),
+            "available_rows": len(validation_anchors),
+        }
     else:
         checkpoint_validation_anchors = validation_anchors
     checkpoint_validation_dataset = DTPDataset(
@@ -897,8 +1185,6 @@ def train_dtp_fold(
             raise RuntimeError("Resume checkpoint uses a different checkpoint selection metric")
         tqdm.write(f"Loaded DTP-SQF resume checkpoint after epoch {start_epoch}/{max_epochs}")
 
-    validation_subjects = set(validation_anchors["subject_key"].unique())
-    validation_truth, validation_ignore = partition_evaluation_events(events, validation_subjects)
     validation_interval = int(training_config["validation_every_epochs"])
     if validation_interval <= 0:
         raise ValueError("validation_every_epochs must be positive")
@@ -907,10 +1193,12 @@ def train_dtp_fold(
     )
     if resume_path is not None and training_complete:
         tqdm.write("Training was already complete; resuming post-training inference only.")
-    if use_checkpoint_subset:
+    if checkpoint_strategy != "full_timeline":
         tqdm.write(
             "Checkpoint selection validation: "
-            f"{len(checkpoint_validation_anchors)}/{len(validation_anchors)} evaluable anchors"
+            f"{len(checkpoint_validation_anchors)}/{len(validation_anchors)} anchors; "
+            f"{checkpoint_metadata.get('selected_sessions', 'n/a')} sessions; "
+            f"{checkpoint_metadata.get('selected_events', 'n/a')} events"
         )
     epoch_range = range(0) if training_complete else range(start_epoch, max_epochs)
     for epoch in epoch_range:
@@ -1247,10 +1535,9 @@ def train_dtp_fold(
         "validation_rows": len(validation_anchors),
         "validation_full_timeline_rows": len(validation_anchors),
         "checkpoint_validation_rows": len(checkpoint_validation_anchors),
-        "checkpoint_validation_strategy": "deterministic_stratified_evaluable"
-        if use_checkpoint_subset
-        else "full_timeline",
+        "checkpoint_validation_strategy": checkpoint_metadata.get("strategy", checkpoint_strategy),
         "checkpoint_validation_seed": seed,
+        "checkpoint_validation_metadata": checkpoint_metadata,
         "checkpoint_validation_positive_rate": float(
             (checkpoint_validation_anchors["state_target"] > 0).mean()
         ),

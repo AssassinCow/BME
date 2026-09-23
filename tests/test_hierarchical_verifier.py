@@ -7,7 +7,6 @@ import pytest
 
 from bme_eating.models.event_verifier import ProposalBatchSampler
 
-
 DEFAULT_RATIOS = {
     "positive": 0.32,
     "near_miss": 0.24,
