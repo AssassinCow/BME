@@ -6,6 +6,7 @@ from bme_eating.models.hierarchical_state import (
     CausalTemporalBranch,
     HierarchicalStateModel,
 )
+from bme_eating.models.losses import HierarchicalStateLoss
 
 
 def _config(use_stable: bool = False) -> dict[str, object]:
@@ -79,3 +80,37 @@ def test_ppg_all_missing_produces_finite_output() -> None:
         output = model(batch)
     assert torch.isfinite(output["state_embedding"]).all()
     assert torch.count_nonzero(output["ppg_gate"]) == 0
+
+
+def test_hierarchical_state_loss_forward_is_finite() -> None:
+    criterion = HierarchicalStateLoss(
+        positive_alpha=0.5,
+        focal_gamma=2.0,
+        dice_weight=0.3,
+        boundary_weight=0.5,
+        sqi_weight=0.1,
+        boundary_positive_weight=20.0,
+        smooth_weight=0.05,
+        smooth_tau=0.25,
+    )
+    output = {
+        "state_logit": torch.zeros(2),
+        "start_logit": torch.zeros(2),
+        "end_logit": torch.zeros(2),
+        "ppg_gate": torch.zeros(2, 3),
+        "state_history_logit": torch.zeros(2, 4),
+    }
+    batch = {
+        "state_target": torch.zeros(2),
+        "state_loss_mask": torch.ones(2),
+        "start_target": torch.zeros(2),
+        "end_target": torch.zeros(2),
+        "start_loss_mask": torch.ones(2),
+        "end_loss_mask": torch.ones(2),
+        "ppg_valid": torch.ones(2, 3),
+        "ppg_quality_target": torch.zeros(2, 3),
+    }
+
+    loss, _ = criterion(output, batch)
+
+    assert torch.isfinite(loss)

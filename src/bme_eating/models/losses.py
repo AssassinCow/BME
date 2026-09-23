@@ -120,7 +120,7 @@ class HierarchicalStateLoss(DTPLoss):
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         total, components = super().forward(output, batch)
         history = output["state_history_logit"]
-        difference = torch.diff(torch.logsigmoid(history), dim=1).square()
+        difference = torch.diff(F.logsigmoid(history), dim=1).square()
         per_sample = difference.clamp_max(self.smooth_tau).mean(dim=1)
         boundary_neighborhood_weight = 1.0 - torch.maximum(
             batch["start_target"], batch["end_target"]
