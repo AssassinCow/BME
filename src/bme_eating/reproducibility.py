@@ -7,6 +7,7 @@ import platform
 import re
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -46,24 +47,81 @@ def _git_value(project_root: Path, *arguments: str) -> str | None:
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="strict",
         )
     except (OSError, subprocess.CalledProcessError):
+        return None
+    if result.stdout is None:
         return None
     return result.stdout.strip()
 
 
-def require_clean_git_worktree(project_root: Path | None = None) -> str:
+def git_worktree_identity(project_root: Path | None = None) -> dict[str, Any]:
     root = project_root or Path(__file__).resolve().parents[2]
     commit = _git_value(root, "rev-parse", "HEAD")
-    dirty_output = _git_value(root, "status", "--porcelain")
-    if not commit or dirty_output is None:
-        raise RuntimeError("Cannot verify the Git identity for formal training")
-    if dirty_output:
+    dirty_output = _git_value(
+        root,
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    )
+    diff_output = _git_value(root, "diff", "--binary", "HEAD", "--")
+    untracked_output = _git_value(
+        root,
+        "ls-files",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    )
+    if (
+        not commit
+        or dirty_output is None
+        or diff_output is None
+        or untracked_output is None
+    ):
+        raise RuntimeError("Cannot verify the Git identity for experiment tracking")
+
+    digest = hashlib.sha256()
+    digest.update(commit.encode("utf-8"))
+    digest.update(b"\0status\0")
+    digest.update(dirty_output.encode("utf-8"))
+    digest.update(b"\0diff\0")
+    digest.update(diff_output.encode("utf-8"))
+    for relative in sorted(value for value in untracked_output.split("\0") if value):
+        path = root / relative
+        digest.update(b"\0untracked\0")
+        digest.update(relative.encode("utf-8"))
+        file_hash = _sha256(path)
+        if file_hash is not None:
+            digest.update(file_hash.encode("ascii"))
+    return {
+        "commit": commit,
+        "dirty": bool(dirty_output),
+        "worktree_sha256": digest.hexdigest(),
+    }
+
+
+def require_git_worktree(project_root: Path | None = None) -> str:
+    identity = git_worktree_identity(project_root)
+    if identity["dirty"]:
+        warnings.warn(
+            "Git worktree has uncommitted changes; execution is allowed and the exact "
+            "worktree fingerprint will be recorded in the run manifest",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return str(identity["commit"])
+
+
+def require_clean_git_worktree(project_root: Path | None = None) -> str:
+    identity = git_worktree_identity(project_root)
+    if identity["dirty"]:
         raise RuntimeError(
             "Formal training requires a clean Git worktree; review, commit, and synchronize "
             "the current changes first"
         )
-    return commit
+    return str(identity["commit"])
 
 
 def write_run_manifest(
@@ -156,7 +214,7 @@ def write_run_manifest(
         cuda_available = False
         gpu_name = None
         cuda_version = None
-    dirty_output = _git_value(project_root, "status", "--porcelain")
+    git_identity = git_worktree_identity(project_root)
     public_config = {
         key: value
         for key, value in config.items()
@@ -176,10 +234,7 @@ def write_run_manifest(
             "name": output_dir.parent.name,
             "fold": int(fold_match.group(1)) if fold_match else None,
         },
-        "git": {
-            "commit": _git_value(project_root, "rev-parse", "HEAD"),
-            "dirty": bool(dirty_output),
-        },
+        "git": git_identity,
         "command": safe_command,
         "random_seeds": {
             "project": int(config.get("project", {}).get("seed", 0)),

@@ -8,7 +8,7 @@ import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.hierarchical_gates import write_freeze_manifest
-from bme_eating.reproducibility import require_clean_git_worktree
+from bme_eating.reproducibility import require_git_worktree
 
 
 def main() -> None:
@@ -17,7 +17,7 @@ def main() -> None:
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--development-decision", required=True)
     args = parser.parse_args()
-    require_clean_git_worktree()
+    require_git_worktree()
     config = load_config(args.config)
     _, _, output_root = resolve_artifact_roots(config)
     decision_path = Path(args.development_decision).resolve()

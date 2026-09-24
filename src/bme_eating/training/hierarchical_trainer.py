@@ -67,6 +67,10 @@ ALIGNMENT_KEYS = ["subject_key", "session_id", "timestamp_ms"]
 RUNTIME_INFERENCE_TRAINING_KEYS = frozenset(
     {"inference_batch_size", "inference_num_workers", "inference_resume_chunk_rows"}
 )
+EARLY_STOPPING_TRAINING_KEY = "early_stopping_patience_checks"
+MIGRATABLE_STATE_TRAINING_KEYS = RUNTIME_INFERENCE_TRAINING_KEYS | {
+    EARLY_STOPPING_TRAINING_KEY
+}
 
 
 @dataclass(frozen=True)
@@ -484,21 +488,90 @@ def _without_runtime_inference_settings(config: dict[str, Any]) -> dict[str, Any
     return normalized
 
 
-def _runtime_inference_changes(
+def _without_migratable_state_settings(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = _public_resolved_config(config)
+    training = normalized.get("training")
+    if isinstance(training, dict):
+        for key in MIGRATABLE_STATE_TRAINING_KEYS:
+            training.pop(key, None)
+    return normalized
+
+
+def _migration_config_changes(
     source_config: dict[str, Any], target_config: dict[str, Any]
 ) -> dict[str, dict[str, Any]]:
-    if _without_runtime_inference_settings(source_config) != _without_runtime_inference_settings(
-        target_config
-    ):
+    if _without_migratable_state_settings(
+        source_config
+    ) != _without_migratable_state_settings(target_config):
         raise RuntimeError(
-            "Checkpoint migration only permits inference batch, worker, and chunk settings to change"
+            "Checkpoint migration only permits inference batch, worker, chunk, and "
+            "early-stopping patience settings to change"
         )
     source_training = source_config.get("training", {})
     target_training = target_config.get("training", {})
     return {
         key: {"source": source_training.get(key), "target": target_training.get(key)}
-        for key in sorted(RUNTIME_INFERENCE_TRAINING_KEYS)
+        for key in sorted(MIGRATABLE_STATE_TRAINING_KEYS)
         if source_training.get(key) != target_training.get(key)
+    }
+
+
+def _early_stopping_migration_compatibility(
+    checkpoints: dict[str, dict[str, Any]],
+    source_config: dict[str, Any],
+    target_config: dict[str, Any],
+) -> dict[str, Any] | None:
+    source_patience = int(source_config["training"][EARLY_STOPPING_TRAINING_KEY])
+    target_patience = int(target_config["training"][EARLY_STOPPING_TRAINING_KEY])
+    if source_patience == target_patience:
+        return None
+    if source_patience <= 0 or target_patience <= 0:
+        raise RuntimeError("Early-stopping patience must remain positive during migration")
+
+    best = checkpoints["best.pt"]
+    last = checkpoints["last.pt"]
+    history = last.get("history")
+    if not isinstance(history, list) or not history:
+        raise RuntimeError(
+            "Changing early-stopping patience requires checkpoint validation history"
+        )
+    metric = str(last.get("checkpoint_selection_metric", "event_f1"))
+    metric_column = "validation_auprc" if metric == "window_auprc" else "validation_f1"
+    evaluated: list[tuple[int, int]] = []
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+        try:
+            score = float(row.get(metric_column, math.nan))
+            epoch = int(float(row["epoch"]))
+            patience = int(float(row["early_stopping_patience"]))
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(score):
+            evaluated.append((epoch, patience))
+    if not evaluated:
+        raise RuntimeError(
+            "Changing early-stopping patience requires evaluated validation epochs"
+        )
+
+    best_epoch = int(best["epoch"])
+    if best_epoch not in {epoch for epoch, _ in evaluated}:
+        raise RuntimeError("Best checkpoint epoch is missing from validation history")
+    target_stop_epoch = next(
+        (epoch for epoch, patience in evaluated if patience >= target_patience),
+        None,
+    )
+    if target_stop_epoch is not None and best_epoch > target_stop_epoch:
+        raise RuntimeError(
+            "The migrated best checkpoint occurs after training would have stopped under "
+            "the target early-stopping patience"
+        )
+    return {
+        "source_patience_checks": source_patience,
+        "target_patience_checks": target_patience,
+        "best_checkpoint_epoch": best_epoch,
+        "counterfactual_stop_epoch": target_stop_epoch,
+        "same_best_checkpoint": True,
     }
 
 
@@ -538,17 +611,22 @@ def migrate_completed_state_partition(
         raise RuntimeError("Source and target runs use different outer folds")
     if source_manifest.get("input_hashes") != target.payload.get("input_hashes"):
         raise RuntimeError("Checkpoint migration requires identical v2 input hashes")
-    if bool(source_manifest.get("git", {}).get("dirty", True)):
-        raise RuntimeError("Checkpoint migration refuses a source run created from dirty code")
+    source_git = source_manifest.get("git", {})
+    if bool(source_git.get("dirty", True)) and not source_git.get("worktree_sha256"):
+        raise RuntimeError(
+            "Checkpoint migration requires a worktree fingerprint for a dirty source run"
+        )
     source_resolved = source_root / "resolved_config.yaml"
     source_resolved_hash = source_manifest.get("artifact_hashes", {}).get(
         "resolved_config.yaml"
     )
     if not source_resolved_hash or sha256_file(source_resolved) != source_resolved_hash:
         raise RuntimeError("Source resolved configuration does not match its manifest")
-    allowed_changes = _runtime_inference_changes(source_config, target_config)
+    allowed_changes = _migration_config_changes(source_config, target_config)
     if not allowed_changes:
-        raise RuntimeError("Checkpoint migration requires an actual runtime inference change")
+        raise RuntimeError(
+            "Checkpoint migration requires an actual permitted configuration change"
+        )
 
     source_state = source_root / f"crossfit_{partition}" / "state"
     target_state = target.root / f"crossfit_{partition}" / "state"
@@ -585,6 +663,11 @@ def migrate_completed_state_partition(
             _without_runtime_inference_settings(expected_training)
         ):
             raise RuntimeError(f"{name} training configuration differs from the source run")
+    early_stopping_compatibility = _early_stopping_migration_compatibility(
+        checkpoints,
+        source_config,
+        target_config,
+    )
     last = checkpoints["last.pt"]
     patience_checks = int(target_config["training"]["early_stopping_patience_checks"])
     if not resume_training_is_complete(
@@ -607,9 +690,11 @@ def migrate_completed_state_partition(
         migrated["training_config"] = expected_target_training
         migrated["checkpoint_migration"] = {
             "source_run": source_manifest["run_name"],
-            "source_commit": source_manifest["git"]["commit"],
+            "source_commit": source_git["commit"],
+            "source_worktree_sha256": source_git.get("worktree_sha256"),
             "source_checkpoint_sha256": sha256_file(source_paths[name]),
             "source_model_state_sha256": source_weight_hash,
+            "early_stopping_compatibility": early_stopping_compatibility,
         }
         target_path = target_state / name
         _save_torch_checkpoint(migrated, target_path)
@@ -639,15 +724,18 @@ def migrate_completed_state_partition(
             copied_records[name] = sha256_file(target_path)
 
     migration = {
-        "version": 1,
+        "version": 2,
         "source_run": source_manifest["run_name"],
         "source_outer_fold": int(source_manifest["outer_fold"]),
-        "source_commit": source_manifest["git"]["commit"],
+        "source_commit": source_git["commit"],
+        "source_worktree_sha256": source_git.get("worktree_sha256"),
         "source_manifest_sha256": sha256_file(source_manifest_path),
         "target_run": target.payload["run_name"],
         "target_commit": target.payload["git"]["commit"],
+        "target_worktree_sha256": target.payload["git"].get("worktree_sha256"),
         "partition": partition,
-        "allowed_runtime_changes": allowed_changes,
+        "allowed_config_changes": allowed_changes,
+        "early_stopping_compatibility": early_stopping_compatibility,
         "source_selection_signature": source_signature,
         "target_selection_signature": target_signature,
         "checkpoints": checkpoint_records,

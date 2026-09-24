@@ -6,7 +6,7 @@ import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.hierarchical_artifacts import initialize_hierarchical_run
-from bme_eating.reproducibility import require_clean_git_worktree
+from bme_eating.reproducibility import require_git_worktree
 from bme_eating.training.hierarchical_trainer import reuse_hierarchical_state_artifacts
 
 
@@ -23,7 +23,7 @@ def main() -> None:
     mode.add_argument("--fresh", action="store_true")
     mode.add_argument("--resume", action="store_true")
     args = parser.parse_args()
-    require_clean_git_worktree()
+    require_git_worktree()
     source_config = load_config(args.source_config)
     target_config = load_config(args.config)
     _, source_input, source_output = resolve_artifact_roots(source_config)

@@ -4,7 +4,10 @@
 
 v3 实现“状态识别 → 候选事件 → 事件验证 → 边界精修”。它只读复用 `outputs/v2`
 中的清洗数据、anchors、fold map、基础特征和冻结 XGBoost 预测；所有新产物写入
-`outputs/v3`。正式命令要求 Git 工作树干净，开始训练前应先提交本次代码。
+`outputs/v3`。v3 命令允许在 Git 工作树存在未提交修改时运行，不要求每次修改后先提交。
+manifest 会记录当前 commit、dirty 状态和完整工作树指纹 `worktree_sha256`。同一个 run
+恢复时必须保持该指纹一致；若继续修改实现，应使用新的 run-name，或使用受控 checkpoint
+迁移命令承接已经完成的状态分区。
 
 主指标固定为事件级 F1，匹配条件严格为 `IoU > 0.25`。所有状态、verifier、校准、
 阈值和边界选择均按受试者交叉拟合。只有 `evaluate_hierarchical.py` 能读取 outer 标签。
@@ -25,7 +28,8 @@ python scripts/smoke_test_hierarchical.py --config configs/hierarchical_v3_state
 git status --short
 ```
 
-最后一条必须无输出。GPU smoke 同时检查 bf16 forward/backward、峰值显存不超过
+最后一条用于人工记录当前修改，不再要求无输出。GPU smoke 同时检查 bf16
+forward/backward、峰值显存不超过
 10.5 GiB，以及同一模型重复推理误差不超过 `1e-6`。本机 2026-09-23 实测两种模式
 batch 16 峰值约 1.24 GB，重复推理误差为 0。
 
@@ -66,10 +70,12 @@ checkpoint 产生后，训练流程仍会对完整 validation partition 做一�
 文件哈希和 AUPRC，然后仅重算未完成或损坏的分块；最终仍合并并严格核验完整时间轴，
 不会把分块指标代替完整 OOF 预测。
 
-若旧 run 已完成某个 state partition 的训练，但在全量推理阶段中断，可在提交推理热修复
+若旧 run 已完成某个 state partition 的训练，但在全量推理阶段中断，可在修改推理配置
 后把该 partition 迁移到新 run，而不重新训练。迁移只允许
-`inference_batch_size`、`inference_num_workers` 和 `inference_resume_chunk_rows` 改变；
-模型、损失、采样、候选、阈值、fold、v2 输入哈希或未完成训练都会触发拒绝。示例：
+`inference_batch_size`、`inference_num_workers`、`inference_resume_chunk_rows` 和
+`early_stopping_patience_checks` 改变。patience 变化时，迁移器会按目标 patience 回放验证
+历史；只有目标规则停止前已经产生同一个最佳 checkpoint 才允许迁移。模型、损失、采样、
+候选、阈值、fold、v2 输入哈希或未完成训练仍会触发拒绝。示例：
 
 ```powershell
 $sourceRun = "hierarchical_v3_verifier_only_20260927b"
@@ -89,6 +95,10 @@ python scripts/train_hierarchical_state.py `
 signature 和推理运行配置，并写入 `crossfit_0/state/checkpoint_migration.json` 以及目标
 `run_manifest.json`。恢复命令会直接进入 partition 0 的分块全量推理；完成后才正常训练
 partition 1 和 partition 2。
+
+若一次迁移在创建目标 manifest 后失败，目标仍处于 `CREATED` 且对应 partition 目录为空，
+可将上面的 `--fresh` 改成 `--resume` 继续迁移；迁移器仍会重新校验配置、输入哈希、
+checkpoint 完整性和权重 SHA-256，不需要删除目标 run。
 
 ## 4. fold 0 模式和消融
 

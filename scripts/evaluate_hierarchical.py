@@ -6,7 +6,7 @@ import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.hierarchical_artifacts import initialize_hierarchical_run
-from bme_eating.reproducibility import require_clean_git_worktree
+from bme_eating.reproducibility import require_git_worktree
 from bme_eating.training.hierarchical_trainer import (
     evaluate_hierarchical_outer,
     load_hierarchical_inputs,
@@ -24,7 +24,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.fresh:
         raise SystemExit("Outer evaluation continues a sealed run; use --resume")
-    require_clean_git_worktree()
+    require_git_worktree()
     config = load_config(args.config)
     _, input_root, output_root = resolve_artifact_roots(config)
     run = initialize_hierarchical_run(

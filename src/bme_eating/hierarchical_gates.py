@@ -285,8 +285,11 @@ def write_freeze_manifest(
     payloads = [json.loads(path.read_text(encoding="utf-8")) for path in manifests]
     config_hashes = {payload["resolved_config_sha256"] for payload in payloads}
     commits = {payload["git"]["commit"] for payload in payloads}
-    if len(config_hashes) != 1 or len(commits) != 1:
-        raise RuntimeError("Development folds do not share one config and Git commit")
+    worktrees = {payload["git"].get("worktree_sha256") for payload in payloads}
+    if len(config_hashes) != 1 or len(commits) != 1 or len(worktrees) != 1:
+        raise RuntimeError(
+            "Development folds do not share one config and Git worktree snapshot"
+        )
     search_contract = {
         "calibration": json.loads(
             (experiment_root / "fold_0" / "selection" / "selected_pipeline.json").read_text(
@@ -308,6 +311,7 @@ def write_freeze_manifest(
             "run_name": run_name,
             "resolved_config_sha256": config_hashes.pop(),
             "git_commit": commits.pop(),
+            "worktree_sha256": worktrees.pop(),
             "development_manifest_hashes": {
                 str(fold): sha256_file(manifests[fold]) for fold in (0, 1)
             },

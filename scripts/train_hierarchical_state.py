@@ -6,7 +6,7 @@ import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.hierarchical_artifacts import initialize_hierarchical_run
-from bme_eating.reproducibility import require_clean_git_worktree
+from bme_eating.reproducibility import require_git_worktree
 from bme_eating.training.hierarchical_trainer import (
     load_hierarchical_inputs,
     train_state_crossfit,
@@ -22,7 +22,7 @@ def main() -> None:
     mode.add_argument("--fresh", action="store_true")
     mode.add_argument("--resume", action="store_true")
     args = parser.parse_args()
-    require_clean_git_worktree()
+    require_git_worktree()
     config = load_config(args.config)
     _, input_root, output_root = resolve_artifact_roots(config)
     run = initialize_hierarchical_run(

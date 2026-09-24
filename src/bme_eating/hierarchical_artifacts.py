@@ -5,7 +5,6 @@ import json
 import math
 import platform
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +16,7 @@ import torch
 import yaml
 
 from bme_eating.config import feature_artifact_name
+from bme_eating.reproducibility import git_worktree_identity
 
 RUN_STAGES = (
     "CREATED",
@@ -94,20 +94,6 @@ def write_yaml_atomic(path: Path, payload: Any) -> None:
     temporary.replace(path)
 
 
-def _git_value(project_root: Path, *arguments: str) -> str | None:
-    try:
-        completed = subprocess.run(
-            ["git", *arguments],
-            cwd=project_root,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return None
-    return completed.stdout.strip()
-
-
 def validate_run_name(name: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{2,79}", name):
         raise ValueError("Run name must be 3-80 safe filename characters")
@@ -140,7 +126,7 @@ def _verify_freeze_manifest(
     run_name: str,
     fold: int,
     config_hash: str,
-    git_commit: str | None,
+    git_identity: dict[str, Any],
 ) -> None:
     experiment_root = output_root / "experiments" / run_name
     fold_zero_manifest = experiment_root / "fold_0" / "run_manifest.json"
@@ -156,8 +142,13 @@ def _verify_freeze_manifest(
     freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
     if freeze.get("resolved_config_sha256") != config_hash:
         raise RuntimeError("Frozen stress fold configuration differs from the locked protocol")
-    if freeze.get("git_commit") != git_commit:
+    if freeze.get("git_commit") != git_identity["commit"]:
         raise RuntimeError("Frozen stress folds must use the Git commit recorded at freeze time")
+    frozen_worktree = freeze.get("worktree_sha256")
+    if frozen_worktree is not None and frozen_worktree != git_identity["worktree_sha256"]:
+        raise RuntimeError(
+            "Frozen stress folds must use the worktree snapshot recorded at freeze time"
+        )
 
 
 def assert_disjoint_subjects(**groups: set[str]) -> None:
@@ -281,10 +272,22 @@ def initialize_hierarchical_run(
         if payload.get("resolved_config_sha256") != config_hash:
             raise RuntimeError("Active configuration differs from the existing run manifest")
         project_root = Path(__file__).resolve().parents[2]
-        git_commit = _git_value(project_root, "rev-parse", "HEAD")
-        if payload.get("git", {}).get("commit") != git_commit:
+        git_identity = git_worktree_identity(project_root)
+        if payload.get("git", {}).get("commit") != git_identity["commit"]:
             raise RuntimeError("Active Git commit differs from the existing run manifest")
-        _verify_freeze_manifest(output_root, run_name, fold, config_hash, git_commit)
+        recorded_worktree = payload.get("git", {}).get("worktree_sha256")
+        if recorded_worktree is None:
+            non_manifest_paths = {
+                path.name
+                for path in run_root.iterdir()
+                if path.name not in {"resolved_config.yaml", "run_manifest.json"}
+            }
+            if not non_manifest_paths:
+                payload["git"] = git_identity
+                write_json_atomic(manifest_path, payload)
+        elif recorded_worktree != git_identity["worktree_sha256"]:
+            raise RuntimeError("Active worktree snapshot differs from the existing run manifest")
+        _verify_freeze_manifest(output_root, run_name, fold, config_hash, git_identity)
         if fold >= 2:
             freeze_path = output_root / "experiments" / run_name / "freeze_manifest.json"
             if payload.get("freeze_manifest_sha256") != sha256_file(freeze_path):
@@ -303,8 +306,8 @@ def initialize_hierarchical_run(
     public_config = _public_config(config)
     config_hash = _canonical_hash(public_config)
     project_root = Path(__file__).resolve().parents[2]
-    git_commit = _git_value(project_root, "rev-parse", "HEAD")
-    _verify_freeze_manifest(output_root, run_name, fold, config_hash, git_commit)
+    git_identity = git_worktree_identity(project_root)
+    _verify_freeze_manifest(output_root, run_name, fold, config_hash, git_identity)
     write_yaml_atomic(run_root / "resolved_config.yaml", public_config)
     tracked = _tracked_inputs(config, input_root)
     missing = [name for name, path in tracked.items() if not path.is_file()]
@@ -324,7 +327,6 @@ def initialize_hierarchical_run(
     else:
         write_json_atomic(snapshot_path, input_snapshot)
 
-    dirty = bool(_git_value(project_root, "status", "--porcelain"))
     from bme_eating.models.factory import build_state_model
 
     state_model = build_state_model(config["model"])
@@ -336,10 +338,7 @@ def initialize_hierarchical_run(
         "run_name": run_name,
         "outer_fold": fold,
         "stage": "CREATED",
-        "git": {
-            "commit": git_commit,
-            "dirty": dirty,
-        },
+        "git": git_identity,
         "command": [Path(value).name if Path(value).is_absolute() else value for value in sys.argv],
         "resolved_config_sha256": config_hash,
         "input_hashes": input_hashes,

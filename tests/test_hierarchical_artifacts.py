@@ -107,8 +107,12 @@ def test_modified_freeze_manifest_is_rejected_after_stress_run_creation(
     )
     monkeypatch.setattr(
         artifacts,
-        "_git_value",
-        lambda _root, *arguments: "commit" if arguments[-1] == "HEAD" else "",
+        "git_worktree_identity",
+        lambda _root: {
+            "commit": "commit",
+            "dirty": False,
+            "worktree_sha256": "snapshot",
+        },
     )
     monkeypatch.setattr(
         "bme_eating.models.factory.build_state_model",

@@ -1,14 +1,38 @@
 import hashlib
 import json
+import subprocess
 
 import pytest
 
 from bme_eating import reproducibility
-from bme_eating.reproducibility import require_clean_git_worktree, write_run_manifest
+from bme_eating.reproducibility import (
+    require_clean_git_worktree,
+    require_git_worktree,
+    write_run_manifest,
+)
+
+
+def test_git_output_is_decoded_as_utf8(monkeypatch, tmp_path):
+    observed = {}
+
+    def fake_run(*args, **kwargs):
+        observed.update(kwargs)
+        return subprocess.CompletedProcess(args[0], 0, stdout="中文差异\n", stderr="")
+
+    monkeypatch.setattr(reproducibility.subprocess, "run", fake_run)
+
+    assert reproducibility._git_value(tmp_path, "diff") == "中文差异"
+    assert observed["encoding"] == "utf-8"
+    assert observed["errors"] == "strict"
 
 
 def test_formal_training_rejects_dirty_or_unverifiable_git(monkeypatch, tmp_path):
-    values = {("rev-parse", "HEAD"): "abc1234", ("status", "--porcelain"): " M file.py"}
+    values = {
+        ("rev-parse", "HEAD"): "abc1234",
+        ("status", "--porcelain=v1", "--untracked-files=all"): " M file.py",
+        ("diff", "--binary", "HEAD", "--"): "diff",
+        ("ls-files", "--others", "--exclude-standard", "-z"): "",
+    }
     monkeypatch.setattr(
         reproducibility,
         "_git_value",
@@ -17,7 +41,10 @@ def test_formal_training_rejects_dirty_or_unverifiable_git(monkeypatch, tmp_path
     with pytest.raises(RuntimeError, match="clean Git worktree"):
         require_clean_git_worktree(tmp_path)
 
-    values[("status", "--porcelain")] = ""
+    with pytest.warns(RuntimeWarning, match="execution is allowed"):
+        assert require_git_worktree(tmp_path) == "abc1234"
+
+    values[("status", "--porcelain=v1", "--untracked-files=all")] = ""
     assert require_clean_git_worktree(tmp_path) == "abc1234"
 
     values[("rev-parse", "HEAD")] = None

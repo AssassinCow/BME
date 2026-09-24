@@ -8,24 +8,26 @@ import yaml
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.hierarchical_artifacts import initialize_hierarchical_run
-from bme_eating.reproducibility import require_clean_git_worktree
+from bme_eating.reproducibility import require_git_worktree
 from bme_eating.training.hierarchical_trainer import migrate_completed_state_partition
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Migrate a completed state checkpoint across inference-only runtime changes"
+        description="Migrate a completed state checkpoint across permitted configuration changes"
     )
     parser.add_argument("--config", default="configs/hierarchical_v3.yaml")
     parser.add_argument("--source-run", required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--fold", type=int, choices=range(5), required=True)
     parser.add_argument("--partition", type=int, choices=range(3), required=True)
-    parser.add_argument("--fresh", action="store_true", required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--fresh", action="store_true")
+    mode.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     if args.source_run == args.run_name:
         raise ValueError("Checkpoint migration requires a new target run name")
-    require_clean_git_worktree()
+    require_git_worktree()
     config = load_config(args.config)
     _, input_root, output_root = resolve_artifact_roots(config)
     source_root = output_root / "experiments" / args.source_run / f"fold_{args.fold}"
