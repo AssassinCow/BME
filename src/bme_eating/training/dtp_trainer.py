@@ -20,6 +20,7 @@ from tqdm import tqdm
 
 from bme_eating.data.deep_dataset import (
     DTPDataset,
+    Normalization,
     SegmentBalancedBatchSampler,
     compute_normalization,
     load_normalization,
@@ -177,6 +178,39 @@ def _prediction_frame(
         if column in frame:
             frame[column] = frame[column].astype(np.float32)
     return frame, float(auprc)
+
+
+def _complete_session_chunks(
+    anchors: pd.DataFrame,
+    maximum_rows: int,
+) -> list[pd.DataFrame]:
+    if maximum_rows <= 0:
+        raise ValueError("inference_resume_chunk_rows must be positive")
+    required = {"subject_key", "session_id"}
+    missing = required - set(anchors.columns)
+    if missing:
+        raise ValueError(f"Resumable inference requires columns: {sorted(missing)}")
+    if anchors.empty:
+        return []
+    grouped_positions = list(
+        anchors.groupby(["subject_key", "session_id"], sort=False, dropna=False).indices.values()
+    )
+    chunks: list[pd.DataFrame] = []
+    current: list[np.ndarray] = []
+    current_rows = 0
+    for positions in grouped_positions:
+        positions = np.asarray(positions, dtype=np.int64)
+        if current and current_rows + len(positions) > maximum_rows:
+            selected = np.concatenate(current)
+            chunks.append(anchors.iloc[selected].reset_index(drop=True))
+            current = []
+            current_rows = 0
+        current.append(positions)
+        current_rows += len(positions)
+    if current:
+        selected = np.concatenate(current)
+        chunks.append(anchors.iloc[selected].reset_index(drop=True))
+    return chunks
 
 
 def _prepare_stable_features(
@@ -674,6 +708,83 @@ def _load_prediction_cache(
         return None
 
 
+def _resumable_prediction_frame(
+    model: nn.Module,
+    anchors: pd.DataFrame,
+    segments: pd.DataFrame,
+    normalization: Normalization,
+    dataset_arguments: dict[str, Any],
+    loader_arguments: dict[str, Any],
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    output_path: Path,
+    checkpoint_path: Path,
+    identity: dict[str, Any],
+    description: str,
+    maximum_chunk_rows: int,
+) -> tuple[pd.DataFrame, float]:
+    chunks = _complete_session_chunks(anchors, maximum_chunk_rows)
+    if not chunks:
+        raise ValueError(f"{description} has no anchors")
+    parts_dir = output_path.parent / f".{output_path.stem}_parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    frames: list[pd.DataFrame] = []
+    for part_index, chunk in enumerate(chunks):
+        part_path = parts_dir / f"part_{part_index:05d}.parquet"
+        part_identity = {
+            **identity,
+            "cache_role": description,
+            "part_index": part_index,
+            "part_count": len(chunks),
+        }
+        cached = _load_prediction_cache(
+            part_path,
+            chunk,
+            checkpoint_path,
+            part_identity,
+            f"{description} part {part_index + 1}/{len(chunks)}",
+        )
+        if cached is not None:
+            frame, _ = cached
+            frames.append(frame)
+            tqdm.write(
+                f"Reusing {description} part {part_index + 1}/{len(chunks)} "
+                f"({len(frame)} rows)."
+            )
+            continue
+        dataset = DTPDataset(
+            chunk,
+            segments,
+            normalization,
+            **dataset_arguments,
+        )
+        loader = DataLoader(
+            dataset,
+            shuffle=False,
+            **loader_arguments,
+        )
+        frame, part_auprc = _prediction_frame(
+            model,
+            loader,
+            device,
+            amp_dtype,
+            description=f"{description} part {part_index + 1}/{len(chunks)}",
+        )
+        validate_prediction_frame(
+            frame,
+            chunk,
+            f"{description} part {part_index + 1}/{len(chunks)}",
+        )
+        _save_prediction_frame(frame, part_path)
+        _write_prediction_cache_manifest(part_path, frame, part_auprc, part_identity)
+        frames.append(frame)
+    predictions = pd.concat(frames, ignore_index=True)
+    auprc = validate_prediction_frame(predictions, anchors, description)
+    _save_prediction_frame(predictions, output_path)
+    _write_prediction_cache_manifest(output_path, predictions, auprc, identity)
+    return predictions, auprc
+
+
 def resume_training_is_complete(
     start_epoch: int,
     max_epochs: int,
@@ -1035,19 +1146,6 @@ def train_dtp_fold(
         ppg_bucket_counts=model_config["ppg_bucket_counts"],
         stable_feature_columns=stable_feature_columns,
     )
-    test_dataset = DTPDataset(
-        test_anchors,
-        segments,
-        normalization,
-        future_context_seconds=future_seconds,
-        training=False,
-        seed=seed,
-        motion_block_seconds=int(model_config.get("motion_block_seconds", 3)),
-        ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
-        motion_bucket_counts=model_config["motion_bucket_counts"],
-        ppg_bucket_counts=model_config["ppg_bucket_counts"],
-        stable_feature_columns=stable_feature_columns,
-    )
     batch_sampler = SegmentBalancedBatchSampler(
         train_anchors,
         batch_size=int(training_config["batch_size"]),
@@ -1061,6 +1159,10 @@ def train_dtp_fold(
     )
     if training_workers < 0 or inference_workers < 0:
         raise ValueError("DataLoader worker counts must be non-negative")
+    inference_batch_size = int(training_config["inference_batch_size"])
+    inference_chunk_rows = int(training_config.get("inference_resume_chunk_rows", 32768))
+    if inference_batch_size <= 0 or inference_chunk_rows <= 0:
+        raise ValueError("Inference batch and resume chunk sizes must be positive")
     training_loader_arguments = {
         "num_workers": training_workers,
         "pin_memory": True,
@@ -1078,16 +1180,24 @@ def train_dtp_fold(
     )
     checkpoint_validation_loader = DataLoader(
         checkpoint_validation_dataset,
-        batch_size=int(training_config["inference_batch_size"]),
+        batch_size=inference_batch_size,
         shuffle=False,
         **inference_loader_arguments,
     )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=int(training_config["inference_batch_size"]),
-        shuffle=False,
+    resumable_loader_arguments = {
+        "batch_size": inference_batch_size,
         **inference_loader_arguments,
-    )
+    }
+    inference_dataset_arguments = {
+        "future_context_seconds": future_seconds,
+        "training": False,
+        "seed": seed,
+        "motion_block_seconds": int(model_config.get("motion_block_seconds", 3)),
+        "ppg_block_seconds": int(model_config.get("ppg_block_seconds", 15)),
+        "motion_bucket_counts": model_config["motion_bucket_counts"],
+        "ppg_bucket_counts": model_config["ppg_bucket_counts"],
+        "stable_feature_columns": stable_feature_columns,
+    }
 
     device = torch.device("cuda")
     torch.cuda.reset_peak_memory_stats(device)
@@ -1455,43 +1565,20 @@ def train_dtp_fold(
             allow_legacy_manifest=True,
         )
         if validation_cache is None:
-            full_validation_dataset = DTPDataset(
+            _, full_validation_auprc = _resumable_prediction_frame(
+                model,
                 validation_anchors,
                 segments,
                 normalization,
-                future_context_seconds=future_seconds,
-                training=False,
-                seed=seed,
-                motion_block_seconds=int(model_config.get("motion_block_seconds", 3)),
-                ppg_block_seconds=int(model_config.get("ppg_block_seconds", 15)),
-                motion_bucket_counts=model_config["motion_bucket_counts"],
-                ppg_bucket_counts=model_config["ppg_bucket_counts"],
-                stable_feature_columns=stable_feature_columns,
-            )
-            full_validation_loader = DataLoader(
-                full_validation_dataset,
-                batch_size=int(training_config["inference_batch_size"]),
-                shuffle=False,
-                **inference_loader_arguments,
-            )
-            full_validation_predictions, full_validation_auprc = _prediction_frame(
-                model,
-                full_validation_loader,
+                inference_dataset_arguments,
+                resumable_loader_arguments,
                 device,
                 amp_dtype,
-                description="Predicting full validation partition",
-            )
-            validate_prediction_frame(
-                full_validation_predictions,
-                validation_anchors,
-                "full validation predictions",
-            )
-            _save_prediction_frame(full_validation_predictions, validation_path)
-            _write_prediction_cache_manifest(
                 validation_path,
-                full_validation_predictions,
-                full_validation_auprc,
+                checkpoint_path,
                 cache_identity,
+                "full validation predictions",
+                inference_chunk_rows,
             )
         else:
             _, full_validation_auprc = validation_cache
@@ -1507,13 +1594,20 @@ def train_dtp_fold(
         "test predictions",
     )
     if test_cache is None:
-        test_predictions, test_auprc = _prediction_frame(
-            model, test_loader, device, amp_dtype, description="Predicting test fold"
-        )
-        validate_prediction_frame(test_predictions, test_anchors, "test predictions")
-        _save_prediction_frame(test_predictions, test_path)
-        _write_prediction_cache_manifest(
-            test_path, test_predictions, test_auprc, cache_identity
+        _, test_auprc = _resumable_prediction_frame(
+            model,
+            test_anchors,
+            segments,
+            normalization,
+            inference_dataset_arguments,
+            resumable_loader_arguments,
+            device,
+            amp_dtype,
+            test_path,
+            checkpoint_path,
+            cache_identity,
+            "test predictions",
+            inference_chunk_rows,
         )
     else:
         _, test_auprc = test_cache

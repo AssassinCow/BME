@@ -59,6 +59,37 @@ manifest 会拒绝修改后的上游文件、配置或 v2 输入。正式训练�
 checkpoint 产生后，训练流程仍会对完整 validation partition 做一次推理，并将完整预测
 写入 `best_validation_predictions.parquet`，供后续 OOF 使用。
 
+完整 validation 和 outer-test 推理使用 batch 64；本机 RTX 4080 Laptop 的 bf16 smoke
+峰值约 4.92 GB，低于 10.5 GB 门限，重复推理误差为 0。全量时间轴按完整 session 聚合
+成目标约 32768 anchor 的分块，每块完成后原子写入隐藏的 `.*_parts/` 目录。若推理被
+`Ctrl+C`、关机或其他异常中断，使用同一命令和 `--resume` 时会校验 checkpoint、时间轴、
+文件哈希和 AUPRC，然后仅重算未完成或损坏的分块；最终仍合并并严格核验完整时间轴，
+不会把分块指标代替完整 OOF 预测。
+
+若旧 run 已完成某个 state partition 的训练，但在全量推理阶段中断，可在提交推理热修复
+后把该 partition 迁移到新 run，而不重新训练。迁移只允许
+`inference_batch_size`、`inference_num_workers` 和 `inference_resume_chunk_rows` 改变；
+模型、损失、采样、候选、阈值、fold、v2 输入哈希或未完成训练都会触发拒绝。示例：
+
+```powershell
+$sourceRun = "hierarchical_v3_verifier_only_20260927b"
+$run = "hierarchical_v3_verifier_only_20260927c"
+
+python scripts/migrate_hierarchical_state_checkpoint.py `
+  --config configs/hierarchical_v3.yaml `
+  --source-run $sourceRun --run-name $run `
+  --fold 0 --partition 0 --fresh
+
+python scripts/train_hierarchical_state.py `
+  --config configs/hierarchical_v3.yaml `
+  --run-name $run --fold 0 --resume
+```
+
+迁移器逐张量计算模型状态 SHA-256，确认迁移前后权重完全一致，只更新目标 selection
+signature 和推理运行配置，并写入 `crossfit_0/state/checkpoint_migration.json` 以及目标
+`run_manifest.json`。恢复命令会直接进入 partition 0 的分块全量推理；完成后才正常训练
+partition 1 和 partition 2。
+
 ## 4. fold 0 模式和消融
 
 先分别运行以下两条主线到 `SELECTED`，不要提前读取 outer 标签：

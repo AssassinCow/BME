@@ -6,12 +6,15 @@ import pytest
 import torch
 
 import bme_eating.data.deep_dataset as deep_dataset_module
+import bme_eating.training.dtp_trainer as dtp_trainer_module
 from bme_eating.data.deep_dataset import DTPDataset, Normalization, _corrupt_ppg
 from bme_eating.models.dtp_sqf import DTPSQF, DyadicPool, logits_to_probability_arrays
 from bme_eating.reproducibility import epoch_random_seed, should_validate_epoch
 from bme_eating.training.dtp_trainer import (
+    _complete_session_chunks,
     _load_prediction_cache,
     _prediction_cache_identity,
+    _resumable_prediction_frame,
     _save_prediction_frame,
     _write_prediction_cache_manifest,
     checkpoint_selection_rank,
@@ -246,6 +249,97 @@ def test_checkpoint_validation_session_sampling_keeps_sessions_and_events():
     assert metadata["selected_events"] == 3
     assert set(selected.groupby(["subject_key", "session_id"]).size()) == {4}
     assert len(selected) <= 16
+
+
+def test_resumable_inference_chunks_never_split_sessions():
+    anchors = pd.DataFrame(
+        {
+            "subject_key": ["s1"] * 3 + ["s1"] * 5 + ["s2"] * 12,
+            "session_id": ["a"] * 3 + ["b"] * 5 + ["c"] * 12,
+            "timestamp_ms": np.arange(20),
+        }
+    )
+
+    chunks = _complete_session_chunks(anchors, maximum_rows=10)
+
+    assert [len(chunk) for chunk in chunks] == [8, 12]
+    observed = pd.concat(chunks, ignore_index=True)
+    pd.testing.assert_frame_equal(observed, anchors)
+    session_chunk: dict[tuple[str, str], int] = {}
+    for chunk_index, chunk in enumerate(chunks):
+        for key in set(zip(chunk["subject_key"], chunk["session_id"])):
+            assert key not in session_chunk
+            session_chunk[key] = chunk_index
+
+
+def test_resumable_inference_reuses_completed_parts(tmp_path, monkeypatch):
+    anchors = pd.DataFrame(
+        {
+            "subject_key": ["s1", "s1", "s1", "s1", "s2", "s2"],
+            "segment_id": ["g1", "g1", "g2", "g2", "g3", "g3"],
+            "session_id": ["a", "a", "b", "b", "c", "c"],
+            "timestamp_ms": [0, 1, 2, 3, 4, 5],
+            "state_target": [0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
+            "state_loss_mask": 1.0,
+        }
+    )
+
+    class FakeDataset:
+        def __init__(self, selected, *_args, **_kwargs):
+            self.anchors = selected.reset_index(drop=True)
+
+        def __len__(self):
+            return len(self.anchors)
+
+    calls: list[int] = []
+
+    def fake_prediction(_model, loader, _device, _dtype, description):
+        calls.append(len(loader.dataset.anchors))
+        selected = loader.dataset.anchors
+        probability = 0.1 + 0.8 * selected["state_target"].to_numpy(dtype=float)
+        frame = selected[["subject_key", "segment_id", "session_id", "timestamp_ms"]].copy()
+        frame["state_probability"] = probability
+        frame["start_probability"] = probability
+        frame["end_probability"] = probability
+        return frame, 1.0
+
+    monkeypatch.setattr(dtp_trainer_module, "DTPDataset", FakeDataset)
+    monkeypatch.setattr(dtp_trainer_module, "_prediction_frame", fake_prediction)
+    checkpoint = tmp_path / "best.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    output = tmp_path / "predictions.parquet"
+    normalization = Normalization(np.zeros(6), np.ones(6), 0.0, 1.0)
+    arguments = {
+        "model": torch.nn.Identity(),
+        "anchors": anchors,
+        "segments": pd.DataFrame(),
+        "normalization": normalization,
+        "dataset_arguments": {},
+        "loader_arguments": {"batch_size": 2},
+        "device": torch.device("cpu"),
+        "amp_dtype": torch.float32,
+        "output_path": output,
+        "checkpoint_path": checkpoint,
+        "identity": {"version": 2, "best_checkpoint_sha256": "test"},
+        "description": "resumable test",
+        "maximum_chunk_rows": 2,
+    }
+
+    first, first_auprc = _resumable_prediction_frame(**arguments)
+    output.unlink()
+    output.with_name(output.name + ".manifest.json").unlink()
+    monkeypatch.setattr(
+        dtp_trainer_module,
+        "_prediction_frame",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed inference part was recomputed")
+        ),
+    )
+    second, second_auprc = _resumable_prediction_frame(**arguments)
+
+    assert calls == [2, 2, 2]
+    assert first_auprc == second_auprc == 1.0
+    pd.testing.assert_frame_equal(first, second)
 
 
 @pytest.mark.parametrize(

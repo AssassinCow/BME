@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import shutil
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,12 +56,17 @@ from bme_eating.proposals import (
     label_event_candidates,
 )
 from bme_eating.training.dtp_trainer import (
+    _save_torch_checkpoint,
     events_overlapping_sessions,
+    resume_training_is_complete,
     seed_everything,
     train_dtp_fold,
 )
 
 ALIGNMENT_KEYS = ["subject_key", "session_id", "timestamp_ms"]
+RUNTIME_INFERENCE_TRAINING_KEYS = frozenset(
+    {"inference_batch_size", "inference_num_workers", "inference_resume_chunk_rows"}
+)
 
 
 @dataclass(frozen=True)
@@ -459,6 +465,207 @@ def reuse_hierarchical_state_artifacts(
             },
         },
     )
+
+
+def _public_resolved_config(config: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: deepcopy(value)
+        for key, value in config.items()
+        if not key.startswith("_") and key not in {"credentials", "secrets"}
+    }
+
+
+def _without_runtime_inference_settings(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = _public_resolved_config(config)
+    training = normalized.get("training")
+    if isinstance(training, dict):
+        for key in RUNTIME_INFERENCE_TRAINING_KEYS:
+            training.pop(key, None)
+    return normalized
+
+
+def _runtime_inference_changes(
+    source_config: dict[str, Any], target_config: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    if _without_runtime_inference_settings(source_config) != _without_runtime_inference_settings(
+        target_config
+    ):
+        raise RuntimeError(
+            "Checkpoint migration only permits inference batch, worker, and chunk settings to change"
+        )
+    source_training = source_config.get("training", {})
+    target_training = target_config.get("training", {})
+    return {
+        key: {"source": source_training.get(key), "target": target_training.get(key)}
+        for key in sorted(RUNTIME_INFERENCE_TRAINING_KEYS)
+        if source_training.get(key) != target_training.get(key)
+    }
+
+
+def _model_state_sha256(state: dict[str, torch.Tensor]) -> str:
+    digest = hashlib.sha256()
+    for name in sorted(state):
+        tensor = state[name].detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tensor.dtype).encode("ascii"))
+        digest.update(json.dumps(list(tensor.shape), separators=(",", ":")).encode("ascii"))
+        digest.update(tensor.view(torch.uint8).numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _copy_atomic(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + ".tmp")
+    shutil.copy2(source, temporary)
+    temporary.replace(target)
+
+
+def migrate_completed_state_partition(
+    source_root: Path,
+    target: HierarchicalRun,
+    source_config: dict[str, Any],
+    target_config: dict[str, Any],
+    partition: int,
+) -> dict[str, Any]:
+    target.require_stage("CREATED")
+    if partition not in range(3):
+        raise ValueError("State partition must be 0, 1, or 2")
+    source_manifest_path = source_root / "run_manifest.json"
+    if not source_manifest_path.is_file():
+        raise FileNotFoundError("Source run manifest is missing")
+    source_manifest = json.loads(source_manifest_path.read_text(encoding="utf-8"))
+    if int(source_manifest.get("outer_fold", -1)) != int(target.payload["outer_fold"]):
+        raise RuntimeError("Source and target runs use different outer folds")
+    if source_manifest.get("input_hashes") != target.payload.get("input_hashes"):
+        raise RuntimeError("Checkpoint migration requires identical v2 input hashes")
+    if bool(source_manifest.get("git", {}).get("dirty", True)):
+        raise RuntimeError("Checkpoint migration refuses a source run created from dirty code")
+    source_resolved = source_root / "resolved_config.yaml"
+    source_resolved_hash = source_manifest.get("artifact_hashes", {}).get(
+        "resolved_config.yaml"
+    )
+    if not source_resolved_hash or sha256_file(source_resolved) != source_resolved_hash:
+        raise RuntimeError("Source resolved configuration does not match its manifest")
+    allowed_changes = _runtime_inference_changes(source_config, target_config)
+    if not allowed_changes:
+        raise RuntimeError("Checkpoint migration requires an actual runtime inference change")
+
+    source_state = source_root / f"crossfit_{partition}" / "state"
+    target_state = target.root / f"crossfit_{partition}" / "state"
+    if target_state.exists() and any(target_state.iterdir()):
+        raise RuntimeError("Target state partition already contains artifacts")
+    source_paths = {name: source_state / name for name in ("best.pt", "last.pt")}
+    missing = [name for name, path in source_paths.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Source state partition is missing checkpoints: {missing}")
+
+    checkpoints = {
+        name: torch.load(path, map_location="cpu", weights_only=False)
+        for name, path in source_paths.items()
+    }
+    expected_source_training = dict(source_config["training"])
+    expected_source_training["random_seed"] = int(source_config["training"]["random_seed"]) + partition
+    expected_target_training = dict(target_config["training"])
+    expected_target_training["random_seed"] = int(target_config["training"]["random_seed"]) + partition
+    source_signature = checkpoints["best.pt"].get("selection_signature")
+    for name, checkpoint in checkpoints.items():
+        if int(checkpoint.get("outer_fold", -1)) != int(target.payload["outer_fold"]):
+            raise RuntimeError(f"{name} belongs to a different outer fold")
+        if int(checkpoint.get("inner_validation_partition", -1)) != partition:
+            raise RuntimeError(f"{name} belongs to a different inner partition")
+        if checkpoint.get("selection_signature") != source_signature:
+            raise RuntimeError("Source best and last checkpoints use different signatures")
+        if checkpoint.get("checkpoint_selection_metric") != "event_f1":
+            raise RuntimeError(f"{name} was not selected with event-level F1")
+        if checkpoint.get("model_config") != source_config["model"]:
+            raise RuntimeError(f"{name} model configuration differs from the source run")
+        checkpoint_training = {"training": checkpoint.get("training_config", {})}
+        expected_training = {"training": expected_source_training}
+        if _without_runtime_inference_settings(checkpoint_training) != (
+            _without_runtime_inference_settings(expected_training)
+        ):
+            raise RuntimeError(f"{name} training configuration differs from the source run")
+    last = checkpoints["last.pt"]
+    patience_checks = int(target_config["training"]["early_stopping_patience_checks"])
+    if not resume_training_is_complete(
+        int(last["epoch"]) + 1,
+        int(target_config["training"]["max_epochs"]),
+        int(last.get("patience", 0)),
+        patience_checks,
+    ):
+        raise RuntimeError("Only a completed or early-stopped state partition may be migrated")
+
+    fold = int(target.payload["outer_fold"])
+    seed = int(expected_target_training["random_seed"])
+    target_signature = _partition_signature(target_config, fold, partition, seed)
+    target_state.mkdir(parents=True, exist_ok=True)
+    checkpoint_records: dict[str, Any] = {}
+    for name, checkpoint in checkpoints.items():
+        source_weight_hash = _model_state_sha256(checkpoint["model"])
+        migrated = dict(checkpoint)
+        migrated["selection_signature"] = target_signature
+        migrated["training_config"] = expected_target_training
+        migrated["checkpoint_migration"] = {
+            "source_run": source_manifest["run_name"],
+            "source_commit": source_manifest["git"]["commit"],
+            "source_checkpoint_sha256": sha256_file(source_paths[name]),
+            "source_model_state_sha256": source_weight_hash,
+        }
+        target_path = target_state / name
+        _save_torch_checkpoint(migrated, target_path)
+        verified = torch.load(target_path, map_location="cpu", weights_only=False)
+        target_weight_hash = _model_state_sha256(verified["model"])
+        if target_weight_hash != source_weight_hash:
+            raise RuntimeError(f"{name} model weights changed during checkpoint migration")
+        checkpoint_records[name] = {
+            "source_sha256": sha256_file(source_paths[name]),
+            "target_sha256": sha256_file(target_path),
+            "model_state_sha256": source_weight_hash,
+        }
+
+    copied_records: dict[str, str] = {}
+    for name in (
+        "normalization.json",
+        "history.csv",
+        "best_validation_selection.json",
+        "best_checkpoint_validation_predictions.parquet",
+    ):
+        source_path = source_state / name
+        if source_path.is_file():
+            target_path = target_state / name
+            _copy_atomic(source_path, target_path)
+            if sha256_file(target_path) != sha256_file(source_path):
+                raise RuntimeError(f"Copied state artifact changed during migration: {name}")
+            copied_records[name] = sha256_file(target_path)
+
+    migration = {
+        "version": 1,
+        "source_run": source_manifest["run_name"],
+        "source_outer_fold": int(source_manifest["outer_fold"]),
+        "source_commit": source_manifest["git"]["commit"],
+        "source_manifest_sha256": sha256_file(source_manifest_path),
+        "target_run": target.payload["run_name"],
+        "target_commit": target.payload["git"]["commit"],
+        "partition": partition,
+        "allowed_runtime_changes": allowed_changes,
+        "source_selection_signature": source_signature,
+        "target_selection_signature": target_signature,
+        "checkpoints": checkpoint_records,
+        "copied_artifacts": copied_records,
+        "model_weights_unchanged": True,
+        "training_will_not_resume": True,
+    }
+    migration_path = target_state / "checkpoint_migration.json"
+    write_json_atomic(migration_path, migration)
+    artifact_hashes = dict(target.payload.get("artifact_hashes", {}))
+    for path in target_state.rglob("*"):
+        if path.is_file():
+            relative = path.relative_to(target.root).as_posix()
+            artifact_hashes[relative] = sha256_file(path)
+    target.payload["artifact_hashes"] = artifact_hashes
+    target.payload.setdefault("state_checkpoint_migrations", {})[str(partition)] = migration
+    write_json_atomic(target.manifest_path, target.payload)
+    return migration
 
 
 def _load_xgb_candidate_events(

@@ -45,7 +45,8 @@ training:
   batch_size: 16
   gradient_accumulation: 2
   steps_per_epoch: 1250
-  inference_batch_size: 16
+  inference_batch_size: 64
+  inference_resume_chunk_rows: 32768
   validation_every_epochs: 2
   num_workers: 8
   inference_num_workers: 2
@@ -54,7 +55,7 @@ training:
   checkpoint_validation_min_subjects: 8
   checkpoint_validation_min_events: 40
   max_epochs: 32
-  early_stopping_patience_checks: 4
+  early_stopping_patience_checks: 3
   early_stopping_min_delta: 0.003
   learning_rate: 0.0003
   encoder_learning_rate: 0.0001
