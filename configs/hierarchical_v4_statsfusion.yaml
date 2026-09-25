@@ -63,12 +63,17 @@ training:
   device: cuda
   amp_dtype: bfloat16
   batch_size: 16
-  gradient_accumulation: 1
-  steps_per_epoch: 63
+  gradient_accumulation: 2
+  steps_per_epoch: 1250
   inference_batch_size: 64
   num_workers: 16
   max_epochs: 32
-  selector_fraction: 0.20
+  selector_fraction: 0.35
+  selector_rolling_epochs: 3
+  validation_every_epochs: 2
+  early_stopping_min_epochs: 12
+  early_stopping_patience_checks: 3
+  early_stopping_min_delta: 0.003
   learning_rate: 0.0003
   weight_decay: 0.01
   warmup_fraction: 0.05

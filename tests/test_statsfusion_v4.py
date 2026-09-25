@@ -77,6 +77,7 @@ from bme_eating.structured_decoder import (
 from bme_eating.training.hierarchical_v4_trainer import (
     UNLABELED_ANCHOR_COLUMNS,
     V4Inputs,
+    _add_robust_epoch_metrics,
     _assert_nested_lineage,
     _assert_proposal_feature_alignment,
     _build_seeded_state_model,
@@ -89,6 +90,8 @@ from bme_eating.training.hierarchical_v4_trainer import (
     _nested_cache_artifacts,
     _nested_cache_key,
     _prepare_nested_meta_cache,
+    _selector_early_stopping_improved,
+    _selector_split,
     _truth_event_durations,
     load_v4_inputs,
 )
@@ -244,6 +247,80 @@ def test_outer_training_never_loads_outer_anchor_labels(tmp_path, monkeypatch) -
     )
     assert evaluation_inputs.anchors.iloc[0].state_target == 99.0
     assert set(evaluation_inputs.events["subject_key"]) == {"outer"}
+
+
+def test_r2_loads_session_statistics_without_segment_id(tmp_path, monkeypatch) -> None:
+    import bme_eating.training.hierarchical_v4_trainer as trainer
+
+    input_root = tmp_path / "v2"
+    output_root = tmp_path / "v4"
+    (input_root / "indices").mkdir(parents=True)
+    canonical_root = output_root / "canonical_input"
+    canonical_root.mkdir(parents=True)
+    anchors = pd.DataFrame(
+        {
+            "segment_id": ["g0", "g1"],
+            "session_id": ["d0", "d1"],
+            "segment_path": ["p0", "p1"],
+            "subject_key": ["train", "outer"],
+            "timestamp_ms": [3_000, 3_000],
+            "state_target": [1.0, 0.0],
+            "state_loss_mask": [1.0, 1.0],
+            "start_target": [0.0, 0.0],
+            "end_target": [0.0, 0.0],
+            "start_loss_mask": [1.0, 1.0],
+            "end_loss_mask": [1.0, 1.0],
+            "event_id": ["e0", None],
+            "hand_relation": ["same", "different"],
+            "motion_history_available_seconds": [0.0, 0.0],
+            "ppg_history_available_seconds": [0.0, 0.0],
+        }
+    )
+    anchors_path = canonical_root / "anchors.parquet"
+    anchors.to_parquet(anchors_path, index=False)
+    statistics = anchors[["subject_key", "session_id", "timestamp_ms"]].copy()
+    for column in STATS_FEATURE_COLUMNS:
+        statistics[column] = 0.0
+    statistics_path = canonical_root / "statistics.parquet"
+    statistics.to_parquet(statistics_path, index=False)
+    pd.DataFrame(
+        columns=["session_id", "segment_id", "segment_path", "start_ms", "end_ms"]
+    ).to_parquet(input_root / "indices" / "segments.parquet", index=False)
+    pd.DataFrame(
+        {
+            "subject_key": ["train"],
+            "event_id": ["e0"],
+            "start_ms": [0],
+            "end_ms": [3_000],
+        }
+    ).to_parquet(input_root / "indices" / "events.parquet", index=False)
+    (input_root / "indices" / "subject_folds.json").write_text(
+        json.dumps({"train": 1, "outer": 0}), encoding="utf-8"
+    )
+    monkeypatch.setattr(trainer, "verify_canonical_statsfusion_inputs", lambda *_args: {})
+    monkeypatch.setattr(
+        trainer,
+        "canonical_input_paths",
+        lambda _root: {"anchors": anchors_path, "statistics": statistics_path},
+    )
+
+    inputs = load_v4_inputs(
+        {
+            "experiment": {"protocol_version": "statsfusion-r2"},
+            "project": {"artifact_schema_version": "v4"},
+            "features": {"artifact_name": "baseline"},
+        },
+        input_root,
+        fold=0,
+        event_role="outer_train",
+    )
+
+    assert "segment_id" not in inputs.statistics.columns
+    assert inputs.statistics.columns[:3].tolist() == [
+        "subject_key",
+        "session_id",
+        "timestamp_ms",
+    ]
 
 
 def test_statsfusion_receptive_fields_shapes_and_causality() -> None:
@@ -1697,6 +1774,109 @@ def test_seeded_selector_model_initialization_is_reproducible() -> None:
     second = _build_seeded_state_model(config, 2026).state_dict()
     assert first.keys() == second.keys()
     assert all(torch.equal(first[name], second[name]) for name in first)
+
+
+def test_selector_split_is_subject_stratified_deterministic_and_large_enough() -> None:
+    subjects = {f"s{index:02d}" for index in range(20)}
+    event_rows = []
+    anchor_rows = []
+    for index, subject in enumerate(sorted(subjects)):
+        for event_index in range(1 + index % 4):
+            event_rows.append(
+                {
+                    "event_id": f"{subject}-e{event_index}",
+                    "subject_key": subject,
+                    "start_ms": event_index * 120_000,
+                    "end_ms": event_index * 120_000 + (30 + index * 3) * 1000,
+                    "valid_duration": True,
+                    "evaluable": True,
+                    "hand_relation": "same" if (index + event_index) % 2 else "different",
+                }
+            )
+        for timestamp_ms in range(3_000, (10 + index) * 3_000, 3_000):
+            anchor_rows.append(
+                {
+                    "subject_key": subject,
+                    "session_id": f"session-{subject}",
+                    "timestamp_ms": timestamp_ms,
+                }
+            )
+    events = pd.DataFrame(event_rows)
+    anchors = pd.DataFrame(anchor_rows)
+
+    first = _selector_split(subjects, 0.35, 2026, events=events, anchors=anchors)
+    second = _selector_split(subjects, 0.35, 2026, events=events, anchors=anchors)
+    fit, selector, report = first
+
+    assert first == second
+    assert len(selector) == 7
+    assert len(fit) == 13
+    assert not fit & selector
+    assert fit | selector == subjects
+    assert report["strategy"] == "event_stratified_subject_subset_v1"
+    assert report["selector_subject_count"] == 7
+    assert report["selector_totals"]["same_event_count"] > 0
+    assert report["selector_totals"]["different_event_count"] > 0
+
+
+def test_selector_epoch_metrics_use_trailing_robust_window() -> None:
+    epochs = [
+        {
+            "candidate_recall": 0.2,
+            "calibration_passed": True,
+            "event_f1": 0.1,
+            "state_fragment_count": 20.0,
+            "ece": 0.04,
+            "window_auprc": 0.2,
+        },
+        {
+            "candidate_recall": 0.9,
+            "calibration_passed": False,
+            "event_f1": 0.8,
+            "state_fragment_count": 80.0,
+            "ece": 0.2,
+            "window_auprc": 0.9,
+        },
+        {
+            "candidate_recall": 0.3,
+            "calibration_passed": True,
+            "event_f1": 0.2,
+            "state_fragment_count": 25.0,
+            "ece": 0.05,
+            "window_auprc": 0.3,
+        },
+    ]
+
+    _add_robust_epoch_metrics(epochs, 3)
+
+    assert epochs[-1]["robust_candidate_recall"] == pytest.approx(0.3)
+    assert epochs[-1]["robust_event_f1"] == pytest.approx(0.2)
+    assert epochs[-1]["robust_calibration_passed"] is True
+
+
+def test_selector_early_stopping_uses_v3_minimum_delta_semantics() -> None:
+    best = {
+        "robust_candidate_recall": 0.30,
+        "robust_event_f1": 0.20,
+        "robust_calibration_passed": False,
+    }
+    insignificant = {
+        "robust_candidate_recall": 0.302,
+        "robust_event_f1": 0.202,
+        "robust_calibration_passed": False,
+    }
+    improved = {
+        "robust_candidate_recall": 0.34,
+        "robust_event_f1": 0.20,
+        "robust_calibration_passed": False,
+    }
+
+    assert not _selector_early_stopping_improved(
+        insignificant, best, minimum_recall=0.83, minimum_delta=0.003
+    )
+    assert _selector_early_stopping_improved(
+        improved, best, minimum_recall=0.83, minimum_delta=0.003
+    )
 
 
 def test_semi_markov_cannot_chain_eating_segments_past_maximum_duration() -> None:

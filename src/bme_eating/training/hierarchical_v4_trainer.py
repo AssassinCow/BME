@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
@@ -85,7 +86,8 @@ from bme_eating.structured_decoder import (
     TruncatedLogNormalDurationPrior,
 )
 
-ALIGNMENT_KEYS = ["segment_id", "session_id", "subject_key", "timestamp_ms"]
+LEGACY_ALIGNMENT_KEYS = ["segment_id", "session_id", "subject_key", "timestamp_ms"]
+SESSION_ALIGNMENT_KEYS = ["subject_key", "session_id", "timestamp_ms"]
 UNLABELED_ANCHOR_COLUMNS = [
     "segment_id",
     "session_id",
@@ -257,11 +259,12 @@ def load_v4_inputs(
         if formal_r2
         else input_root / "features" / f"{feature_artifact_name(config)}.parquet"
     )
+    alignment_keys = SESSION_ALIGNMENT_KEYS if formal_r2 else LEGACY_ALIGNMENT_KEYS
     statistics = pd.read_parquet(
         feature_path,
-        columns=[*ALIGNMENT_KEYS, *STATS_FEATURE_COLUMNS],
+        columns=[*alignment_keys, *STATS_FEATURE_COLUMNS],
     )
-    if statistics.duplicated(ALIGNMENT_KEYS).any():
+    if statistics.duplicated(alignment_keys).any():
         raise RuntimeError("V4 statistics contain duplicate timeline keys")
     return V4Inputs(anchors, segments, events, statistics, subject_folds)
 
@@ -285,17 +288,179 @@ def stacking_partitions(subjects: set[str], partitions: int, seed: int) -> dict[
     return {str(subject): index % partitions for index, subject in enumerate(ordered)}
 
 
-def _selector_split(subjects: set[str], fraction: float, seed: int) -> tuple[set[str], set[str]]:
+def _selector_subject_summary(
+    subjects: set[str],
+    events: pd.DataFrame,
+    anchors: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    ordered = sorted(str(subject) for subject in subjects)
+    summary = pd.DataFrame({"subject_key": ordered})
+    candidate_events = events[events["subject_key"].astype(str).isin(subjects)].copy()
+    if "valid_duration" in candidate_events:
+        candidate_events = candidate_events[candidate_events["valid_duration"].fillna(False)]
+    if "evaluable" in candidate_events:
+        candidate_events = candidate_events[candidate_events["evaluable"].fillna(False)]
+    elif "coverage" in candidate_events:
+        candidate_events = candidate_events[candidate_events["coverage"].fillna("").eq("full")]
+    candidate_events = candidate_events[
+        candidate_events["end_ms"].to_numpy(dtype=np.int64)
+        > candidate_events["start_ms"].to_numpy(dtype=np.int64)
+    ].copy()
+    candidate_events["duration_seconds"] = (
+        candidate_events["end_ms"].to_numpy(dtype=np.float64)
+        - candidate_events["start_ms"].to_numpy(dtype=np.float64)
+    ) / 1000.0
+    if len(candidate_events):
+        short_threshold, long_threshold = np.quantile(
+            candidate_events["duration_seconds"].to_numpy(dtype=np.float64),
+            [1.0 / 3.0, 2.0 / 3.0],
+        )
+    else:
+        short_threshold = long_threshold = 0.0
+    relation = candidate_events.get(
+        "hand_relation", pd.Series("unknown", index=candidate_events.index, dtype=object)
+    ).fillna("unknown").astype(str)
+    candidate_events = candidate_events.assign(
+        same_event=(relation == "same").astype(np.int64),
+        different_event=(relation == "different").astype(np.int64),
+        short_event=(candidate_events["duration_seconds"] <= short_threshold).astype(np.int64),
+        long_event=(candidate_events["duration_seconds"] >= long_threshold).astype(np.int64),
+    )
+    event_summary = (
+        candidate_events.groupby("subject_key", as_index=False)
+        .agg(
+            event_count=("duration_seconds", "size"),
+            same_event_count=("same_event", "sum"),
+            different_event_count=("different_event", "sum"),
+            short_event_count=("short_event", "sum"),
+            long_event_count=("long_event", "sum"),
+            event_duration_seconds=("duration_seconds", "sum"),
+        )
+        .assign(subject_key=lambda frame: frame["subject_key"].astype(str))
+    )
+    summary = summary.merge(event_summary, on="subject_key", how="left")
+    anchor_keys = [
+        column
+        for column in ("subject_key", "session_id", "timestamp_ms")
+        if column in anchors
+    ]
+    if {"subject_key", "timestamp_ms"}.issubset(anchor_keys):
+        observation = (
+            anchors[anchors["subject_key"].astype(str).isin(subjects)]
+            .assign(subject_key=lambda frame: frame["subject_key"].astype(str))
+            .drop_duplicates(anchor_keys)
+            .groupby("subject_key", as_index=False)
+            .agg(observation_anchor_count=("timestamp_ms", "size"))
+        )
+        summary = summary.merge(observation, on="subject_key", how="left")
+    else:
+        summary["observation_anchor_count"] = 0
+    value_columns = [
+        "event_count",
+        "same_event_count",
+        "different_event_count",
+        "short_event_count",
+        "long_event_count",
+        "event_duration_seconds",
+        "observation_anchor_count",
+    ]
+    summary[value_columns] = summary[value_columns].fillna(0.0).astype(np.float64)
+    return summary, {
+        "short_event_threshold_seconds": float(short_threshold),
+        "long_event_threshold_seconds": float(long_threshold),
+    }
+
+
+def _selector_split(
+    subjects: set[str],
+    fraction: float,
+    seed: int,
+    *,
+    events: pd.DataFrame,
+    anchors: pd.DataFrame,
+) -> tuple[set[str], set[str], dict[str, Any]]:
     if not 0 < fraction < 0.5:
         raise ValueError("Selector fraction must be in (0, 0.5)")
+    if len(subjects) < 2:
+        raise ValueError("Selector split requires at least two subjects")
+    summary, duration_thresholds = _selector_subject_summary(subjects, events, anchors)
     rng = np.random.default_rng(seed)
-    ordered = np.asarray(sorted(subjects), dtype=object)
+    ordered = summary["subject_key"].to_numpy(dtype=object)
     rng.shuffle(ordered)
-    count = max(1, min(len(ordered) - 1, round(len(ordered) * fraction)))
-    selector = {str(value) for value in ordered[:count]}
-    fit = {str(value) for value in ordered[count:]}
+    summary = summary.set_index("subject_key").loc[ordered].reset_index()
+    count = min(len(ordered) - 1, max(2, round(len(ordered) * fraction)))
+    value_columns = [column for column in summary.columns if column != "subject_key"]
+    values = summary[value_columns].to_numpy(dtype=np.float64)
+    total = values.sum(axis=0)
+    target_ratio = count / len(ordered)
+    target = total * target_ratio
+    scale = np.maximum(target, 1.0)
+    coverage_columns = {
+        value_columns.index(column)
+        for column in (
+            "event_count",
+            "same_event_count",
+            "different_event_count",
+            "short_event_count",
+            "long_event_count",
+        )
+        if column in value_columns
+    }
+
+    def score(indices: tuple[int, ...]) -> float:
+        selected = values[np.asarray(indices, dtype=np.int64)].sum(axis=0)
+        active = total > 0
+        error = float(np.square((selected[active] - target[active]) / scale[active]).mean())
+        missing_coverage = sum(
+            1 for index in coverage_columns if total[index] > 0 and selected[index] == 0
+        )
+        return error + 4.0 * missing_coverage
+
+    combination_count = math.comb(len(ordered), count)
+    if combination_count <= 250_000:
+        candidates = combinations(range(len(ordered)), count)
+    else:
+        sampled = {
+            tuple(sorted(rng.choice(len(ordered), size=count, replace=False).tolist()))
+            for _ in range(4096)
+        }
+        candidates = iter(sorted(sampled))
+    best_indices: tuple[int, ...] | None = None
+    best_score = math.inf
+    for indices in candidates:
+        current = score(indices)
+        if current < best_score - 1e-12:
+            best_indices = indices
+            best_score = current
+    if best_indices is None:
+        raise RuntimeError("Selector balancing did not produce a subject subset")
+    selected_indices = set(best_indices)
+    selector = {str(ordered[index]) for index in selected_indices}
+    fit = {str(value) for index, value in enumerate(ordered) if index not in selected_indices}
     assert_disjoint_subjects(fit=fit, selector=selector)
-    return fit, selector
+    selector_totals = values[np.asarray(best_indices, dtype=np.int64)].sum(axis=0)
+    report = {
+        "strategy": "event_stratified_subject_subset_v1",
+        "seed": int(seed),
+        "requested_fraction": float(fraction),
+        "actual_fraction": float(len(selector) / len(subjects)),
+        "fit_subject_count": len(fit),
+        "selector_subject_count": len(selector),
+        "balance_score": float(best_score),
+        "balance_columns": value_columns,
+        "overall_totals": {
+            column: float(value) for column, value in zip(value_columns, total, strict=True)
+        },
+        "target_totals": {
+            column: float(value) for column, value in zip(value_columns, target, strict=True)
+        },
+        "selector_totals": {
+            column: float(value)
+            for column, value in zip(value_columns, selector_totals, strict=True)
+        },
+        **duration_thresholds,
+    }
+    return fit, selector, report
 
 
 def _geometry(config: dict[str, Any]) -> SequenceGeometry:
@@ -321,13 +486,18 @@ def _fit_scaler_and_transform(
 
 def _transform_with_scaler(inputs: V4Inputs, scaler: FoldRobustScaler) -> pd.DataFrame:
     transformed = scaler.transform_frame(inputs.statistics)
+    alignment_keys = (
+        LEGACY_ALIGNMENT_KEYS
+        if "segment_id" in transformed.columns
+        else SESSION_ALIGNMENT_KEYS
+    )
     statistics_columns = [
         *(f"stat_{name}" for name in STATS_FEATURE_COLUMNS),
         *(f"stat_{name}_missing" for name in STATS_FEATURE_COLUMNS),
     ]
     anchors = inputs.anchors.merge(
-        transformed[[*ALIGNMENT_KEYS, *statistics_columns]],
-        on=ALIGNMENT_KEYS,
+        transformed[[*alignment_keys, *statistics_columns]],
+        on=alignment_keys,
         how="left",
         validate="one_to_one",
     )
@@ -394,6 +564,7 @@ def _train_state_epochs(
     epoch_offset: int = 0,
     progress_label: str = "state",
     total_epochs: int | None = None,
+    scheduler_total_epochs: int | None = None,
 ) -> torch.optim.Optimizer:
     device = _device(config)
     model.to(device)
@@ -422,10 +593,11 @@ def _train_state_epochs(
         )
     accumulation = int(config["training"]["gradient_accumulation"])
     display_total = total_epochs or epoch_offset + int(epochs)
+    schedule_total = scheduler_total_epochs or display_total
     scheduler = getattr(optimizer, "_bme_scheduler", None)
     if scheduler is None:
         updates_per_epoch = math.ceil(len(loader) / accumulation)
-        total_updates = max(1, updates_per_epoch * int(display_total))
+        total_updates = max(1, updates_per_epoch * int(schedule_total))
         warmup_updates = max(1, round(total_updates * float(config["training"]["warmup_fraction"])))
 
         def learning_rate_multiplier(step: int) -> float:
@@ -494,8 +666,7 @@ def _selector_score(
     subjects = sorted(predictions["subject_key"].astype(str).unique())
     if len(subjects) < 2:
         raise RuntimeError("State selector requires at least two disjoint subjects")
-    partition_count = min(int(config["calibration"]["partitions"]), len(subjects))
-    subject_partition = {subject: index % partition_count for index, subject in enumerate(subjects)}
+    subject_partition = {subject: index for index, subject in enumerate(subjects)}
     predictions["stacking_partition"] = (
         predictions["subject_key"].astype(str).map(subject_partition)
     )
@@ -577,6 +748,57 @@ def _build_seeded_state_model(config: dict[str, Any], seed: int) -> torch.nn.Mod
     return build_state_model(config["model"])
 
 
+def _add_robust_epoch_metrics(
+    epoch_metrics: list[dict[str, Any]], rolling_epochs: int
+) -> None:
+    if rolling_epochs <= 0:
+        raise ValueError("Selector rolling epoch count must be positive")
+    metric_names = (
+        "candidate_recall",
+        "event_f1",
+        "state_fragment_count",
+        "ece",
+        "window_auprc",
+    )
+    for index, metrics in enumerate(epoch_metrics):
+        values = epoch_metrics[max(0, index - rolling_epochs + 1) : index + 1]
+        for name in metric_names:
+            metrics[f"robust_{name}"] = float(np.median([float(value[name]) for value in values]))
+        passed = sum(bool(value["calibration_passed"]) for value in values)
+        metrics["robust_calibration_passed"] = passed >= math.ceil(len(values) / 2)
+
+
+def _selector_early_stopping_improved(
+    current: dict[str, Any],
+    best: dict[str, Any] | None,
+    *,
+    minimum_recall: float,
+    minimum_delta: float,
+) -> bool:
+    if best is None:
+        return True
+    current_qualified = bool(
+        current["robust_candidate_recall"] >= minimum_recall
+        and current["robust_calibration_passed"]
+    )
+    best_qualified = bool(
+        best["robust_candidate_recall"] >= minimum_recall
+        and best["robust_calibration_passed"]
+    )
+    if current_qualified != best_qualified:
+        return current_qualified
+    primary_name = "robust_event_f1" if current_qualified else "robust_candidate_recall"
+    secondary_name = "robust_candidate_recall" if current_qualified else "robust_event_f1"
+    current_primary = float(current[primary_name])
+    best_primary = float(best[primary_name])
+    if current_primary > best_primary + minimum_delta:
+        return True
+    return bool(
+        current_primary >= best_primary - minimum_delta
+        and float(current[secondary_name]) > float(best[secondary_name]) + minimum_delta
+    )
+
+
 def _select_epoch(
     fit_anchors: pd.DataFrame,
     selector_anchors: pd.DataFrame,
@@ -615,6 +837,22 @@ def _select_epoch(
     epoch_metrics: list[dict[str, Any]] = []
     optimizer = None
     maximum_epochs = int(config["training"]["max_epochs"])
+    rolling_epochs = int(config["training"].get("selector_rolling_epochs", 1))
+    validation_interval = int(config["training"].get("validation_every_epochs", 1))
+    minimum_training_epochs = int(
+        config["training"].get("early_stopping_min_epochs", maximum_epochs)
+    )
+    patience_checks = int(
+        config["training"].get("early_stopping_patience_checks", maximum_epochs)
+    )
+    minimum_delta = float(config["training"].get("early_stopping_min_delta", 0.0))
+    minimum_recall = float(config["promotion_gate"]["minimum_candidate_recall"])
+    if validation_interval <= 0 or minimum_training_epochs <= 0 or patience_checks <= 0:
+        raise ValueError("State selector early-stopping intervals must be positive")
+    best_progress: dict[str, Any] | None = None
+    checks_without_improvement = 0
+    stopped_early = False
+    completed_training_epochs = 0
     for epoch in range(1, maximum_epochs + 1):
         optimizer = _train_state_epochs(
             model,
@@ -627,6 +865,9 @@ def _select_epoch(
             progress_label=f"state select seed={seed}",
             total_epochs=maximum_epochs,
         )
+        completed_training_epochs = epoch
+        if epoch % validation_interval != 0 and epoch != maximum_epochs:
+            continue
         score = _selector_score(
             model,
             selector_dataset,
@@ -636,26 +877,46 @@ def _select_epoch(
             progress_label=f"state validate {epoch}/{maximum_epochs}",
         )
         epoch_metrics.append({"epoch": epoch, **score})
+        _add_robust_epoch_metrics(epoch_metrics, rolling_epochs)
+        current = epoch_metrics[-1]
+        if _selector_early_stopping_improved(
+            current,
+            best_progress,
+            minimum_recall=minimum_recall,
+            minimum_delta=minimum_delta,
+        ):
+            best_progress = dict(current)
+            checks_without_improvement = 0
+        else:
+            checks_without_improvement += 1
         tqdm.write(
             f"[state selector seed={seed}] epoch {epoch}/{maximum_epochs} "
             f"recall={score['candidate_recall']:.4f} F1={score['event_f1']:.4f} "
             f"ECE={score['ece']:.4f}"
         )
-    minimum_recall = float(config["promotion_gate"]["minimum_candidate_recall"])
+        if epoch >= minimum_training_epochs and checks_without_improvement >= patience_checks:
+            stopped_early = True
+            tqdm.write(
+                f"[state selector seed={seed}] early stop after epoch {epoch}; "
+                f"no robust improvement for {checks_without_improvement} checks"
+            )
+            break
     qualified = [
         value
         for value in epoch_metrics
-        if value["candidate_recall"] >= minimum_recall and bool(value["calibration_passed"])
+        if value["robust_candidate_recall"] >= minimum_recall
+        and bool(value["robust_calibration_passed"])
     ]
     if qualified:
         best = max(
             qualified,
             key=lambda value: (
+                value["robust_event_f1"],
+                value["robust_candidate_recall"],
+                -value["robust_state_fragment_count"],
+                -value["robust_ece"],
+                value["robust_window_auprc"],
                 value["event_f1"],
-                value["candidate_recall"],
-                -value["state_fragment_count"],
-                -value["ece"],
-                value["window_auprc"],
             ),
         )
         promotion_eligible = True
@@ -663,11 +924,12 @@ def _select_epoch(
         best = max(
             epoch_metrics,
             key=lambda value: (
+                value["robust_candidate_recall"],
+                value["robust_event_f1"],
+                -value["robust_state_fragment_count"],
+                -value["robust_ece"],
+                value["robust_window_auprc"],
                 value["candidate_recall"],
-                value["event_f1"],
-                -value["state_fragment_count"],
-                -value["ece"],
-                value["window_auprc"],
             ),
         )
         promotion_eligible = False
@@ -675,6 +937,16 @@ def _select_epoch(
         "selected_epoch": int(best["epoch"]),
         "promotion_eligible": promotion_eligible,
         "minimum_candidate_recall": minimum_recall,
+        "selector_calibration_protocol": "leave_one_subject_out",
+        "selector_rolling_epochs": rolling_epochs,
+        "validation_every_epochs": validation_interval,
+        "early_stopping_min_epochs": minimum_training_epochs,
+        "early_stopping_patience_checks": patience_checks,
+        "early_stopping_min_delta": minimum_delta,
+        "stopped_early": stopped_early,
+        "completed_training_epochs": completed_training_epochs,
+        "validation_checks": len(epoch_metrics),
+        "selected_metrics": dict(best),
         "epochs": epoch_metrics,
     }
 
@@ -857,10 +1129,12 @@ def train_state_crossfit_v4(
         tqdm.write(f"[state] starting stacking partition {partition}")
         holdout = {subject for subject, value in partitions.items() if value == partition}
         training_subjects = outer_train - holdout
-        fit_subjects, selector_subjects = _selector_split(
+        fit_subjects, selector_subjects, selector_split_report = _selector_split(
             training_subjects,
             float(config["training"]["selector_fraction"]),
             int(config["training"]["random_seed"]) + partition,
+            events=inputs.events,
+            anchors=inputs.anchors,
         )
         assert_disjoint_subjects(
             fit=fit_subjects, selector=selector_subjects, holdout=holdout, outer=outer_test
@@ -911,6 +1185,12 @@ def train_state_crossfit_v4(
                     config,
                     seed + partition * 10_000,
                 )
+                selector_report = {
+                    **selector_report,
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "selector_split": selector_split_report,
+                }
                 write_json_atomic(selector_report_path, selector_report)
                 train_rows = transformed[
                     transformed["subject_key"].astype(str).isin(training_subjects)
@@ -937,6 +1217,7 @@ def train_state_crossfit_v4(
                     seed=seed + partition * 10_000,
                     progress_label=f"state partition={partition} seed={seed} retrain",
                     total_epochs=epochs,
+                    scheduler_total_epochs=int(config["training"]["max_epochs"]),
                 )
                 _save_torch_atomic(
                     checkpoint_path,
@@ -1030,6 +1311,7 @@ def train_state_crossfit_v4(
             seed=seed + 50_000,
             progress_label=f"state outer seed={seed} retrain",
             total_epochs=epochs,
+            scheduler_total_epochs=int(config["training"]["max_epochs"]),
         )
         checkpoint_path = outer_state_root / f"state_seed_{seed}.pt"
         _save_torch_atomic(
@@ -1541,12 +1823,14 @@ def _prepare_nested_meta_cache(
             prediction_subjects=prediction_subjects,
             globally_excluded_subjects=holdout_subjects,
         )
-        fit_subjects, selector_subjects = _selector_split(
+        fit_subjects, selector_subjects, selector_split_report = _selector_split(
             model_subjects,
             float(config["training"]["selector_fraction"]),
             int(config["training"]["random_seed"])
             + meta_partition * 10_000
             + inner_partition,
+            events=inputs.events,
+            anchors=inputs.anchors,
         )
         scaler, transformed = _fit_scaler_and_transform(inputs, model_subjects)
         normalization = compute_normalization(inputs.segments, model_subjects)
@@ -1610,6 +1894,7 @@ def _prepare_nested_meta_cache(
                     f"nested state meta={meta_partition} inner={inner_partition} seed={seed}"
                 ),
                 total_epochs=epochs,
+                scheduler_total_epochs=int(config["training"]["max_epochs"]),
             )
             checkpoint = inner_root / f"seed_{seed}.pt"
             selector_path = inner_root / f"selector_seed_{seed}.json"
@@ -1631,6 +1916,9 @@ def _prepare_nested_meta_cache(
                 selector_path,
                 {
                     **selector_report,
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "selector_split": selector_split_report,
                     "training_subjects": sorted(model_subjects),
                     "prediction_subjects": sorted(prediction_subjects),
                     "globally_excluded_subjects": sorted(holdout_subjects),
@@ -2260,10 +2548,12 @@ def train_verifier_crossfit_v4(
             holdout_features, holdout_proposals, context=f"Nested verifier holdout {partition}"
         )
         categories = classify_proposals(train_proposals)
-        fit_subjects, selector_subjects = _selector_split(
+        fit_subjects, selector_subjects, selector_split_report = _selector_split(
             train_subjects,
             float(config["training"]["selector_fraction"]),
             int(config["training"]["random_seed"]) + int(partition) + 60_000,
+            events=inputs.events,
+            anchors=inputs.anchors,
         )
         fit_indices = np.flatnonzero(
             train_proposals["subject_key"].astype(str).isin(fit_subjects).to_numpy()
@@ -2322,6 +2612,7 @@ def train_verifier_crossfit_v4(
                     "globally_excluded_subjects": sorted(holdout_subjects),
                     "fit_subjects": sorted(fit_subjects),
                     "selector_subjects": sorted(selector_subjects),
+                    "selector_split": selector_split_report,
                     "parent_artifact_sha256": nested_parent_sha256,
                     "state_calibration_source": "nested_meta_train_oof",
                     "duration_prior_source": "nested_meta_training_truth",
@@ -2337,6 +2628,7 @@ def train_verifier_crossfit_v4(
                     "globally_excluded_subjects": sorted(holdout_subjects),
                     "fit_subjects": sorted(fit_subjects),
                     "selector_subjects": sorted(selector_subjects),
+                    "selector_split": selector_split_report,
                     "parent_artifact_sha256": nested_parent_sha256,
                     "state_calibration_source": "nested_meta_train_oof",
                     "duration_prior_source": "nested_meta_training_truth",
@@ -2582,10 +2874,12 @@ def _train_verifier_crossfit_v4_r1_blocked(
         assert_disjoint_subjects(verifier_train=train_subjects, verifier_holdout=holdout_subjects)
         train_features = _slice_proposal_features(features, train_indices)
         holdout_features = _slice_proposal_features(features, holdout_indices)
-        fit_subjects, selector_subjects = _selector_split(
+        fit_subjects, selector_subjects, selector_split_report = _selector_split(
             train_subjects,
             float(config["training"]["selector_fraction"]),
             int(config["training"]["random_seed"]) + partition + 60_000,
+            events=inputs.events,
+            anchors=inputs.anchors,
         )
         fit_local = np.flatnonzero(
             proposals.iloc[train_indices]["subject_key"].astype(str).isin(fit_subjects).to_numpy()
@@ -2651,6 +2945,7 @@ def _train_verifier_crossfit_v4_r1_blocked(
                     "history": selection_history,
                     "fit_subjects": sorted(fit_subjects),
                     "selector_subjects": sorted(selector_subjects),
+                    "selector_split": selector_split_report,
                 },
             )
             artifacts.append(selector_path)
@@ -3089,10 +3384,12 @@ def train_boundary_crossfit_v4(
         if boundary_range.clipped_fraction > float(config["boundary"]["maximum_clipped_fraction"]):
             raise RuntimeError("Boundary residual clipping exceeds 5%; repair candidates first")
         train_subjects = set(train["subject_key"].astype(str))
-        fit_subjects, selector_subjects = _selector_split(
+        fit_subjects, selector_subjects, selector_split_report = _selector_split(
             train_subjects,
             float(config["training"]["selector_fraction"]),
             int(config["training"]["random_seed"]) + partition + 70_000,
+            events=inputs.events,
+            anchors=inputs.anchors,
         )
         fit_positive = train[train["subject_key"].astype(str).isin(fit_subjects)]
         selector_positive = train[train["subject_key"].astype(str).isin(selector_subjects)]
@@ -3209,6 +3506,7 @@ def train_boundary_crossfit_v4(
                     "globally_excluded_subjects": sorted(holdout_subjects),
                     "fit_subjects": sorted(fit_subjects),
                     "selector_subjects": sorted(selector_subjects),
+                    "selector_split": selector_split_report,
                     "parent_artifact_sha256": boundary_parent_sha256,
                     "state_calibration_source": "nested_meta_train_oof",
                     "duration_prior_source": "nested_meta_training_truth",
@@ -3994,6 +4292,8 @@ def train_hierarchical_final_v4(
             config,
             epochs=fixed_epochs[seed],
             seed=int(seed),
+            total_epochs=fixed_epochs[seed],
+            scheduler_total_epochs=int(config["training"]["max_epochs"]),
         )
         path = final_root / f"state_seed_{seed}.pt"
         _save_torch_atomic(

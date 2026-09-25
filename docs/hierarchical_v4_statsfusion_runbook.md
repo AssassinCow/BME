@@ -179,5 +179,19 @@ preprocessor 的 motion、motion validity、PPG、PPG quality、PPG validity、P
 replay；官方文件格式目前仍为 `UNKNOWN`，这里只冻结原始数组接口，不伪造官方 adapter。
 
 当前 RTX 4080 Laptop bf16 smoke 在 batch size 4、gradient accumulation 4、895 步输入下
-峰值约 `1.277 GB`，重复推理最大概率误差为 `0.0`。正式训练若环境变化后超过 10.5 GB，
-只降低 batch size 并等比例提高 gradient accumulation，保持有效 batch 为 16。
+峰值约 `1.277 GB`，重复推理最大概率误差为 `0.0`。正式训练参数向 v3 对齐为
+`batch_size=16`、`gradient_accumulation=2`、`steps_per_epoch=1250`，即有效 batch 32、
+每轮 20000 个 clip 和 625 次参数更新。若环境变化后超过 10.5 GB，只降低物理 batch size
+并等比例提高 gradient accumulation，保持有效 batch 32、每轮样本量和参数更新次数不变。
+
+状态、verifier 和 boundary 的 epoch selector 保持受试者级隔离，但不再随机抽取 20%。
+默认选择约 35% 的可训练受试者（20 人时为 7 人），并联合平衡可评估事件数、同侧/异侧事件、
+短/长事件、事件总时长和观察 anchor 数。状态 selector 内部使用 leave-one-subject-out
+Platt 校准，并按最近 3 个 epoch 的指标中位数选择 epoch，减少少量事件造成的单轮 F1 跳变。
+split 统计和受试者名单写入 selector JSON；该配置变化会触发 strict resume identity，旧 run
+不能直接 resume，必须使用新的 run name 从 state 阶段重新训练。
+
+状态学习率与 v3 保持为 `0.0003`；v3 中的 `0.003` 是 early-stopping min delta，
+不是 learning rate。v4 每 2 个 epoch 验证一次，至少训练 12 个 epoch，连续 3 次检查没有达到
+`0.003` 的稳健提升后停止。选 epoch 阶段与全训练受试者重训阶段固定使用相同的 32-epoch
+cosine schedule horizon，避免因选中 epoch 较小而改变前期学习率轨迹。

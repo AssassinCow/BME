@@ -14,6 +14,18 @@ def test_v4_config_is_strict_and_has_fixed_features() -> None:
     assert tuple(config["model"]["stable_feature_columns"]) == STATS_FEATURE_COLUMNS
     assert config["hierarchical"]["maximum_event_latency_seconds"] == 60
     assert config["decoder"]["fixed_lag_seconds"] == 60
+    assert config["training"]["batch_size"] == 16
+    assert config["training"]["gradient_accumulation"] == 2
+    assert config["training"]["steps_per_epoch"] == 1250
+    assert config["training"]["inference_batch_size"] == 64
+    assert config["training"]["num_workers"] == 16
+    assert config["training"]["selector_fraction"] == 0.35
+    assert config["training"]["selector_rolling_epochs"] == 3
+    assert config["training"]["validation_every_epochs"] == 2
+    assert config["training"]["early_stopping_min_epochs"] == 12
+    assert config["training"]["early_stopping_patience_checks"] == 3
+    assert config["training"]["early_stopping_min_delta"] == 0.003
+    assert config["training"]["learning_rate"] == 0.0003
 
 
 def test_v4_ablation_configs_change_only_registered_components() -> None:
