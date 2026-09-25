@@ -6,6 +6,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from bme_eating.data.stats_fusion_preprocess import session_right_endpoint_grid
+
 
 def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
     merged: list[list[int]] = []
@@ -273,6 +275,230 @@ def build_anchor_index(
     anchors = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=anchor_columns)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     anchors.to_parquet(output_path, index=False)
+    return anchors
+
+
+def build_statsfusion_session_anchor_index(
+    segments: pd.DataFrame,
+    events: pd.DataFrame,
+    output_step_seconds: int = 3,
+    output_path: Path | None = None,
+) -> pd.DataFrame:
+    required_segments = {
+        "segment_id",
+        "session_id",
+        "segment_path",
+        "subject_key",
+        "start_ms",
+        "end_ms",
+    }
+    missing_segments = required_segments - set(segments.columns)
+    if missing_segments:
+        raise ValueError(f"StatsFusion segments are missing columns: {sorted(missing_segments)}")
+    required_events = {"event_id", "subject_key", "start_ms", "end_ms", "valid_duration"}
+    missing_events = required_events - set(events.columns)
+    if len(events) and missing_events:
+        raise ValueError(f"StatsFusion events are missing columns: {sorted(missing_events)}")
+    if output_step_seconds <= 0:
+        raise ValueError("StatsFusion output step must be positive")
+    step_ms = int(output_step_seconds * 1000)
+    valid_events = events[events["valid_duration"].astype(bool)].copy()
+    rows: list[pd.DataFrame] = []
+    ordered = segments.sort_values(
+        ["subject_key", "session_id", "start_ms", "end_ms", "segment_id"], kind="stable"
+    )
+    for (subject_key, session_id), session_segments in ordered.groupby(
+        ["subject_key", "session_id"], sort=False
+    ):
+        session_segments = session_segments.sort_values(
+            ["start_ms", "end_ms", "segment_id"], kind="stable"
+        )
+        observed_starts: list[int] = []
+        observed_ends: list[int] = []
+        observed_bounds: dict[str, tuple[int, int]] = {}
+        for segment in session_segments.itertuples(index=False):
+            path = Path(str(segment.segment_path))
+            if not path.is_file():
+                continue
+            segment_starts: list[int] = []
+            segment_ends: list[int] = []
+            with np.load(path) as payload:
+                for name in ("motion_timestamp_ms", "ppg_timestamp_ms"):
+                    timestamps = payload[name]
+                    if len(timestamps):
+                        segment_starts.append(int(timestamps[0]))
+                        segment_ends.append(int(timestamps[-1]))
+            if segment_starts:
+                segment_start = min(segment_starts)
+                segment_end = max(segment_ends)
+                observed_starts.append(segment_start)
+                observed_ends.append(segment_end)
+                observed_bounds[str(segment.segment_id)] = (segment_start, segment_end)
+        first_ms = (
+            min(observed_starts)
+            if observed_starts
+            else int(session_segments["start_ms"].min())
+        )
+        last_ms = (
+            max(observed_ends)
+            if observed_ends
+            else int(session_segments["end_ms"].max())
+        )
+        anchor_time = session_right_endpoint_grid(first_ms, last_ms, step_ms)
+        if not len(anchor_time):
+            continue
+        interval_start = anchor_time - step_ms
+        observable = np.zeros(len(anchor_time), dtype=np.float32)
+        segment_ids = np.full(len(anchor_time), "", dtype=object)
+        segment_paths = np.full(len(anchor_time), "", dtype=object)
+        motion_history = np.zeros(len(anchor_time), dtype=np.float32)
+        ppg_history = np.zeros(len(anchor_time), dtype=np.float32)
+        accumulated_motion = 0.0
+        accumulated_ppg = 0.0
+        for segment in session_segments.itertuples(index=False):
+            segment_start, segment_end = observed_bounds.get(
+                str(segment.segment_id), (int(segment.start_ms), int(segment.end_ms))
+            )
+            in_segment = (anchor_time > segment_start) & (anchor_time <= segment_end)
+            after_segment = anchor_time > segment_end
+            segment_ids[in_segment] = str(segment.segment_id)
+            segment_paths[in_segment] = str(segment.segment_path)
+            path = Path(str(segment.segment_path))
+            if path.is_file():
+                with np.load(path) as payload:
+                    motion_time = payload["motion_timestamp_ms"].astype(np.int64)
+                    motion_mask = payload["motion_mask"].astype(bool)
+                    ppg_time = payload["ppg_timestamp_ms"].astype(np.int64)
+                    ppg_mask = payload["ppg_mask"].astype(bool).reshape(-1)
+                motion_valid = motion_mask.any(axis=1)
+                ppg_valid = ppg_mask.astype(bool)
+                motion_period = (
+                    max(float(np.median(np.diff(motion_time))) / 1000.0, 0.0)
+                    if len(motion_time) > 1
+                    else 0.01
+                )
+                ppg_period = (
+                    max(float(np.median(np.diff(ppg_time))) / 1000.0, 0.0)
+                    if len(ppg_time) > 1
+                    else 0.02
+                )
+                motion_prefix = np.concatenate(([0], np.cumsum(motion_valid, dtype=np.int64)))
+                ppg_prefix = np.concatenate(([0], np.cumsum(ppg_valid, dtype=np.int64)))
+                selected_times = anchor_time[in_segment]
+                if len(selected_times):
+                    motion_positions = np.searchsorted(motion_time, selected_times, side="right")
+                    ppg_positions = np.searchsorted(ppg_time, selected_times, side="right")
+                    motion_history[in_segment] = accumulated_motion + (
+                        motion_prefix[motion_positions] * motion_period
+                    ).astype(np.float32)
+                    ppg_history[in_segment] = accumulated_ppg + (
+                        ppg_prefix[ppg_positions] * ppg_period
+                    ).astype(np.float32)
+                    nearest = np.searchsorted(motion_time, selected_times, side="left")
+                    nearest = np.clip(nearest, 0, max(len(motion_time) - 1, 0))
+                    observable[in_segment] = (
+                        motion_mask[nearest, :3].all(axis=1).astype(np.float32)
+                        if len(motion_time)
+                        else 0.0
+                    )
+                segment_motion = float(motion_valid.sum()) * motion_period
+                segment_ppg = float(ppg_valid.sum()) * ppg_period
+            else:
+                segment_motion = max(0.0, (int(segment.end_ms) - int(segment.start_ms)) / 1000.0)
+                segment_ppg = segment_motion
+                observable[in_segment] = 1.0
+                motion_history[in_segment] = accumulated_motion + (
+                    (anchor_time[in_segment] - segment_start) / 1000.0
+                ).astype(np.float32)
+                ppg_history[in_segment] = accumulated_ppg + (
+                    (anchor_time[in_segment] - segment_start) / 1000.0
+                ).astype(np.float32)
+            motion_history[after_segment] = accumulated_motion + segment_motion
+            ppg_history[after_segment] = accumulated_ppg + segment_ppg
+            accumulated_motion += segment_motion
+            accumulated_ppg += segment_ppg
+
+        subject_events = valid_events[
+            valid_events["subject_key"].astype(str).eq(str(subject_key))
+            & (valid_events["end_ms"].astype(np.int64) > first_ms)
+            & (valid_events["start_ms"].astype(np.int64) < last_ms)
+        ]
+        state = np.zeros(len(anchor_time), dtype=np.float32)
+        onset = np.zeros(len(anchor_time), dtype=np.float32)
+        offset = np.zeros(len(anchor_time), dtype=np.float32)
+        start_loss_mask = observable.copy()
+        end_loss_mask = observable.copy()
+        hand_relation = np.full(len(anchor_time), "background", dtype=object)
+        event_id = np.full(len(anchor_time), "", dtype=object)
+        for event in subject_events.itertuples(index=False):
+            state = np.maximum(
+                state,
+                _overlap_fraction(
+                    interval_start,
+                    anchor_time,
+                    float(event.start_ms),
+                    float(event.end_ms),
+                ).astype(np.float32),
+            )
+            start_delta = anchor_time - int(event.start_ms)
+            end_delta = anchor_time - int(event.end_ms)
+            onset = np.maximum(
+                onset,
+                np.where(
+                    (start_delta >= 0) & (start_delta <= 30_000),
+                    1.0 - start_delta / 30_000.0,
+                    0.0,
+                ).astype(np.float32),
+            )
+            offset = np.maximum(
+                offset,
+                np.where(
+                    (end_delta >= 0) & (end_delta <= 60_000),
+                    1.0 - end_delta / 60_000.0,
+                    0.0,
+                ).astype(np.float32),
+            )
+            inside = (anchor_time > int(event.start_ms)) & (
+                interval_start < int(event.end_ms)
+            )
+            hand_relation[inside] = str(getattr(event, "hand_relation", "unknown"))
+            event_id[inside] = str(event.event_id)
+            if not bool(getattr(event, "start_observed", True)):
+                start_loss_mask[(start_delta >= 0) & (start_delta <= 30_000)] = 0.0
+            if not bool(getattr(event, "end_observed", True)):
+                end_loss_mask[(end_delta >= 0) & (end_delta <= 60_000)] = 0.0
+        frame = pd.DataFrame(
+            {
+                "segment_id": segment_ids,
+                "session_id": str(session_id),
+                "segment_path": segment_paths,
+                "subject_key": str(subject_key),
+                "timestamp_ms": anchor_time,
+                "state_target": state,
+                "state_loss_mask": observable,
+                "censor_mask": 1.0 - observable,
+                "start_target": onset,
+                "end_target": offset,
+                "start_loss_mask": start_loss_mask,
+                "end_loss_mask": end_loss_mask,
+                "distance_to_event_seconds": _minimum_event_distance(
+                    anchor_time, subject_events
+                ),
+                "hand_relation": hand_relation,
+                "event_id": event_id,
+                "motion_history_available_seconds": motion_history,
+                "ppg_history_available_seconds": ppg_history,
+            }
+        )
+        rows.append(frame)
+    anchors = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+    if len(anchors) and anchors.duplicated(["subject_key", "session_id", "timestamp_ms"]).any():
+        raise RuntimeError("StatsFusion canonical anchors contain duplicate session timestamps")
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = output_path.with_name(output_path.name + ".tmp")
+        anchors.to_parquet(temporary, index=False)
+        temporary.replace(output_path)
     return anchors
 
 

@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import yaml
 
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 
@@ -62,6 +63,60 @@ def _candidate_metrics(output_root: Path, run_name: str, fold: int = 0) -> dict[
     return _read_json(root / "decoder" / "candidate_metrics.json")
 
 
+def evaluate_ppg_promotion(
+    output_root: Path,
+    *,
+    s2_run: str,
+    s3_run: str,
+    gate: dict[str, Any],
+) -> dict[str, Any]:
+    s2 = _candidate_metrics(output_root, s2_run)
+    s3 = _candidate_metrics(output_root, s3_run)
+    evidence = {
+        name: {
+            "run_manifest": _evidence_file(
+                output_root / "experiments" / run / "fold_0" / "run_manifest.json",
+                output_root.parent,
+            ),
+            "candidate_metrics": _evidence_file(
+                output_root / "experiments" / run / "fold_0" / "decoder" / "candidate_metrics.json",
+                output_root.parent,
+            ),
+        }
+        for name, run in (("S2", s2_run), ("S3", s3_run))
+    }
+    f1_delta = float(s3["state_only_f1"]) - float(s2["state_only_f1"])
+    recall_delta = float(s3["candidate_recall"]) - float(s2["candidate_recall"])
+    different_delta = float(s3["different_sensitivity"]) - float(s2["different_sensitivity"])
+    checks = {
+        "quality_route": bool(
+            f1_delta >= float(gate.get("minimum_ppg_f1_improvement", 0.005))
+            or (
+                recall_delta
+                >= float(gate.get("minimum_ppg_candidate_recall_improvement", 0.010))
+                and f1_delta >= -float(gate.get("maximum_ppg_f1_drop", 0.005))
+            )
+        ),
+        "fp_per_hour": float(s3["state_only_fp_per_hour"])
+        <= float(s2["state_only_fp_per_hour"])
+        * float(gate.get("maximum_fp_per_hour_ratio", 1.05)),
+        "different_sensitivity": different_delta
+        >= -float(gate.get("maximum_ppg_different_sensitivity_drop", 0.02)),
+    }
+    return {
+        "schema_version": 1,
+        "protocol_version": "statsfusion-r2",
+        "source_runs": {"S2": s2_run, "S3": s3_run},
+        "evidence_sha256": evidence,
+        "f1_delta_vs_S2": f1_delta,
+        "candidate_recall_delta_vs_S2": recall_delta,
+        "different_sensitivity_delta_vs_S2": different_delta,
+        "checks": checks,
+        "passed": all(checks.values()),
+        "resolved_use_ppg": all(checks.values()),
+    }
+
+
 def evaluate_fold0_ablations(
     output_root: Path,
     *,
@@ -86,9 +141,7 @@ def evaluate_fold0_ablations(
     for name, run in runs.items():
         fold_root = output_root / "experiments" / run / "fold_0"
         evidence_sha256[name] = {
-            "run_manifest": _evidence_file(
-                fold_root / "run_manifest.json", output_root.parent
-            ),
+            "run_manifest": _evidence_file(fold_root / "run_manifest.json", output_root.parent),
             "candidate_metrics": _evidence_file(
                 fold_root / "decoder" / "candidate_metrics.json", output_root.parent
             ),
@@ -113,29 +166,47 @@ def evaluate_fold0_ablations(
         float(metrics["S1"]["state_fragment_count"]), 1.0
     )
     long_context_checks = {
-        "recall_route": recall_gain
-        >= float(gate["minimum_long_context_recall_improvement"]),
-        "f1_fragment_route": f1_gain
-        >= float(gate["minimum_long_context_f1_improvement"])
+        "recall_route": recall_gain >= float(gate["minimum_long_context_recall_improvement"]),
+        "f1_fragment_route": f1_gain >= float(gate["minimum_long_context_f1_improvement"])
         and fragment_reduction >= float(gate["minimum_fragment_reduction"]),
     }
     ppg_evidence = {
         "f1_delta_vs_S2": delta("S3", "S2", "state_only_f1"),
         "candidate_recall_delta_vs_S2": delta("S3", "S2", "candidate_recall"),
-        "different_sensitivity_delta_vs_S2": delta(
-            "S3", "S2", "different_sensitivity"
-        ),
+        "different_sensitivity_delta_vs_S2": delta("S3", "S2", "different_sensitivity"),
         "motion_only_f1": float(metrics["S0"]["state_only_f1"]),
         "ppg_only_f1": float(metrics["PPG_ONLY"]["state_only_f1"]),
         "motion_ppg_f1": float(metrics["S3"]["state_only_f1"]),
     }
+    ppg_checks = {
+        "quality_route": (
+            ppg_evidence["f1_delta_vs_S2"] >= float(gate.get("minimum_ppg_f1_improvement", 0.005))
+            or (
+                ppg_evidence["candidate_recall_delta_vs_S2"]
+                >= float(gate.get("minimum_ppg_candidate_recall_improvement", 0.010))
+                and ppg_evidence["f1_delta_vs_S2"] >= -float(gate.get("maximum_ppg_f1_drop", 0.005))
+            )
+        ),
+        "fp_per_hour": float(metrics["S3"]["state_only_fp_per_hour"])
+        <= float(metrics["S2"]["state_only_fp_per_hour"])
+        * float(gate["maximum_fp_per_hour_ratio"]),
+        "different_sensitivity": ppg_evidence["different_sensitivity_delta_vs_S2"]
+        >= -float(gate.get("maximum_ppg_different_sensitivity_drop", 0.02)),
+    }
+    ppg_passed = all(ppg_checks.values())
+    s4_config = yaml.safe_load(
+        (output_root / "experiments" / s4_run / "fold_0" / "resolved_config.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    if bool(s4_config["model"].get("use_ppg", True)) != ppg_passed:
+        expected = "enabled" if ppg_passed else "disabled"
+        raise RuntimeError(f"S4 must be rebuilt from the promoted state path with PPG {expected}")
     candidate_checks = {
         "state_calibration": bool(metrics["S4"]["state_calibration_gate_passed"]),
         "minimum_recall": float(metrics["S4"]["candidate_recall"])
         >= float(gate["minimum_candidate_recall"]),
-        "same_side_not_worse_than_sensor_only": float(
-            metrics["S4"]["same_candidate_recall"]
-        )
+        "same_side_not_worse_than_sensor_only": float(metrics["S4"]["same_candidate_recall"])
         >= float(metrics["S0"]["same_candidate_recall"]) - 0.03,
         "different_side_not_worse_than_sensor_only": float(
             metrics["S4"]["different_candidate_recall"]
@@ -157,7 +228,12 @@ def evaluate_fold0_ablations(
             "checks": long_context_checks,
             "passed": any(long_context_checks.values()),
         },
-        "ppg_ablation": ppg_evidence,
+        "ppg_ablation": {
+            **ppg_evidence,
+            "checks": ppg_checks,
+            "passed": ppg_passed,
+            "s4_use_ppg": bool(s4_config["model"].get("use_ppg", True)),
+        },
         "candidate_gate": {
             "checks": candidate_checks,
             "passed": all(candidate_checks.values()),
@@ -176,7 +252,9 @@ def evaluate_fold0_ablations(
 def _evaluation_metrics(
     root: Path, run_name: str, fold: int, *, state_only: bool = False
 ) -> dict[str, float]:
-    payload = _read_json(root / "experiments" / run_name / f"fold_{fold}" / "evaluation" / "metrics.json")
+    payload = _read_json(
+        root / "experiments" / run_name / f"fold_{fold}" / "evaluation" / "metrics.json"
+    )
     primary = (
         payload["state_only"]
         if state_only
@@ -206,9 +284,7 @@ def _evaluation_metrics(
     }
 
 
-def _per_subject(
-    root: Path, run_name: str, fold: int, *, state_only: bool = False
-) -> pd.DataFrame:
+def _per_subject(root: Path, run_name: str, fold: int, *, state_only: bool = False) -> pd.DataFrame:
     filename = "state_only_per_subject_metrics.csv" if state_only else "per_subject_metrics.csv"
     path = root / "experiments" / run_name / f"fold_{fold}" / "evaluation" / filename
     frame = pd.read_csv(path)
@@ -272,14 +348,7 @@ def _stronger_baseline(
     v3_run: str | None,
 ) -> tuple[str, dict[str, float], pd.DataFrame]:
     choices = []
-    s0_path = (
-        v4_root
-        / "experiments"
-        / s0_run
-        / f"fold_{fold}"
-        / "evaluation"
-        / "metrics.json"
-    )
+    s0_path = v4_root / "experiments" / s0_run / f"fold_{fold}" / "evaluation" / "metrics.json"
     if s0_path.is_file():
         choices.append(
             (
@@ -297,9 +366,7 @@ def _stronger_baseline(
             )
         )
     if not choices:
-        raise FileNotFoundError(
-            f"Fold {fold} has neither S0 state-only nor v3 baseline evidence"
-        )
+        raise FileNotFoundError(f"Fold {fold} has neither S0 state-only nor v3 baseline evidence")
     return max(choices, key=lambda value: value[1]["f1"])
 
 
@@ -340,9 +407,7 @@ def evaluate_crossfold_gate(
         else:
             if v3_root is None or v3_run is None:
                 raise RuntimeError("Selected v3 baseline has no configured root")
-            baseline_directory = (
-                v3_root / "experiments" / v3_run / f"fold_{fold}" / "evaluation"
-            )
+            baseline_directory = v3_root / "experiments" / v3_run / f"fold_{fold}" / "evaluation"
             baseline_subject_name = "per_subject_metrics.csv"
         fold_rows.append(
             {
@@ -378,12 +443,6 @@ def evaluate_crossfold_gate(
     baseline_frame = pd.concat(baseline_subjects, ignore_index=True)
     candidate_pooled = _pooled(candidate_frame)
     baseline_pooled = _pooled(baseline_frame)
-    candidate_pooled["fp_per_hour"] = float(
-        np.mean([row["candidate"]["fp_per_hour"] for row in fold_rows])
-    )
-    baseline_pooled["fp_per_hour"] = float(
-        np.mean([row["baseline_metrics"]["fp_per_hour"] for row in fold_rows])
-    )
     if mode == "development":
         probability = _bootstrap_probability(candidate_frame, baseline_frame)
         checks = {
@@ -403,8 +462,7 @@ def evaluate_crossfold_gate(
     else:
         probability = None
         checks = {
-            "two_of_three_non_degrading": sum(row["delta_f1"] >= 0 for row in fold_rows)
-            >= 2,
+            "two_of_three_non_degrading": sum(row["delta_f1"] >= 0 for row in fold_rows) >= 2,
             "pooled_f1": candidate_pooled["f1"] > baseline_pooled["f1"],
             "maximum_single_fold_drop": min(row["delta_f1"] for row in fold_rows)
             >= -float(gate.get("maximum_stress_fold_f1_drop", 0.03)),

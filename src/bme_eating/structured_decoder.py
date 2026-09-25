@@ -5,6 +5,17 @@ from dataclasses import dataclass
 import numpy as np
 
 
+def right_endpoint_run_to_interval(
+    timestamps_ms: np.ndarray, start: int, end: int, step_ms: int
+) -> tuple[int, int]:
+    timestamps = np.asarray(timestamps_ms, dtype=np.int64)
+    if not 0 <= int(start) < int(end) <= len(timestamps):
+        raise ValueError("State run indices are outside the timestamp grid")
+    if int(step_ms) <= 0:
+        raise ValueError("Right-endpoint interval step must be positive")
+    return int(timestamps[int(start)] - int(step_ms)), int(timestamps[int(end) - 1])
+
+
 @dataclass(frozen=True)
 class TruncatedLogNormalDurationPrior:
     log_mean: float
@@ -83,14 +94,17 @@ class FixedLagSemiMarkovDecoder:
         self,
         endpoint: int,
         target: int,
-        previous: np.ndarray,
-        labels: np.ndarray,
+        state: int,
+        previous_endpoint: np.ndarray,
+        previous_state: np.ndarray,
     ) -> bool:
         cursor = int(endpoint)
+        cursor_state = int(state)
         while cursor > 0:
-            start = int(previous[cursor])
+            start = int(previous_endpoint[cursor_state, cursor])
             if start <= target < cursor:
-                return bool(labels[cursor])
+                return bool(cursor_state)
+            cursor_state = int(previous_state[cursor_state, cursor])
             cursor = start
         return False
 
@@ -105,16 +119,22 @@ class FixedLagSemiMarkovDecoder:
         )
         log_eating = np.log(probability)
         eating_prefix = np.concatenate(([0.0], np.cumsum(log_eating)))
-        dp = np.full(steps + 1, -np.inf, dtype=np.float64)
-        previous = np.zeros(steps + 1, dtype=np.int64)
-        labels = np.zeros(steps + 1, dtype=bool)
-        dp[0] = 0.0
+        background = 0
+        eating = 1
+        scores = np.full((2, steps + 1), -np.inf, dtype=np.float64)
+        previous_endpoint = np.zeros((2, steps + 1), dtype=np.int64)
+        previous_state = np.zeros((2, steps + 1), dtype=np.int8)
+        scores[background, 0] = 0.0
         finalized = np.zeros(steps, dtype=bool)
         lag_steps = int(np.ceil(self.fixed_lag_seconds / self.grid_seconds))
         for endpoint in range(1, steps + 1):
-            best_score = dp[endpoint - 1] + np.log1p(-probability[endpoint - 1])
-            best_previous = endpoint - 1
-            best_label = False
+            background_source = int(np.argmax(scores[:, endpoint - 1]))
+            scores[background, endpoint] = (
+                scores[background_source, endpoint - 1]
+                + np.log1p(-probability[endpoint - 1])
+            )
+            previous_endpoint[background, endpoint] = endpoint - 1
+            previous_state[background, endpoint] = background_source
             largest = min(maximum_steps, endpoint)
             if largest >= minimum_steps:
                 durations = np.arange(minimum_steps, largest + 1, dtype=np.int64)
@@ -122,23 +142,34 @@ class FixedLagSemiMarkovDecoder:
                 segment_score = eating_prefix[endpoint] - eating_prefix[starts]
                 duration_seconds = durations.astype(np.float64) * self.grid_seconds
                 candidates = (
-                    dp[starts]
+                    scores[background, starts]
                     + segment_score
                     + self.duration_weight * self.prior.log_probability(duration_seconds)
                 )
                 winner = int(np.argmax(candidates))
-                if candidates[winner] > best_score:
-                    best_score = float(candidates[winner])
-                    best_previous = int(starts[winner])
-                    best_label = True
-            dp[endpoint] = best_score
-            previous[endpoint] = best_previous
-            labels[endpoint] = best_label
+                if np.isfinite(candidates[winner]):
+                    scores[eating, endpoint] = float(candidates[winner])
+                    previous_endpoint[eating, endpoint] = int(starts[winner])
+                    previous_state[eating, endpoint] = background
             commit = endpoint - 1 - lag_steps
             if commit >= 0:
-                finalized[commit] = self._state_at(endpoint, commit, previous, labels)
+                terminal_state = int(np.argmax(scores[:, endpoint]))
+                finalized[commit] = self._state_at(
+                    endpoint,
+                    commit,
+                    terminal_state,
+                    previous_endpoint,
+                    previous_state,
+                )
+        terminal_state = int(np.argmax(scores[:, steps]))
         for target in range(max(0, steps - lag_steps), steps):
-            finalized[target] = self._state_at(steps, target, previous, labels)
+            finalized[target] = self._state_at(
+                steps,
+                target,
+                terminal_state,
+                previous_endpoint,
+                previous_state,
+            )
         return finalized
 
     def decode_events(
@@ -155,7 +186,8 @@ class FixedLagSemiMarkovDecoder:
         ends = np.flatnonzero(transitions == -1)
         output: list[tuple[int, int, float]] = []
         for start, end in zip(starts, ends):
-            start_ms = int(timestamps[start])
-            end_ms = int(timestamps[end - 1] + self.grid_seconds * 1000)
+            start_ms, end_ms = right_endpoint_run_to_interval(
+                timestamps, int(start), int(end), self.grid_seconds * 1000
+            )
             output.append((start_ms, end_ms, float(probability[start:end].mean())))
         return output

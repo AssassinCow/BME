@@ -7,7 +7,8 @@ project:
 
 experiment:
   name: hierarchical_v4_statsfusion
-  protocol_version: 4
+  protocol_version: statsfusion-r2
+  blocked_protocols: [statsfusion-r0-blocked, statsfusion-r1-blocked]
   ablation_id: S4
 
 features:
@@ -61,11 +62,11 @@ sequence:
 training:
   device: cuda
   amp_dtype: bfloat16
-  batch_size: 4
-  gradient_accumulation: 4
-  steps_per_epoch: 250
-  inference_batch_size: 4
-  num_workers: 4
+  batch_size: 16
+  gradient_accumulation: 1
+  steps_per_epoch: 63
+  inference_batch_size: 64
+  num_workers: 16
   max_epochs: 32
   selector_fraction: 0.20
   learning_rate: 0.0003
@@ -168,6 +169,10 @@ promotion_gate:
   minimum_long_context_recall_improvement: 0.020
   minimum_long_context_f1_improvement: 0.010
   minimum_fragment_reduction: 0.20
+  minimum_ppg_f1_improvement: 0.005
+  minimum_ppg_candidate_recall_improvement: 0.010
+  maximum_ppg_f1_drop: 0.005
+  maximum_ppg_different_sensitivity_drop: 0.02
   minimum_verifier_f1_improvement: 0.010
   maximum_verifier_f1_drop: 0.005
   minimum_verifier_fp_reduction: 0.10

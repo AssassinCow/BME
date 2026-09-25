@@ -25,6 +25,15 @@ def logit(probabilities: np.ndarray) -> np.ndarray:
     return np.log(values / (1.0 - values))
 
 
+def binary_state_targets(targets: np.ndarray) -> np.ndarray:
+    values = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if not len(values):
+        raise ValueError("State targets must be non-empty")
+    if not np.isfinite(values).all() or np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("State targets must be finite values in [0, 1]")
+    return (values > 0.0).astype(np.int64)
+
+
 @dataclass(frozen=True)
 class TemperatureCalibrationV4:
     temperature: float
@@ -71,7 +80,7 @@ class PlattCalibration:
         cls, logits: np.ndarray, targets: np.ndarray, sample_weight: np.ndarray | None = None
     ) -> PlattCalibration:
         logits = np.asarray(logits, dtype=np.float64).reshape(-1)
-        targets = np.asarray(targets, dtype=np.int64).reshape(-1)
+        targets = binary_state_targets(targets)
         if len(logits) != len(targets) or not len(logits):
             raise ValueError("Platt calibration requires aligned non-empty arrays")
         if len(np.unique(targets)) != 2:
@@ -119,7 +128,7 @@ def state_calibration_metrics(
     low_threshold: float,
     bins: int = 15,
 ) -> dict[str, float]:
-    targets = np.asarray(targets, dtype=np.float64)
+    targets = binary_state_targets(targets).astype(np.float64)
     raw = sigmoid(raw_logits)
     calibrated = np.asarray(calibrated, dtype=np.float64)
     prevalence = float(targets.mean())
@@ -146,13 +155,21 @@ def subject_crossfit_platt(
     partition_column: str = "stacking_partition",
     logit_column: str = "state_logit",
     target_column: str = "state_target",
+    fit_mask_column: str | None = None,
 ) -> tuple[pd.DataFrame, PlattCalibration]:
     required = {"subject_key", partition_column, logit_column, target_column}
+    if fit_mask_column is not None:
+        required.add(fit_mask_column)
     missing = required - set(frame.columns)
     if missing:
         raise ValueError(f"Calibration frame is missing columns: {sorted(missing)}")
     output = frame.copy()
     calibrated = np.full(len(output), np.nan, dtype=np.float64)
+    eligible = (
+        output[fit_mask_column].fillna(0.0).to_numpy(dtype=np.float64) > 0
+        if fit_mask_column is not None
+        else np.ones(len(output), dtype=bool)
+    )
     subject_partitions = output.groupby("subject_key")[partition_column].nunique()
     if (subject_partitions != 1).any():
         raise RuntimeError("A subject appears in multiple calibration partitions")
@@ -163,9 +180,10 @@ def subject_crossfit_platt(
         holdout_subjects = set(output.loc[holdout, "subject_key"].astype(str))
         if fit_subjects & holdout_subjects:
             raise RuntimeError("Subject leakage in Platt crossfit")
+        fit_eligible = fit.to_numpy() & eligible
         calibrator = PlattCalibration.fit(
-            output.loc[fit, logit_column].to_numpy(),
-            output.loc[fit, target_column].to_numpy(),
+            output.loc[fit_eligible, logit_column].to_numpy(),
+            output.loc[fit_eligible, target_column].to_numpy(),
         )
         calibrated[holdout.to_numpy()] = calibrator.transform(
             output.loc[holdout, logit_column].to_numpy()
@@ -174,7 +192,8 @@ def subject_crossfit_platt(
         raise RuntimeError("Crossfit calibration left unscored rows")
     output["state_probability"] = calibrated
     final = PlattCalibration.fit(
-        output[logit_column].to_numpy(), output[target_column].to_numpy()
+        output.loc[eligible, logit_column].to_numpy(),
+        output.loc[eligible, target_column].to_numpy(),
     )
     return output, final
 
@@ -262,9 +281,7 @@ class ProposalCalibrationV4:
         output["calibrated_event_probability"] = self.event.transform_logits(
             output["event_logit"].to_numpy()
         )
-        output["calibrated_iou"] = self.iou.transform_logits(
-            output["iou_logit"].to_numpy()
-        )
+        output["calibrated_iou"] = self.iou.transform_logits(output["iou_logit"].to_numpy())
         features = np.column_stack(
             (
                 logit(output["calibrated_event_probability"]),

@@ -49,6 +49,41 @@ def partition_evaluation_events(
     return selected[evaluable].copy(), selected[~evaluable].copy()
 
 
+def evaluation_event_partition_summary(events: pd.DataFrame) -> dict[str, int]:
+    subjects = set(events["subject_key"].astype(str))
+    truth, ignore = partition_evaluation_events(events, subjects)
+    valid = events["valid_duration"].fillna(False).astype(bool)
+    return {
+        "truth": len(truth),
+        "ignore": len(ignore),
+        "invalid_duration": int((~valid).sum()),
+    }
+
+
+def prediction_ignore_mask(prediction: pd.DataFrame, ignore: pd.DataFrame) -> np.ndarray:
+    if prediction.empty or ignore.empty:
+        return np.zeros(len(prediction), dtype=bool)
+    required = {"subject_key", "start_ms", "end_ms"}
+    for name, frame in (("prediction", prediction), ("ignore", ignore)):
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(f"{name} is missing columns: {sorted(missing)}")
+    grouped = {
+        str(subject): group[["start_ms", "end_ms"]].to_numpy(dtype=np.int64)
+        for subject, group in ignore.groupby("subject_key", sort=False)
+    }
+    mask = np.zeros(len(prediction), dtype=bool)
+    for position, row in enumerate(prediction.itertuples(index=False)):
+        intervals = grouped.get(str(row.subject_key))
+        if intervals is None:
+            continue
+        overlap = np.minimum(int(row.end_ms), intervals[:, 1]) - np.maximum(
+            int(row.start_ms), intervals[:, 0]
+        )
+        mask[position] = bool(np.any(overlap > 0))
+    return mask
+
+
 def interval_iou_matrix(truth: np.ndarray, prediction: np.ndarray) -> np.ndarray:
     truth = np.asarray(truth, dtype=np.float64)
     prediction = np.asarray(prediction, dtype=np.float64)
@@ -160,19 +195,17 @@ def evaluate_events(
     )
     for subject_key in sorted(subjects):
         subject_truth = truth[truth["subject_key"] == subject_key].reset_index(drop=True)
-        subject_prediction = prediction[prediction["subject_key"] == subject_key].reset_index(drop=True)
-        truth_intervals = subject_truth[["start_ms", "end_ms"]].to_numpy(dtype=np.float64)
-        prediction_intervals = subject_prediction[["start_ms", "end_ms"]].to_numpy(
-            dtype=np.float64
+        subject_prediction = prediction[prediction["subject_key"] == subject_key].reset_index(
+            drop=True
         )
+        truth_intervals = subject_truth[["start_ms", "end_ms"]].to_numpy(dtype=np.float64)
+        prediction_intervals = subject_prediction[["start_ms", "end_ms"]].to_numpy(dtype=np.float64)
         matches = match_events(truth_intervals, prediction_intervals, iou_threshold, method)
         matched_prediction_indices = {match.prediction_index for match in matches}
         subject_ignore = ignore[ignore["subject_key"] == subject_key]
         ignored_indices: set[int] = set()
         if len(subject_ignore):
-            ignore_intervals = subject_ignore[["start_ms", "end_ms"]].to_numpy(
-                dtype=np.float64
-            )
+            ignore_intervals = subject_ignore[["start_ms", "end_ms"]].to_numpy(dtype=np.float64)
             for prediction_index, interval in enumerate(prediction_intervals):
                 if prediction_index in matched_prediction_indices:
                     continue
@@ -210,9 +243,7 @@ def evaluate_events(
                     "start_signed_error_ms": (
                         int(prediction_row.start_ms) - int(truth_row.start_ms)
                     ),
-                    "end_signed_error_ms": (
-                        int(prediction_row.end_ms) - int(truth_row.end_ms)
-                    ),
+                    "end_signed_error_ms": (int(prediction_row.end_ms) - int(truth_row.end_ms)),
                 }
             )
     false_positive = total_prediction - true_positive
@@ -247,4 +278,3 @@ def evaluate_events(
         else float("nan"),
     }
     return metrics, matched
-

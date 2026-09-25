@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -15,6 +16,12 @@ from bme_eating.calibration_v4 import (
     PlattCalibration,
     ProposalCalibrationV4,
 )
+from bme_eating.data.deep_dataset import Normalization, load_normalization
+from bme_eating.data.stats_fusion_preprocess import (
+    RawSessionInput,
+    StatsFusionRawSessionPreprocessor,
+)
+from bme_eating.data.stats_fusion_sequence import SequenceGeometry
 from bme_eating.models.endpoint_refiner import (
     BoundaryRange,
     EndpointRefiner,
@@ -37,11 +44,26 @@ from bme_eating.structured_decoder import (
 from bme_eating.types import Event
 
 
-def _proposal_nms(frame: pd.DataFrame, iou_threshold: float) -> pd.DataFrame:
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _proposal_nms(
+    frame: pd.DataFrame, iou_threshold: float, minimum_gap_seconds: int = 3
+) -> pd.DataFrame:
     from bme_eating.proposals_v4 import interval_iou
 
     kept: list[int] = []
-    for index in frame.sort_values("final_score", ascending=False).index:
+    ranked_input = frame.sort_values(
+        ["final_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"],
+        ascending=[False, True, True, True],
+        kind="stable",
+    )
+    for index in ranked_input.index:
         row = frame.loc[index]
         if any(
             interval_iou(
@@ -55,7 +77,27 @@ def _proposal_nms(frame: pd.DataFrame, iou_threshold: float) -> pd.DataFrame:
         ):
             continue
         kept.append(int(index))
-    return frame.loc[kept].copy().reset_index(drop=True)
+    candidates = frame.loc[kept].copy()
+    gap_ms = int(minimum_gap_seconds) * 1000
+    separated: list[int] = []
+    ranked = candidates.sort_values(
+        ["final_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"],
+        ascending=[False, True, True, True],
+        kind="stable",
+    )
+    for index, row in ranked.iterrows():
+        start = int(row.coarse_start_ms)
+        end = int(row.coarse_end_ms)
+        if any(
+            not (
+                end + gap_ms <= int(candidates.loc[other].coarse_start_ms)
+                or int(candidates.loc[other].coarse_end_ms) + gap_ms <= start
+            )
+            for other in separated
+        ):
+            continue
+        separated.append(int(index))
+    return candidates.loc[separated].copy().reset_index(drop=True)
 
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -81,11 +123,12 @@ class HierarchicalEatingDetectorV4:
         *,
         state_models: Sequence[torch.nn.Module],
         state_calibration: PlattCalibration,
-        verifier: EventVerifierV4 | None,
+        verifier: EventVerifierV4 | Sequence[EventVerifierV4] | None,
         logistic_verifier: LogisticScoreCombiner | None,
         proposal_calibration: ProposalCalibrationV4 | None,
         boundary: EndpointRefiner | None,
         statistics_scaler: FoldRobustScaler,
+        sensor_normalization: Normalization,
         duration_prior: TruncatedLogNormalDurationPrior,
         boundary_range: BoundaryRange | None,
         config: dict[str, Any],
@@ -106,11 +149,18 @@ class HierarchicalEatingDetectorV4:
         self.device = torch.device(device)
         self.state_models = list(state_models)
         self.state_calibration = state_calibration
-        self.verifier = verifier
+        self.verifiers = (
+            []
+            if verifier is None
+            else list(verifier)
+            if isinstance(verifier, Sequence)
+            else [verifier]
+        )
         self.logistic_verifier = logistic_verifier
         self.proposal_calibration = proposal_calibration
         self.boundary = boundary
         self.statistics_scaler = statistics_scaler
+        self.sensor_normalization = sensor_normalization
         self.duration_prior = duration_prior
         self.boundary_range = boundary_range
         self.config = config
@@ -118,8 +168,8 @@ class HierarchicalEatingDetectorV4:
         self.statistics_columns = [f"stat_{name}" for name in STATS_FEATURE_COLUMNS]
         for model in self.state_models:
             model.to(self.device).eval()
-        if self.verifier is not None:
-            self.verifier.to(self.device).eval()
+        for model in self.verifiers:
+            model.to(self.device).eval()
         if self.boundary is not None:
             self.boundary.to(self.device).eval()
 
@@ -187,9 +237,7 @@ class HierarchicalEatingDetectorV4:
         return np.concatenate((mean, maximum, features.scalar), axis=1)
 
     @torch.no_grad()
-    def _score_proposals(
-        self, proposals: pd.DataFrame, windows: pd.DataFrame
-    ) -> pd.DataFrame:
+    def _score_proposals(self, proposals: pd.DataFrame, windows: pd.DataFrame) -> pd.DataFrame:
         features = build_proposal_features_v4(
             proposals,
             windows,
@@ -206,10 +254,20 @@ class HierarchicalEatingDetectorV4:
             output["predicted_iou"] = np.nan
             return output
         tensors = _feature_batch_to_tensors(features, self.device)
-        prediction = self.verifier(tensors)
-        output["event_logit"] = prediction["event_logit"].cpu().numpy()
-        output["iou_logit"] = prediction["iou_logit"].cpu().numpy()
-        output["predicted_iou"] = prediction["predicted_iou"].cpu().numpy()
+        predictions = [model(tensors) for model in self.verifiers]
+        output["event_logit"] = (
+            torch.stack([value["event_logit"].float() for value in predictions])
+            .mean(dim=0)
+            .cpu()
+            .numpy()
+        )
+        output["iou_logit"] = (
+            torch.stack([value["iou_logit"].float() for value in predictions])
+            .mean(dim=0)
+            .cpu()
+            .numpy()
+        )
+        output["predicted_iou"] = 1.0 / (1.0 + np.exp(-output["iou_logit"]))
         return self.proposal_calibration.apply(output)
 
     @torch.no_grad()
@@ -220,6 +278,8 @@ class HierarchicalEatingDetectorV4:
             output["refined_end_ms"] = output["coarse_end_ms"]
             output["start_entropy"] = 1.0
             output["end_entropy"] = 1.0
+            output["start_fallback"] = True
+            output["end_fallback"] = True
             output["boundary_fallback"] = True
             return output
         features = build_endpoint_features(
@@ -240,11 +300,13 @@ class HierarchicalEatingDetectorV4:
             prediction["start_logit"],
             torch.from_numpy(features.start_offsets_seconds).to(self.device),
             int(self.config["boundary"]["local_softargmax_radius_bins"]),
+            batch["start_mask"],
         )
         end_offset, end_entropy = local_soft_argmax(
             prediction["end_logit"],
             torch.from_numpy(features.end_offsets_seconds).to(self.device),
             int(self.config["boundary"]["local_softargmax_radius_bins"]),
+            batch["end_mask"],
         )
         return apply_boundary_refinement(
             accepted,
@@ -256,16 +318,9 @@ class HierarchicalEatingDetectorV4:
             safety_gap_seconds=int(self.config["boundary"]["safety_gap_seconds"]),
         )
 
-    def predict_session(
-        self,
-        state_batch: dict[str, Any],
-        *,
-        subject_key: str,
-        session_id: str,
-    ) -> list[Event]:
-        windows = self.predict_state_sequence(
-            state_batch, subject_key=subject_key, session_id=session_id
-        )
+    def _events_from_windows(self, windows: pd.DataFrame) -> list[Event]:
+        if windows.empty:
+            return []
         proposals = generate_event_candidates_v4(
             windows,
             self.decoder,
@@ -279,7 +334,9 @@ class HierarchicalEatingDetectorV4:
             scored["final_score"] >= float(self.selection["acceptance_threshold"])
         ].copy()
         accepted = _proposal_nms(
-            accepted, float(self.selection.get("nms_iou_threshold", 0.5))
+            accepted,
+            float(self.selection.get("nms_iou_threshold", 0.5)),
+            int(self.selection.get("minimum_event_gap_seconds", 3)),
         )
         refined = self._refine(accepted, windows)
         return [
@@ -293,30 +350,116 @@ class HierarchicalEatingDetectorV4:
             for row in refined.itertuples(index=False)
         ]
 
+    def predict_preprocessed_session(
+        self,
+        state_batch: dict[str, Any],
+        *,
+        subject_key: str,
+        session_id: str,
+    ) -> list[Event]:
+        windows = self.predict_state_sequence(
+            state_batch, subject_key=subject_key, session_id=session_id
+        )
+        return self._events_from_windows(windows)
+
+    def predict_session(self, session: RawSessionInput) -> list[Event]:
+        sequence = self.config["sequence"]
+        geometry = SequenceGeometry(
+            supervised_steps=int(sequence["supervised_steps"]),
+            short_receptive_field_steps=int(sequence["short_receptive_field_steps"]),
+            long_receptive_field_tokens=int(sequence["long_receptive_field_tokens"]),
+            long_pool_factor=int(sequence["long_pool_factor"]),
+            step_seconds=int(sequence["step_seconds"]),
+        )
+        preprocessor = StatsFusionRawSessionPreprocessor(
+            normalization=self.sensor_normalization,
+            statistics_scaler=self.statistics_scaler,
+            geometry=geometry,
+        )
+        frames = [
+            self.predict_state_sequence(
+                batch,
+                subject_key=session.subject_key,
+                session_id=session.session_id,
+            )
+            for batch in preprocessor.iter_state_batches(session)
+        ]
+        if not frames:
+            return []
+        windows = (
+            pd.concat(frames, ignore_index=True)
+            .sort_values("timestamp_ms")
+            .drop_duplicates(["subject_key", "session_id", "timestamp_ms"], keep="last")
+            .reset_index(drop=True)
+        )
+        return self._events_from_windows(windows)
+
 
 def load_hierarchical_v4_bundle(
     bundle_root: str | Path, *, device: torch.device | str = "cpu"
 ) -> HierarchicalEatingDetectorV4:
     root = Path(bundle_root)
+    hashes_path = root / "SHA256SUMS.json"
+    if not hashes_path.is_file():
+        raise FileNotFoundError("V4 bundle SHA256SUMS.json is required")
+    expected_files = json.loads(hashes_path.read_text(encoding="utf-8"))["files"]
+    actual_files = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file()
+        and path.name != "SHA256SUMS.json"
+        and path.suffix.lower() != ".pyc"
+        and "__pycache__" not in path.parts
+    }
+    if actual_files != set(expected_files):
+        raise RuntimeError("V4 bundle file set differs from its hash manifest")
+    for relative, expected in expected_files.items():
+        if _sha256_file(root / relative) != expected:
+            raise RuntimeError(f"V4 bundle artifact hash mismatch: {relative}")
     config = yaml.safe_load((root / "resolved_config.yaml").read_text(encoding="utf-8"))
     selection = json.loads((root / "selected_pipeline.json").read_text(encoding="utf-8"))
+    if selection.get("protocol_version") != "statsfusion-r2":
+        raise RuntimeError("Only statsfusion-r2 bundles are supported")
+    if selection.get("selection_source") != "pooled_outer_oof":
+        raise RuntimeError("V4 bundle selection must come from pooled outer OOF")
+    state_seeds = [int(value) for value in selection.get("state_seeds", [])]
+    if state_seeds != [2026, 2027, 2028]:
+        raise RuntimeError("V4 bundle requires state seeds 2026/2027/2028")
     state_models: list[torch.nn.Module] = []
-    for seed in (2026, 2027, 2028):
-        checkpoint = torch.load(root / f"state_seed_{seed}.pt", map_location=device, weights_only=False)
+    for seed in state_seeds:
+        checkpoint = torch.load(
+            root / f"state_seed_{seed}.pt", map_location=device, weights_only=False
+        )
         model = build_state_model(checkpoint["model_config"])
         model.load_state_dict(checkpoint["model"])
         state_models.append(model)
-    verifier = None
-    verifier_path = root / "verifier.pt"
-    if verifier_path.is_file():
+    verifier_models: list[EventVerifierV4] = []
+    verifier_kind = str(selection.get("verifier_kind", ""))
+    verifier_paths: list[Path] = []
+    if verifier_kind == "deep":
+        verifier_seeds = [int(value) for value in selection.get("verifier_seeds", [])]
+        if verifier_seeds != [2026, 2027, 2028]:
+            raise RuntimeError("Deep v4 bundle requires verifier seeds 2026/2027/2028")
+        verifier_paths = [root / f"verifier_seed_{seed}.pt" for seed in verifier_seeds]
+        missing = [path.name for path in verifier_paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"Deep v4 verifier checkpoints are missing: {missing}")
+    elif verifier_kind != "logistic":
+        raise RuntimeError(f"Unsupported v4 verifier kind: {verifier_kind}")
+    for verifier_path in verifier_paths:
         checkpoint = torch.load(verifier_path, map_location=device, weights_only=False)
-        verifier = EventVerifierV4(
+        verifier_model = EventVerifierV4(
             int(checkpoint["sequence_dim"]), int(checkpoint["scalar_dim"]), checkpoint["config"]
         )
-        verifier.load_state_dict(checkpoint["model"])
+        verifier_model.load_state_dict(checkpoint["model"])
+        verifier_models.append(verifier_model)
     boundary = None
     boundary_path = root / "boundary.pt"
-    if boundary_path.is_file():
+    if bool(selection.get("boundary_enabled", False)):
+        if not boundary_path.is_file():
+            raise FileNotFoundError("Selected v4 boundary checkpoint is missing")
+        if not (root / "boundary_range.json").is_file():
+            raise FileNotFoundError("Selected v4 boundary range is missing")
         checkpoint = torch.load(boundary_path, map_location=device, weights_only=False)
         boundary = EndpointRefiner(int(checkpoint["input_dim"]), checkpoint["config"])
         boundary.load_state_dict(checkpoint["model"])
@@ -328,7 +471,7 @@ def load_hierarchical_v4_bundle(
         state_calibration=PlattCalibration.from_json(
             json.loads((root / "state_calibration.json").read_text(encoding="utf-8"))
         ),
-        verifier=verifier,
+        verifier=verifier_models or None,
         logistic_verifier=(
             LogisticScoreCombiner.from_json(json.loads(logistic_path.read_text(encoding="utf-8")))
             if logistic_path.is_file()
@@ -345,6 +488,7 @@ def load_hierarchical_v4_bundle(
         statistics_scaler=FoldRobustScaler.from_json(
             json.loads((root / "statistics_scaler.json").read_text(encoding="utf-8"))
         ),
+        sensor_normalization=load_normalization(root / "sensor_normalization.json"),
         duration_prior=TruncatedLogNormalDurationPrior.from_json(
             json.loads((root / "duration_prior.json").read_text(encoding="utf-8"))
         ),

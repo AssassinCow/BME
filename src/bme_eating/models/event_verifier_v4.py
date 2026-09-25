@@ -36,7 +36,12 @@ class ProposalDatasetV4(Dataset[dict[str, torch.Tensor | str]]):
     def __len__(self) -> int:
         return len(self.features.proposal_ids)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+    def __getitem__(self, index: int | tuple[int, float]) -> dict[str, torch.Tensor | str]:
+        if isinstance(index, tuple):
+            row_index, sampling_probability = index
+        else:
+            row_index, sampling_probability = index, 1.0
+        index = int(row_index)
         output: dict[str, torch.Tensor | str] = {
             "proposal_id": str(self.features.proposal_ids[index]),
             "sequence": torch.from_numpy(self.features.sequence[index]),
@@ -47,6 +52,13 @@ class ProposalDatasetV4(Dataset[dict[str, torch.Tensor | str]]):
             values = getattr(self.features, name)
             if values is not None:
                 output[name] = torch.tensor(float(values[index]), dtype=torch.float32)
+        if self.features.sample_weight is not None:
+            probability = max(float(sampling_probability), np.finfo(np.float32).tiny)
+            output["sampling_probability"] = torch.tensor(probability, dtype=torch.float32)
+            output["importance_weight"] = torch.tensor(
+                float(self.features.sample_weight[index]) / probability,
+                dtype=torch.float32,
+            )
         return output
 
 
@@ -59,6 +71,7 @@ class HardNegativeBatchSampler(Sampler[list[int]]):
         ratios: dict[str, float],
         steps_per_epoch: int,
         seed: int,
+        target_weights: np.ndarray | None = None,
     ) -> None:
         self.categories = np.asarray(categories, dtype=str)
         self.batch_size = int(batch_size)
@@ -83,14 +96,33 @@ class HardNegativeBatchSampler(Sampler[list[int]]):
                 continue
             missing = int(counts[index])
             counts[index] = 0
-            available = [
-                value for value in redistribution if len(pools[value]) and value != name
-            ]
+            available = [value for value in redistribution if len(pools[value]) and value != name]
             if not available:
                 available = [value for value in CATEGORY_ORDER if len(pools[value])]
             counts[CATEGORY_ORDER.index(available[0])] += missing
         self.pools = pools
         self.counts = {name: int(counts[index]) for index, name in enumerate(CATEGORY_ORDER)}
+        target = (
+            np.ones(len(self.categories), dtype=np.float64)
+            if target_weights is None
+            else np.asarray(target_weights, dtype=np.float64)
+        )
+        if (
+            target.shape != self.categories.shape
+            or not np.isfinite(target).all()
+            or np.any(target < 0)
+        ):
+            raise ValueError("Verifier target weights must be finite, non-negative, and aligned")
+        self.within_category_probability: dict[str, np.ndarray] = {}
+        for name, pool in pools.items():
+            if not len(pool):
+                self.within_category_probability[name] = np.empty(0, dtype=np.float64)
+                continue
+            selected = target[pool]
+            total = selected.sum()
+            self.within_category_probability[name] = (
+                selected / total if total > 0 else np.full(len(pool), 1.0 / len(pool))
+            )
 
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
@@ -102,13 +134,31 @@ class HardNegativeBatchSampler(Sampler[list[int]]):
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch]))
         for _ in range(self.steps_per_epoch):
             parts = [
-                rng.choice(self.pools[name], size=count, replace=True)
+                np.column_stack(
+                    (
+                        selected := rng.choice(
+                            self.pools[name],
+                            size=count,
+                            replace=True,
+                            p=self.within_category_probability[name],
+                        ),
+                        np.asarray(
+                            [
+                                (count / self.batch_size)
+                                * self.within_category_probability[name][
+                                    np.searchsorted(self.pools[name], value)
+                                ]
+                                for value in selected
+                            ]
+                        ),
+                    )
+                )
                 for name, count in self.counts.items()
                 if count
             ]
             batch = np.concatenate(parts)
             rng.shuffle(batch)
-            yield batch.astype(int).tolist()
+            yield [(int(row[0]), float(row[1])) for row in batch]
 
 
 class DepthwiseVerifierBlock(nn.Module):
@@ -118,12 +168,15 @@ class DepthwiseVerifierBlock(nn.Module):
             channels, channels, kernel_size=3, padding=1, groups=channels, bias=False
         )
         self.pointwise = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
-        self.norm = nn.GroupNorm(8 if channels % 8 == 0 else 1, channels)
+        self.norm = nn.LayerNorm(channels)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, values: torch.Tensor) -> torch.Tensor:
-        update = self.pointwise(self.depthwise(values))
-        return values + self.dropout(torch.nn.functional.silu(self.norm(update)))
+    def forward(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        weights = mask.unsqueeze(1).to(values.dtype)
+        masked = values * weights
+        update = self.pointwise(self.depthwise(masked)).transpose(1, 2)
+        update = self.dropout(torch.nn.functional.silu(self.norm(update))).transpose(1, 2)
+        return (masked + update * weights) * weights
 
 
 class EventVerifierV4(nn.Module):
@@ -133,9 +186,11 @@ class EventVerifierV4(nn.Module):
         hidden = int(config.get("hidden_dim", 128))
         dropout = float(config.get("dropout", 0.1))
         self.input_projection = nn.Conv1d(sequence_dim, channels, kernel_size=1, bias=False)
-        self.blocks = nn.Sequential(
-            DepthwiseVerifierBlock(channels, dropout),
-            DepthwiseVerifierBlock(channels, dropout),
+        self.blocks = nn.ModuleList(
+            [
+                DepthwiseVerifierBlock(channels, dropout),
+                DepthwiseVerifierBlock(channels, dropout),
+            ]
         )
         self.projection = nn.Sequential(
             nn.Linear(2 * channels + scalar_dim, hidden),
@@ -150,7 +205,10 @@ class EventVerifierV4(nn.Module):
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         mask = batch["sequence_mask"].bool()
-        sequence = self.blocks(self.input_projection(batch["sequence"].transpose(1, 2)))
+        values = batch["sequence"] * mask.unsqueeze(-1).to(batch["sequence"].dtype)
+        sequence = self.input_projection(values.transpose(1, 2))
+        for block in self.blocks:
+            sequence = block(sequence, mask)
         weights = mask.unsqueeze(1).to(sequence.dtype)
         mean = (sequence * weights).sum(dim=-1) / weights.sum(dim=-1).clamp_min(1.0)
         maximum = sequence.masked_fill(~mask.unsqueeze(1), -torch.inf).amax(dim=-1)
@@ -168,7 +226,10 @@ class EventVerifierV4(nn.Module):
 def verifier_loss_v4(
     output: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], iou_weight: float = 0.5
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    weight = batch.get("sample_weight", torch.ones_like(batch["event_target"]))
+    weight = batch.get(
+        "importance_weight",
+        batch.get("sample_weight", torch.ones_like(batch["event_target"])),
+    )
     event_element = nn.functional.binary_cross_entropy_with_logits(
         output["event_logit"], batch["event_target"], reduction="none"
     )
@@ -228,9 +289,19 @@ def normalized_proposal_weights(frame: pd.DataFrame) -> np.ndarray:
 
 def _bin_specs(start_ms: int, end_ms: int, config: dict[str, Any]):
     specifications = (
-        (start_ms - int(config["left_context_seconds"]) * 1000, start_ms, int(config["left_bins"]), 0),
+        (
+            start_ms - int(config["left_context_seconds"]) * 1000,
+            start_ms,
+            int(config["left_bins"]),
+            0,
+        ),
         (start_ms, end_ms, int(config["event_bins"]), 1),
-        (end_ms, end_ms + int(config["right_context_seconds"]) * 1000, int(config["right_bins"]), 2),
+        (
+            end_ms,
+            end_ms + int(config["right_context_seconds"]) * 1000,
+            int(config["right_bins"]),
+            2,
+        ),
     )
     total = sum(value[2] for value in specifications)
     position = 0
@@ -299,7 +370,12 @@ def build_proposal_features_v4(
                 )
             region_one_hot = np.eye(3, dtype=np.float64)[region]
             metadata = np.asarray(
-                [*region_one_hot, relative, (right - left) / 1000.0, float(not len(selected_values))]
+                [
+                    *region_one_hot,
+                    relative,
+                    (right - left) / 1000.0,
+                    float(not len(selected_values)),
+                ]
             )
             bins.append(
                 np.nan_to_num(
@@ -334,17 +410,15 @@ def build_proposal_features_v4(
         if "max_iou" in proposals
         else None
     )
-    iou_target = (
-        proposals["max_iou"].to_numpy(dtype=np.float32)
-        if "max_iou" in proposals
-        else None
-    )
+    iou_target = proposals["max_iou"].to_numpy(dtype=np.float32) if "max_iou" in proposals else None
     weights = normalized_proposal_weights(proposals) if "max_iou" in proposals else None
     bin_count = int(config["left_bins"]) + int(config["event_bins"]) + int(config["right_bins"])
     feature_dim = 5 * len(base_columns) + 6
     return ProposalFeatureBatchV4(
         proposal_ids=proposals["proposal_id"].astype(str).to_numpy(),
-        sequence=np.stack(sequences) if sequences else np.empty((0, bin_count, feature_dim), np.float32),
+        sequence=np.stack(sequences)
+        if sequences
+        else np.empty((0, bin_count, feature_dim), np.float32),
         sequence_mask=np.stack(masks) if masks else np.empty((0, bin_count), bool),
         scalar=np.stack(scalars) if scalars else np.empty((0, 8), np.float32),
         event_target=event_target,

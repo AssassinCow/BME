@@ -116,15 +116,11 @@ def _hint_candidates(
         valid_ends = [
             int(end_index)
             for end_index in ends
-            if minimum_ms
-            <= int(timestamps[end_index] - timestamps[start_index])
-            <= maximum_ms
+            if minimum_ms <= int(timestamps[end_index] - timestamps[start_index]) <= maximum_ms
         ]
         valid_ends.sort(key=lambda value: end_probability[value], reverse=True)
         for end_index in valid_ends[:3]:
-            score = math.sqrt(
-                max(0.0, start_probability[start_index] * end_probability[end_index])
-            )
+            score = math.sqrt(max(0.0, start_probability[start_index] * end_probability[end_index]))
             candidates.append(
                 {
                     "coarse_start_ms": int(timestamps[start_index]),
@@ -171,9 +167,7 @@ def _jitter_candidates(
     return output
 
 
-def _deduplicate(
-    candidates: list[dict[str, object]], threshold: float
-) -> list[dict[str, object]]:
+def _deduplicate(candidates: list[dict[str, object]], threshold: float) -> list[dict[str, object]]:
     selected: list[dict[str, object]] = []
     for candidate in sorted(
         candidates,
@@ -185,20 +179,21 @@ def _deduplicate(
     ):
         duplicate = None
         for existing in selected:
-            if interval_iou(
-                int(candidate["coarse_start_ms"]),
-                int(candidate["coarse_end_ms"]),
-                int(existing["coarse_start_ms"]),
-                int(existing["coarse_end_ms"]),
-            ) > threshold:
+            if (
+                interval_iou(
+                    int(candidate["coarse_start_ms"]),
+                    int(candidate["coarse_end_ms"]),
+                    int(existing["coarse_start_ms"]),
+                    int(existing["coarse_end_ms"]),
+                )
+                > threshold
+            ):
                 duplicate = existing
                 break
         if duplicate is None:
             selected.append(dict(candidate))
         else:
-            duplicate["source_mask"] = int(duplicate["source_mask"]) | int(
-                candidate["source_mask"]
-            )
+            duplicate["source_mask"] = int(duplicate["source_mask"]) | int(candidate["source_mask"])
     return selected
 
 
@@ -214,9 +209,7 @@ def _apply_candidate_budget(
         raise ValueError("Candidate budget must be positive")
     required: list[dict[str, object]] = []
     for source in (SOURCE_STATE, SOURCE_HINT, SOURCE_XGBOOST):
-        candidate = next(
-            (row for row in candidates if int(row["source_mask"]) & source), None
-        )
+        candidate = next((row for row in candidates if int(row["source_mask"]) & source), None)
         if candidate is not None and candidate not in required:
             required.append(candidate)
     effective_budget = max(budget, len(required))
@@ -275,9 +268,7 @@ def generate_event_candidates(
             ]
 
     rows: list[dict[str, object]] = []
-    for (subject, session), frame in predictions.groupby(
-        ["subject_key", "session_id"], sort=True
-    ):
+    for (subject, session), frame in predictions.groupby(["subject_key", "session_id"], sort=True):
         frame = frame.sort_values("timestamp_ms")
         seed_candidates = _hysteresis_candidates(
             frame, float(config["high_threshold"]), float(config["low_threshold"])
@@ -292,11 +283,7 @@ def generate_event_candidates(
         )
         seed_candidates.extend(xgb_lookup.get((str(subject), str(session)), []))
         timestamp_values = frame["timestamp_ms"].to_numpy(dtype=np.int64)
-        step = (
-            int(np.median(np.diff(timestamp_values)))
-            if len(timestamp_values) > 1
-            else 3000
-        )
+        step = int(np.median(np.diff(timestamp_values))) if len(timestamp_values) > 1 else 3000
         observed_start = int(timestamp_values[0])
         observed_end = int(timestamp_values[-1] + step)
         valid_seeds = [
@@ -328,9 +315,7 @@ def generate_event_candidates(
         )
         budget = max(
             1,
-            math.ceil(
-                observed_ms / 3_600_000 * float(config["maximum_candidates_per_hour"])
-            ),
+            math.ceil(observed_ms / 3_600_000 * float(config["maximum_candidates_per_hour"])),
         )
         candidates = _apply_candidate_budget(candidates, budget)
         for rank, candidate in enumerate(candidates):
@@ -368,16 +353,11 @@ def label_event_candidates(
         output["negative_type"] = pd.Series(dtype=object)
         return output
     labels: list[tuple[float, str | None]] = []
-    grouped = {
-        str(subject): group
-        for subject, group in events.groupby("subject_key", sort=False)
-    }
+    grouped = {str(subject): group for subject, group in events.groupby("subject_key", sort=False)}
     for proposal in output.itertuples(index=False):
         best_iou = 0.0
         best_id: str | None = None
-        for event in grouped.get(str(proposal.subject_key), pd.DataFrame()).itertuples(
-            index=False
-        ):
+        for event in grouped.get(str(proposal.subject_key), pd.DataFrame()).itertuples(index=False):
             value = interval_iou(
                 int(proposal.coarse_start_ms),
                 int(proposal.coarse_end_ms),
@@ -409,9 +389,7 @@ def exclude_ignored_candidates(
 ) -> pd.DataFrame:
     if proposals.empty or ignored_events.empty:
         return proposals.copy()
-    grouped = {
-        str(subject): group for subject, group in ignored_events.groupby("subject_key")
-    }
+    grouped = {str(subject): group for subject, group in ignored_events.groupby("subject_key")}
     keep: list[bool] = []
     for proposal in proposals.itertuples(index=False):
         ignored = grouped.get(str(proposal.subject_key), pd.DataFrame())
@@ -420,5 +398,5 @@ def exclude_ignored_candidates(
             > max(int(proposal.coarse_start_ms), int(event.start_ms))
             for event in ignored.itertuples(index=False)
         )
-        keep.append(bool(getattr(proposal, "is_positive", False)) or not overlaps)
+        keep.append(not overlaps)
     return proposals.loc[np.asarray(keep, dtype=bool)].reset_index(drop=True)

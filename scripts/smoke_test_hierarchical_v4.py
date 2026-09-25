@@ -4,9 +4,11 @@ import argparse
 import json
 
 import _bootstrap  # noqa: F401
+import numpy as np
 import torch
 
 from bme_eating.config import load_config
+from bme_eating.data.stats_fusion_preprocess import causal_completed_block_layout
 from bme_eating.data.stats_fusion_sequence import SequenceGeometry
 from bme_eating.models.factory import build_state_model
 from bme_eating.models.stats_fusion_loss import StatsFusionStateLoss
@@ -30,17 +32,28 @@ def main() -> None:
     )
     batch_size = args.batch_size or int(config["training"]["batch_size"])
     steps = geometry.total_steps
-    ppg_steps = steps // geometry.long_pool_factor
-    mapping = torch.div(
-        torch.arange(steps) + 1, geometry.long_pool_factor, rounding_mode="floor"
-    ) - 1
+    timestamps = np.arange(1, steps + 1, dtype=np.int64) * geometry.step_seconds * 1000
+    _, block_end_indices, mapping = causal_completed_block_layout(
+        timestamps,
+        session_origin_ms=0,
+        step_ms=geometry.step_seconds * 1000,
+        factor=geometry.long_pool_factor,
+    )
+    ppg_steps = len(block_end_indices)
     batch = {
         "motion_blocks": torch.randn(batch_size, steps, 12, 300, device=device),
         "motion_valid": torch.ones(batch_size, steps, device=device),
         "ppg_blocks": torch.randn(batch_size, ppg_steps, 2, 750, device=device),
         "ppg_quality": torch.randn(batch_size, ppg_steps, 8, device=device),
         "ppg_valid": torch.ones(batch_size, ppg_steps, device=device),
-        "ppg_to_motion_index": mapping.unsqueeze(0).expand(batch_size, -1).to(device),
+        "ppg_to_motion_index": torch.from_numpy(mapping)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .to(device),
+        "long_block_end_indices": torch.from_numpy(block_end_indices)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+        .to(device),
         "statistics": torch.randn(batch_size, steps, 24, device=device),
         "state_target": torch.randint(0, 2, (batch_size, steps), device=device).float(),
         "onset_target": torch.zeros(batch_size, steps, device=device),

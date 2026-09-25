@@ -56,8 +56,8 @@ class StatsFusionStateLoss(nn.Module):
         importance = batch.get("importance_weight", torch.ones_like(supervision))
         if importance.ndim == 1:
             importance = importance.unsqueeze(-1)
-        state_weights = supervision * importance * batch.get(
-            "state_loss_mask", torch.ones_like(supervision)
+        state_weights = (
+            supervision * importance * batch.get("state_loss_mask", torch.ones_like(supervision))
         )
         state_element = F.binary_cross_entropy_with_logits(
             output["state_logit"], batch["state_target"], reduction="none"
@@ -72,19 +72,18 @@ class StatsFusionStateLoss(nn.Module):
         )
         onset = self._weighted_mean(
             onset_element,
-            supervision * batch.get("onset_loss_mask", torch.ones_like(supervision)),
+            supervision * importance * batch.get("onset_loss_mask", torch.ones_like(supervision)),
         )
         offset = self._weighted_mean(
             offset_element,
-            supervision * batch.get("offset_loss_mask", torch.ones_like(supervision)),
+            supervision * importance * batch.get("offset_loss_mask", torch.ones_like(supervision)),
         )
 
         difference = torch.diff(output["state_logit"], dim=1)
         smooth_element = difference.square().clamp_max(self.smooth_tau)
         smooth_mask = supervision[:, 1:] * supervision[:, :-1]
-        smooth_mask = smooth_mask * batch.get(
-            "smooth_mask", torch.ones_like(supervision)
-        )[:, 1:]
+        smooth_mask = smooth_mask * batch.get("smooth_mask", torch.ones_like(supervision))[:, 1:]
+        smooth_mask = smooth_mask * torch.minimum(importance[:, 1:], importance[:, :-1])
         smooth = self._weighted_mean(smooth_element, smooth_mask)
         total = state + self.smooth_weight * smooth + self.boundary_weight * (onset + offset)
         return total, {

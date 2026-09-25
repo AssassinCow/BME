@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 from dataclasses import dataclass
@@ -11,10 +12,12 @@ import pandas as pd
 import torch
 from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
 
 from bme_eating.calibration_v4 import (
     LogisticScoreCombiner,
     ProposalCalibrationV4,
+    binary_state_targets,
     state_calibration_metrics,
     subject_crossfit_platt,
 )
@@ -24,6 +27,10 @@ from bme_eating.data.deep_dataset import (
     compute_normalization,
     load_normalization,
     save_normalization,
+)
+from bme_eating.data.stats_fusion_inputs import (
+    canonical_input_paths,
+    verify_canonical_statsfusion_inputs,
 )
 from bme_eating.data.stats_fusion_sequence import (
     ClipMixtureSampler,
@@ -38,8 +45,14 @@ from bme_eating.hierarchical_artifacts import (
     write_parquet_atomic,
     write_yaml_atomic,
 )
+from bme_eating.hierarchical_v4_artifacts import current_v4_identity
 from bme_eating.hierarchical_v4_gates import verify_gate_evidence
-from bme_eating.metrics import evaluate_events
+from bme_eating.metrics import (
+    evaluate_events,
+    evaluation_event_partition_summary,
+    partition_evaluation_events,
+    prediction_ignore_mask,
+)
 from bme_eating.models.endpoint_refiner import (
     EndpointRefiner,
     apply_boundary_refinement,
@@ -92,6 +105,81 @@ OUTER_PLACEHOLDER_COLUMNS = {
 }
 
 
+def _dataframe_sha256(frame: pd.DataFrame, columns: list[str]) -> str:
+    selected = frame.loc[:, columns].sort_values(columns, kind="stable").reset_index(drop=True)
+    hashed = pd.util.hash_pandas_object(selected, index=False).to_numpy(dtype=np.uint64)
+    digest = hashlib.sha256()
+    digest.update("\n".join(columns).encode("utf-8"))
+    digest.update(hashed.tobytes())
+    return digest.hexdigest()
+
+
+def _truth_event_durations(events: pd.DataFrame, subjects: set[str]) -> np.ndarray:
+    truth, _ = partition_evaluation_events(events, subjects)
+    durations = (
+        truth["end_ms"].to_numpy(dtype=np.float64)
+        - truth["start_ms"].to_numpy(dtype=np.float64)
+    ) / 1000.0
+    if not len(durations):
+        raise ValueError("Duration prior requires at least one evaluable truth event")
+    return durations
+
+
+def _mask_ignored_state_rows(
+    frame: pd.DataFrame,
+    ignore: pd.DataFrame,
+    *,
+    step_ms: int,
+) -> pd.DataFrame:
+    output = frame.copy()
+    if "state_loss_mask" not in output:
+        output["state_loss_mask"] = 1.0
+    for event in ignore.itertuples(index=False):
+        selected = output["subject_key"].astype(str).eq(str(event.subject_key))
+        timestamps = output["timestamp_ms"].to_numpy(dtype=np.int64)
+        selected &= (timestamps > int(event.start_ms)) & (
+            timestamps - int(step_ms) < int(event.end_ms)
+        )
+        output.loc[selected, "state_loss_mask"] = 0.0
+    return output
+
+
+def _evaluable_state_calibration_rows(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    required = {"state_target", "state_logit", "state_probability", "state_loss_mask"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"State calibration frame is missing columns: {sorted(missing)}")
+    mask = frame["state_loss_mask"].to_numpy(dtype=float) > 0
+    selected = frame.loc[mask].copy()
+    if selected.empty:
+        raise RuntimeError("State calibration has no evaluable windows")
+    return selected, {
+        "calibration_total_windows": len(frame),
+        "calibration_evaluable_windows": int(mask.sum()),
+        "calibration_masked_windows": int((~mask).sum()),
+    }
+
+
+def _assert_proposal_feature_alignment(
+    features: ProposalFeatureBatchV4,
+    frame: pd.DataFrame,
+    *,
+    context: str,
+) -> None:
+    frame_ids = frame["proposal_id"].astype(str).to_numpy()
+    feature_ids = np.asarray(features.proposal_ids, dtype=str)
+    if len(np.unique(frame_ids)) != len(frame_ids):
+        raise RuntimeError(f"{context} proposal IDs are not globally unique")
+    if not np.array_equal(feature_ids, frame_ids):
+        raise RuntimeError(f"{context} proposal feature rows are not aligned with score rows")
+    if features.event_target is not None and "is_positive" in frame:
+        targets = frame["is_positive"].to_numpy(dtype=np.float32)
+        if not np.array_equal(features.event_target.astype(np.float32), targets):
+            raise RuntimeError(f"{context} proposal labels are not aligned with feature targets")
+
+
 @dataclass(frozen=True)
 class V4Inputs:
     anchors: pd.DataFrame
@@ -121,7 +209,14 @@ def load_v4_inputs(
             (input_root / "indices" / "subject_folds.json").read_text(encoding="utf-8")
         ).items()
     }
-    anchor_path = input_root / "indices" / "anchors.parquet"
+    formal_r2 = config.get("experiment", {}).get("protocol_version") == "statsfusion-r2"
+    if formal_r2:
+        output_root = input_root.parent / str(config["project"]["artifact_schema_version"])
+        verify_canonical_statsfusion_inputs(input_root, output_root)
+        canonical_paths = canonical_input_paths(output_root)
+        anchor_path = canonical_paths["anchors"]
+    else:
+        anchor_path = input_root / "indices" / "anchors.parquet"
     outer_train_subjects = {
         subject for subject, subject_fold in subject_folds.items() if subject_fold != fold
     }
@@ -157,7 +252,11 @@ def load_v4_inputs(
             input_root / "indices" / "events.parquet",
             filters=[("subject_key", "in", selected)],
         )
-    feature_path = input_root / "features" / f"{feature_artifact_name(config)}.parquet"
+    feature_path = (
+        canonical_paths["statistics"]
+        if formal_r2
+        else input_root / "features" / f"{feature_artifact_name(config)}.parquet"
+    )
     statistics = pd.read_parquet(
         feature_path,
         columns=[*ALIGNMENT_KEYS, *STATS_FEATURE_COLUMNS],
@@ -220,9 +319,7 @@ def _fit_scaler_and_transform(
     return scaler, _transform_with_scaler(inputs, scaler)
 
 
-def _transform_with_scaler(
-    inputs: V4Inputs, scaler: FoldRobustScaler
-) -> pd.DataFrame:
+def _transform_with_scaler(inputs: V4Inputs, scaler: FoldRobustScaler) -> pd.DataFrame:
     transformed = scaler.transform_frame(inputs.statistics)
     statistics_columns = [
         *(f"stat_{name}" for name in STATS_FEATURE_COLUMNS),
@@ -295,6 +392,8 @@ def _train_state_epochs(
     seed: int,
     optimizer: torch.optim.Optimizer | None = None,
     epoch_offset: int = 0,
+    progress_label: str = "state",
+    total_epochs: int | None = None,
 ) -> torch.optim.Optimizer:
     device = _device(config)
     model.to(device)
@@ -305,6 +404,7 @@ def _train_state_epochs(
         samples_per_epoch=int(config["training"]["steps_per_epoch"]) * batch_size,
         mixture=config["sequence"]["sampling_mixture"],
         seed=seed,
+        supervised_steps=dataset.geometry.supervised_steps,
     )
     loader = DataLoader(
         dataset,
@@ -321,33 +421,58 @@ def _train_state_epochs(
             weight_decay=float(config["training"]["weight_decay"]),
         )
     accumulation = int(config["training"]["gradient_accumulation"])
+    display_total = total_epochs or epoch_offset + int(epochs)
+    scheduler = getattr(optimizer, "_bme_scheduler", None)
+    if scheduler is None:
+        updates_per_epoch = math.ceil(len(loader) / accumulation)
+        total_updates = max(1, updates_per_epoch * int(display_total))
+        warmup_updates = max(1, round(total_updates * float(config["training"]["warmup_fraction"])))
+
+        def learning_rate_multiplier(step: int) -> float:
+            if step < warmup_updates:
+                return float(step + 1) / warmup_updates
+            progress = (step - warmup_updates + 1) / max(total_updates - warmup_updates, 1)
+            return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=learning_rate_multiplier)
+        optimizer._bme_scheduler = scheduler
     amp_enabled = device.type == "cuda"
-    amp_dtype = torch.bfloat16 if config["training"].get("amp_dtype") == "bfloat16" else torch.float16
+    amp_dtype = (
+        torch.bfloat16 if config["training"].get("amp_dtype") == "bfloat16" else torch.float16
+    )
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(epoch_offset, epoch_offset + int(epochs)):
         sampler.set_epoch(epoch)
-        for step, batch in enumerate(loader, start=1):
+        progress = tqdm(
+            loader,
+            desc=f"{progress_label} epoch {epoch + 1}/{display_total}",
+            unit="batch",
+            leave=False,
+            dynamic_ncols=True,
+        )
+        for step, batch in enumerate(progress, start=1):
             tensors = {
-                key: value.to(device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+                key: value.to(device, non_blocking=True)
+                if isinstance(value, torch.Tensor)
+                else value
                 for key, value in batch.items()
             }
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                 output = model(tensors)
                 loss, _ = criterion(output, tensors)
-                loss = loss / accumulation
+                group_start = ((step - 1) // accumulation) * accumulation + 1
+                group_size = min(accumulation, len(loader) - group_start + 1)
+                loss = loss / group_size
             loss.backward()
-            if step % accumulation == 0:
+            if step % accumulation == 0 or step == len(loader):
                 torch.nn.utils.clip_grad_norm_(
                     model.parameters(), float(config["training"]["gradient_clip_norm"])
                 )
                 optimizer.step()
+                scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
-        if len(loader) % accumulation:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), float(config["training"]["gradient_clip_norm"])
-            )
-            optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            if step == 1 or step % 10 == 0 or step == len(loader):
+                progress.set_postfix(loss=f"{float(loss.detach().cpu()) * accumulation:.4f}")
     return optimizer
 
 
@@ -355,32 +480,101 @@ def _selector_score(
     model: torch.nn.Module,
     dataset: StatsFusionSequenceDataset,
     config: dict[str, Any],
-    seed: int,
-) -> float:
-    device = _device(config)
-    sampler = ClipMixtureSampler(
-        dataset.anchors,
-        samples_per_epoch=min(128, len(dataset)),
-        mixture={"uniform": 1.0, "event": 0.0, "boundary": 0.0},
-        seed=seed,
+    fit_events: pd.DataFrame,
+    selector_events: pd.DataFrame,
+    progress_label: str = "state selector",
+) -> dict[str, float | bool]:
+    predictions = infer_state_windows(
+        model,
+        dataset,
+        config,
+        stacking_partition=-1,
+        progress_label=progress_label,
     )
-    loader = DataLoader(dataset, batch_size=int(config["training"]["batch_size"]), sampler=sampler)
-    targets: list[np.ndarray] = []
-    probabilities: list[np.ndarray] = []
-    model.eval()
-    with torch.no_grad():
-        for batch in loader:
-            tensors = {
-                key: value.to(device) if isinstance(value, torch.Tensor) else value
-                for key, value in batch.items()
-            }
-            output = model(tensors)
-            mask = tensors["supervision_mask"] > 0
-            targets.append(tensors["state_target"][mask].cpu().numpy())
-            probabilities.append(torch.sigmoid(output["state_logit"][mask]).cpu().numpy())
-    target = np.concatenate(targets)
-    probability = np.concatenate(probabilities)
-    return float(average_precision_score(target, probability)) if np.any(target > 0) else 0.0
+    subjects = sorted(predictions["subject_key"].astype(str).unique())
+    if len(subjects) < 2:
+        raise RuntimeError("State selector requires at least two disjoint subjects")
+    partition_count = min(int(config["calibration"]["partitions"]), len(subjects))
+    subject_partition = {subject: index % partition_count for index, subject in enumerate(subjects)}
+    predictions["stacking_partition"] = (
+        predictions["subject_key"].astype(str).map(subject_partition)
+    )
+    calibrated, _ = subject_crossfit_platt(
+        predictions,
+        fit_mask_column="state_loss_mask",
+    )
+    calibrated["onset_probability"] = 1.0 / (1.0 + np.exp(-calibrated["onset_logit"]))
+    calibrated["offset_probability"] = 1.0 / (1.0 + np.exp(-calibrated["offset_logit"]))
+    calibrated["state_probability_derivative"] = (
+        calibrated.groupby(["subject_key", "session_id"], sort=False)["state_probability"]
+        .diff()
+        .fillna(0.0)
+    )
+    calibration_rows = calibrated[calibrated["state_loss_mask"].to_numpy(dtype=float) > 0]
+    calibration = state_calibration_metrics(
+        calibration_rows["state_target"].to_numpy(),
+        calibration_rows["state_logit"].to_numpy(),
+        calibration_rows["state_probability"].to_numpy(),
+        low_threshold=float(config["decoder"]["low_threshold"]),
+        bins=int(config["calibration"]["ece_bins"]),
+    )
+    calibration_passed = bool(
+        calibration["ece"] <= float(config["promotion_gate"]["maximum_state_ece"])
+        and calibration["brier"] < calibration["uncalibrated_brier"]
+        and calibration["mean_probability_to_prevalence"]
+        <= float(config["promotion_gate"]["maximum_state_prevalence_ratio"])
+    )
+    fit_subjects = set(fit_events["subject_key"].astype(str))
+    durations = _truth_event_durations(fit_events, fit_subjects)
+    decoder_config = config["decoder"]
+    prior = TruncatedLogNormalDurationPrior.fit(
+        durations,
+        lower_quantile=float(decoder_config["duration_lower_quantile"]),
+        upper_quantile=float(decoder_config["duration_upper_quantile"]),
+        minimum_floor_seconds=float(decoder_config["minimum_duration_floor_seconds"]),
+        maximum_ceiling_seconds=float(decoder_config["maximum_duration_ceiling_seconds"]),
+    )
+    decoder = FixedLagSemiMarkovDecoder(
+        prior,
+        grid_seconds=int(decoder_config["grid_seconds"]),
+        fixed_lag_seconds=int(decoder_config["fixed_lag_seconds"]),
+    )
+    proposals = generate_event_candidates_v4(
+        calibrated, decoder, decoder_config, split_role="state_selector"
+    )
+    truth, ignore = partition_evaluation_events(selector_events, set(subjects))
+    labeled = exclude_ignored_candidates(label_event_candidates(proposals, truth, 0.25), ignore)
+    recall = _candidate_recall(proposals, truth)["candidate_recall"]
+    if len(labeled):
+        point = _best_verifier_operating_point(
+            labeled, truth, calibrated, "generator_score", config, ignore
+        )
+        f1 = float(point["f1"])
+    else:
+        f1 = 0.0
+    fragments = hysteresis_fragment_diagnostics(calibrated, decoder_config)["state_fragment_count"]
+    binary_target = binary_state_targets(calibration_rows["state_target"].to_numpy())
+    raw_probability = 1.0 / (1.0 + np.exp(-calibration_rows["state_logit"].to_numpy()))
+    auprc = (
+        float(average_precision_score(binary_target, raw_probability))
+        if np.any(binary_target > 0)
+        else 0.0
+    )
+    return {
+        "candidate_recall": float(recall),
+        "calibration_passed": calibration_passed,
+        "event_f1": f1,
+        "state_fragment_count": float(fragments),
+        "ece": float(calibration["ece"]),
+        "window_auprc": auprc,
+    }
+
+
+def _build_seeded_state_model(config: dict[str, Any], seed: int) -> torch.nn.Module:
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    return build_state_model(config["model"])
 
 
 def _select_epoch(
@@ -390,10 +584,12 @@ def _select_epoch(
     inputs: V4Inputs,
     config: dict[str, Any],
     seed: int,
-) -> int:
+) -> tuple[int, dict[str, Any]]:
     scaler, transformed = _fit_scaler_and_transform(inputs, fit_subjects)
     del scaler
-    fit_rows = transformed[transformed["subject_key"].astype(str).isin(fit_subjects)].reset_index(drop=True)
+    fit_rows = transformed[transformed["subject_key"].astype(str).isin(fit_subjects)].reset_index(
+        drop=True
+    )
     selector_subjects = set(selector_anchors["subject_key"].astype(str))
     selector_rows = transformed[
         transformed["subject_key"].astype(str).isin(selector_subjects)
@@ -415,11 +611,11 @@ def _select_epoch(
         training=False,
         seed=seed,
     )
-    model = build_state_model(config["model"])
-    best_epoch = 1
-    best_score = -math.inf
+    model = _build_seeded_state_model(config, seed)
+    epoch_metrics: list[dict[str, Any]] = []
     optimizer = None
-    for epoch in range(1, int(config["training"]["max_epochs"]) + 1):
+    maximum_epochs = int(config["training"]["max_epochs"])
+    for epoch in range(1, maximum_epochs + 1):
         optimizer = _train_state_epochs(
             model,
             train_dataset,
@@ -428,12 +624,59 @@ def _select_epoch(
             seed=seed,
             optimizer=optimizer,
             epoch_offset=epoch - 1,
+            progress_label=f"state select seed={seed}",
+            total_epochs=maximum_epochs,
         )
-        score = _selector_score(model, selector_dataset, config, seed + 10_000 + epoch)
-        if score > best_score:
-            best_score = score
-            best_epoch = epoch
-    return best_epoch
+        score = _selector_score(
+            model,
+            selector_dataset,
+            config,
+            fit_events,
+            selector_events,
+            progress_label=f"state validate {epoch}/{maximum_epochs}",
+        )
+        epoch_metrics.append({"epoch": epoch, **score})
+        tqdm.write(
+            f"[state selector seed={seed}] epoch {epoch}/{maximum_epochs} "
+            f"recall={score['candidate_recall']:.4f} F1={score['event_f1']:.4f} "
+            f"ECE={score['ece']:.4f}"
+        )
+    minimum_recall = float(config["promotion_gate"]["minimum_candidate_recall"])
+    qualified = [
+        value
+        for value in epoch_metrics
+        if value["candidate_recall"] >= minimum_recall and bool(value["calibration_passed"])
+    ]
+    if qualified:
+        best = max(
+            qualified,
+            key=lambda value: (
+                value["event_f1"],
+                value["candidate_recall"],
+                -value["state_fragment_count"],
+                -value["ece"],
+                value["window_auprc"],
+            ),
+        )
+        promotion_eligible = True
+    else:
+        best = max(
+            epoch_metrics,
+            key=lambda value: (
+                value["candidate_recall"],
+                value["event_f1"],
+                -value["state_fragment_count"],
+                -value["ece"],
+                value["window_auprc"],
+            ),
+        )
+        promotion_eligible = False
+    return int(best["epoch"]), {
+        "selected_epoch": int(best["epoch"]),
+        "promotion_eligible": promotion_eligible,
+        "minimum_candidate_recall": minimum_recall,
+        "epochs": epoch_metrics,
+    }
 
 
 def _inference_endpoints(dataset: StatsFusionSequenceDataset) -> list[int]:
@@ -455,6 +698,7 @@ def infer_state_windows(
     config: dict[str, Any],
     *,
     stacking_partition: int,
+    progress_label: str = "state inference",
 ) -> pd.DataFrame:
     device = _device(config)
     model.to(device).eval()
@@ -466,7 +710,13 @@ def infer_state_windows(
     )
     frames: list[pd.DataFrame] = []
     statistic_names = [f"stat_{name}" for name in STATS_FEATURE_COLUMNS]
-    for batch in loader:
+    for batch in tqdm(
+        loader,
+        desc=progress_label,
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+    ):
         tensors = {
             key: value.to(device) if isinstance(value, torch.Tensor) else value
             for key, value in batch.items()
@@ -484,10 +734,29 @@ def infer_state_windows(
                     "onset_logit": output["onset_logit"][sample].float().cpu().numpy()[mask],
                     "offset_logit": output["offset_logit"][sample].float().cpu().numpy()[mask],
                     "ppg_gate": output["ppg_gate"][sample].float().cpu().numpy()[mask],
-                    "statistics_gate": output["statistics_gate"][sample].float().cpu().numpy()[mask],
+                    "statistics_gate": output["statistics_gate"][sample]
+                    .float()
+                    .cpu()
+                    .numpy()[mask],
                     "long_gate": output["long_gate"][sample].float().cpu().numpy()[mask],
-                    "missing_fraction": output["missing_fraction"][sample].float().cpu().numpy()[mask],
+                    "missing_fraction": output["missing_fraction"][sample]
+                    .float()
+                    .cpu()
+                    .numpy()[mask],
+                    "motion_valid_fraction": output["motion_valid_fraction"][sample]
+                    .float()
+                    .cpu()
+                    .numpy()[mask],
+                    "ppg_valid_fraction": output["ppg_valid_fraction"][sample]
+                    .float()
+                    .cpu()
+                    .numpy()[mask],
+                    "statistics_missing_fraction": output["statistics_missing_fraction"][sample]
+                    .float()
+                    .cpu()
+                    .numpy()[mask],
                     "state_target": tensors["state_target"][sample].cpu().numpy()[mask],
+                    "state_loss_mask": tensors["state_loss_mask"][sample].cpu().numpy()[mask],
                     "stacking_partition": int(stacking_partition),
                 }
             )
@@ -500,7 +769,15 @@ def infer_state_windows(
 
 
 def _gate_diagnostics(windows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, Any]]:
-    gate_columns = ["ppg_gate", "statistics_gate", "long_gate"]
+    gate_columns = [
+        "ppg_gate",
+        "statistics_gate",
+        "long_gate",
+        "motion_valid_fraction",
+        "ppg_valid_fraction",
+        "statistics_missing_fraction",
+        "missing_fraction",
+    ]
     rows: list[dict[str, Any]] = []
     for subject, group in windows.groupby("subject_key", sort=True):
         row: dict[str, Any] = {"subject_key": str(subject)}
@@ -517,9 +794,9 @@ def _gate_diagnostics(windows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, An
                 row[f"{column}_{name}"] = float(np.quantile(finite, quantile))
         rows.append(row)
     diagnostics = pd.DataFrame(rows)
-    statistics_mean = diagnostics.get(
-        "statistics_gate_mean", pd.Series(dtype=np.float64)
-    ).to_numpy(dtype=np.float64)
+    statistics_mean = diagnostics.get("statistics_gate_mean", pd.Series(dtype=np.float64)).to_numpy(
+        dtype=np.float64
+    )
     finite = statistics_mean[np.isfinite(statistics_mean)]
     summary = {
         "subject_count": len(diagnostics),
@@ -537,6 +814,25 @@ def _save_torch_atomic(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _average_state_prediction_frames(
+    frames: list[pd.DataFrame], *, primary_seed_index: int = 0
+) -> pd.DataFrame:
+    if not frames:
+        raise ValueError("State ensemble requires at least one prediction frame")
+    keys = ["subject_key", "session_id", "timestamp_ms"]
+    ordered = [frame.sort_values(keys).reset_index(drop=True) for frame in frames]
+    reference = ordered[primary_seed_index].copy()
+    for frame in ordered:
+        if not reference[keys].equals(frame[keys]):
+            raise RuntimeError("State seed predictions are not timeline-aligned")
+    for column in ("state_logit", "onset_logit", "offset_logit"):
+        reference[column] = np.mean(
+            [frame[column].to_numpy(dtype=np.float64) for frame in ordered], axis=0
+        )
+    reference["state_seed_count"] = len(ordered)
+    return reference
+
+
 def train_state_crossfit_v4(
     run: HierarchicalRun,
     config: dict[str, Any],
@@ -551,10 +847,14 @@ def train_state_crossfit_v4(
         int(config["hierarchical"]["verifier_crossfit_partitions"]),
         int(config["training"]["random_seed"]),
     )
+    state_seeds = [int(value) for value in config["final_training"]["state_seeds"]]
+    if state_seeds != [2026, 2027, 2028]:
+        raise ValueError("statsfusion-r2 requires state seeds 2026/2027/2028")
     all_predictions: list[pd.DataFrame] = []
     artifacts: list[Path] = []
-    selected_epochs: list[int] = []
+    selected_epochs: dict[int, list[int]] = {seed: [] for seed in state_seeds}
     for partition in sorted(set(partitions.values())):
+        tqdm.write(f"[state] starting stacking partition {partition}")
         holdout = {subject for subject, value in partitions.items() if value == partition}
         training_subjects = outer_train - holdout
         fit_subjects, selector_subjects = _selector_split(
@@ -562,68 +862,22 @@ def train_state_crossfit_v4(
             float(config["training"]["selector_fraction"]),
             int(config["training"]["random_seed"]) + partition,
         )
-        assert_disjoint_subjects(fit=fit_subjects, selector=selector_subjects, holdout=holdout, outer=outer_test)
+        assert_disjoint_subjects(
+            fit=fit_subjects, selector=selector_subjects, holdout=holdout, outer=outer_test
+        )
         partition_root = run.root / "crossfit" / f"partition_{partition}" / "state"
-        checkpoint_path = partition_root / "best.pt"
         scaler_path = partition_root / "statistics_scaler.json"
         normalization_path = partition_root / "sensor_normalization.json"
-        if resume and checkpoint_path.is_file() and scaler_path.is_file() and normalization_path.is_file():
-            checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-            epochs = int(checkpoint["epochs"])
+        if resume and scaler_path.is_file() and normalization_path.is_file():
             scaler = FoldRobustScaler.from_json(json.loads(scaler_path.read_text(encoding="utf-8")))
             normalization = load_normalization(normalization_path)
-            model = build_state_model(checkpoint["model_config"])
-            model.load_state_dict(checkpoint["model"])
             transformed = _transform_with_scaler(inputs, scaler)
         else:
-            epochs = _select_epoch(
-                inputs.anchors[inputs.anchors["subject_key"].astype(str).isin(fit_subjects)],
-                inputs.anchors[
-                    inputs.anchors["subject_key"].astype(str).isin(selector_subjects)
-                ],
-                fit_subjects,
-                inputs,
-                config,
-                int(config["training"]["random_seed"]) + partition,
-            )
             scaler, transformed = _fit_scaler_and_transform(inputs, training_subjects)
             normalization = compute_normalization(inputs.segments, training_subjects)
-            train_rows = transformed[
-                transformed["subject_key"].astype(str).isin(training_subjects)
-            ].reset_index(drop=True)
-            train_events = inputs.events[
-                inputs.events["subject_key"].astype(str).isin(training_subjects)
-            ]
-            dataset = _make_dataset(
-                train_rows,
-                inputs,
-                train_events,
-                normalization,
-                config,
-                training=True,
-                seed=int(config["training"]["random_seed"]) + partition,
-            )
-            torch.manual_seed(int(config["training"]["random_seed"]) + partition)
-            model = build_state_model(config["model"])
-            _train_state_epochs(
-                model,
-                dataset,
-                config,
-                epochs=epochs,
-                seed=int(config["training"]["random_seed"]) + partition,
-            )
             write_json_atomic(scaler_path, scaler.to_json())
             save_normalization(normalization, normalization_path)
-            _save_torch_atomic(
-                checkpoint_path,
-                {
-                    "model": model.state_dict(),
-                    "model_config": config["model"],
-                    "epochs": epochs,
-                    "training_subjects": sorted(training_subjects),
-                    "holdout_subjects": sorted(holdout),
-                },
-            )
+        artifacts.extend((scaler_path, normalization_path))
         holdout_rows = transformed[
             transformed["subject_key"].astype(str).isin(holdout)
         ].reset_index(drop=True)
@@ -637,13 +891,82 @@ def train_state_crossfit_v4(
             training=False,
             seed=int(config["training"]["random_seed"]),
         )
-        all_predictions.append(
-            infer_state_windows(
-                model, holdout_dataset, config, stacking_partition=partition
+        seed_frames: list[pd.DataFrame] = []
+        for seed in state_seeds:
+            checkpoint_path = partition_root / f"seed_{seed}.pt"
+            selector_report_path = partition_root / f"selector_seed_{seed}.json"
+            if resume and checkpoint_path.is_file() and selector_report_path.is_file():
+                checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+                epochs = int(checkpoint["epochs"])
+                model = build_state_model(checkpoint["model_config"])
+                model.load_state_dict(checkpoint["model"])
+            else:
+                epochs, selector_report = _select_epoch(
+                    inputs.anchors[inputs.anchors["subject_key"].astype(str).isin(fit_subjects)],
+                    inputs.anchors[
+                        inputs.anchors["subject_key"].astype(str).isin(selector_subjects)
+                    ],
+                    fit_subjects,
+                    inputs,
+                    config,
+                    seed + partition * 10_000,
+                )
+                write_json_atomic(selector_report_path, selector_report)
+                train_rows = transformed[
+                    transformed["subject_key"].astype(str).isin(training_subjects)
+                ].reset_index(drop=True)
+                train_events = inputs.events[
+                    inputs.events["subject_key"].astype(str).isin(training_subjects)
+                ]
+                dataset = _make_dataset(
+                    train_rows,
+                    inputs,
+                    train_events,
+                    normalization,
+                    config,
+                    training=True,
+                    seed=seed,
+                )
+                torch.manual_seed(seed)
+                model = build_state_model(config["model"])
+                _train_state_epochs(
+                    model,
+                    dataset,
+                    config,
+                    epochs=epochs,
+                    seed=seed + partition * 10_000,
+                    progress_label=f"state partition={partition} seed={seed} retrain",
+                    total_epochs=epochs,
+                )
+                _save_torch_atomic(
+                    checkpoint_path,
+                    {
+                        "model": model.state_dict(),
+                        "model_config": config["model"],
+                        "epochs": epochs,
+                        "seed": seed,
+                        "training_subjects": sorted(training_subjects),
+                        "holdout_subjects": sorted(holdout),
+                        "prediction_subjects": sorted(holdout),
+                        "globally_excluded_subjects": sorted(holdout),
+                        "parent_artifact_sha256": {
+                            "statistics_scaler": sha256_file(scaler_path),
+                            "sensor_normalization": sha256_file(normalization_path),
+                        },
+                    },
+                )
+            seed_frames.append(
+                infer_state_windows(
+                    model,
+                    holdout_dataset,
+                    config,
+                    stacking_partition=partition,
+                    progress_label=f"state partition={partition} seed={seed} OOF inference",
+                )
             )
-        )
-        selected_epochs.append(epochs)
-        artifacts.extend((checkpoint_path, scaler_path, normalization_path))
+            selected_epochs[seed].append(epochs)
+            artifacts.extend((checkpoint_path, selector_report_path))
+        all_predictions.append(_average_state_prediction_frames(seed_frames))
     oof_predictions = pd.concat(all_predictions, ignore_index=True)
     oof_path = run.root / "oof" / "window_logits.parquet"
     gate_path = run.root / "oof" / "gate_diagnostics.parquet"
@@ -653,46 +976,16 @@ def train_state_crossfit_v4(
     write_parquet_atomic(gate_path, gate_diagnostics)
     write_json_atomic(gate_summary_path, gate_summary)
     artifacts.extend((oof_path, gate_path, gate_summary_path))
-    fixed_outer_epoch = int(np.median(selected_epochs))
+    fixed_outer_epochs = {seed: int(np.median(values)) for seed, values in selected_epochs.items()}
     outer_scaler, outer_transformed = _fit_scaler_and_transform(inputs, outer_train)
     outer_normalization = compute_normalization(inputs.segments, outer_train)
     outer_train_rows = outer_transformed[
         outer_transformed["subject_key"].astype(str).isin(outer_train)
     ].reset_index(drop=True)
-    outer_train_events = inputs.events[
-        inputs.events["subject_key"].astype(str).isin(outer_train)
-    ]
-    outer_dataset = _make_dataset(
-        outer_train_rows,
-        inputs,
-        outer_train_events,
-        outer_normalization,
-        config,
-        training=True,
-        seed=int(config["training"]["random_seed"]) + 50_000,
-    )
-    torch.manual_seed(int(config["training"]["random_seed"]) + 50_000)
-    outer_model = build_state_model(config["model"])
-    _train_state_epochs(
-        outer_model,
-        outer_dataset,
-        config,
-        epochs=fixed_outer_epoch,
-        seed=int(config["training"]["random_seed"]) + 50_000,
-    )
+    outer_train_events = inputs.events[inputs.events["subject_key"].astype(str).isin(outer_train)]
     outer_state_root = run.root / "outer" / "state"
-    outer_checkpoint = outer_state_root / "model.pt"
     outer_scaler_path = outer_state_root / "statistics_scaler.json"
     outer_normalization_path = outer_state_root / "sensor_normalization.json"
-    _save_torch_atomic(
-        outer_checkpoint,
-        {
-            "model": outer_model.state_dict(),
-            "model_config": config["model"],
-            "epochs": fixed_outer_epoch,
-            "training_subjects": sorted(outer_train),
-        },
-    )
     write_json_atomic(outer_scaler_path, outer_scaler.to_json())
     save_normalization(outer_normalization, outer_normalization_path)
     outer_rows = outer_transformed[
@@ -714,22 +1007,78 @@ def train_state_crossfit_v4(
         seed=int(config["training"]["random_seed"]),
     )
     outer_logits_path = run.root / "outer" / "window_logits.parquet"
+    outer_frames: list[pd.DataFrame] = []
+    outer_checkpoints: list[Path] = []
+    for seed in state_seeds:
+        outer_dataset = _make_dataset(
+            outer_train_rows,
+            inputs,
+            outer_train_events,
+            outer_normalization,
+            config,
+            training=True,
+            seed=seed,
+        )
+        torch.manual_seed(seed)
+        outer_model = build_state_model(config["model"])
+        epochs = fixed_outer_epochs[seed]
+        _train_state_epochs(
+            outer_model,
+            outer_dataset,
+            config,
+            epochs=epochs,
+            seed=seed + 50_000,
+            progress_label=f"state outer seed={seed} retrain",
+            total_epochs=epochs,
+        )
+        checkpoint_path = outer_state_root / f"state_seed_{seed}.pt"
+        _save_torch_atomic(
+            checkpoint_path,
+            {
+                "model": outer_model.state_dict(),
+                "model_config": config["model"],
+                "epochs": epochs,
+                "seed": seed,
+                "training_subjects": sorted(outer_train),
+                "prediction_subjects": sorted(outer_test),
+                "globally_excluded_subjects": sorted(outer_test),
+                "parent_artifact_sha256": {
+                    "statistics_scaler": sha256_file(outer_scaler_path),
+                    "sensor_normalization": sha256_file(outer_normalization_path),
+                },
+            },
+        )
+        outer_checkpoints.append(checkpoint_path)
+        outer_frames.append(
+            infer_state_windows(
+                outer_model,
+                outer_inference_dataset,
+                config,
+                stacking_partition=-1,
+                progress_label=f"state outer seed={seed} inference",
+            )
+        )
     write_parquet_atomic(
         outer_logits_path,
-        infer_state_windows(
-            outer_model,
-            outer_inference_dataset,
-            config,
-            stacking_partition=-1,
-        ).drop(columns=["state_target"]),
+        _average_state_prediction_frames(outer_frames).drop(
+            columns=["state_target", "state_loss_mask"]
+        ),
     )
     artifacts.extend(
-        (outer_checkpoint, outer_scaler_path, outer_normalization_path, outer_logits_path)
+        (*outer_checkpoints, outer_scaler_path, outer_normalization_path, outer_logits_path)
     )
     epoch_path = run.root / "selection" / "state_epochs.json"
     write_json_atomic(
         epoch_path,
-        {"partition_epochs": selected_epochs, "fixed_outer_epoch": fixed_outer_epoch},
+        {
+            "state_seeds": state_seeds,
+            "partition_epochs_by_seed": {
+                str(seed): values for seed, values in selected_epochs.items()
+            },
+            "fixed_outer_epoch_by_seed": {
+                str(seed): value for seed, value in fixed_outer_epochs.items()
+            },
+        },
     )
     artifacts.append(epoch_path)
     run.transition(
@@ -744,13 +1093,10 @@ def train_state_crossfit_v4(
 
 
 def _candidate_recall(proposals: pd.DataFrame, events: pd.DataFrame) -> dict[str, float]:
-    valid_events = (
-        events[events["evaluable"].fillna(False)] if "evaluable" in events else events
-    )
+    valid_events = events[events["evaluable"].fillna(False)] if "evaluable" in events else events
     matched: set[str] = set()
     grouped = {
-        str(subject): group
-        for subject, group in proposals.groupby("subject_key", sort=False)
+        str(subject): group for subject, group in proposals.groupby("subject_key", sort=False)
     }
     for event in valid_events.itertuples(index=False):
         candidates = grouped.get(str(event.subject_key), pd.DataFrame())
@@ -765,9 +1111,7 @@ def _candidate_recall(proposals: pd.DataFrame, events: pd.DataFrame) -> dict[str
             for candidate in candidates.itertuples(index=False)
         ):
             matched.add(str(event.event_id))
-    metrics = {
-        "candidate_recall": len(matched) / len(valid_events) if len(valid_events) else 0.0
-    }
+    metrics = {"candidate_recall": len(matched) / len(valid_events) if len(valid_events) else 0.0}
     for relation in ("same", "different"):
         subset = valid_events[valid_events.get("hand_relation", "unknown") == relation]
         identifiers = set(subset["event_id"].astype(str)) if "event_id" in subset else set()
@@ -784,22 +1128,27 @@ def build_candidates_v4(
 ) -> None:
     run.require_stage("STATE_COMPLETE")
     logits = pd.read_parquet(run.root / "oof" / "window_logits.parquet")
-    calibrated, calibrator = subject_crossfit_platt(logits)
+    calibrated, calibrator = subject_crossfit_platt(
+        logits,
+        fit_mask_column="state_loss_mask",
+    )
     calibrated["onset_probability"] = 1.0 / (1.0 + np.exp(-calibrated["onset_logit"]))
     calibrated["offset_probability"] = 1.0 / (1.0 + np.exp(-calibrated["offset_logit"]))
-    calibrated["state_probability_derivative"] = calibrated.groupby(
-        ["subject_key", "session_id"], sort=False
-    )["state_probability"].diff().fillna(0.0)
+    calibrated["state_probability_derivative"] = (
+        calibrated.groupby(["subject_key", "session_id"], sort=False)["state_probability"]
+        .diff()
+        .fillna(0.0)
+    )
+    calibration_rows = calibrated[calibrated["state_loss_mask"].to_numpy(dtype=float) > 0]
     metrics = state_calibration_metrics(
-        calibrated["state_target"].to_numpy(),
-        calibrated["state_logit"].to_numpy(),
-        calibrated["state_probability"].to_numpy(),
+        calibration_rows["state_target"].to_numpy(),
+        calibration_rows["state_logit"].to_numpy(),
+        calibration_rows["state_probability"].to_numpy(),
         low_threshold=float(config["decoder"]["low_threshold"]),
         bins=int(config["calibration"]["ece_bins"]),
     )
     calibration_checks = {
-        "ece": metrics["ece"]
-        <= float(config["promotion_gate"]["maximum_state_ece"]),
+        "ece": metrics["ece"] <= float(config["promotion_gate"]["maximum_state_ece"]),
         "brier": metrics["brier"] < metrics["uncalibrated_brier"],
         "prevalence_ratio": metrics["mean_probability_to_prevalence"]
         <= float(config["promotion_gate"]["maximum_state_prevalence_ratio"]),
@@ -808,10 +1157,8 @@ def build_candidates_v4(
     if strict_gates and not all(calibration_checks.values()):
         failed = [name for name, passed in calibration_checks.items() if not passed]
         raise RuntimeError(f"State calibration gate failed: {failed}")
-    durations = (
-        inputs.events.loc[inputs.events["valid_duration"], "end_ms"].to_numpy(dtype=float)
-        - inputs.events.loc[inputs.events["valid_duration"], "start_ms"].to_numpy(dtype=float)
-    ) / 1000.0
+    training_subjects = set(logits["subject_key"].astype(str))
+    durations = _truth_event_durations(inputs.events, training_subjects)
     decoder_config = config["decoder"]
     prior = TruncatedLogNormalDurationPrior.fit(
         durations,
@@ -828,10 +1175,7 @@ def build_candidates_v4(
     proposals = generate_event_candidates_v4(
         calibrated, decoder, decoder_config, split_role="outer_train_oof"
     )
-    evaluable = inputs.events[
-        inputs.events.get("evaluable", pd.Series(True, index=inputs.events.index)).fillna(False)
-    ]
-    ignored = inputs.events.loc[~inputs.events.index.isin(evaluable.index)]
+    evaluable, ignored = partition_evaluation_events(inputs.events, training_subjects)
     labeled = exclude_ignored_candidates(
         label_event_candidates(proposals, evaluable, 0.25), ignored
     )
@@ -848,10 +1192,9 @@ def build_candidates_v4(
             calibrated,
             "generator_score",
             config,
+            ignored,
         )
-        state_only_accepted = _accepted_from_point(
-            labeled, state_only_point, "generator_score"
-        )
+        state_only_accepted = _accepted_from_point(labeled, state_only_point, "generator_score")
     else:
         state_only_point = {
             "acceptance_threshold": float("inf"),
@@ -860,17 +1203,13 @@ def build_candidates_v4(
             "fp_per_hour": 0.0,
         }
         state_only_accepted = labeled.copy()
-    state_only_hand = _hand_metrics(evaluable, _prediction_events(state_only_accepted))
+    state_only_hand = _hand_metrics(evaluable, _prediction_events(state_only_accepted), ignored)
     candidate_metrics.update(
         {
             "state_only_f1": float(state_only_point["f1"]),
             "state_only_fp_per_hour": float(state_only_point["fp_per_hour"]),
-            "state_only_acceptance_threshold": float(
-                state_only_point["acceptance_threshold"]
-            ),
-            "state_only_nms_iou_threshold": float(
-                state_only_point["nms_iou_threshold"]
-            ),
+            "state_only_acceptance_threshold": float(state_only_point["acceptance_threshold"]),
+            "state_only_nms_iou_threshold": float(state_only_point["nms_iou_threshold"]),
             **state_only_hand,
             "state_calibration_gate_passed": bool(all(calibration_checks.values())),
         }
@@ -886,14 +1225,14 @@ def build_candidates_v4(
     window_path = run.root / "oof" / "window_predictions.parquet"
     proposal_path = run.root / "oof" / "proposals_labeled.parquet"
     outer_logits = pd.read_parquet(run.root / "outer" / "window_logits.parquet")
-    outer_logits["state_probability"] = calibrator.transform(
-        outer_logits["state_logit"].to_numpy()
-    )
+    outer_logits["state_probability"] = calibrator.transform(outer_logits["state_logit"].to_numpy())
     outer_logits["onset_probability"] = 1.0 / (1.0 + np.exp(-outer_logits["onset_logit"]))
     outer_logits["offset_probability"] = 1.0 / (1.0 + np.exp(-outer_logits["offset_logit"]))
-    outer_logits["state_probability_derivative"] = outer_logits.groupby(
-        ["subject_key", "session_id"], sort=False
-    )["state_probability"].diff().fillna(0.0)
+    outer_logits["state_probability_derivative"] = (
+        outer_logits.groupby(["subject_key", "session_id"], sort=False)["state_probability"]
+        .diff()
+        .fillna(0.0)
+    )
     outer_proposals = generate_event_candidates_v4(
         outer_logits, decoder, decoder_config, split_role="outer_test_unlabeled"
     )
@@ -923,6 +1262,494 @@ def build_candidates_v4(
     )
 
 
+def _assert_nested_lineage(
+    *,
+    training_subjects: set[str],
+    prediction_subjects: set[str],
+    globally_excluded_subjects: set[str],
+) -> None:
+    training = {str(value) for value in training_subjects}
+    prediction = {str(value) for value in prediction_subjects}
+    excluded = {str(value) for value in globally_excluded_subjects}
+    if training & prediction:
+        raise RuntimeError(
+            f"Nested state training includes prediction subjects: {sorted(training & prediction)}"
+        )
+    if training & excluded:
+        raise RuntimeError(
+            f"Nested state training includes globally excluded subjects: {sorted(training & excluded)}"
+        )
+
+
+def _state_probabilities(
+    oof_logits: pd.DataFrame, prediction_logits: pd.DataFrame
+) -> tuple[pd.DataFrame, pd.DataFrame, Any]:
+    calibrated, calibrator = subject_crossfit_platt(
+        oof_logits,
+        fit_mask_column="state_loss_mask",
+    )
+    prediction = prediction_logits.copy()
+    prediction["state_probability"] = calibrator.transform(
+        prediction["state_logit"].to_numpy(dtype=float)
+    )
+    for frame in (calibrated, prediction):
+        frame["onset_probability"] = 1.0 / (1.0 + np.exp(-frame["onset_logit"]))
+        frame["offset_probability"] = 1.0 / (1.0 + np.exp(-frame["offset_logit"]))
+        frame["state_probability_derivative"] = (
+            frame.groupby(["subject_key", "session_id"], sort=False)["state_probability"]
+            .diff()
+            .fillna(0.0)
+        )
+    return calibrated, prediction, calibrator
+
+
+def _nested_cache_key(
+    config: dict[str, Any],
+    training_subjects: set[str],
+    excluded_subjects: set[str],
+    parent_artifact_sha256: dict[str, str] | None = None,
+) -> str:
+    payload = {
+        "protocol_version": "statsfusion-r2",
+        "training_subjects": sorted(training_subjects),
+        "globally_excluded_subjects": sorted(excluded_subjects),
+        "model": config["model"],
+        "sequence": config["sequence"],
+        "training": config["training"],
+        "decoder": config["decoder"],
+        "state_seeds": config["final_training"]["state_seeds"],
+        "parent_artifact_sha256": parent_artifact_sha256 or {},
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def _nested_cache_artifacts(
+    run: HierarchicalRun,
+    lineage: dict[str, Any],
+    required: dict[str, Path],
+    lineage_path: Path,
+    *,
+    training_subjects: set[str],
+    holdout_subjects: set[str],
+    state_seeds: list[int],
+    cache_key: str,
+    parent_artifact_sha256: dict[str, str],
+) -> list[Path]:
+    if lineage.get("protocol_version") != "statsfusion-r2":
+        raise RuntimeError("Nested state cache uses a blocked protocol")
+    if lineage.get("meta_crossfit_protocol") != "fully_nested_v1":
+        raise RuntimeError("Nested state cache is not fully nested")
+    if lineage.get("cache_key") != cache_key:
+        raise RuntimeError("Nested state cache identity changed; use a fresh run name")
+    if set(lineage.get("training_subjects", [])) != training_subjects:
+        raise RuntimeError("Nested state cache training subjects changed")
+    if set(lineage.get("prediction_subjects", [])) != holdout_subjects:
+        raise RuntimeError("Nested state cache prediction subjects changed")
+    if set(lineage.get("globally_excluded_subjects", [])) != holdout_subjects:
+        raise RuntimeError("Nested state cache exclusions changed")
+    if [int(value) for value in lineage.get("state_seeds", [])] != state_seeds:
+        raise RuntimeError("Nested state cache seed mirror changed")
+    if lineage.get("parent_artifact_sha256") != parent_artifact_sha256:
+        raise RuntimeError("Nested state cache parent artifacts changed")
+    _assert_nested_lineage(
+        training_subjects=training_subjects,
+        prediction_subjects=holdout_subjects,
+        globally_excluded_subjects=holdout_subjects,
+    )
+    artifacts = [*required.values(), lineage_path]
+    for name, path in required.items():
+        if not path.is_file():
+            raise RuntimeError(f"Nested state cache artifact is missing: {name}")
+        if lineage.get("artifact_sha256", {}).get(name) != sha256_file(path):
+            raise RuntimeError(f"Nested state cache artifact changed: {name}")
+    inner_models = lineage.get("inner_models", [])
+    if not inner_models:
+        raise RuntimeError("Nested state cache has no inner model lineage")
+    prediction_counts = {subject: 0 for subject in training_subjects}
+    partition_seeds: dict[int, set[int]] = {}
+    for model in inner_models:
+        model_training = {str(value) for value in model.get("training_subjects", [])}
+        model_prediction = {str(value) for value in model.get("prediction_subjects", [])}
+        model_excluded = {str(value) for value in model.get("globally_excluded_subjects", [])}
+        _assert_nested_lineage(
+            training_subjects=model_training,
+            prediction_subjects=model_prediction,
+            globally_excluded_subjects=model_excluded,
+        )
+        if model_excluded != holdout_subjects:
+            raise RuntimeError("Nested inner model exclusions changed")
+        if model_training | model_prediction != training_subjects:
+            raise RuntimeError("Nested inner model does not partition the meta-training subjects")
+        for subject in model_prediction:
+            prediction_counts[subject] += 1
+        partition = int(model["inner_partition"])
+        partition_seeds.setdefault(partition, set()).add(int(model["seed"]))
+        for path_key, hash_key in (
+            ("checkpoint_path", "checkpoint_sha256"),
+            ("selector_path", "selector_sha256"),
+            ("scaler_path", "scaler_sha256"),
+            ("normalization_path", "normalization_sha256"),
+        ):
+            relative = Path(str(model[path_key]))
+            artifact = run.root / relative
+            if not artifact.is_file() or sha256_file(artifact) != model.get(hash_key):
+                raise RuntimeError(f"Nested inner model artifact changed: {relative.as_posix()}")
+            artifacts.append(artifact)
+        checkpoint_path = run.root / Path(str(model["checkpoint_path"]))
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        if int(checkpoint.get("epochs", -1)) != int(model.get("selected_epoch", -2)):
+            raise RuntimeError("Nested inner model epoch lineage changed")
+        expected_preprocessing_parents = {
+            "statistics_scaler": model["scaler_sha256"],
+            "sensor_normalization": model["normalization_sha256"],
+        }
+        if checkpoint.get("parent_artifact_sha256") != expected_preprocessing_parents:
+            raise RuntimeError("Nested inner model preprocessing parents changed")
+    expected_seeds = set(state_seeds)
+    if any(seeds != expected_seeds for seeds in partition_seeds.values()):
+        raise RuntimeError("Nested state cache has an incomplete seed mirror")
+    if any(count != len(state_seeds) for count in prediction_counts.values()):
+        raise RuntimeError("Nested state cache does not predict every training subject once per seed")
+    return list(dict.fromkeys(artifacts))
+
+
+def _state_holdout_parent_lineage(
+    run: HierarchicalRun,
+    *,
+    meta_partition: int,
+    training_subjects: set[str],
+    holdout_subjects: set[str],
+    state_seeds: list[int],
+) -> dict[str, str]:
+    state_root = run.root / "crossfit" / f"partition_{meta_partition}" / "state"
+    scaler_path = state_root / "statistics_scaler.json"
+    normalization_path = state_root / "sensor_normalization.json"
+    if not scaler_path.is_file() or not normalization_path.is_file():
+        raise FileNotFoundError("Nested meta holdout state preprocessing lineage is missing")
+    scaler_payload = json.loads(scaler_path.read_text(encoding="utf-8"))
+    if set(scaler_payload.get("training_subjects", [])) != training_subjects:
+        raise RuntimeError("Meta holdout state scaler was not fit only on its training subjects")
+    parent_artifact_sha256 = {
+        "outer_state_statistics_scaler": sha256_file(scaler_path),
+        "outer_state_sensor_normalization": sha256_file(normalization_path),
+    }
+    for seed in state_seeds:
+        checkpoint_path = state_root / f"seed_{seed}.pt"
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(f"Meta holdout state checkpoint is missing for seed {seed}")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        prediction_subjects = set(
+            checkpoint.get("prediction_subjects", checkpoint.get("holdout_subjects", []))
+        )
+        excluded_subjects = set(checkpoint.get("globally_excluded_subjects", []))
+        _assert_nested_lineage(
+            training_subjects=set(checkpoint.get("training_subjects", [])),
+            prediction_subjects=prediction_subjects,
+            globally_excluded_subjects=excluded_subjects,
+        )
+        if set(checkpoint.get("training_subjects", [])) != training_subjects:
+            raise RuntimeError("Meta holdout state checkpoint training subjects changed")
+        if prediction_subjects != holdout_subjects or excluded_subjects != holdout_subjects:
+            raise RuntimeError("Meta holdout state checkpoint prediction lineage changed")
+        expected_parents = {
+            "statistics_scaler": sha256_file(scaler_path),
+            "sensor_normalization": sha256_file(normalization_path),
+        }
+        if checkpoint.get("parent_artifact_sha256") != expected_parents:
+            raise RuntimeError("Meta holdout state checkpoint preprocessing parents changed")
+        parent_artifact_sha256[f"outer_state_checkpoint_seed_{seed}"] = sha256_file(
+            checkpoint_path
+        )
+    return parent_artifact_sha256
+
+
+def _prepare_nested_meta_cache(
+    run: HierarchicalRun,
+    config: dict[str, Any],
+    inputs: V4Inputs,
+    *,
+    meta_partition: int,
+    training_subjects: set[str],
+    holdout_subjects: set[str],
+) -> tuple[Path, list[Path]]:
+    _assert_nested_lineage(
+        training_subjects=training_subjects,
+        prediction_subjects=holdout_subjects,
+        globally_excluded_subjects=holdout_subjects,
+    )
+    root = run.root / "nested" / f"meta_{meta_partition}"
+    lineage_path = root / "lineage.json"
+    required = {
+        "train_windows": root / "train_window_predictions.parquet",
+        "train_proposals": root / "train_proposals_labeled.parquet",
+        "holdout_windows": root / "holdout_window_predictions.parquet",
+        "holdout_proposals": root / "holdout_proposals.parquet",
+        "calibration": root / "state_calibration.json",
+        "duration_prior": root / "duration_prior.json",
+    }
+    outer_oof_path = run.root / "oof" / "window_logits.parquet"
+    if not outer_oof_path.is_file():
+        raise FileNotFoundError("Nested meta-crossfit requires outer-train OOF state logits")
+    state_seeds = [int(value) for value in config["final_training"]["state_seeds"]]
+    parent_artifact_sha256 = {
+        "outer_oof_window_logits": sha256_file(outer_oof_path),
+        **_state_holdout_parent_lineage(
+            run,
+            meta_partition=meta_partition,
+            training_subjects=training_subjects,
+            holdout_subjects=holdout_subjects,
+            state_seeds=state_seeds,
+        ),
+    }
+    cache_key = _nested_cache_key(
+        config,
+        training_subjects,
+        holdout_subjects,
+        parent_artifact_sha256,
+    )
+    if lineage_path.is_file() and all(path.is_file() for path in required.values()):
+        lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+        return root, _nested_cache_artifacts(
+            run,
+            lineage,
+            required,
+            lineage_path,
+            training_subjects=training_subjects,
+            holdout_subjects=holdout_subjects,
+            state_seeds=state_seeds,
+            cache_key=cache_key,
+            parent_artifact_sha256=parent_artifact_sha256,
+        )
+
+    inner_partitions = stacking_partitions(
+        training_subjects,
+        int(config["hierarchical"]["verifier_crossfit_partitions"]),
+        int(config["training"]["random_seed"]) + 100_000 + meta_partition,
+    )
+    oof_parts: list[pd.DataFrame] = []
+    artifacts: list[Path] = []
+    model_lineage: list[dict[str, Any]] = []
+    for inner_partition in sorted(set(inner_partitions.values())):
+        prediction_subjects = {
+            subject for subject, value in inner_partitions.items() if value == inner_partition
+        }
+        model_subjects = training_subjects - prediction_subjects
+        _assert_nested_lineage(
+            training_subjects=model_subjects,
+            prediction_subjects=prediction_subjects,
+            globally_excluded_subjects=holdout_subjects,
+        )
+        fit_subjects, selector_subjects = _selector_split(
+            model_subjects,
+            float(config["training"]["selector_fraction"]),
+            int(config["training"]["random_seed"])
+            + meta_partition * 10_000
+            + inner_partition,
+        )
+        scaler, transformed = _fit_scaler_and_transform(inputs, model_subjects)
+        normalization = compute_normalization(inputs.segments, model_subjects)
+        train_rows = transformed[
+            transformed["subject_key"].astype(str).isin(model_subjects)
+        ].reset_index(drop=True)
+        train_events = inputs.events[
+            inputs.events["subject_key"].astype(str).isin(model_subjects)
+        ]
+        prediction_rows = transformed[
+            transformed["subject_key"].astype(str).isin(prediction_subjects)
+        ].reset_index(drop=True)
+        prediction_events = inputs.events[
+            inputs.events["subject_key"].astype(str).isin(prediction_subjects)
+        ]
+        prediction_dataset = _make_dataset(
+            prediction_rows,
+            inputs,
+            prediction_events,
+            normalization,
+            config,
+            training=False,
+            seed=int(config["training"]["random_seed"]),
+        )
+        seed_frames: list[pd.DataFrame] = []
+        inner_root = root / "state" / f"inner_{inner_partition}"
+        scaler_path = inner_root / "statistics_scaler.json"
+        normalization_path = inner_root / "sensor_normalization.json"
+        write_json_atomic(scaler_path, scaler.to_json())
+        save_normalization(normalization, normalization_path)
+        artifacts.extend((scaler_path, normalization_path))
+        for seed in state_seeds:
+            epochs, selector_report = _select_epoch(
+                inputs.anchors[inputs.anchors["subject_key"].astype(str).isin(fit_subjects)],
+                inputs.anchors[
+                    inputs.anchors["subject_key"].astype(str).isin(selector_subjects)
+                ],
+                fit_subjects,
+                inputs,
+                config,
+                seed + meta_partition * 100_000 + inner_partition * 10_000,
+            )
+            dataset = _make_dataset(
+                train_rows,
+                inputs,
+                train_events,
+                normalization,
+                config,
+                training=True,
+                seed=seed,
+            )
+            torch.manual_seed(seed)
+            model = build_state_model(config["model"])
+            _train_state_epochs(
+                model,
+                dataset,
+                config,
+                epochs=epochs,
+                seed=seed + meta_partition * 100_000 + inner_partition * 10_000,
+                progress_label=(
+                    f"nested state meta={meta_partition} inner={inner_partition} seed={seed}"
+                ),
+                total_epochs=epochs,
+            )
+            checkpoint = inner_root / f"seed_{seed}.pt"
+            selector_path = inner_root / f"selector_seed_{seed}.json"
+            checkpoint_payload = {
+                "model": model.state_dict(),
+                "model_config": config["model"],
+                "epochs": epochs,
+                "seed": seed,
+                "training_subjects": sorted(model_subjects),
+                "prediction_subjects": sorted(prediction_subjects),
+                "globally_excluded_subjects": sorted(holdout_subjects),
+                "parent_artifact_sha256": {
+                    "statistics_scaler": sha256_file(scaler_path),
+                    "sensor_normalization": sha256_file(normalization_path),
+                },
+            }
+            _save_torch_atomic(checkpoint, checkpoint_payload)
+            write_json_atomic(
+                selector_path,
+                {
+                    **selector_report,
+                    "training_subjects": sorted(model_subjects),
+                    "prediction_subjects": sorted(prediction_subjects),
+                    "globally_excluded_subjects": sorted(holdout_subjects),
+                    "parent_artifact_sha256": {
+                        "statistics_scaler": sha256_file(scaler_path),
+                        "sensor_normalization": sha256_file(normalization_path),
+                    },
+                },
+            )
+            artifacts.extend((checkpoint, selector_path))
+            model_lineage.append(
+                {
+                    "seed": seed,
+                    "inner_partition": inner_partition,
+                    "training_subjects": sorted(model_subjects),
+                    "prediction_subjects": sorted(prediction_subjects),
+                    "globally_excluded_subjects": sorted(holdout_subjects),
+                    "checkpoint_sha256": sha256_file(checkpoint),
+                    "checkpoint_path": checkpoint.relative_to(run.root).as_posix(),
+                    "selector_sha256": sha256_file(selector_path),
+                    "selector_path": selector_path.relative_to(run.root).as_posix(),
+                    "scaler_sha256": sha256_file(scaler_path),
+                    "scaler_path": scaler_path.relative_to(run.root).as_posix(),
+                    "normalization_sha256": sha256_file(normalization_path),
+                    "normalization_path": normalization_path.relative_to(run.root).as_posix(),
+                    "selected_epoch": int(epochs),
+                }
+            )
+            seed_frames.append(
+                infer_state_windows(
+                    model,
+                    prediction_dataset,
+                    config,
+                    stacking_partition=inner_partition,
+                    progress_label=(
+                        f"nested state meta={meta_partition} inner={inner_partition} inference"
+                    ),
+                )
+            )
+        oof_parts.append(_average_state_prediction_frames(seed_frames))
+
+    nested_oof_logits = pd.concat(oof_parts, ignore_index=True)
+    holdout_logits = pd.read_parquet(outer_oof_path)
+    holdout_logits = holdout_logits[
+        holdout_logits["subject_key"].astype(str).isin(holdout_subjects)
+    ].reset_index(drop=True)
+    observed_holdout_subjects = set(holdout_logits["subject_key"].astype(str))
+    if observed_holdout_subjects != holdout_subjects:
+        raise RuntimeError("Nested meta holdout logits do not cover the expected subjects")
+    if "stacking_partition" not in holdout_logits:
+        raise RuntimeError("Nested meta holdout logits lack state stacking lineage")
+    if set(holdout_logits["stacking_partition"].astype(int)) != {int(meta_partition)}:
+        raise RuntimeError("Nested meta holdout logits came from a different state partition")
+    calibrated_train, calibrated_holdout, calibrator = _state_probabilities(
+        nested_oof_logits, holdout_logits
+    )
+    durations = _truth_event_durations(inputs.events, training_subjects)
+    decoder_config = config["decoder"]
+    prior = TruncatedLogNormalDurationPrior.fit(
+        durations,
+        lower_quantile=float(decoder_config["duration_lower_quantile"]),
+        upper_quantile=float(decoder_config["duration_upper_quantile"]),
+        minimum_floor_seconds=float(decoder_config["minimum_duration_floor_seconds"]),
+        maximum_ceiling_seconds=float(decoder_config["maximum_duration_ceiling_seconds"]),
+    )
+    decoder = FixedLagSemiMarkovDecoder(
+        prior,
+        grid_seconds=int(decoder_config["grid_seconds"]),
+        fixed_lag_seconds=int(decoder_config["fixed_lag_seconds"]),
+    )
+    train_proposals = generate_event_candidates_v4(
+        calibrated_train, decoder, decoder_config, split_role="nested_meta_train_oof"
+    )
+    train_truth, train_ignore = partition_evaluation_events(inputs.events, training_subjects)
+    train_labeled = exclude_ignored_candidates(
+        label_event_candidates(train_proposals, train_truth, 0.25), train_ignore
+    )
+    holdout_proposals = generate_event_candidates_v4(
+        calibrated_holdout, decoder, decoder_config, split_role="nested_meta_holdout"
+    )
+    write_parquet_atomic(required["train_windows"], calibrated_train)
+    write_parquet_atomic(required["train_proposals"], train_labeled)
+    write_parquet_atomic(required["holdout_windows"], calibrated_holdout)
+    write_parquet_atomic(required["holdout_proposals"], holdout_proposals)
+    write_json_atomic(required["calibration"], calibrator.to_json())
+    write_json_atomic(required["duration_prior"], prior.to_json())
+    artifact_sha256 = {name: sha256_file(path) for name, path in required.items()}
+    write_json_atomic(
+        lineage_path,
+        {
+            "protocol_version": "statsfusion-r2",
+            "meta_crossfit_protocol": "fully_nested_v1",
+            "cache_key": cache_key,
+            "meta_partition": meta_partition,
+            "training_subjects": sorted(training_subjects),
+            "prediction_subjects": sorted(holdout_subjects),
+            "globally_excluded_subjects": sorted(holdout_subjects),
+            "state_seeds": state_seeds,
+            "inner_models": model_lineage,
+            "parent_artifact_sha256": parent_artifact_sha256,
+            "state_calibration_source": "nested_meta_train_oof",
+            "duration_prior_source": "nested_meta_training_truth",
+            "artifact_sha256": artifact_sha256,
+        },
+    )
+    lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+    return root, _nested_cache_artifacts(
+        run,
+        lineage,
+        required,
+        lineage_path,
+        training_subjects=training_subjects,
+        holdout_subjects=holdout_subjects,
+        state_seeds=state_seeds,
+        cache_key=cache_key,
+        parent_artifact_sha256=parent_artifact_sha256,
+    )
+
+
 def _slice_proposal_features(features, indices: np.ndarray):
     from bme_eating.models.event_verifier_v4 import ProposalFeatureBatchV4
 
@@ -933,7 +1760,9 @@ def _slice_proposal_features(features, indices: np.ndarray):
         scalar=features.scalar[indices],
         event_target=features.event_target[indices] if features.event_target is not None else None,
         iou_target=features.iou_target[indices] if features.iou_target is not None else None,
-        sample_weight=features.sample_weight[indices] if features.sample_weight is not None else None,
+        sample_weight=features.sample_weight[indices]
+        if features.sample_weight is not None
+        else None,
     )
 
 
@@ -952,6 +1781,7 @@ def _train_verifier_model_v4(
     config: dict[str, Any],
     *,
     seed: int,
+    epochs: int | None = None,
 ) -> EventVerifierV4:
     torch.manual_seed(seed)
     device = _device(config)
@@ -967,6 +1797,7 @@ def _train_verifier_model_v4(
         ratios=config["verifier"]["batch_composition"],
         steps_per_epoch=steps,
         seed=seed,
+        target_weights=features.sample_weight,
     )
     loader = DataLoader(dataset, batch_sampler=sampler)
     optimizer = torch.optim.AdamW(
@@ -974,8 +1805,75 @@ def _train_verifier_model_v4(
         lr=float(config["verifier"]["learning_rate"]),
         weight_decay=float(config["verifier"]["weight_decay"]),
     )
-    for epoch in range(int(config["verifier"]["max_epochs"])):
+    maximum_epochs = int(epochs or config["verifier"]["max_epochs"])
+    progress = tqdm(
+        range(maximum_epochs),
+        desc=f"verifier seed={seed}",
+        unit="epoch",
+        dynamic_ncols=True,
+    )
+    for epoch in progress:
         sampler.set_epoch(epoch)
+        model.train()
+        epoch_loss_total = torch.zeros((), device=device)
+        epoch_steps = 0
+        for batch in loader:
+            tensors = {
+                key: value.to(device) if isinstance(value, torch.Tensor) else value
+                for key, value in batch.items()
+            }
+            output = model(tensors)
+            loss, _ = verifier_loss_v4(
+                output, tensors, float(config["verifier"]["iou_loss_weight"])
+            )
+            epoch_loss_total += loss.detach()
+            epoch_steps += 1
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+        progress.set_postfix(loss=f"{float(epoch_loss_total.cpu()) / max(epoch_steps, 1):.4f}")
+    return model
+
+
+def _select_verifier_epoch(
+    fit_features,
+    fit_categories: np.ndarray,
+    selector_features,
+    selector_proposals: pd.DataFrame,
+    selector_truth: pd.DataFrame,
+    selector_ignore: pd.DataFrame,
+    selector_windows: pd.DataFrame,
+    config: dict[str, Any],
+    *,
+    seed: int,
+) -> tuple[int, list[dict[str, float]]]:
+    torch.manual_seed(seed)
+    device = _device(config)
+    model = EventVerifierV4(
+        fit_features.sequence.shape[-1], fit_features.scalar.shape[-1], config["verifier"]
+    ).to(device)
+    dataset = ProposalDatasetV4(fit_features)
+    batch_size = int(config["verifier"]["batch_size"])
+    sampler = HardNegativeBatchSampler(
+        fit_categories,
+        batch_size=batch_size,
+        ratios=config["verifier"]["batch_composition"],
+        steps_per_epoch=max(1, math.ceil(len(dataset) / batch_size)),
+        seed=seed,
+        target_weights=fit_features.sample_weight,
+    )
+    loader = DataLoader(dataset, batch_sampler=sampler)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(config["verifier"]["learning_rate"]),
+        weight_decay=float(config["verifier"]["weight_decay"]),
+    )
+    best_epoch = 1
+    best_key = (-math.inf, -math.inf)
+    patience = 0
+    history: list[dict[str, float]] = []
+    for epoch in range(1, int(config["verifier"]["max_epochs"]) + 1):
+        sampler.set_epoch(epoch - 1)
         model.train()
         for batch in loader:
             tensors = {
@@ -989,7 +1887,36 @@ def _train_verifier_model_v4(
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-    return model
+        event_logit, iou_logit = _infer_verifier_model(model, selector_features, config)
+        scored = selector_proposals.copy().reset_index(drop=True)
+        scored["event_logit"] = event_logit
+        scored["iou_logit"] = iou_logit
+        scored["final_score"] = 1.0 / (1.0 + np.exp(-event_logit))
+        point = _best_verifier_operating_point(
+            scored,
+            selector_truth,
+            selector_windows,
+            "final_score",
+            config,
+            selector_ignore,
+        )
+        key = (float(point["f1"]), -float(point["fp_per_hour"]))
+        history.append(
+            {
+                "epoch": float(epoch),
+                "event_f1": float(point["f1"]),
+                "fp_per_hour": float(point["fp_per_hour"]),
+            }
+        )
+        if key > best_key:
+            best_key = key
+            best_epoch = epoch
+            patience = 0
+        else:
+            patience += 1
+        if patience >= int(config["verifier"]["patience"]):
+            break
+    return best_epoch, history
 
 
 @torch.no_grad()
@@ -1003,7 +1930,13 @@ def _infer_verifier_model(model: EventVerifierV4, features, config: dict[str, An
     )
     event: list[np.ndarray] = []
     iou: list[np.ndarray] = []
-    for batch in loader:
+    for batch in tqdm(
+        loader,
+        desc="verifier inference",
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+    ):
         tensors = {
             key: value.to(device) if isinstance(value, torch.Tensor) else value
             for key, value in batch.items()
@@ -1016,7 +1949,12 @@ def _infer_verifier_model(model: EventVerifierV4, features, config: dict[str, An
 
 def _nms(frame: pd.DataFrame, threshold: float, score_column: str) -> pd.DataFrame:
     kept: list[int] = []
-    for index in frame.sort_values(score_column, ascending=False).index:
+    ranked = frame.sort_values(
+        [score_column, "coarse_start_ms", "coarse_end_ms", "proposal_id"],
+        ascending=[False, True, True, True],
+        kind="stable",
+    )
+    for index in ranked.index:
         candidate = frame.loc[index]
         if any(
             interval_iou(
@@ -1033,12 +1971,41 @@ def _nms(frame: pd.DataFrame, threshold: float, score_column: str) -> pd.DataFra
     return frame.loc[kept].copy()
 
 
+def _gap_aware_nms(
+    frame: pd.DataFrame,
+    threshold: float,
+    score_column: str,
+    minimum_gap_seconds: int = 3,
+) -> pd.DataFrame:
+    candidates = _nms(frame, threshold, score_column)
+    gap_ms = int(minimum_gap_seconds) * 1000
+    kept: list[int] = []
+    ranked = candidates.sort_values(
+        [score_column, "coarse_start_ms", "coarse_end_ms", "proposal_id"],
+        ascending=[False, True, True, True],
+        kind="stable",
+    )
+    for index, candidate in ranked.iterrows():
+        start = int(candidate.coarse_start_ms)
+        end = int(candidate.coarse_end_ms)
+        conflicts = any(
+            not (
+                end + gap_ms <= int(candidates.loc[other].coarse_start_ms)
+                or int(candidates.loc[other].coarse_end_ms) + gap_ms <= start
+            )
+            for other in kept
+        )
+        if not conflicts:
+            kept.append(int(index))
+    return candidates.loc[kept].copy()
+
+
 def _prediction_events(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty:
         return pd.DataFrame(columns=["subject_key", "start_ms", "end_ms", "proposal_id"])
-    return frame.rename(
-        columns={"coarse_start_ms": "start_ms", "coarse_end_ms": "end_ms"}
-    )[["subject_key", "start_ms", "end_ms", "proposal_id"]]
+    return frame.rename(columns={"coarse_start_ms": "start_ms", "coarse_end_ms": "end_ms"})[
+        ["subject_key", "start_ms", "end_ms", "proposal_id"]
+    ]
 
 
 def _observed_hours(windows: pd.DataFrame) -> float:
@@ -1056,6 +2023,7 @@ def _best_verifier_operating_point(
     windows: pd.DataFrame,
     score_column: str,
     config: dict[str, Any],
+    ignore: pd.DataFrame | None = None,
 ) -> dict[str, float]:
     best: dict[str, float] | None = None
     values = scores[score_column].to_numpy(dtype=np.float64)
@@ -1063,14 +2031,28 @@ def _best_verifier_operating_point(
         threshold = float(np.quantile(values, float(quantile)))
         for nms_threshold in config["calibration"]["nms_iou_thresholds"]:
             accepted = scores[scores[score_column] >= threshold]
-            accepted = pd.concat(
-                [
-                    _nms(group, float(nms_threshold), score_column)
-                    for _, group in accepted.groupby(["subject_key", "session_id"], sort=False)
-                ],
-                ignore_index=True,
-            ) if len(accepted) else accepted
-            metrics, _ = evaluate_events(events, _prediction_events(accepted), method="max_cardinality_iou")
+            accepted = (
+                pd.concat(
+                    [
+                        _gap_aware_nms(
+                            group,
+                            float(nms_threshold),
+                            score_column,
+                            int(config["boundary"]["safety_gap_seconds"]),
+                        )
+                        for _, group in accepted.groupby(["subject_key", "session_id"], sort=False)
+                    ],
+                    ignore_index=True,
+                )
+                if len(accepted)
+                else accepted
+            )
+            metrics, _ = evaluate_events(
+                events,
+                _prediction_events(accepted),
+                method="max_cardinality_iou",
+                ignore=ignore,
+            )
             metrics["fp_per_hour"] = metrics["false_positive"] / max(_observed_hours(windows), 1e-9)
             point = {
                 "acceptance_threshold": threshold,
@@ -1100,7 +2082,474 @@ def _matching_ranking_reversal(
     )
 
 
+def _nested_verifier_oof_scores(
+    root: Path,
+    proposals: pd.DataFrame,
+    features: ProposalFeatureBatchV4,
+    categories: np.ndarray,
+    selected_epochs: dict[int, int],
+    config: dict[str, Any],
+    *,
+    meta_partition: int,
+    globally_excluded_subjects: set[str],
+) -> tuple[pd.DataFrame, list[Path]]:
+    subjects = set(proposals["subject_key"].astype(str))
+    parent_paths = {
+        "nested_train_windows": root / "train_window_predictions.parquet",
+        "nested_train_proposals": root / "train_proposals_labeled.parquet",
+        "state_calibration": root / "state_calibration.json",
+        "duration_prior": root / "duration_prior.json",
+    }
+    missing_parents = [name for name, path in parent_paths.items() if not path.is_file()]
+    if missing_parents:
+        raise FileNotFoundError(f"Nested verifier parents are missing: {missing_parents}")
+    parent_artifact_sha256 = {
+        name: sha256_file(path) for name, path in parent_paths.items()
+    }
+    partition_count = min(int(config["hierarchical"]["verifier_crossfit_partitions"]), len(subjects))
+    if partition_count < 2:
+        raise RuntimeError("Nested verifier OOF requires at least two training subjects")
+    partitions = stacking_partitions(
+        subjects,
+        partition_count,
+        int(config["training"]["random_seed"]) + 200_000 + meta_partition,
+    )
+    proposal_partition = proposals["subject_key"].astype(str).map(partitions).to_numpy(dtype=int)
+    deep_event = np.zeros(len(proposals), dtype=np.float64)
+    deep_iou = np.zeros(len(proposals), dtype=np.float64)
+    logistic_score = np.zeros(len(proposals), dtype=np.float64)
+    artifacts: list[Path] = []
+    for partition in sorted(set(proposal_partition)):
+        holdout_indices = np.flatnonzero(proposal_partition == partition)
+        train_indices = np.flatnonzero(proposal_partition != partition)
+        training_subjects = set(proposals.iloc[train_indices]["subject_key"].astype(str))
+        prediction_subjects = set(proposals.iloc[holdout_indices]["subject_key"].astype(str))
+        _assert_nested_lineage(
+            training_subjects=training_subjects,
+            prediction_subjects=prediction_subjects,
+            globally_excluded_subjects=globally_excluded_subjects,
+        )
+        train_features = _slice_proposal_features(features, train_indices)
+        holdout_features = _slice_proposal_features(features, holdout_indices)
+        seed_predictions: list[tuple[np.ndarray, np.ndarray]] = []
+        for seed in config["verifier"]["seeds"]:
+            seed = int(seed)
+            model = _train_verifier_model_v4(
+                train_features,
+                categories[train_indices],
+                config,
+                seed=seed + meta_partition * 10_000 + partition * 100,
+                epochs=int(selected_epochs[seed]),
+            )
+            checkpoint = root / "verifier_oof" / f"partition_{partition}_seed_{seed}.pt"
+            _save_torch_atomic(
+                checkpoint,
+                {
+                    "model": model.state_dict(),
+                    "sequence_dim": features.sequence.shape[-1],
+                    "scalar_dim": features.scalar.shape[-1],
+                    "config": config["verifier"],
+                    "epochs": int(selected_epochs[seed]),
+                    "seed": seed,
+                    "training_subjects": sorted(training_subjects),
+                    "prediction_subjects": sorted(prediction_subjects),
+                    "globally_excluded_subjects": sorted(globally_excluded_subjects),
+                    "parent_artifact_sha256": parent_artifact_sha256,
+                    "state_calibration_source": "nested_meta_train_oof",
+                    "duration_prior_source": "nested_meta_training_truth",
+                },
+            )
+            artifacts.append(checkpoint)
+            seed_predictions.append(_infer_verifier_model(model, holdout_features, config))
+        deep_event[holdout_indices] = np.mean([value[0] for value in seed_predictions], axis=0)
+        deep_iou[holdout_indices] = np.mean([value[1] for value in seed_predictions], axis=0)
+        logistic = LogisticScoreCombiner.fit(
+            _verifier_matrix(train_features),
+            train_features.event_target,
+            sample_weight=train_features.sample_weight,
+        )
+        logistic_score[holdout_indices] = logistic.predict(_verifier_matrix(holdout_features))
+    scored = proposals.copy().reset_index(drop=True)
+    scored["stacking_partition"] = proposal_partition
+    scored["category"] = categories
+    scored["sample_weight"] = features.sample_weight
+    scored["event_logit"] = deep_event
+    scored["iou_logit"] = deep_iou
+    scored["predicted_iou"] = 1.0 / (1.0 + np.exp(-deep_iou))
+    scored["state_score"] = features.scalar[:, 2]
+    scored["logistic_score"] = logistic_score
+    return scored, artifacts
+
+
 def train_verifier_crossfit_v4(
+    run: HierarchicalRun,
+    config: dict[str, Any],
+    inputs: V4Inputs,
+) -> None:
+    run.require_stage("PROPOSALS_COMPLETE")
+    global_proposals = pd.read_parquet(run.root / "oof" / "proposals_labeled.parquet")
+    global_windows = pd.read_parquet(run.root / "oof" / "window_predictions.parquet")
+    global_features = build_proposal_features_v4(
+        global_proposals,
+        global_windows,
+        [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+        config["verifier"],
+    )
+    _assert_proposal_feature_alignment(
+        global_features, global_proposals, context="Final verifier training"
+    )
+    global_categories = classify_proposals(global_proposals)
+    partitions = run.payload["stacking_partitions"]
+    outer_train_subjects = set(partitions)
+    artifacts: list[Path] = []
+    scored_parts: list[pd.DataFrame] = []
+    selected_verifier_epochs: dict[int, list[int]] = {
+        int(seed): [] for seed in config["verifier"]["seeds"]
+    }
+    for partition in sorted(set(partitions.values())):
+        holdout_subjects = {
+            subject for subject, value in partitions.items() if int(value) == int(partition)
+        }
+        train_subjects = outer_train_subjects - holdout_subjects
+        nested_root, nested_artifacts = _prepare_nested_meta_cache(
+            run,
+            config,
+            inputs,
+            meta_partition=int(partition),
+            training_subjects=train_subjects,
+            holdout_subjects=holdout_subjects,
+        )
+        artifacts.extend(nested_artifacts)
+        train_proposals = pd.read_parquet(nested_root / "train_proposals_labeled.parquet")
+        train_windows = pd.read_parquet(nested_root / "train_window_predictions.parquet")
+        holdout_proposals = pd.read_parquet(nested_root / "holdout_proposals.parquet")
+        holdout_windows = pd.read_parquet(nested_root / "holdout_window_predictions.parquet")
+        nested_parent_paths = {
+            "nested_train_windows": nested_root / "train_window_predictions.parquet",
+            "nested_train_proposals": nested_root / "train_proposals_labeled.parquet",
+            "nested_holdout_windows": nested_root / "holdout_window_predictions.parquet",
+            "nested_holdout_proposals": nested_root / "holdout_proposals.parquet",
+            "state_calibration": nested_root / "state_calibration.json",
+            "duration_prior": nested_root / "duration_prior.json",
+        }
+        nested_parent_sha256 = {
+            name: sha256_file(path) for name, path in nested_parent_paths.items()
+        }
+        holdout_truth, holdout_ignore = partition_evaluation_events(
+            inputs.events, holdout_subjects
+        )
+        holdout_proposals = exclude_ignored_candidates(
+            label_event_candidates(holdout_proposals, holdout_truth, 0.25), holdout_ignore
+        )
+        train_features = build_proposal_features_v4(
+            train_proposals,
+            train_windows,
+            [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+            config["verifier"],
+        )
+        holdout_features = build_proposal_features_v4(
+            holdout_proposals,
+            holdout_windows,
+            [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+            config["verifier"],
+        )
+        _assert_proposal_feature_alignment(
+            train_features, train_proposals, context=f"Nested verifier train {partition}"
+        )
+        _assert_proposal_feature_alignment(
+            holdout_features, holdout_proposals, context=f"Nested verifier holdout {partition}"
+        )
+        categories = classify_proposals(train_proposals)
+        fit_subjects, selector_subjects = _selector_split(
+            train_subjects,
+            float(config["training"]["selector_fraction"]),
+            int(config["training"]["random_seed"]) + int(partition) + 60_000,
+        )
+        fit_indices = np.flatnonzero(
+            train_proposals["subject_key"].astype(str).isin(fit_subjects).to_numpy()
+        )
+        selector_indices = np.flatnonzero(
+            train_proposals["subject_key"].astype(str).isin(selector_subjects).to_numpy()
+        )
+        fit_features = _slice_proposal_features(train_features, fit_indices)
+        selector_features = _slice_proposal_features(train_features, selector_indices)
+        selector_proposals = train_proposals.iloc[selector_indices].reset_index(drop=True)
+        selector_truth, selector_ignore = partition_evaluation_events(
+            inputs.events, selector_subjects
+        )
+        selector_windows = train_windows[
+            train_windows["subject_key"].astype(str).isin(selector_subjects)
+        ]
+        selected_epochs: dict[int, int] = {}
+        holdout_seed_predictions: list[tuple[np.ndarray, np.ndarray]] = []
+        for seed in config["verifier"]["seeds"]:
+            seed = int(seed)
+            selected_epoch, selection_history = _select_verifier_epoch(
+                fit_features,
+                categories[fit_indices],
+                selector_features,
+                selector_proposals,
+                selector_truth,
+                selector_ignore,
+                selector_windows,
+                config,
+                seed=seed + int(partition) * 100,
+            )
+            selected_epochs[seed] = selected_epoch
+            selected_verifier_epochs[seed].append(selected_epoch)
+            model = _train_verifier_model_v4(
+                train_features,
+                categories,
+                config,
+                seed=seed + int(partition) * 100,
+                epochs=selected_epoch,
+            )
+            checkpoint = run.root / "verifier" / f"partition_{partition}_seed_{seed}.pt"
+            selector_path = (
+                run.root / "verifier" / f"partition_{partition}_seed_{seed}_selector.json"
+            )
+            _save_torch_atomic(
+                checkpoint,
+                {
+                    "model": model.state_dict(),
+                    "sequence_dim": train_features.sequence.shape[-1],
+                    "scalar_dim": train_features.scalar.shape[-1],
+                    "config": config["verifier"],
+                    "epochs": selected_epoch,
+                    "seed": seed,
+                    "training_subjects": sorted(train_subjects),
+                    "prediction_subjects": sorted(holdout_subjects),
+                    "globally_excluded_subjects": sorted(holdout_subjects),
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "parent_artifact_sha256": nested_parent_sha256,
+                    "state_calibration_source": "nested_meta_train_oof",
+                    "duration_prior_source": "nested_meta_training_truth",
+                },
+            )
+            write_json_atomic(
+                selector_path,
+                {
+                    "selected_epoch": selected_epoch,
+                    "history": selection_history,
+                    "training_subjects": sorted(train_subjects),
+                    "prediction_subjects": sorted(holdout_subjects),
+                    "globally_excluded_subjects": sorted(holdout_subjects),
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "parent_artifact_sha256": nested_parent_sha256,
+                    "state_calibration_source": "nested_meta_train_oof",
+                    "duration_prior_source": "nested_meta_training_truth",
+                },
+            )
+            artifacts.extend((checkpoint, selector_path))
+            holdout_seed_predictions.append(
+                _infer_verifier_model(model, holdout_features, config)
+            )
+        train_oof_scores, verifier_oof_artifacts = _nested_verifier_oof_scores(
+            nested_root,
+            train_proposals,
+            train_features,
+            categories,
+            selected_epochs,
+            config,
+            meta_partition=int(partition),
+            globally_excluded_subjects=holdout_subjects,
+        )
+        artifacts.extend(verifier_oof_artifacts)
+        calibration = ProposalCalibrationV4.fit(train_oof_scores)
+        calibration_path = nested_root / "proposal_calibration.json"
+        write_json_atomic(calibration_path, calibration.to_json())
+        calibration_lineage_path = nested_root / "proposal_calibration_lineage.json"
+        write_json_atomic(
+            calibration_lineage_path,
+            {
+                "protocol_version": "statsfusion-r2",
+                "training_subjects": sorted(train_subjects),
+                "prediction_subjects": sorted(holdout_subjects),
+                "globally_excluded_subjects": sorted(holdout_subjects),
+                "parent_artifact_sha256": {
+                    **nested_parent_sha256,
+                    **{
+                        checkpoint.relative_to(nested_root).as_posix(): sha256_file(checkpoint)
+                        for checkpoint in verifier_oof_artifacts
+                    },
+                },
+                "calibration_source": "nested_verifier_oof",
+            },
+        )
+        artifacts.extend((calibration_path, calibration_lineage_path))
+        logistic = LogisticScoreCombiner.fit(
+            _verifier_matrix(train_features),
+            train_features.event_target,
+            sample_weight=train_features.sample_weight,
+        )
+        holdout_scored = holdout_proposals.copy().reset_index(drop=True)
+        holdout_scored["stacking_partition"] = int(partition)
+        holdout_scored["category"] = classify_proposals(holdout_proposals)
+        holdout_scored["sample_weight"] = holdout_features.sample_weight
+        holdout_scored["event_logit"] = np.mean(
+            [value[0] for value in holdout_seed_predictions], axis=0
+        )
+        holdout_scored["iou_logit"] = np.mean(
+            [value[1] for value in holdout_seed_predictions], axis=0
+        )
+        holdout_scored["predicted_iou"] = 1.0 / (
+            1.0 + np.exp(-holdout_scored["iou_logit"])
+        )
+        holdout_scored["state_score"] = holdout_features.scalar[:, 2]
+        holdout_scored["logistic_score"] = logistic.predict(
+            _verifier_matrix(holdout_features)
+        )
+        holdout_scored = calibration.apply(holdout_scored)
+        scored_parts.append(holdout_scored)
+
+    scored = pd.concat(scored_parts, ignore_index=True).sort_values("proposal_id")
+    final_calibration = ProposalCalibrationV4.fit(scored)
+    logistic_final = LogisticScoreCombiner.fit(
+        _verifier_matrix(global_features),
+        global_features.event_target,
+        sample_weight=global_features.sample_weight,
+    )
+    outer_proposals = pd.read_parquet(run.root / "outer" / "proposals.parquet")
+    outer_windows = pd.read_parquet(run.root / "outer" / "window_predictions.parquet")
+    outer_features = build_proposal_features_v4(
+        outer_proposals,
+        outer_windows,
+        [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+        config["verifier"],
+    )
+    _assert_proposal_feature_alignment(
+        features=outer_features, frame=outer_proposals, context="Outer"
+    )
+    outer_seed_predictions: list[tuple[np.ndarray, np.ndarray]] = []
+    final_verifier_parent_sha256 = {
+        "oof_window_predictions": sha256_file(run.root / "oof" / "window_predictions.parquet"),
+        "oof_proposals_labeled": sha256_file(run.root / "oof" / "proposals_labeled.parquet"),
+    }
+    for seed in config["verifier"]["seeds"]:
+        seed = int(seed)
+        final_epochs = int(np.median(selected_verifier_epochs[seed]))
+        model = _train_verifier_model_v4(
+            global_features,
+            global_categories,
+            config,
+            seed=seed + 90_000,
+            epochs=final_epochs,
+        )
+        checkpoint = run.root / "verifier" / f"final_seed_{seed}.pt"
+        _save_torch_atomic(
+            checkpoint,
+            {
+                "model": model.state_dict(),
+                "sequence_dim": global_features.sequence.shape[-1],
+                "scalar_dim": global_features.scalar.shape[-1],
+                "config": config["verifier"],
+                "training_subjects": sorted(outer_train_subjects),
+                "prediction_subjects": sorted(set(run.payload["outer_test_subjects"])),
+                "globally_excluded_subjects": sorted(set(run.payload["outer_test_subjects"])),
+                "epochs": final_epochs,
+                "parent_artifact_sha256": final_verifier_parent_sha256,
+                "state_calibration_source": "outer_train_subject_crossfit_oof",
+                "duration_prior_source": "outer_train_truth",
+            },
+        )
+        artifacts.append(checkpoint)
+        if len(outer_proposals):
+            outer_seed_predictions.append(_infer_verifier_model(model, outer_features, config))
+    outer_scored = outer_proposals.copy().reset_index(drop=True)
+    if len(outer_scored):
+        outer_scored["event_logit"] = np.mean(
+            [value[0] for value in outer_seed_predictions], axis=0
+        )
+        outer_scored["iou_logit"] = np.mean(
+            [value[1] for value in outer_seed_predictions], axis=0
+        )
+        outer_scored["predicted_iou"] = 1.0 / (1.0 + np.exp(-outer_scored["iou_logit"]))
+        outer_scored["state_score"] = outer_features.scalar[:, 2]
+        outer_scored["logistic_score"] = logistic_final.predict(
+            _verifier_matrix(outer_features)
+        )
+        outer_scored = final_calibration.apply(outer_scored)
+    else:
+        for column in (
+            "event_logit",
+            "iou_logit",
+            "predicted_iou",
+            "state_score",
+            "logistic_score",
+            "calibrated_event_probability",
+            "calibrated_iou",
+            "final_score",
+        ):
+            outer_scored[column] = pd.Series(dtype=float)
+    evaluable, ignored = partition_evaluation_events(inputs.events, outer_train_subjects)
+    deep_point = _best_verifier_operating_point(
+        scored, evaluable, global_windows, "final_score", config, ignored
+    )
+    logistic_point = _best_verifier_operating_point(
+        scored, evaluable, global_windows, "logistic_score", config, ignored
+    )
+    matching_sensitivity: dict[str, dict[str, float]] = {}
+    for name, point, score_column in (
+        ("deep", deep_point, "final_score"),
+        ("logistic", logistic_point, "logistic_score"),
+    ):
+        accepted = _accepted_from_point(scored, point, score_column)
+        greedy, _ = evaluate_events(
+            evaluable, _prediction_events(accepted), method="greedy", ignore=ignored
+        )
+        matching_sensitivity[name] = {
+            "max_cardinality_f1": float(point["f1"]),
+            "greedy_f1": float(greedy["f1"]),
+        }
+    if _matching_ranking_reversal(
+        matching_sensitivity["deep"]["max_cardinality_f1"]
+        - matching_sensitivity["logistic"]["max_cardinality_f1"],
+        matching_sensitivity["deep"]["greedy_f1"]
+        - matching_sensitivity["logistic"]["greedy_f1"],
+        tolerance=float(config["calibration"].get("matching_reversal_tolerance", 0.005)),
+    ):
+        raise RuntimeError("Verifier ranking reverses between matching methods")
+    deep_passed = deep_point["f1"] >= logistic_point["f1"] + float(
+        config["promotion_gate"]["minimum_verifier_f1_improvement"]
+    ) or (
+        deep_point["f1"]
+        >= logistic_point["f1"]
+        - float(config["promotion_gate"]["maximum_verifier_f1_drop"])
+        and deep_point["fp_per_hour"]
+        <= logistic_point["fp_per_hour"]
+        * (1.0 - float(config["promotion_gate"]["minimum_verifier_fp_reduction"]))
+    )
+    preselection = {
+        "protocol_version": "statsfusion-r2",
+        "meta_crossfit_protocol": "fully_nested_v1",
+        "verifier_kind": "deep" if deep_passed else "logistic",
+        "deep": deep_point,
+        "logistic": logistic_point,
+        "deep_gate_passed": bool(deep_passed),
+        "matching_sensitivity": matching_sensitivity,
+    }
+    if not deep_passed:
+        scored["final_score"] = scored["logistic_score"]
+        outer_scored["final_score"] = outer_scored["logistic_score"]
+    score_path = run.root / "oof" / "proposal_scores.parquet"
+    outer_score_path = run.root / "outer" / "proposal_scores.parquet"
+    calibration_path = run.root / "verifier" / "proposal_calibration.json"
+    logistic_path = run.root / "verifier" / "logistic_verifier.json"
+    preselection_path = run.root / "verifier" / "preselection.json"
+    write_parquet_atomic(score_path, scored)
+    write_parquet_atomic(outer_score_path, outer_scored)
+    write_json_atomic(calibration_path, final_calibration.to_json())
+    write_json_atomic(logistic_path, logistic_final.to_json())
+    write_json_atomic(preselection_path, preselection)
+    artifacts.extend(
+        (score_path, outer_score_path, calibration_path, logistic_path, preselection_path)
+    )
+    run.transition("VERIFIER_COMPLETE", artifacts)
+
+
+def _train_verifier_crossfit_v4_r1_blocked(
     run: HierarchicalRun,
     config: dict[str, Any],
     inputs: V4Inputs,
@@ -1114,6 +2563,7 @@ def train_verifier_crossfit_v4(
         [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
         config["verifier"],
     )
+    _assert_proposal_feature_alignment(features, proposals, context="Verifier crossfit")
     categories = classify_proposals(proposals)
     partitions = run.payload["stacking_partitions"]
     proposal_partition = proposals["subject_key"].astype(str).map(partitions).to_numpy(dtype=int)
@@ -1121,6 +2571,9 @@ def train_verifier_crossfit_v4(
     deep_iou = np.zeros(len(proposals), dtype=np.float64)
     logistic_score = np.zeros(len(proposals), dtype=np.float64)
     artifacts: list[Path] = []
+    selected_verifier_epochs: dict[int, list[int]] = {
+        int(seed): [] for seed in config["verifier"]["seeds"]
+    }
     for partition in sorted(set(proposal_partition)):
         holdout_indices = np.flatnonzero(proposal_partition == partition)
         train_indices = np.flatnonzero(proposal_partition != partition)
@@ -1129,13 +2582,49 @@ def train_verifier_crossfit_v4(
         assert_disjoint_subjects(verifier_train=train_subjects, verifier_holdout=holdout_subjects)
         train_features = _slice_proposal_features(features, train_indices)
         holdout_features = _slice_proposal_features(features, holdout_indices)
+        fit_subjects, selector_subjects = _selector_split(
+            train_subjects,
+            float(config["training"]["selector_fraction"]),
+            int(config["training"]["random_seed"]) + partition + 60_000,
+        )
+        fit_local = np.flatnonzero(
+            proposals.iloc[train_indices]["subject_key"].astype(str).isin(fit_subjects).to_numpy()
+        )
+        selector_local = np.flatnonzero(
+            proposals.iloc[train_indices]["subject_key"]
+            .astype(str)
+            .isin(selector_subjects)
+            .to_numpy()
+        )
+        fit_features = _slice_proposal_features(train_features, fit_local)
+        selector_features = _slice_proposal_features(train_features, selector_local)
+        selector_proposals = (
+            proposals.iloc[train_indices].iloc[selector_local].reset_index(drop=True)
+        )
+        selector_truth, selector_ignore = partition_evaluation_events(
+            inputs.events, selector_subjects
+        )
+        selector_windows = windows[windows["subject_key"].astype(str).isin(selector_subjects)]
         seed_predictions: list[tuple[np.ndarray, np.ndarray]] = []
         for seed in config["verifier"]["seeds"]:
+            seed = int(seed)
+            selected_epoch, selection_history = _select_verifier_epoch(
+                fit_features,
+                categories[train_indices][fit_local],
+                selector_features,
+                selector_proposals,
+                selector_truth,
+                selector_ignore,
+                selector_windows,
+                config,
+                seed=seed + int(partition) * 100,
+            )
             model = _train_verifier_model_v4(
                 train_features,
                 categories[train_indices],
                 config,
-                seed=int(seed) + int(partition) * 100,
+                seed=seed + int(partition) * 100,
+                epochs=selected_epoch,
             )
             checkpoint = run.root / "verifier" / f"partition_{partition}_seed_{seed}.pt"
             _save_torch_atomic(
@@ -1147,8 +2636,25 @@ def train_verifier_crossfit_v4(
                     "config": config["verifier"],
                     "training_subjects": sorted(train_subjects),
                     "holdout_subjects": sorted(holdout_subjects),
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "epochs": selected_epoch,
                 },
             )
+            selector_path = (
+                run.root / "verifier" / f"partition_{partition}_seed_{seed}_selector.json"
+            )
+            write_json_atomic(
+                selector_path,
+                {
+                    "selected_epoch": selected_epoch,
+                    "history": selection_history,
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                },
+            )
+            artifacts.append(selector_path)
+            selected_verifier_epochs[seed].append(selected_epoch)
             artifacts.append(checkpoint)
             seed_predictions.append(_infer_verifier_model(model, holdout_features, config))
         deep_event[holdout_indices] = np.mean([value[0] for value in seed_predictions], axis=0)
@@ -1188,13 +2694,17 @@ def train_verifier_crossfit_v4(
         [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
         config["verifier"],
     )
+    _assert_proposal_feature_alignment(features=outer_features, frame=outer_proposals, context="Outer")
     outer_seed_predictions: list[tuple[np.ndarray, np.ndarray]] = []
     for seed in config["verifier"]["seeds"]:
+        seed = int(seed)
+        final_epochs = int(np.median(selected_verifier_epochs[seed]))
         model = _train_verifier_model_v4(
             features,
             categories,
             config,
-            seed=int(seed) + 90_000,
+            seed=seed + 90_000,
+            epochs=final_epochs,
         )
         checkpoint = run.root / "verifier" / f"final_seed_{seed}.pt"
         _save_torch_atomic(
@@ -1205,6 +2715,7 @@ def train_verifier_crossfit_v4(
                 "scalar_dim": features.scalar.shape[-1],
                 "config": config["verifier"],
                 "training_subjects": sorted(set(proposals["subject_key"].astype(str))),
+                "epochs": final_epochs,
             },
         )
         artifacts.append(checkpoint)
@@ -1215,14 +2726,10 @@ def train_verifier_crossfit_v4(
         outer_scored["event_logit"] = np.mean(
             [value[0] for value in outer_seed_predictions], axis=0
         )
-        outer_scored["iou_logit"] = np.mean(
-            [value[1] for value in outer_seed_predictions], axis=0
-        )
+        outer_scored["iou_logit"] = np.mean([value[1] for value in outer_seed_predictions], axis=0)
         outer_scored["predicted_iou"] = 1.0 / (1.0 + np.exp(-outer_scored["iou_logit"]))
         outer_scored["state_score"] = outer_features.scalar[:, 2]
-        outer_scored["logistic_score"] = logistic_final.predict(
-            _verifier_matrix(outer_features)
-        )
+        outer_scored["logistic_score"] = logistic_final.predict(_verifier_matrix(outer_features))
         outer_scored = final_calibration.apply(outer_scored)
     else:
         for column in (
@@ -1236,14 +2743,13 @@ def train_verifier_crossfit_v4(
             "final_score",
         ):
             outer_scored[column] = pd.Series(dtype=float)
-    evaluable = inputs.events[
-        inputs.events.get("evaluable", pd.Series(True, index=inputs.events.index)).fillna(False)
-    ]
+    training_subjects = set(proposals["subject_key"].astype(str))
+    evaluable, ignored = partition_evaluation_events(inputs.events, training_subjects)
     deep_point = _best_verifier_operating_point(
-        scored, evaluable, windows, "final_score", config
+        scored, evaluable, windows, "final_score", config, ignored
     )
     logistic_point = _best_verifier_operating_point(
-        scored, evaluable, windows, "logistic_score", config
+        scored, evaluable, windows, "logistic_score", config, ignored
     )
     matching_sensitivity: dict[str, dict[str, float]] = {}
     for name, point, score_column in (
@@ -1252,7 +2758,7 @@ def train_verifier_crossfit_v4(
     ):
         accepted = _accepted_from_point(scored, point, score_column)
         greedy, _ = evaluate_events(
-            evaluable, _prediction_events(accepted), method="greedy"
+            evaluable, _prediction_events(accepted), method="greedy", ignore=ignored
         )
         matching_sensitivity[name] = {
             "max_cardinality_f1": float(point["f1"]),
@@ -1261,25 +2767,18 @@ def train_verifier_crossfit_v4(
     if _matching_ranking_reversal(
         matching_sensitivity["deep"]["max_cardinality_f1"]
         - matching_sensitivity["logistic"]["max_cardinality_f1"],
-        matching_sensitivity["deep"]["greedy_f1"]
-        - matching_sensitivity["logistic"]["greedy_f1"],
+        matching_sensitivity["deep"]["greedy_f1"] - matching_sensitivity["logistic"]["greedy_f1"],
         tolerance=float(config["calibration"].get("matching_reversal_tolerance", 0.005)),
     ):
-        raise RuntimeError(
-            "Verifier ranking reverses between max-cardinality and greedy matching"
-        )
-    deep_passed = (
-        deep_point["f1"] >= logistic_point["f1"] + float(
-            config["promotion_gate"]["minimum_verifier_f1_improvement"]
-        )
-        or (
-            deep_point["f1"] >= logistic_point["f1"] - float(
-                config["promotion_gate"]["maximum_verifier_f1_drop"]
-            )
-            and deep_point["fp_per_hour"]
-            <= logistic_point["fp_per_hour"]
-            * (1.0 - float(config["promotion_gate"]["minimum_verifier_fp_reduction"]))
-        )
+        raise RuntimeError("Verifier ranking reverses between max-cardinality and greedy matching")
+    deep_passed = deep_point["f1"] >= logistic_point["f1"] + float(
+        config["promotion_gate"]["minimum_verifier_f1_improvement"]
+    ) or (
+        deep_point["f1"]
+        >= logistic_point["f1"] - float(config["promotion_gate"]["maximum_verifier_f1_drop"])
+        and deep_point["fp_per_hour"]
+        <= logistic_point["fp_per_hour"]
+        * (1.0 - float(config["promotion_gate"]["minimum_verifier_fp_reduction"]))
     )
     preselection = {
         "verifier_kind": "deep" if deep_passed else "logistic",
@@ -1288,6 +2787,9 @@ def train_verifier_crossfit_v4(
         "deep_gate_passed": bool(deep_passed),
         "matching_sensitivity": matching_sensitivity,
     }
+    if not deep_passed:
+        scored["final_score"] = scored["logistic_score"]
+        outer_scored["final_score"] = outer_scored["logistic_score"]
     score_path = run.root / "oof" / "proposal_scores.parquet"
     outer_score_path = run.root / "outer" / "proposal_scores.parquet"
     calibration_path = run.root / "verifier" / "proposal_calibration.json"
@@ -1305,14 +2807,22 @@ def train_verifier_crossfit_v4(
 
 
 def _accepted_from_point(
-    scores: pd.DataFrame, point: dict[str, Any], score_column: str
+    scores: pd.DataFrame,
+    point: dict[str, Any],
+    score_column: str,
+    minimum_gap_seconds: int = 3,
 ) -> pd.DataFrame:
     selected = scores[scores[score_column] >= float(point["acceptance_threshold"])]
     if selected.empty:
         return selected.copy()
     return pd.concat(
         [
-            _nms(group, float(point["nms_iou_threshold"]), score_column)
+            _gap_aware_nms(
+                group,
+                float(point["nms_iou_threshold"]),
+                score_column,
+                minimum_gap_seconds,
+            )
             for _, group in selected.groupby(["subject_key", "session_id"], sort=False)
         ],
         ignore_index=True,
@@ -1324,6 +2834,7 @@ def _train_endpoint_model(
     config: dict[str, Any],
     *,
     seed: int,
+    epochs: int | None = None,
 ) -> EndpointRefiner:
     torch.manual_seed(seed)
     device = _device(config)
@@ -1335,9 +2846,18 @@ def _train_endpoint_model(
     )
     rng = np.random.default_rng(seed)
     batch_size = int(config["boundary"]["batch_size"])
-    for _ in range(int(config["boundary"]["max_epochs"])):
+    maximum_epochs = int(epochs or config["boundary"]["max_epochs"])
+    progress = tqdm(
+        range(maximum_epochs),
+        desc=f"boundary seed={seed}",
+        unit="epoch",
+        dynamic_ncols=True,
+    )
+    for _ in progress:
         order = rng.permutation(len(features.sample_ids))
         model.train()
+        epoch_loss_total = torch.zeros((), device=device)
+        epoch_steps = 0
         for start in range(0, len(order), batch_size):
             indices = order[start : start + batch_size]
             batch = {
@@ -1348,13 +2868,98 @@ def _train_endpoint_model(
                 "start_target": torch.from_numpy(features.start_target[indices]).to(device),
                 "end_target": torch.from_numpy(features.end_target[indices]).to(device),
                 "sample_weight": torch.from_numpy(features.sample_weight[indices]).to(device),
+                "start_weight": torch.from_numpy(features.start_weight[indices]).to(device),
+                "end_weight": torch.from_numpy(features.end_weight[indices]).to(device),
+            }
+            output = model(batch)
+            loss, _ = endpoint_loss(output, batch)
+            epoch_loss_total += loss.detach()
+            epoch_steps += 1
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            optimizer.step()
+        progress.set_postfix(loss=f"{float(epoch_loss_total.cpu()) / max(epoch_steps, 1):.4f}")
+    return model
+
+
+def _select_boundary_epoch(
+    fit_features,
+    selector_features,
+    config: dict[str, Any],
+    *,
+    seed: int,
+) -> tuple[int, list[dict[str, float]]]:
+    if not len(fit_features.sample_ids) or not len(selector_features.sample_ids):
+        raise ValueError("Boundary selector requires non-empty fit and selector samples")
+    torch.manual_seed(seed)
+    device = _device(config)
+    model = EndpointRefiner(fit_features.start_sequence.shape[-1], config["boundary"]).to(device)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(config["boundary"]["learning_rate"]),
+        weight_decay=float(config["boundary"]["weight_decay"]),
+    )
+    rng = np.random.default_rng(seed)
+    batch_size = int(config["boundary"]["batch_size"])
+    patience_limit = int(config["boundary"]["patience"])
+    best_epoch = 1
+    best_mae = math.inf
+    patience = 0
+    history: list[dict[str, float]] = []
+    for epoch in range(1, int(config["boundary"]["max_epochs"]) + 1):
+        order = rng.permutation(len(fit_features.sample_ids))
+        model.train()
+        for start in range(0, len(order), batch_size):
+            indices = order[start : start + batch_size]
+            batch = {
+                "start_sequence": torch.from_numpy(fit_features.start_sequence[indices]).to(device),
+                "end_sequence": torch.from_numpy(fit_features.end_sequence[indices]).to(device),
+                "start_mask": torch.from_numpy(fit_features.start_mask[indices]).to(device),
+                "end_mask": torch.from_numpy(fit_features.end_mask[indices]).to(device),
+                "start_target": torch.from_numpy(fit_features.start_target[indices]).to(device),
+                "end_target": torch.from_numpy(fit_features.end_target[indices]).to(device),
+                "sample_weight": torch.from_numpy(fit_features.sample_weight[indices]).to(device),
+                "start_weight": torch.from_numpy(fit_features.start_weight[indices]).to(device),
+                "end_weight": torch.from_numpy(fit_features.end_weight[indices]).to(device),
             }
             output = model(batch)
             loss, _ = endpoint_loss(output, batch)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
-    return model
+        predicted = _infer_endpoint_model(model, selector_features, config)
+        errors: list[np.ndarray] = []
+        for predicted_offset, target, endpoint_weight, grid in (
+            (
+                predicted[0],
+                selector_features.start_target,
+                selector_features.start_weight,
+                selector_features.start_offsets_seconds,
+            ),
+            (
+                predicted[1],
+                selector_features.end_target,
+                selector_features.end_weight,
+                selector_features.end_offsets_seconds,
+            ),
+        ):
+            valid = endpoint_weight > 0
+            target_offset = (target * grid[None, :]).sum(axis=1)
+            errors.append(np.abs(predicted_offset[valid] - target_offset[valid]))
+        finite_errors = np.concatenate([value[np.isfinite(value)] for value in errors])
+        mae = float(finite_errors.mean()) if len(finite_errors) else math.inf
+        history.append({"epoch": float(epoch), "endpoint_mae_seconds": mae})
+        if np.isfinite(mae) and mae < best_mae - 1e-9:
+            best_mae = mae
+            best_epoch = epoch
+            patience = 0
+        else:
+            patience += 1
+        if patience >= patience_limit:
+            break
+    if not np.isfinite(best_mae):
+        raise RuntimeError("Boundary selector never produced a finite endpoint MAE")
+    return best_epoch, history
 
 
 @torch.no_grad()
@@ -1368,7 +2973,13 @@ def _infer_endpoint_model(model, features, config: dict[str, Any]):
     end_entropies: list[np.ndarray] = []
     start_grid = torch.from_numpy(features.start_offsets_seconds).to(device)
     end_grid = torch.from_numpy(features.end_offsets_seconds).to(device)
-    for first in range(0, len(features.sample_ids), batch_size):
+    for first in tqdm(
+        range(0, len(features.sample_ids), batch_size),
+        desc="boundary inference",
+        unit="batch",
+        leave=False,
+        dynamic_ncols=True,
+    ):
         selected = slice(first, first + batch_size)
         batch = {
             "start_sequence": torch.from_numpy(features.start_sequence[selected]).to(device),
@@ -1381,11 +2992,13 @@ def _infer_endpoint_model(model, features, config: dict[str, Any]):
             output["start_logit"],
             start_grid,
             int(config["boundary"]["local_softargmax_radius_bins"]),
+            batch["start_mask"],
         )
         end_offset, end_entropy = local_soft_argmax(
             output["end_logit"],
             end_grid,
             int(config["boundary"]["local_softargmax_radius_bins"]),
+            batch["end_mask"],
         )
         start_offsets.append(start_offset.cpu().numpy())
         end_offsets.append(end_offset.cpu().numpy())
@@ -1431,13 +3044,26 @@ def train_boundary_crossfit_v4(
     artifacts: list[Path] = []
     outputs: list[pd.DataFrame] = []
     disabled_reason: str | None = None
+    selected_boundary_epochs: dict[int, list[int]] = {
+        int(seed): [] for seed in config["boundary"]["seeds"]
+    }
     for partition in sorted(set(partitions.values())):
-        train = positive[
-            positive["subject_key"].astype(str).map(partitions) != partition
-        ].copy()
-        holdout = accepted[
-            accepted["subject_key"].astype(str).map(partitions) == partition
-        ].copy()
+        holdout_subjects = {
+            subject for subject, value in partitions.items() if int(value) == int(partition)
+        }
+        nested_root = run.root / "nested" / f"meta_{partition}"
+        lineage_path = nested_root / "lineage.json"
+        if not lineage_path.is_file():
+            raise FileNotFoundError(f"Nested meta cache is missing for partition {partition}")
+        lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+        if set(lineage.get("globally_excluded_subjects", [])) != holdout_subjects:
+            raise RuntimeError("Boundary nested cache exclusion does not match its holdout")
+        nested_train = pd.read_parquet(nested_root / "train_proposals_labeled.parquet")
+        train = nested_train[nested_train["max_iou"] > 0.25].copy()
+        train = _attach_truth_boundaries(train, inputs.events)
+        holdout = accepted[accepted["subject_key"].astype(str).map(partitions) == partition].copy()
+        train_windows = pd.read_parquet(nested_root / "train_window_predictions.parquet")
+        holdout_windows = pd.read_parquet(nested_root / "holdout_window_predictions.parquet")
         independent_events = train["matched_event_id"].nunique()
         if independent_events < minimum_events:
             disabled_reason = (
@@ -1460,10 +3086,53 @@ def train_boundary_crossfit_v4(
             minimum_seconds=int(config["boundary"]["minimum_range_seconds"]),
             maximum_seconds=int(config["boundary"]["maximum_range_seconds"]),
         )
-        if boundary_range.clipped_fraction > float(
-            config["boundary"]["maximum_clipped_fraction"]
-        ):
+        if boundary_range.clipped_fraction > float(config["boundary"]["maximum_clipped_fraction"]):
             raise RuntimeError("Boundary residual clipping exceeds 5%; repair candidates first")
+        train_subjects = set(train["subject_key"].astype(str))
+        fit_subjects, selector_subjects = _selector_split(
+            train_subjects,
+            float(config["training"]["selector_fraction"]),
+            int(config["training"]["random_seed"]) + partition + 70_000,
+        )
+        fit_positive = train[train["subject_key"].astype(str).isin(fit_subjects)]
+        selector_positive = train[train["subject_key"].astype(str).isin(selector_subjects)]
+        selection_start_residual = (
+            fit_positive["truth_start_ms"].to_numpy(dtype=float)
+            - fit_positive["coarse_start_ms"].to_numpy(dtype=float)
+        ) / 1000.0
+        selection_end_residual = (
+            fit_positive["truth_end_ms"].to_numpy(dtype=float)
+            - fit_positive["coarse_end_ms"].to_numpy(dtype=float)
+        ) / 1000.0
+        selection_range = select_boundary_range(
+            selection_start_residual,
+            selection_end_residual,
+            quantile=float(config["boundary"]["residual_quantile"]),
+            minimum_seconds=int(config["boundary"]["minimum_range_seconds"]),
+            maximum_seconds=int(config["boundary"]["maximum_range_seconds"]),
+        )
+        fit_features = build_endpoint_features(
+            augment_boundary_training_proposals(
+                fit_positive,
+                maximum_jitters_per_event=int(config["boundary"]["maximum_jitters_per_event"]),
+                jitter_seconds=int(config["boundary"]["jitter_seconds"]),
+            ),
+            train_windows,
+            [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+            selection_range,
+            config["boundary"],
+        )
+        selector_features = build_endpoint_features(
+            augment_boundary_training_proposals(
+                selector_positive,
+                maximum_jitters_per_event=int(config["boundary"]["maximum_jitters_per_event"]),
+                jitter_seconds=int(config["boundary"]["jitter_seconds"]),
+            ),
+            train_windows,
+            [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+            selection_range,
+            config["boundary"],
+        )
         augmented = augment_boundary_training_proposals(
             train,
             maximum_jitters_per_event=int(config["boundary"]["maximum_jitters_per_event"]),
@@ -1471,23 +3140,42 @@ def train_boundary_crossfit_v4(
         )
         train_features = build_endpoint_features(
             augmented,
-            windows,
+            train_windows,
             [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
             boundary_range,
             config["boundary"],
         )
         holdout_features = build_endpoint_features(
             holdout,
-            windows,
+            holdout_windows,
             [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
             boundary_range,
             config["boundary"],
         )
+        boundary_parent_paths = {
+            "nested_train_windows": nested_root / "train_window_predictions.parquet",
+            "nested_train_proposals": nested_root / "train_proposals_labeled.parquet",
+            "nested_holdout_windows": nested_root / "holdout_window_predictions.parquet",
+            "oof_proposal_scores": run.root / "oof" / "proposal_scores.parquet",
+            "verifier_preselection": run.root / "verifier" / "preselection.json",
+        }
+        boundary_parent_sha256 = {
+            name: sha256_file(path) for name, path in boundary_parent_paths.items()
+        }
         seed_outputs: dict[int, tuple[np.ndarray, ...]] = {}
         for seed in config["boundary"]["seeds"]:
             seed = int(seed)
+            selected_epoch, selection_history = _select_boundary_epoch(
+                fit_features,
+                selector_features,
+                config,
+                seed=seed + partition * 100,
+            )
             model = _train_endpoint_model(
-                train_features, config, seed=seed + partition * 100
+                train_features,
+                config,
+                seed=seed + partition * 100,
+                epochs=selected_epoch,
             )
             checkpoint = run.root / "boundary" / f"partition_{partition}_seed_{seed}.pt"
             _save_torch_atomic(
@@ -1498,8 +3186,36 @@ def train_boundary_crossfit_v4(
                     "config": config["boundary"],
                     "range": boundary_range.__dict__,
                     "training_subjects": sorted(set(train["subject_key"].astype(str))),
+                    "prediction_subjects": sorted(holdout_subjects),
+                    "globally_excluded_subjects": sorted(holdout_subjects),
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "epochs": selected_epoch,
+                    "parent_artifact_sha256": boundary_parent_sha256,
+                    "state_calibration_source": "nested_meta_train_oof",
+                    "duration_prior_source": "nested_meta_training_truth",
                 },
             )
+            selector_path = (
+                run.root / "boundary" / f"partition_{partition}_seed_{seed}_selector.json"
+            )
+            write_json_atomic(
+                selector_path,
+                {
+                    "selected_epoch": selected_epoch,
+                    "history": selection_history,
+                    "training_subjects": sorted(set(train["subject_key"].astype(str))),
+                    "prediction_subjects": sorted(holdout_subjects),
+                    "globally_excluded_subjects": sorted(holdout_subjects),
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "parent_artifact_sha256": boundary_parent_sha256,
+                    "state_calibration_source": "nested_meta_train_oof",
+                    "duration_prior_source": "nested_meta_training_truth",
+                },
+            )
+            artifacts.append(selector_path)
+            selected_boundary_epochs[seed].append(selected_epoch)
             artifacts.append(checkpoint)
             seed_outputs[seed] = _infer_endpoint_model(model, holdout_features, config)
         holdout_output = holdout[["proposal_id"]].copy()
@@ -1554,9 +3270,7 @@ def train_boundary_crossfit_v4(
         minimum_seconds=int(config["boundary"]["minimum_range_seconds"]),
         maximum_seconds=int(config["boundary"]["maximum_range_seconds"]),
     )
-    if final_range.clipped_fraction > float(
-        config["boundary"]["maximum_clipped_fraction"]
-    ):
+    if final_range.clipped_fraction > float(config["boundary"]["maximum_clipped_fraction"]):
         raise RuntimeError("Final boundary residual clipping exceeds 5%; repair candidates first")
     final_augmented = augment_boundary_training_proposals(
         positive,
@@ -1581,9 +3295,17 @@ def train_boundary_crossfit_v4(
         config["boundary"],
     )
     outer_seed_outputs: dict[int, tuple[np.ndarray, ...]] = {}
+    final_boundary_parent_sha256 = {
+        "oof_window_predictions": sha256_file(run.root / "oof" / "window_predictions.parquet"),
+        "oof_proposal_scores": sha256_file(run.root / "oof" / "proposal_scores.parquet"),
+        "verifier_preselection": sha256_file(run.root / "verifier" / "preselection.json"),
+    }
     for seed in config["boundary"]["seeds"]:
         seed = int(seed)
-        model = _train_endpoint_model(final_features, config, seed=seed + 90_000)
+        final_epochs = int(np.median(selected_boundary_epochs[seed]))
+        model = _train_endpoint_model(
+            final_features, config, seed=seed + 90_000, epochs=final_epochs
+        )
         checkpoint = run.root / "boundary" / f"final_seed_{seed}.pt"
         _save_torch_atomic(
             checkpoint,
@@ -1592,6 +3314,13 @@ def train_boundary_crossfit_v4(
                 "input_dim": final_features.start_sequence.shape[-1],
                 "config": config["boundary"],
                 "range": final_range.__dict__,
+                "epochs": final_epochs,
+                "training_subjects": sorted(set(positive["subject_key"].astype(str))),
+                "prediction_subjects": sorted(set(run.payload["outer_test_subjects"])),
+                "globally_excluded_subjects": sorted(set(run.payload["outer_test_subjects"])),
+                "parent_artifact_sha256": final_boundary_parent_sha256,
+                "state_calibration_source": "outer_train_subject_crossfit_oof",
+                "duration_prior_source": "outer_train_truth",
             },
         )
         artifacts.append(checkpoint)
@@ -1656,9 +3385,13 @@ def _seeded_boundary_scores(frame: pd.DataFrame, seed: int) -> pd.DataFrame:
     return output
 
 
-def _hand_metrics(events: pd.DataFrame, predictions: pd.DataFrame) -> dict[str, float]:
+def _hand_metrics(
+    events: pd.DataFrame,
+    predictions: pd.DataFrame,
+    ignore: pd.DataFrame | None = None,
+) -> dict[str, float]:
     overall, matches = evaluate_events(
-        events, predictions, method="max_cardinality_iou"
+        events, predictions, method="max_cardinality_iou", ignore=ignore
     )
     output: dict[str, float] = {}
     for relation in ("same", "different"):
@@ -1674,9 +3407,7 @@ def _hand_metrics(events: pd.DataFrame, predictions: pd.DataFrame) -> dict[str, 
             if np.isfinite(sensitivity) and precision + sensitivity > 0
             else float("nan")
         )
-        relation_matches = matches[
-            matches.get("hand_relation", pd.Series(dtype=str)) == relation
-        ]
+        relation_matches = matches[matches.get("hand_relation", pd.Series(dtype=str)) == relation]
         output[f"{relation}_start_mae_seconds"] = (
             float(relation_matches["start_absolute_error_ms"].mean() / 1000.0)
             if len(relation_matches)
@@ -1691,7 +3422,10 @@ def _hand_metrics(events: pd.DataFrame, predictions: pd.DataFrame) -> dict[str, 
 
 
 def _per_subject_metrics_v4(
-    events: pd.DataFrame, predictions: pd.DataFrame, windows: pd.DataFrame
+    events: pd.DataFrame,
+    predictions: pd.DataFrame,
+    windows: pd.DataFrame,
+    ignore: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     subjects = sorted(
@@ -1702,15 +3436,19 @@ def _per_subject_metrics_v4(
         truth = events[events["subject_key"].astype(str) == subject]
         predicted = predictions[predictions["subject_key"].astype(str) == subject]
         observed = windows[windows["subject_key"].astype(str) == subject]
-        metrics, _ = evaluate_events(truth, predicted, method="max_cardinality_iou")
+        subject_ignore = (
+            ignore[ignore["subject_key"].astype(str) == subject] if ignore is not None else None
+        )
+        metrics, _ = evaluate_events(
+            truth, predicted, method="max_cardinality_iou", ignore=subject_ignore
+        )
         rows.append(
             {
                 "subject_key": subject,
                 **metrics,
-                **_hand_metrics(truth, predicted),
+                **_hand_metrics(truth, predicted, subject_ignore),
                 "observed_hours": _observed_hours(observed),
-                "fp_per_hour": metrics["false_positive"]
-                / max(_observed_hours(observed), 1e-9),
+                "fp_per_hour": metrics["false_positive"] / max(_observed_hours(observed), 1e-9),
             }
         )
     return pd.DataFrame(rows)
@@ -1731,12 +3469,11 @@ def select_v4_pipeline(
     score_column = "final_score" if verifier_kind == "deep" else "logistic_score"
     point = preselection[verifier_kind]
     accepted = _accepted_from_point(scores, point, score_column)
-    truth = inputs.events[
-        inputs.events.get("evaluable", pd.Series(True, index=inputs.events.index)).fillna(False)
-    ]
+    subjects = set(scores["subject_key"].astype(str))
+    truth, ignore = partition_evaluation_events(inputs.events, subjects)
     coarse_predictions = _prediction_events(accepted)
     coarse_metrics, coarse_matches = evaluate_events(
-        truth, coarse_predictions, method="max_cardinality_iou"
+        truth, coarse_predictions, method="max_cardinality_iou", ignore=ignore
     )
     boundary_status = json.loads(
         (run.root / "boundary" / "status.json").read_text(encoding="utf-8")
@@ -1759,9 +3496,7 @@ def select_v4_pipeline(
         for seed in config["boundary"]["seeds"]:
             seed = int(seed)
             seeded = _seeded_boundary_scores(boundary_scores, seed)
-            candidates: list[
-                tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame, float]
-            ] = []
+            candidates: list[tuple[float, dict[str, float], pd.DataFrame, pd.DataFrame, float]] = []
             for threshold in config["boundary"]["entropy_thresholds"]:
                 seed_refined = _refine_from_scores(
                     accepted,
@@ -1776,7 +3511,7 @@ def select_v4_pipeline(
                     }
                 )[["subject_key", "start_ms", "end_ms", "proposal_id"]]
                 seed_metrics, seed_matches = evaluate_events(
-                    truth, seed_predictions, method="max_cardinality_iou"
+                    truth, seed_predictions, method="max_cardinality_iou", ignore=ignore
                 )
                 seed_mae = np.nanmean(
                     [
@@ -1818,41 +3553,77 @@ def select_v4_pipeline(
             refined_matches.get("prediction_event_id", pd.Series(dtype=str)).astype(str)
         )
         lost_fraction = len(coarse_ids - refined_ids) / max(len(coarse_ids), 1)
-        seed_consistency_passed = seed_improvements >= min(
-            2, len(config["boundary"]["seeds"])
-        )
+        seed_consistency_passed = seed_improvements >= min(2, len(config["boundary"]["seeds"]))
+        hand_gate: dict[str, Any] = {}
+        hand_gate_passed = True
+        for relation in ("same", "different"):
+            coarse_relation = coarse_matches[
+                coarse_matches.get("hand_relation", pd.Series(dtype=str)) == relation
+            ]
+            refined_relation = refined_matches[
+                refined_matches.get("hand_relation", pd.Series(dtype=str)) == relation
+            ]
+            enough = len(coarse_relation) >= 5 and len(refined_relation) >= 5
+            mae_checks: dict[str, bool] = {}
+            for endpoint in ("start", "end"):
+                column = f"{endpoint}_absolute_error_ms"
+                coarse_value = (
+                    float(coarse_relation[column].mean()) if len(coarse_relation) else float("nan")
+                )
+                refined_value = (
+                    float(refined_relation[column].mean())
+                    if len(refined_relation)
+                    else float("nan")
+                )
+                mae_checks[endpoint] = bool(
+                    np.isfinite(coarse_value)
+                    and np.isfinite(refined_value)
+                    and refined_value <= coarse_value * 1.05
+                )
+            relation_passed = enough and all(mae_checks.values())
+            hand_gate_passed &= relation_passed
+            hand_gate[relation] = {
+                "matched_events": len(refined_relation),
+                "minimum_matched_events": 5,
+                "start_mae_not_worse_than_5pct": mae_checks["start"],
+                "end_mae_not_worse_than_5pct": mae_checks["end"],
+                "passed": relation_passed,
+            }
         boundary_passed = (
             refined_mae
             <= coarse_mae
-            * (
-                1.0
-                - float(
-                    config["promotion_gate"]["minimum_boundary_mae_improvement"]
-                )
-            )
+            * (1.0 - float(config["promotion_gate"]["minimum_boundary_mae_improvement"]))
             and refined_metrics["f1"]
             >= coarse_metrics["f1"] - float(config["promotion_gate"]["maximum_boundary_f1_drop"])
             and lost_fraction <= float(config["promotion_gate"]["maximum_tp_to_fp_fraction"])
             and seed_consistency_passed
+            and hand_gate_passed
         )
         if not boundary_passed:
             refined_predictions = coarse_predictions
             refined_metrics = coarse_metrics
             selected_entropy = None
             selected_boundary_seed = None
-    greedy_metrics, _ = evaluate_events(truth, refined_predictions, method="greedy")
+    greedy_metrics, _ = evaluate_events(truth, refined_predictions, method="greedy", ignore=ignore)
     metrics = {
-        "coarse": {**coarse_metrics, **_hand_metrics(truth, coarse_predictions)},
-        "selected": {**refined_metrics, **_hand_metrics(truth, refined_predictions)},
+        "coarse": {**coarse_metrics, **_hand_metrics(truth, coarse_predictions, ignore)},
+        "selected": {**refined_metrics, **_hand_metrics(truth, refined_predictions, ignore)},
         "greedy_selected": greedy_metrics,
         "fp_per_hour": refined_metrics["false_positive"] / max(_observed_hours(windows), 1e-9),
         "boundary_gate_passed": bool(boundary_passed),
         "boundary_seed_consistency": boundary_seed_results,
+        "boundary_hand_gate": hand_gate if boundary_status["enabled"] else {},
     }
     selection = {
         "schema_version": 4,
+        "protocol_version": "statsfusion-r2",
+        "anchor_semantics": "right_endpoint_half_open",
+        "masking_protocol": "zero_mask_layernorm_v1",
+        "candidate_budget_scope": "session",
+        "meta_crossfit_protocol": "fully_nested_v1",
+        "minimum_event_gap_seconds": int(config["boundary"]["safety_gap_seconds"]),
         "verifier_kind": verifier_kind,
-        "score_column": score_column,
+        "score_column": "final_score",
         "acceptance_threshold": float(point["acceptance_threshold"]),
         "nms_iou_threshold": float(point["nms_iou_threshold"]),
         "boundary_enabled": bool(boundary_passed),
@@ -1886,12 +3657,11 @@ def evaluate_v4_outer(
             "nms_iou_threshold": selection["nms_iou_threshold"],
         },
         selection["score_column"],
+        int(selection.get("minimum_event_gap_seconds", 3)),
     )
     if selection["boundary_enabled"]:
         boundary_scores = pd.read_parquet(run.root / "outer" / "boundary_scores.parquet")
-        boundary_scores = _seeded_boundary_scores(
-            boundary_scores, int(selection["boundary_seed"])
-        )
+        boundary_scores = _seeded_boundary_scores(boundary_scores, int(selection["boundary_seed"]))
         refined = _refine_from_scores(
             accepted,
             boundary_scores,
@@ -1905,18 +3675,17 @@ def evaluate_v4_outer(
         predictions = accepted.rename(
             columns={"coarse_start_ms": "start_ms", "coarse_end_ms": "end_ms"}
         )[["subject_key", "start_ms", "end_ms", "proposal_id", "final_score"]]
-    truth = outer_inputs.events[
-        outer_inputs.events.get(
-            "evaluable", pd.Series(True, index=outer_inputs.events.index)
-        ).fillna(False)
-    ]
-    max_metrics, matches = evaluate_events(
-        truth, predictions, method="max_cardinality_iou"
+    outer_subjects = set(predictions["subject_key"].astype(str)) | set(
+        outer_inputs.events["subject_key"].astype(str)
     )
-    greedy_metrics, _ = evaluate_events(truth, predictions, method="greedy")
+    truth, ignore = partition_evaluation_events(outer_inputs.events, outer_subjects)
+    max_metrics, matches = evaluate_events(
+        truth, predictions, method="max_cardinality_iou", ignore=ignore
+    )
+    greedy_metrics, _ = evaluate_events(truth, predictions, method="greedy", ignore=ignore)
     windows = pd.read_parquet(run.root / "outer" / "window_predictions.parquet")
     outer_window_labels = outer_inputs.anchors[
-        ["subject_key", "session_id", "timestamp_ms", "state_target"]
+        ["subject_key", "session_id", "timestamp_ms", "state_target", "state_loss_mask"]
     ]
     calibrated_windows = windows.merge(
         outer_window_labels,
@@ -1924,15 +3693,19 @@ def evaluate_v4_outer(
         how="left",
         validate="one_to_one",
     )
-    if calibrated_windows["state_target"].isna().any():
+    if calibrated_windows[["state_target", "state_loss_mask"]].isna().any().any():
         raise RuntimeError("Outer state predictions failed to align with evaluation labels")
+    calibration_windows, calibration_counts = _evaluable_state_calibration_rows(
+        calibrated_windows
+    )
     outer_calibration = state_calibration_metrics(
-        calibrated_windows["state_target"].to_numpy(),
-        calibrated_windows["state_logit"].to_numpy(),
-        calibrated_windows["state_probability"].to_numpy(),
+        calibration_windows["state_target"].to_numpy(),
+        calibration_windows["state_logit"].to_numpy(),
+        calibration_windows["state_probability"].to_numpy(),
         low_threshold=float(config["decoder"]["low_threshold"]),
         bins=int(config["calibration"]["ece_bins"]),
     )
+    outer_calibration.update(calibration_counts)
     state_only_point = json.loads(
         (run.root / "decoder" / "candidate_metrics.json").read_text(encoding="utf-8")
     )
@@ -1947,7 +3720,7 @@ def evaluate_v4_outer(
     )
     state_only_predictions = _prediction_events(state_only_accepted)
     state_only_metrics, _ = evaluate_events(
-        truth, state_only_predictions, method="max_cardinality_iou"
+        truth, state_only_predictions, method="max_cardinality_iou", ignore=ignore
     )
     outer_candidate_metrics = _candidate_recall(state_only_proposals, truth)
     outer_candidate_metrics.update(
@@ -1961,28 +3734,28 @@ def evaluate_v4_outer(
     metrics = {
         "max_cardinality_iou": max_metrics,
         "greedy": greedy_metrics,
-        "hand": _hand_metrics(truth, predictions),
+        "hand": _hand_metrics(truth, predictions, ignore),
         "fp_per_hour": max_metrics["false_positive"] / max(_observed_hours(windows), 1e-9),
         "state_calibration": outer_calibration,
         "candidate": outer_candidate_metrics,
         "state_only": {
             **state_only_metrics,
-            **_hand_metrics(truth, state_only_predictions),
+            **_hand_metrics(truth, state_only_predictions, ignore),
             "fp_per_hour": state_only_metrics["false_positive"]
             / max(_observed_hours(windows), 1e-9),
         },
     }
     matched_truth = set(matches.get("event_id", pd.Series(dtype=str)).astype(str))
-    matched_prediction = set(
-        matches.get("prediction_event_id", pd.Series(dtype=str)).astype(str)
-    )
+    matched_prediction = set(matches.get("prediction_event_id", pd.Series(dtype=str)).astype(str))
+    ignored_mask = prediction_ignore_mask(predictions, ignore)
+    ignored_predictions = predictions.loc[ignored_mask].copy()
     failures = pd.concat(
         (
             truth.loc[~truth["event_id"].astype(str).isin(matched_truth)].assign(
                 failure_type="false_negative"
             ),
             predictions.loc[
-                ~predictions["proposal_id"].astype(str).isin(matched_prediction)
+                ~predictions["proposal_id"].astype(str).isin(matched_prediction) & ~ignored_mask
             ].assign(failure_type="false_positive"),
         ),
         ignore_index=True,
@@ -1993,9 +3766,8 @@ def evaluate_v4_outer(
     metric_path = run.root / "evaluation" / "metrics.json"
     failure_path = run.root / "evaluation" / "failure_cases.csv"
     per_subject_path = run.root / "evaluation" / "per_subject_metrics.csv"
-    state_only_subject_path = (
-        run.root / "evaluation" / "state_only_per_subject_metrics.csv"
-    )
+    state_only_subject_path = run.root / "evaluation" / "state_only_per_subject_metrics.csv"
+    ignored_prediction_path = run.root / "evaluation" / "ignored_predictions.parquet"
     write_parquet_atomic(prediction_path, predictions)
     event_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_event = event_path.with_name(event_path.name + ".tmp")
@@ -2005,13 +3777,12 @@ def evaluate_v4_outer(
     temporary_failure = failure_path.with_name(failure_path.name + ".tmp")
     failures.to_csv(temporary_failure, index=False)
     temporary_failure.replace(failure_path)
-    per_subject = _per_subject_metrics_v4(truth, predictions, windows)
+    write_parquet_atomic(ignored_prediction_path, ignored_predictions)
+    per_subject = _per_subject_metrics_v4(truth, predictions, windows, ignore)
     temporary_subject = per_subject_path.with_name(per_subject_path.name + ".tmp")
     per_subject.to_csv(temporary_subject, index=False)
     temporary_subject.replace(per_subject_path)
-    state_only_subjects = _per_subject_metrics_v4(
-        truth, state_only_predictions, windows
-    )
+    state_only_subjects = _per_subject_metrics_v4(truth, state_only_predictions, windows, ignore)
     temporary_state_subject = state_only_subject_path.with_name(
         state_only_subject_path.name + ".tmp"
     )
@@ -2026,6 +3797,7 @@ def evaluate_v4_outer(
             failure_path,
             per_subject_path,
             state_only_subject_path,
+            ignored_prediction_path,
         ],
     )
 
@@ -2058,24 +3830,32 @@ def train_hierarchical_final_v4(
     fresh: bool,
     resume: bool,
 ) -> Path:
+    if fresh == resume:
+        raise ValueError("Choose exactly one of fresh or resume for final v4 training")
     final_root = output_root / "final" / run_name
     manifest_path = final_root / "final_manifest.json"
+    existing_manifest: dict[str, Any] | None = None
     if manifest_path.is_file():
         if fresh:
             raise FileExistsError(f"V4 final run already exists: {final_root}")
-        if not resume:
-            raise RuntimeError("Existing V4 final run requires --resume")
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        for relative, expected in manifest.get("artifact_hashes", {}).items():
-            if not (final_root / relative).is_file() or sha256_file(final_root / relative) != expected:
+        existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        for relative, expected in existing_manifest.get("artifact_hashes", {}).items():
+            if (
+                not (final_root / relative).is_file()
+                or sha256_file(final_root / relative) != expected
+            ):
                 raise RuntimeError(f"V4 final artifact changed: {relative}")
-        return final_root
-    if resume:
+    elif resume:
         raise FileNotFoundError("V4 final run does not exist; start with --fresh")
-    final_root.mkdir(parents=True, exist_ok=True)
+    elif final_root.exists() and any(final_root.iterdir()):
+        raise RuntimeError("V4 final directory exists without a valid final manifest")
+    identity = current_v4_identity(config, input_root)
     experiment_root = output_root / "experiments" / run_name
     fold_roots = [experiment_root / f"fold_{fold}" for fold in range(5)]
     manifests = []
+    parent_artifact_hashes: dict[str, str] = {}
+    expected_state_seeds = [int(value) for value in config["final_training"]["state_seeds"]]
+    expected_verifier_seeds = [int(value) for value in config["verifier"]["seeds"]]
     for fold, root in enumerate(fold_roots):
         path = root / "run_manifest.json"
         if not path.is_file():
@@ -2083,13 +3863,72 @@ def train_hierarchical_final_v4(
         manifest = json.loads(path.read_text(encoding="utf-8"))
         if manifest.get("stage") != "EVALUATED":
             raise RuntimeError(f"V4 fold {fold} must be EVALUATED before final training")
+        if manifest.get("protocol_version") != "statsfusion-r2":
+            raise RuntimeError(f"V4 fold {fold} was not produced by statsfusion-r2")
+        if manifest.get("resolved_config_sha256") != identity["resolved_config_sha256"]:
+            raise RuntimeError(f"V4 fold {fold} configuration differs from final training")
+        if manifest.get("git") != identity["git"]:
+            raise RuntimeError(f"V4 fold {fold} worktree differs from final training")
+        if manifest.get("input_hashes") != identity["input_hashes"]:
+            raise RuntimeError(f"V4 fold {fold} v2 inputs differ from final training")
+        if manifest.get("random_seeds", {}).get("state") != expected_state_seeds:
+            raise RuntimeError(f"V4 fold {fold} state seeds differ from statsfusion-r2")
+        if manifest.get("random_seeds", {}).get("verifier") != expected_verifier_seeds:
+            raise RuntimeError(f"V4 fold {fold} verifier seeds differ from statsfusion-r2")
         HierarchicalRun(root, path, manifest).verify_artifacts()
         manifests.append(manifest)
+        required_parent_paths = [
+            path,
+            root / "resolved_config.yaml",
+            root / "selection" / "selected_pipeline.json",
+            root / "selection" / "state_epochs.json",
+            root / "outer" / "window_logits.parquet",
+            root / "outer" / "window_predictions.parquet",
+            root / "outer" / "proposals.parquet",
+            root / "outer" / "proposal_scores.parquet",
+            *(root / "outer" / f"state_seed_{seed}.pt" for seed in expected_state_seeds),
+            *(root / "verifier" / f"final_seed_{seed}.pt" for seed in expected_verifier_seeds),
+        ]
+        missing_parent_paths = [
+            item.relative_to(root).as_posix()
+            for item in required_parent_paths
+            if not item.is_file()
+        ]
+        if missing_parent_paths:
+            raise FileNotFoundError(
+                f"V4 fold {fold} final evidence is missing: {missing_parent_paths}"
+            )
+        for item in required_parent_paths:
+            relative = item.relative_to(experiment_root).as_posix()
+            parent_artifact_hashes[relative] = sha256_file(item)
+        boundary_scores = root / "outer" / "boundary_scores.parquet"
+        if boundary_scores.is_file():
+            parent_artifact_hashes[boundary_scores.relative_to(experiment_root).as_posix()] = (
+                sha256_file(boundary_scores)
+            )
     stress_path = experiment_root / "stress_gate.json"
+    if not stress_path.is_file():
+        raise FileNotFoundError("V4 stress gate is missing")
     stress = json.loads(stress_path.read_text(encoding="utf-8"))
     if not bool(stress.get("passed", False)):
         raise RuntimeError("V4 frozen stress gate did not pass; final training is blocked")
     verify_gate_evidence(output_root.parent, stress)
+    parent_artifact_hashes[stress_path.relative_to(experiment_root).as_posix()] = sha256_file(
+        stress_path
+    )
+    resume_identity = {
+        **identity,
+        "state_seeds": expected_state_seeds,
+        "verifier_seeds": expected_verifier_seeds,
+        "parent_artifact_hashes": parent_artifact_hashes,
+    }
+    if existing_manifest is not None:
+        if existing_manifest.get("protocol_version") != "statsfusion-r2":
+            raise RuntimeError("Legacy or blocked v4 final runs cannot be resumed")
+        if existing_manifest.get("resume_identity") != resume_identity:
+            raise RuntimeError("V4 final resume identity differs from its locked evidence")
+        return final_root
+    final_root.mkdir(parents=True, exist_ok=True)
     inputs = load_v4_inputs(
         config,
         input_root,
@@ -2097,14 +3936,19 @@ def train_hierarchical_final_v4(
         event_role="all",
         allow_outer_labels=True,
     )
-    selection = json.loads(
-        (fold_roots[0] / "selection" / "selected_pipeline.json").read_text(encoding="utf-8")
-    )
-    for root in fold_roots[1:]:
-        current = json.loads(
-            (root / "selection" / "selected_pipeline.json").read_text(encoding="utf-8")
+    expected_partition = {"truth": 161, "ignore": 100, "invalid_duration": 6}
+    actual_partition = evaluation_event_partition_summary(inputs.events)
+    if actual_partition != expected_partition:
+        raise RuntimeError(
+            f"V4 truth/ignore contract changed: expected {expected_partition}, got {actual_partition}"
         )
-        if current["verifier_kind"] != selection["verifier_kind"]:
+    fold_selections = [
+        json.loads((root / "selection" / "selected_pipeline.json").read_text(encoding="utf-8"))
+        for root in fold_roots
+    ]
+    verifier_kind = str(fold_selections[0]["verifier_kind"])
+    for current in fold_selections[1:]:
+        if current["verifier_kind"] != verifier_kind:
             raise RuntimeError("Final folds disagree on the frozen verifier kind")
     scaler, transformed = _fit_scaler_and_transform(
         inputs, set(inputs.anchors["subject_key"].astype(str))
@@ -2112,29 +3956,43 @@ def train_hierarchical_final_v4(
     normalization = compute_normalization(
         inputs.segments, set(inputs.anchors["subject_key"].astype(str))
     )
-    epochs = []
+    epochs_by_seed: dict[int, list[int]] = {
+        int(seed): [] for seed in config["final_training"]["state_seeds"]
+    }
     for root in fold_roots:
         payload = json.loads((root / "selection" / "state_epochs.json").read_text(encoding="utf-8"))
-        epochs.append(int(payload["fixed_outer_epoch"]))
-    fixed_epoch = int(np.median(epochs))
-    full_dataset = _make_dataset(
-        transformed,
-        inputs,
-        inputs.events,
-        normalization,
-        config,
-        training=True,
-        seed=int(config["training"]["random_seed"]),
-    )
+        for seed, values in epochs_by_seed.items():
+            values.append(int(payload["fixed_outer_epoch_by_seed"][str(seed)]))
+    fixed_epochs = {seed: int(np.median(values)) for seed, values in epochs_by_seed.items()}
     artifacts: list[Path] = []
+    scaler_path = final_root / "statistics_scaler.json"
+    normalization_path = final_root / "sensor_normalization.json"
+    write_json_atomic(scaler_path, scaler.to_json())
+    save_normalization(normalization, normalization_path)
+    artifacts.extend((scaler_path, normalization_path))
+    final_state_parent_sha256 = {
+        "statistics_scaler": sha256_file(scaler_path),
+        "sensor_normalization": sha256_file(normalization_path),
+    }
+    final_training_subjects = set(inputs.anchors["subject_key"].astype(str))
     for seed in config["final_training"]["state_seeds"]:
+        seed = int(seed)
+        full_dataset = _make_dataset(
+            transformed,
+            inputs,
+            inputs.events,
+            normalization,
+            config,
+            training=True,
+            seed=seed,
+        )
         torch.manual_seed(int(seed))
         model = build_state_model(config["model"])
         _train_state_epochs(
             model,
             full_dataset,
             config,
-            epochs=fixed_epoch,
+            epochs=fixed_epochs[seed],
             seed=int(seed),
         )
         path = final_root / f"state_seed_{seed}.pt"
@@ -2143,29 +4001,34 @@ def train_hierarchical_final_v4(
             {
                 "model": model.state_dict(),
                 "model_config": config["model"],
-                "epochs": fixed_epoch,
+                "epochs": fixed_epochs[seed],
                 "training_subject_count": int(inputs.anchors["subject_key"].nunique()),
+                "training_subjects": sorted(final_training_subjects),
+                "prediction_subjects": [],
+                "globally_excluded_subjects": [],
+                "parent_artifact_sha256": final_state_parent_sha256,
             },
         )
         artifacts.append(path)
-    scaler_path = final_root / "statistics_scaler.json"
-    normalization_path = final_root / "sensor_normalization.json"
-    write_json_atomic(scaler_path, scaler.to_json())
-    save_normalization(normalization, normalization_path)
-    artifacts.extend((scaler_path, normalization_path))
 
     outer_logits_parts: list[pd.DataFrame] = []
     proposal_feature_parts: list[ProposalFeatureBatchV4] = []
     scored_parts: list[pd.DataFrame] = []
     boundary_positive_parts: list[pd.DataFrame] = []
     window_parts: list[pd.DataFrame] = []
+    truth_parts: list[pd.DataFrame] = []
+    ignore_parts: list[pd.DataFrame] = []
+    pooled_evidence: list[dict[str, Any]] = []
     for fold, root in enumerate(fold_roots):
         outer_subjects = {
-            subject for subject, subject_fold in inputs.subject_folds.items() if subject_fold == fold
+            subject
+            for subject, subject_fold in inputs.subject_folds.items()
+            if subject_fold == fold
         }
-        anchors = inputs.anchors[
-            inputs.anchors["subject_key"].astype(str).isin(outer_subjects)
-        ][["subject_key", "session_id", "timestamp_ms", "state_target"]]
+        evaluable, ignored = partition_evaluation_events(inputs.events, outer_subjects)
+        anchors = inputs.anchors[inputs.anchors["subject_key"].astype(str).isin(outer_subjects)][
+            ["subject_key", "session_id", "timestamp_ms", "state_target", "state_loss_mask"]
+        ]
         logits = pd.read_parquet(root / "outer" / "window_logits.parquet").merge(
             anchors,
             on=["subject_key", "session_id", "timestamp_ms"],
@@ -2174,14 +4037,19 @@ def train_hierarchical_final_v4(
         )
         if logits["state_target"].isna().any():
             raise RuntimeError(f"Fold {fold} outer logits failed to align with final labels")
+        logits = _mask_ignored_state_rows(
+            logits,
+            ignored,
+            step_ms=int(config["sequence"]["step_seconds"]) * 1000,
+        )
         outer_logits_parts.append(logits)
         windows = pd.read_parquet(root / "outer" / "window_predictions.parquet")
         proposals = pd.read_parquet(root / "outer" / "proposals.parquet")
-        fold_truth = inputs.events[inputs.events["subject_key"].astype(str).isin(outer_subjects)]
-        evaluable = fold_truth[
-            fold_truth.get("evaluable", pd.Series(True, index=fold_truth.index)).fillna(False)
-        ]
-        labeled = label_event_candidates(proposals, evaluable, 0.25)
+        labeled = (
+            exclude_ignored_candidates(label_event_candidates(proposals, evaluable, 0.25), ignored)
+            .sort_values("proposal_id")
+            .reset_index(drop=True)
+        )
         proposal_feature_parts.append(
             build_proposal_features_v4(
                 labeled,
@@ -2190,29 +4058,65 @@ def train_hierarchical_final_v4(
                 config["verifier"],
             )
         )
-        scored = pd.read_parquet(root / "outer" / "proposal_scores.parquet").merge(
+        scored = pd.read_parquet(root / "outer" / "proposal_scores.parquet")
+        scored = scored[
+            scored["proposal_id"].astype(str).isin(set(labeled["proposal_id"].astype(str)))
+        ].merge(
             labeled[["proposal_id", "max_iou", "matched_event_id", "is_positive"]],
             on="proposal_id",
             how="left",
             validate="one_to_one",
         )
+        scored = scored.sort_values("proposal_id").reset_index(drop=True)
         scored_parts.append(scored)
         positive = scored[scored["max_iou"] > 0.25]
         boundary_positive_parts.append(_attach_truth_boundaries(positive, evaluable))
         window_parts.append(windows)
+        truth_parts.append(evaluable)
+        ignore_parts.append(ignored)
+        pooled_evidence.append(
+            {
+                "fold": fold,
+                "run_manifest_sha256": sha256_file(root / "run_manifest.json"),
+                "resolved_config_sha256": sha256_file(root / "resolved_config.yaml"),
+                "window_logits_sha256": sha256_file(root / "outer" / "window_logits.parquet"),
+                "window_predictions_sha256": sha256_file(
+                    root / "outer" / "window_predictions.parquet"
+                ),
+                "proposals_sha256": sha256_file(root / "outer" / "proposals.parquet"),
+                "proposal_scores_sha256": sha256_file(root / "outer" / "proposal_scores.parquet"),
+                "selection_sha256": sha256_file(root / "selection" / "selected_pipeline.json"),
+                "truth_labels_sha256": _dataframe_sha256(
+                    evaluable, ["subject_key", "event_id", "start_ms", "end_ms"]
+                ),
+                "ignore_labels_sha256": _dataframe_sha256(
+                    ignored, ["subject_key", "event_id", "start_ms", "end_ms"]
+                ),
+                "state_checkpoint_sha256": {
+                    str(seed): sha256_file(root / "outer" / f"state_seed_{seed}.pt")
+                    for seed in expected_state_seeds
+                },
+                "verifier_checkpoint_sha256": {
+                    str(seed): sha256_file(root / "verifier" / f"final_seed_{seed}.pt")
+                    for seed in expected_verifier_seeds
+                },
+                "state_seeds": expected_state_seeds,
+                "verifier_seeds": expected_verifier_seeds,
+            }
+        )
     final_logits = pd.concat(outer_logits_parts, ignore_index=True)
     from bme_eating.calibration_v4 import PlattCalibration
 
+    calibration_rows = final_logits[final_logits["state_loss_mask"].to_numpy(dtype=float) > 0]
     state_calibration = PlattCalibration.fit(
-        final_logits["state_logit"].to_numpy(), final_logits["state_target"].to_numpy()
+        calibration_rows["state_logit"].to_numpy(),
+        calibration_rows["state_target"].to_numpy(),
     )
     state_calibration_path = final_root / "state_calibration.json"
     write_json_atomic(state_calibration_path, state_calibration.to_json())
     artifacts.append(state_calibration_path)
-    durations = (
-        inputs.events.loc[inputs.events["valid_duration"], "end_ms"].to_numpy(dtype=float)
-        - inputs.events.loc[inputs.events["valid_duration"], "start_ms"].to_numpy(dtype=float)
-    ) / 1000.0
+    all_subjects = set(inputs.events["subject_key"].astype(str))
+    durations = _truth_event_durations(inputs.events, all_subjects)
     prior = TruncatedLogNormalDurationPrior.fit(
         durations,
         lower_quantile=float(config["decoder"]["duration_lower_quantile"]),
@@ -2225,12 +4129,14 @@ def train_hierarchical_final_v4(
     artifacts.append(prior_path)
 
     verifier_features = _concatenate_proposal_features(proposal_feature_parts)
-    categories = classify_proposals(pd.concat([
-        pd.read_parquet(root / "outer" / "proposals.parquet").assign(
-            max_iou=part.iou_target,
-        )
-        for root, part in zip(fold_roots, proposal_feature_parts)
-    ], ignore_index=True))
+    calibration_frame = pd.concat(scored_parts, ignore_index=True)
+    pooled_verifier_subjects = set(calibration_frame["subject_key"].astype(str))
+    _assert_proposal_feature_alignment(
+        verifier_features,
+        calibration_frame,
+        context="Pooled outer OOF",
+    )
+    categories = classify_proposals(calibration_frame)
     logistic = LogisticScoreCombiner.fit(
         _verifier_matrix(verifier_features),
         verifier_features.event_target,
@@ -2239,37 +4145,225 @@ def train_hierarchical_final_v4(
     logistic_path = final_root / "logistic_verifier.json"
     write_json_atomic(logistic_path, logistic.to_json())
     artifacts.append(logistic_path)
-    if selection["verifier_kind"] == "deep":
-        verifier = _train_verifier_model_v4(
-            verifier_features,
-            categories,
-            config,
-            seed=int(config["verifier"]["seeds"][0]) + 120_000,
-        )
-        verifier_path = final_root / "verifier.pt"
-        _save_torch_atomic(
-            verifier_path,
-            {
-                "model": verifier.state_dict(),
-                "sequence_dim": verifier_features.sequence.shape[-1],
-                "scalar_dim": verifier_features.scalar.shape[-1],
-                "config": config["verifier"],
-            },
-        )
-        artifacts.append(verifier_path)
-    calibration_frame = pd.concat(scored_parts, ignore_index=True)
+    verifier_epoch_by_seed: dict[int, int] = {}
+    pooled_verifier_parent_sha256 = {
+        **parent_artifact_hashes,
+        "state_calibration": sha256_file(state_calibration_path),
+        "duration_prior": sha256_file(prior_path),
+    }
+    if verifier_kind == "deep":
+        for seed_value in config["verifier"]["seeds"]:
+            seed = int(seed_value)
+            selected_epochs = []
+            for root in fold_roots:
+                for path in sorted(root.glob(f"verifier/partition_*_seed_{seed}_selector.json")):
+                    selected_epochs.append(
+                        int(json.loads(path.read_text(encoding="utf-8"))["selected_epoch"])
+                    )
+            if not selected_epochs:
+                raise RuntimeError(f"Missing verifier selector evidence for seed {seed}")
+            epochs = int(np.median(selected_epochs))
+            verifier_epoch_by_seed[seed] = epochs
+            verifier = _train_verifier_model_v4(
+                verifier_features,
+                categories,
+                config,
+                seed=seed + 120_000,
+                epochs=epochs,
+            )
+            verifier_path = final_root / f"verifier_seed_{seed}.pt"
+            _save_torch_atomic(
+                verifier_path,
+                {
+                    "model": verifier.state_dict(),
+                    "sequence_dim": verifier_features.sequence.shape[-1],
+                    "scalar_dim": verifier_features.scalar.shape[-1],
+                    "config": config["verifier"],
+                    "seed": seed,
+                    "epochs": epochs,
+                    "training_subjects": sorted(pooled_verifier_subjects),
+                    "prediction_subjects": [],
+                    "globally_excluded_subjects": [],
+                    "parent_artifact_sha256": pooled_verifier_parent_sha256,
+                    "state_calibration_source": "pooled_outer_oof",
+                    "duration_prior_source": "pooled_outer_training_truth",
+                },
+            )
+            artifacts.append(verifier_path)
     proposal_calibration = ProposalCalibrationV4.fit(calibration_frame)
     proposal_calibration_path = final_root / "proposal_calibration.json"
     write_json_atomic(proposal_calibration_path, proposal_calibration.to_json())
     artifacts.append(proposal_calibration_path)
 
+    pooled_scores = proposal_calibration.apply(calibration_frame)
+    pooled_scores["logistic_score"] = logistic.predict(_verifier_matrix(verifier_features))
+    if verifier_kind == "logistic":
+        pooled_scores["final_score"] = pooled_scores["logistic_score"]
+    pooled_truth = pd.concat(truth_parts, ignore_index=True)
+    pooled_ignore = pd.concat(ignore_parts, ignore_index=True)
+    pooled_windows = pd.concat(window_parts, ignore_index=True)
+    point = _best_verifier_operating_point(
+        pooled_scores,
+        pooled_truth,
+        pooled_windows,
+        "final_score",
+        config,
+        pooled_ignore,
+    )
+    selection: dict[str, Any] = {
+        "schema_version": 4,
+        "protocol_version": "statsfusion-r2",
+        "selection_source": "pooled_outer_oof",
+        "anchor_semantics": "right_endpoint_half_open",
+        "masking_protocol": "zero_mask_layernorm_v1",
+        "candidate_budget_scope": "session",
+        "meta_crossfit_protocol": "fully_nested_v1",
+        "minimum_event_gap_seconds": int(config["boundary"]["safety_gap_seconds"]),
+        "verifier_kind": verifier_kind,
+        "score_column": "final_score",
+        "acceptance_threshold": float(point["acceptance_threshold"]),
+        "nms_iou_threshold": float(point["nms_iou_threshold"]),
+        "boundary_enabled": False,
+        "boundary_seed": None,
+        "boundary_entropy_threshold": None,
+        "state_seeds": [int(value) for value in config["final_training"]["state_seeds"]],
+        "verifier_seeds": [int(value) for value in config["verifier"]["seeds"]],
+        "ignore_protocol_version": "valid-duration-truth-ignore-v1",
+        "strict_iou_operator": ">",
+        "strict_iou_threshold": 0.25,
+        "maximum_future_context_seconds": 60,
+        "input_evidence_sha256": {
+            "folds": pooled_evidence,
+            "labels": _dataframe_sha256(
+                pooled_truth, ["subject_key", "event_id", "start_ms", "end_ms"]
+            ),
+            "ignore": _dataframe_sha256(
+                pooled_ignore, ["subject_key", "event_id", "start_ms", "end_ms"]
+            ),
+            "config": manifests[0]["resolved_config_sha256"],
+            "events_file": manifests[0]["input_hashes"]["events"],
+        },
+    }
+
+    all_fold_boundary_enabled = all(
+        bool(value.get("boundary_enabled", False)) for value in fold_selections
+    )
+    boundary_score_files_complete = all(
+        (root / "outer" / "boundary_scores.parquet").is_file() for root in fold_roots
+    )
+    selection["boundary_selection_diagnostics"] = {
+        "all_folds_enabled": all_fold_boundary_enabled,
+        "score_files_complete": boundary_score_files_complete,
+        "full_accepted_coverage": False,
+        "accepted_count": 0,
+        "covered_count": 0,
+    }
+    if all_fold_boundary_enabled and boundary_score_files_complete:
+        accepted = _accepted_from_point(pooled_scores, point, "final_score")
+        pooled_boundary = pd.concat(
+            [pd.read_parquet(root / "outer" / "boundary_scores.parquet") for root in fold_roots],
+            ignore_index=True,
+        )
+        if pooled_boundary["proposal_id"].astype(str).duplicated().any():
+            raise RuntimeError("Pooled boundary proposal IDs are not globally unique")
+        accepted_ids = set(accepted["proposal_id"].astype(str))
+        covered_ids = set(pooled_boundary["proposal_id"].astype(str))
+        full_coverage = accepted_ids.issubset(covered_ids)
+        selection["boundary_selection_diagnostics"].update(
+            {
+                "full_accepted_coverage": full_coverage,
+                "accepted_count": len(accepted_ids),
+                "covered_count": len(accepted_ids & covered_ids),
+            }
+        )
+        if full_coverage:
+            coarse_predictions = _prediction_events(accepted)
+            coarse_metrics, coarse_matches = evaluate_events(
+                pooled_truth,
+                coarse_predictions,
+                method="max_cardinality_iou",
+                ignore=pooled_ignore,
+            )
+            coarse_mae = np.nanmean(
+                [coarse_metrics["start_mae_seconds"], coarse_metrics["end_mae_seconds"]]
+            )
+            winners: list[tuple[float, int, float]] = []
+            for seed_value in config["boundary"]["seeds"]:
+                seed = int(seed_value)
+                seeded = _seeded_boundary_scores(pooled_boundary, seed)
+                for threshold in config["boundary"]["entropy_thresholds"]:
+                    refined = _refine_from_scores(
+                        accepted,
+                        seeded,
+                        float(threshold),
+                        int(config["boundary"]["safety_gap_seconds"]),
+                    )
+                    predictions = refined.rename(
+                        columns={"refined_start_ms": "start_ms", "refined_end_ms": "end_ms"}
+                    )[["subject_key", "start_ms", "end_ms", "proposal_id"]]
+                    metrics, matches = evaluate_events(
+                        pooled_truth,
+                        predictions,
+                        method="max_cardinality_iou",
+                        ignore=pooled_ignore,
+                    )
+                    mae = np.nanmean([metrics["start_mae_seconds"], metrics["end_mae_seconds"]])
+                    coarse_ids = set(
+                        coarse_matches.get("prediction_event_id", pd.Series(dtype=str)).astype(str)
+                    )
+                    refined_ids = set(
+                        matches.get("prediction_event_id", pd.Series(dtype=str)).astype(str)
+                    )
+                    lost = len(coarse_ids - refined_ids) / max(len(coarse_ids), 1)
+                    hand_safe = True
+                    for relation in ("same", "different"):
+                        coarse_relation = coarse_matches[
+                            coarse_matches.get("hand_relation", pd.Series(dtype=str)) == relation
+                        ]
+                        refined_relation = matches[
+                            matches.get("hand_relation", pd.Series(dtype=str)) == relation
+                        ]
+                        if len(coarse_relation) < 5 or len(refined_relation) < 5:
+                            hand_safe = False
+                            break
+                        for endpoint in ("start", "end"):
+                            column = f"{endpoint}_absolute_error_ms"
+                            if (
+                                float(refined_relation[column].mean())
+                                > float(coarse_relation[column].mean()) * 1.05
+                            ):
+                                hand_safe = False
+                    passed = bool(
+                        np.isfinite(mae)
+                        and mae
+                        <= coarse_mae
+                        * (
+                            1.0
+                            - float(config["promotion_gate"]["minimum_boundary_mae_improvement"])
+                        )
+                        and metrics["f1"]
+                        >= coarse_metrics["f1"]
+                        - float(config["promotion_gate"]["maximum_boundary_f1_drop"])
+                        and lost <= float(config["promotion_gate"]["maximum_tp_to_fp_fraction"])
+                        and hand_safe
+                    )
+                    if passed:
+                        winners.append((float(mae), seed, float(threshold)))
+            if winners:
+                _, boundary_seed, entropy_threshold = min(winners)
+                selection.update(
+                    {
+                        "boundary_enabled": True,
+                        "boundary_seed": boundary_seed,
+                        "boundary_entropy_threshold": entropy_threshold,
+                    }
+                )
+
     if selection["boundary_enabled"]:
         positive = pd.concat(boundary_positive_parts, ignore_index=True)
         independent_events = positive["matched_event_id"].nunique()
         if independent_events < int(config["boundary"]["minimum_independent_events"]):
-            raise RuntimeError(
-                "Final boundary training has fewer independent events than required"
-            )
+            raise RuntimeError("Final boundary training has fewer independent events than required")
         start_residual = (
             positive["truth_start_ms"].to_numpy(dtype=float)
             - positive["coarse_start_ms"].to_numpy(dtype=float)
@@ -2285,12 +4379,8 @@ def train_hierarchical_final_v4(
             minimum_seconds=int(config["boundary"]["minimum_range_seconds"]),
             maximum_seconds=int(config["boundary"]["maximum_range_seconds"]),
         )
-        if boundary_range.clipped_fraction > float(
-            config["boundary"]["maximum_clipped_fraction"]
-        ):
-            raise RuntimeError(
-                "Final OOF boundary residual clipping exceeds the configured limit"
-            )
+        if boundary_range.clipped_fraction > float(config["boundary"]["maximum_clipped_fraction"]):
+            raise RuntimeError("Final OOF boundary residual clipping exceeds the configured limit")
         augmented = augment_boundary_training_proposals(
             positive,
             maximum_jitters_per_event=int(config["boundary"]["maximum_jitters_per_event"]),
@@ -2303,10 +4393,23 @@ def train_hierarchical_final_v4(
             boundary_range,
             config["boundary"],
         )
+        boundary_seed = int(selection["boundary_seed"])
+        boundary_epochs = []
+        for root in fold_roots:
+            for path in sorted(
+                root.glob(f"boundary/partition_*_seed_{boundary_seed}_selector.json")
+            ):
+                boundary_epochs.append(
+                    int(json.loads(path.read_text(encoding="utf-8"))["selected_epoch"])
+                )
+        if not boundary_epochs:
+            raise RuntimeError("Missing pooled boundary selector evidence")
+        fixed_boundary_epoch = int(np.median(boundary_epochs))
         boundary = _train_endpoint_model(
             boundary_features,
             config,
-            seed=int(selection["boundary_seed"]) + 120_000,
+            seed=boundary_seed + 120_000,
+            epochs=fixed_boundary_epoch,
         )
         boundary_path = final_root / "boundary.pt"
         range_path = final_root / "boundary_range.json"
@@ -2316,6 +4419,14 @@ def train_hierarchical_final_v4(
                 "model": boundary.state_dict(),
                 "input_dim": boundary_features.start_sequence.shape[-1],
                 "config": config["boundary"],
+                "seed": boundary_seed,
+                "epochs": fixed_boundary_epoch,
+                "training_subjects": sorted(set(positive["subject_key"].astype(str))),
+                "prediction_subjects": [],
+                "globally_excluded_subjects": [],
+                "parent_artifact_sha256": parent_artifact_hashes,
+                "state_calibration_source": "pooled_outer_oof",
+                "duration_prior_source": "pooled_outer_training_truth",
             },
         )
         write_json_atomic(range_path, boundary_range.__dict__)
@@ -2335,6 +4446,9 @@ def train_hierarchical_final_v4(
         snapshot_path,
         {
             "run_name": run_name,
+            "protocol_version": "statsfusion-r2",
+            "selection_source": "pooled_outer_oof",
+            "pooled_evidence": pooled_evidence,
             "fold_manifests": [
                 {
                     "fold": fold,
@@ -2352,8 +4466,14 @@ def train_hierarchical_final_v4(
         "version": 4,
         "stage": "COMPLETE",
         "run_name": run_name,
+        "protocol_version": "statsfusion-r2",
         "state_seeds": [int(value) for value in config["final_training"]["state_seeds"]],
-        "fixed_state_epoch": fixed_epoch,
+        "fixed_state_epoch_by_seed": {str(seed): epoch for seed, epoch in fixed_epochs.items()},
+        "verifier_seeds": [int(value) for value in config["verifier"]["seeds"]],
+        "fixed_verifier_epoch_by_seed": {
+            str(seed): epoch for seed, epoch in verifier_epoch_by_seed.items()
+        },
+        "resume_identity": resume_identity,
         "stress_gate_sha256": sha256_file(stress_path),
         "artifact_hashes": {
             path.relative_to(final_root).as_posix(): sha256_file(path) for path in artifacts

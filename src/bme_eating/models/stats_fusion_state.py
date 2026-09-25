@@ -72,8 +72,7 @@ class CausalTCN(nn.Module):
         self.dilations = tuple(int(value) for value in dilations)
         self.input_projection = nn.Conv1d(input_dim, channels, kernel_size=1, bias=False)
         self.blocks = nn.ModuleList(
-            CausalDepthwiseBlock(channels, dilation, dropout)
-            for dilation in self.dilations
+            CausalDepthwiseBlock(channels, dilation, dropout) for dilation in self.dilations
         )
         self.output_norm = TimewiseGroupNorm(channels)
 
@@ -101,41 +100,69 @@ class CausalCompletedBlockPool(nn.Module):
         )
 
     def forward(
-        self, values: torch.Tensor, valid: torch.Tensor
+        self,
+        values: torch.Tensor,
+        valid: torch.Tensor,
+        block_end_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, steps, channels = values.shape
-        complete = steps // self.factor
-        if complete == 0:
+        if valid.shape != (batch, steps):
+            raise ValueError("Completed-block validity has an incompatible shape")
+        if block_end_indices.ndim != 2 or block_end_indices.shape[0] != batch:
+            raise ValueError("long_block_end_indices has an incompatible shape")
+        block_count = block_end_indices.shape[1]
+        if block_count == 0:
             empty = values.new_zeros((batch, 0, self.projection[0].out_features))
             return empty, valid.new_zeros((batch, 0))
-        values = values[:, : complete * self.factor].reshape(
-            batch, complete, self.factor, channels
+
+        endpoint_valid = (block_end_indices >= self.factor - 1) & (block_end_indices < steps)
+        offsets = torch.arange(
+            1 - self.factor,
+            1,
+            device=values.device,
+            dtype=block_end_indices.dtype,
         )
-        valid = valid[:, : complete * self.factor].reshape(batch, complete, self.factor)
-        weights = valid.unsqueeze(-1).to(values.dtype)
+        member_indices = block_end_indices.unsqueeze(-1) + offsets.view(1, 1, -1)
+        member_indices = member_indices.clamp(0, max(0, steps - 1))
+        flat_indices = member_indices.reshape(batch, block_count * self.factor)
+        pooled_values = values.gather(
+            1,
+            flat_indices.unsqueeze(-1).expand(-1, -1, channels),
+        ).reshape(batch, block_count, self.factor, channels)
+        pooled_valid = valid.gather(1, flat_indices).reshape(batch, block_count, self.factor)
+        pooled_valid = pooled_valid * endpoint_valid.unsqueeze(-1).to(pooled_valid.dtype)
+        weights = pooled_valid.unsqueeze(-1).to(values.dtype)
         count = weights.sum(dim=2).clamp_min(1.0)
-        mean = (values * weights).sum(dim=2) / count
-        maximum = values.masked_fill(weights <= 0, -torch.inf).amax(dim=2)
+        mean = (pooled_values * weights).sum(dim=2) / count
+        maximum = pooled_values.masked_fill(weights <= 0, -torch.inf).amax(dim=2)
         maximum = torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum))
-        last = values[:, :, -1]
-        valid_fraction = valid.to(values.dtype).mean(dim=2, keepdim=True)
+        valid_bool = pooled_valid > 0
+        reverse_index = valid_bool.flip(dims=(2,)).to(torch.int64).argmax(dim=2)
+        last_index = self.factor - 1 - reverse_index
+        gather_index = last_index.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, channels)
+        last = pooled_values.gather(2, gather_index).squeeze(2)
+        last = torch.where(valid_bool.any(dim=2, keepdim=True), last, torch.zeros_like(last))
+        valid_fraction = pooled_valid.to(values.dtype).mean(dim=2, keepdim=True)
         pooled = self.projection(torch.cat((mean, maximum, last, valid_fraction), dim=-1))
+        pooled = pooled * endpoint_valid.unsqueeze(-1).to(pooled.dtype)
         return pooled, valid_fraction.squeeze(-1)
 
-    def hold_completed(
-        self, low_rate: torch.Tensor, high_steps: int
-    ) -> torch.Tensor:
+    def hold_completed(self, low_rate: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
+        if indices.ndim != 2 or indices.shape[0] != low_rate.shape[0]:
+            raise ValueError("Completed-block hold indices have an incompatible shape")
         if low_rate.shape[1] == 0:
-            return low_rate.new_zeros((low_rate.shape[0], high_steps, low_rate.shape[-1]))
-        indices = torch.div(
-            torch.arange(high_steps, device=low_rate.device) + 1,
-            self.factor,
-            rounding_mode="floor",
-        ) - 1
+            return low_rate.new_zeros(
+                (low_rate.shape[0], indices.shape[1], low_rate.shape[-1])
+            )
+        if torch.any(indices >= low_rate.shape[1]):
+            raise ValueError("Completed-block hold refers to a missing low-rate token")
         valid = indices >= 0
         indices = indices.clamp(0, low_rate.shape[1] - 1)
-        held = low_rate.index_select(1, indices)
-        return held * valid.view(1, -1, 1).to(held.dtype)
+        held = low_rate.gather(
+            1,
+            indices.unsqueeze(-1).expand(-1, -1, low_rate.shape[-1]),
+        )
+        return held * valid.unsqueeze(-1).to(held.dtype)
 
 
 class StatsFusionStateModel(nn.Module):
@@ -252,6 +279,8 @@ class StatsFusionStateModel(nn.Module):
     def _align_ppg(values: torch.Tensor, indices: torch.Tensor, steps: int) -> torch.Tensor:
         if indices.shape != (values.shape[0], steps):
             raise ValueError("ppg_to_motion_index has an incompatible shape")
+        if torch.any(indices >= values.shape[1]):
+            raise ValueError("ppg_to_motion_index refers to a missing completed block")
         safe = indices.clamp(0, max(0, values.shape[1] - 1))
         aligned = values.gather(1, safe.unsqueeze(-1).expand(-1, -1, values.shape[-1]))
         return aligned * (indices >= 0).unsqueeze(-1).to(aligned.dtype)
@@ -292,9 +321,9 @@ class StatsFusionStateModel(nn.Module):
             ppg_valid_aligned = ppg_valid
         else:
             ppg_aligned = self._align_ppg(ppg, ppg_indices, steps)
-            ppg_gate_aligned = self._align_ppg(
-                ppg_gate.unsqueeze(-1), ppg_indices, steps
-            ).squeeze(-1)
+            ppg_gate_aligned = self._align_ppg(ppg_gate.unsqueeze(-1), ppg_indices, steps).squeeze(
+                -1
+            )
             ppg_valid_aligned = self._align_ppg(
                 ppg_valid.unsqueeze(-1), ppg_indices, steps
             ).squeeze(-1)
@@ -327,9 +356,14 @@ class StatsFusionStateModel(nn.Module):
 
         combined = torch.cat((short, statistics), dim=-1)
         combined_valid = torch.maximum(motion_fusion_valid, ppg_fusion_valid)
-        low, _ = self.long_pool(combined, combined_valid)
+        block_end_indices = batch.get("long_block_end_indices")
+        if block_end_indices is None:
+            raise ValueError("StatsFusion requires session-phased long_block_end_indices")
+        low, _ = self.long_pool(combined, combined_valid, block_end_indices)
         if low.shape[1]:
-            long = self.long_pool.hold_completed(self.long_tcn(low), steps)
+            if ppg_indices is None:
+                raise ValueError("StatsFusion requires session-phased completed-block mapping")
+            long = self.long_pool.hold_completed(self.long_tcn(low), ppg_indices)
         else:
             long = short.new_zeros(short.shape)
         if not self.use_long_context:
@@ -340,7 +374,10 @@ class StatsFusionStateModel(nn.Module):
             + long_gate * self.long_to_hidden(long)
             + statistics_gate * self.statistics_to_hidden(statistics)
         )
-        missing_fraction = 1.0 - 0.5 * (motion_valid + ppg_valid_aligned)
+        statistics_missing_fraction = batch["statistics"][..., 12:].to(short.dtype).mean(dim=-1)
+        missing_fraction = (
+            1.0 - (motion_valid + ppg_valid_aligned + (1.0 - statistics_missing_fraction)) / 3.0
+        )
         return {
             "state_logit": self.state_head(final).squeeze(-1),
             "onset_logit": self.onset_head(final).squeeze(-1),
@@ -349,4 +386,8 @@ class StatsFusionStateModel(nn.Module):
             "statistics_gate": statistics_gate.mean(dim=-1),
             "long_gate": long_gate.mean(dim=-1),
             "missing_fraction": missing_fraction,
+            "motion_valid_fraction": motion_valid,
+            "motion_present": (motion_valid > 0).to(motion_valid.dtype),
+            "ppg_valid_fraction": ppg_valid_aligned,
+            "statistics_missing_fraction": statistics_missing_fraction,
         }

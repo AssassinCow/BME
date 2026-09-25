@@ -7,7 +7,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from bme_eating.structured_decoder import FixedLagSemiMarkovDecoder
+from bme_eating.structured_decoder import (
+    FixedLagSemiMarkovDecoder,
+    right_endpoint_run_to_interval,
+)
 
 
 class ProposalSource(IntFlag):
@@ -31,7 +34,9 @@ def interval_iou(start_a: int, end_a: int, start_b: int, end_b: int) -> float:
     return intersection / union if union > 0 else 0.0
 
 
-def causal_ema(probabilities: np.ndarray, half_life_seconds: float, step_seconds: float) -> np.ndarray:
+def causal_ema(
+    probabilities: np.ndarray, half_life_seconds: float, step_seconds: float
+) -> np.ndarray:
     values = np.asarray(probabilities, dtype=np.float64)
     if half_life_seconds <= 0 or step_seconds <= 0:
         raise ValueError("EMA time constants must be positive")
@@ -63,20 +68,26 @@ def _hysteresis(
             active = True
             start = index
         elif active and probability < low:
+            start_ms, end_ms = right_endpoint_run_to_interval(
+                timestamps, start, index, step_ms
+            )
             events.append(
                 (
-                    int(timestamps[start]),
-                    int(timestamps[index - 1] + step_ms),
+                    start_ms,
+                    end_ms,
                     float(np.max(probabilities[start:index])),
                     int(ProposalSource.HYSTERESIS),
                 )
             )
             active = False
     if active:
+        start_ms, end_ms = right_endpoint_run_to_interval(
+            timestamps, start, len(timestamps), step_ms
+        )
         events.append(
             (
-                int(timestamps[start]),
-                int(timestamps[-1] + step_ms),
+                start_ms,
+                end_ms,
                 float(np.max(probabilities[start:])),
                 int(ProposalSource.HYSTERESIS),
             )
@@ -114,9 +125,7 @@ def _transition_candidates(
     maximum_ms: int,
 ) -> list[tuple[int, int, float, int]]:
     onset_peaks = np.flatnonzero(
-        (onset >= threshold)
-        & (onset >= np.r_[0.0, onset[:-1]])
-        & (onset >= np.r_[onset[1:], 0.0])
+        (onset >= threshold) & (onset >= np.r_[0.0, onset[:-1]]) & (onset >= np.r_[onset[1:], 0.0])
     )
     offset_peaks = np.flatnonzero(
         (offset >= threshold)
@@ -174,7 +183,12 @@ def _jitter(
     maximum_variants: int,
     minimum_ms: int,
     maximum_ms: int,
+    *,
+    observation_start_ms: int,
+    observation_end_ms: int,
 ) -> list[tuple[int, int, float, int, str]]:
+    if observation_end_ms <= observation_start_ms:
+        raise ValueError("Proposal jitter requires a positive observation interval")
     shifts = sorted(
         ((left, right) for left in jitter_seconds for right in jitter_seconds),
         key=lambda value: (abs(value[0]) + abs(value[1]), abs(value[0] - value[1]), value),
@@ -182,8 +196,8 @@ def _jitter(
     output: list[tuple[int, int, float, int, str]] = []
     for start, end, score, source, family_id in events:
         for left, right in shifts:
-            candidate_start = start + left * 1000
-            candidate_end = end + right * 1000
+            candidate_start = max(int(observation_start_ms), start + left * 1000)
+            candidate_end = min(int(observation_end_ms), end + right * 1000)
             duration = candidate_end - candidate_start
             if minimum_ms <= duration <= maximum_ms:
                 mask = source | (int(ProposalSource.JITTER) if left or right else 0)
@@ -253,10 +267,8 @@ def generate_event_candidates_v4(
     if missing:
         raise ValueError(f"V4 window predictions are missing columns: {sorted(missing)}")
     rows: list[dict[str, Any]] = []
-    observed_hours: dict[str, float] = {}
-    for (subject, session), group in windows.groupby(
-        ["subject_key", "session_id"], sort=False
-    ):
+    observed_hours: dict[tuple[str, str], float] = {}
+    for (subject, session), group in windows.groupby(["subject_key", "session_id"], sort=False):
         group = group.sort_values("timestamp_ms")
         timestamps = group["timestamp_ms"].to_numpy(dtype=np.int64)
         state = group["state_probability"].to_numpy(dtype=np.float64)
@@ -265,8 +277,8 @@ def generate_event_candidates_v4(
         if len(timestamps) < 2:
             continue
         step_ms = int(np.median(np.diff(timestamps)))
-        subject_key = str(subject)
-        observed_hours[subject_key] = observed_hours.get(subject_key, 0.0) + (
+        session_key = (str(subject), str(session))
+        observed_hours[session_key] = (
             timestamps[-1] - timestamps[0] + step_ms
         ) / 3_600_000.0
         smoothed = causal_ema(
@@ -285,10 +297,12 @@ def generate_event_candidates_v4(
         )
         seeds = _merge_gaps(seeds, int(config["gap_merge_seconds"]) * 1000)
         grid_ms = int(config["grid_seconds"]) * 1000
-        grid_start = int(timestamps[0] // grid_ms * grid_ms)
+        grid_start = int(-(-int(timestamps[0]) // grid_ms) * grid_ms)
         grid_end = int(timestamps[-1] // grid_ms * grid_ms)
         grid = np.arange(grid_start, grid_end + 1, grid_ms, dtype=np.int64)
         if len(grid) and bool(config.get("use_semi_markov", True)):
+            if grid[0] < timestamps[0] or grid[-1] > timestamps[-1]:
+                raise RuntimeError("Semi-Markov grid extends beyond observed timestamps")
             sampled = np.interp(grid, timestamps, smoothed)
             seeds.extend(
                 (
@@ -329,6 +343,8 @@ def generate_event_candidates_v4(
             int(config["maximum_variants_per_event"]),
             minimum_ms,
             maximum_ms,
+            observation_start_ms=int(timestamps[0] - step_ms),
+            observation_end_ms=int(timestamps[-1]),
         )
         deduplicated = _deduplicate(variants, float(config["deduplication_iou"]))
         for start, end, score, source, family_id in deduplicated:
@@ -365,8 +381,11 @@ def generate_event_candidates_v4(
         return unbudgeted
     selected_frames: list[pd.DataFrame] = []
     maximum_per_hour = int(config["maximum_candidates_per_hour"])
-    for subject, group in unbudgeted.groupby("subject_key", sort=False):
-        budget = max(1, int(np.ceil(observed_hours[str(subject)] * maximum_per_hour)))
+    for (subject, session), group in unbudgeted.groupby(
+        ["subject_key", "session_id"], sort=False
+    ):
+        session_key = (str(subject), str(session))
+        budget = max(1, int(np.ceil(observed_hours[session_key] * maximum_per_hour)))
         preferred: list[int] = []
         for source in (
             ProposalSource.HYSTERESIS,
@@ -375,10 +394,32 @@ def generate_event_candidates_v4(
         ):
             eligible = group[(group["source_mask"].astype(int) & int(source)) > 0]
             if len(eligible):
-                preferred.append(int(eligible["generator_score"].idxmax()))
+                preferred.append(
+                    int(
+                        eligible.sort_values(
+                            [
+                                "generator_score",
+                                "coarse_start_ms",
+                                "coarse_end_ms",
+                                "proposal_id",
+                            ],
+                            ascending=[False, True, True, True],
+                            kind="stable",
+                        ).index[0]
+                    )
+                )
+        preferred = (
+            unbudgeted.loc[list(dict.fromkeys(preferred))]
+            .sort_values(
+                ["generator_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"],
+                ascending=[False, True, True, True],
+                kind="stable",
+            )
+            .index.tolist()
+        )
         ranked = group.sort_values(
-            ["generator_score", "coarse_start_ms", "coarse_end_ms"],
-            ascending=[False, True, True],
+            ["generator_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"],
+            ascending=[False, True, True, True],
             kind="stable",
         ).index.tolist()
         selected: list[int] = []
@@ -391,8 +432,8 @@ def generate_event_candidates_v4(
     output = pd.concat(selected_frames, ignore_index=True)
     output["rank_within_session"] = (
         output.sort_values(
-            ["generator_score", "coarse_start_ms", "coarse_end_ms"],
-            ascending=[False, True, True],
+            ["generator_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"],
+            ascending=[False, True, True, True],
             kind="stable",
         )
         .groupby(["subject_key", "session_id"], sort=False)
@@ -401,6 +442,8 @@ def generate_event_candidates_v4(
         .reindex(output.index)
         .astype(int)
     )
-    return output[columns].sort_values(
-        ["subject_key", "session_id", "rank_within_session"], kind="stable"
-    ).reset_index(drop=True)
+    return (
+        output[columns]
+        .sort_values(["subject_key", "session_id", "rank_within_session"], kind="stable")
+        .reset_index(drop=True)
+    )

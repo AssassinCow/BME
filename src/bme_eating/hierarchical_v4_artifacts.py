@@ -9,6 +9,10 @@ from typing import Any
 import torch
 
 from bme_eating.config import feature_artifact_name
+from bme_eating.data.stats_fusion_inputs import (
+    canonical_input_paths,
+    verify_canonical_statsfusion_inputs,
+)
 from bme_eating.hierarchical_artifacts import (
     HierarchicalRun,
     _canonical_hash,
@@ -31,6 +35,9 @@ def _public_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def _tracked_inputs(config: dict[str, Any], input_root: Path) -> dict[str, Path]:
     feature_name = feature_artifact_name(config)
+    output_root = input_root.parent / str(config["project"]["artifact_schema_version"])
+    canonical = canonical_input_paths(output_root)
+    verify_canonical_statsfusion_inputs(input_root, output_root)
     return {
         "anchors": input_root / "indices" / "anchors.parquet",
         "events": input_root / "indices" / "events.parquet",
@@ -39,6 +46,30 @@ def _tracked_inputs(config: dict[str, Any], input_root: Path) -> dict[str, Path]
         "subject_folds_manifest": input_root / "indices" / "subject_folds.manifest.json",
         "quality_report": input_root / "indices" / "quality_report.json",
         "features": input_root / "features" / f"{feature_name}.parquet",
+        "canonical_anchors": canonical["anchors"],
+        "canonical_statistics": canonical["statistics"],
+        "canonical_preparation_identity": canonical["preparation_identity"],
+        "canonical_anchors_identity": canonical["anchors_identity"],
+        "canonical_manifest": canonical["manifest"],
+    }
+
+
+def current_v4_identity(config: dict[str, Any], input_root: Path) -> dict[str, Any]:
+    if config["project"].get("artifact_schema_version") != "v4":
+        raise ValueError("StatsFusion runs must write to artifact schema v4")
+    if config.get("experiment", {}).get("protocol_version") != "statsfusion-r2":
+        raise ValueError("Formal v4 runs require protocol_version: statsfusion-r2")
+    if not bool(config["project"].get("strict_resume_identity", False)):
+        raise ValueError("StatsFusion v4 requires strict_resume_identity: true")
+    tracked = _tracked_inputs(config, input_root)
+    missing = [name for name, path in tracked.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(f"Required StatsFusion inputs are missing: {missing}")
+    return {
+        "protocol_version": "statsfusion-r2",
+        "resolved_config_sha256": _canonical_hash(_public_config(config)),
+        "git": git_worktree_identity(Path(__file__).resolve().parents[2]),
+        "input_hashes": {name: sha256_file(path) for name, path in tracked.items()},
     }
 
 
@@ -56,6 +87,8 @@ def initialize_v4_run(
         raise ValueError("Outer fold is outside the configured fold range")
     if config["project"].get("artifact_schema_version") != "v4":
         raise ValueError("StatsFusion runs must write to artifact schema v4")
+    if config.get("experiment", {}).get("protocol_version", "statsfusion-r2") != "statsfusion-r2":
+        raise ValueError("Formal v4 runs require protocol_version: statsfusion-r2")
     if not bool(config["project"].get("strict_resume_identity", False)):
         raise ValueError("StatsFusion v4 requires strict_resume_identity: true")
     run_root = output_root / "experiments" / run_name / f"fold_{fold}"
@@ -82,7 +115,7 @@ def initialize_v4_run(
     tracked = _tracked_inputs(config, input_root)
     missing = [name for name, path in tracked.items() if not path.is_file()]
     if missing:
-        raise FileNotFoundError(f"Required v2 inputs are missing: {missing}")
+        raise FileNotFoundError(f"Required StatsFusion inputs are missing: {missing}")
     input_hashes = {name: sha256_file(path) for name, path in tracked.items()}
     if manifest_path.is_file():
         if fresh:
@@ -107,6 +140,7 @@ def initialize_v4_run(
     write_yaml_atomic(run_root / "resolved_config.yaml", public_config)
     snapshot = {
         "version": 4,
+        "protocol_version": "statsfusion-r2",
         "input_artifact_schema_version": "v2",
         "hashes": input_hashes,
     }
@@ -138,7 +172,8 @@ def initialize_v4_run(
     parameter_count = sum(parameter.numel() for parameter in state_model.parameters())
     payload = {
         "version": 4,
-        "protocol_version": 4,
+        "protocol_version": "statsfusion-r2",
+        "blocked_predecessors": ["statsfusion-r0-blocked", "statsfusion-r1-blocked"],
         "run_name": run_name,
         "outer_fold": int(fold),
         "stage": "CREATED",
@@ -148,14 +183,17 @@ def initialize_v4_run(
         "input_hashes": input_hashes,
         "feature_provenance_sha256": sha256_file(provenance_path),
         "random_seeds": {
-            "state": int(config["training"]["random_seed"]),
+            "state": [
+                int(value)
+                for value in config.get("final_training", {}).get(
+                    "state_seeds", [config["training"]["random_seed"]]
+                )
+            ],
             "verifier": [int(value) for value in config["verifier"]["seeds"]],
             "boundary": [int(value) for value in config["boundary"]["seeds"]],
         },
         "state_model_parameter_count": parameter_count,
-        "artifact_hashes": {
-            "resolved_config.yaml": sha256_file(run_root / "resolved_config.yaml")
-        },
+        "artifact_hashes": {"resolved_config.yaml": sha256_file(run_root / "resolved_config.yaml")},
         "maximum_future_context_seconds": int(
             config["hierarchical"]["maximum_event_latency_seconds"]
         ),

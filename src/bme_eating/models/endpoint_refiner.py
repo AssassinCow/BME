@@ -46,49 +46,77 @@ def select_boundary_range(
 
 
 def truncated_gaussian_target(
-    offsets_seconds: np.ndarray, target_seconds: float, sigma_seconds: float
+    offsets_seconds: np.ndarray,
+    target_seconds: float,
+    sigma_seconds: float,
+    valid_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     offsets = np.asarray(offsets_seconds, dtype=np.float64)
     if sigma_seconds <= 0:
         raise ValueError("Boundary Gaussian sigma must be positive")
     density = np.exp(-0.5 * ((offsets - float(target_seconds)) / sigma_seconds) ** 2)
+    if valid_mask is not None:
+        valid = np.asarray(valid_mask, dtype=bool)
+        if valid.shape != offsets.shape:
+            raise ValueError("Boundary target mask must match the offset grid")
+        density = np.where(valid, density, 0.0)
     total = float(density.sum())
     if total <= 0 or not np.isfinite(total):
         raise ValueError("Boundary target cannot be normalized")
     return (density / total).astype(np.float32)
 
 
-def normalized_entropy(probabilities: torch.Tensor) -> torch.Tensor:
-    values = probabilities.clamp_min(1e-8)
-    entropy = -(values * values.log()).sum(dim=-1)
-    return entropy / np.log(values.shape[-1])
+def normalized_entropy(
+    probabilities: torch.Tensor, valid_mask: torch.Tensor | None = None
+) -> torch.Tensor:
+    if valid_mask is None:
+        valid_mask = torch.ones_like(probabilities, dtype=torch.bool)
+    valid = valid_mask.bool()
+    values = torch.where(valid, probabilities, torch.zeros_like(probabilities))
+    values = values / values.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    safe = values.clamp_min(1e-8)
+    entropy = -(torch.where(valid, values * safe.log(), torch.zeros_like(values))).sum(dim=-1)
+    valid_count = valid.sum(dim=-1)
+    denominator = valid_count.to(values.dtype).log().clamp_min(1e-8)
+    normalized = entropy / denominator
+    return torch.where(valid_count >= 2, normalized, torch.ones_like(normalized))
 
 
 class EndpointNetwork(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(8 if hidden_dim % 8 == 0 else 1, hidden_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Conv1d(
-                hidden_dim,
-                hidden_dim,
-                kernel_size=3,
-                padding=1,
-                groups=hidden_dim,
-                bias=False,
-            ),
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False),
-            nn.GroupNorm(8 if hidden_dim % 8 == 0 else 1, hidden_dim),
-            nn.SiLU(),
-            nn.Conv1d(hidden_dim, 1, kernel_size=1),
+        self.input_convolution = nn.Conv1d(
+            input_dim, hidden_dim, kernel_size=3, padding=1, bias=False
         )
+        self.input_norm = nn.LayerNorm(hidden_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.depthwise = nn.Conv1d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=3,
+            padding=1,
+            groups=hidden_dim,
+            bias=False,
+        )
+        self.pointwise = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False)
+        self.output_norm = nn.LayerNorm(hidden_dim)
+        self.output_convolution = nn.Conv1d(hidden_dim, 1, kernel_size=1)
 
     def forward(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        logits = self.network(values.transpose(1, 2)).squeeze(1)
-        return logits.masked_fill(~mask.bool(), -torch.inf)
+        valid = mask.bool()
+        weights = valid.unsqueeze(1).to(values.dtype)
+        hidden = self.input_convolution(
+            (values * valid.unsqueeze(-1).to(values.dtype)).transpose(1, 2)
+        )
+        hidden = self.dropout(
+            torch.nn.functional.silu(self.input_norm(hidden.transpose(1, 2)))
+        ).transpose(1, 2)
+        hidden *= weights
+        hidden = self.pointwise(self.depthwise(hidden)).transpose(1, 2)
+        hidden = torch.nn.functional.silu(self.output_norm(hidden)).transpose(1, 2)
+        hidden *= weights
+        logits = self.output_convolution(hidden).squeeze(1)
+        return logits.masked_fill(~valid, -torch.inf)
 
 
 class EndpointRefiner(nn.Module):
@@ -109,12 +137,41 @@ class EndpointRefiner(nn.Module):
 def endpoint_loss(
     output: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    weight = batch.get("sample_weight", torch.ones(output["start_logit"].shape[0], device=output["start_logit"].device))
-    start = -(batch["start_target"] * torch.log_softmax(output["start_logit"], dim=-1)).sum(dim=-1)
-    end = -(batch["end_target"] * torch.log_softmax(output["end_logit"], dim=-1)).sum(dim=-1)
-    denominator = weight.sum().clamp_min(1.0)
-    start_loss = (start * weight).sum() / denominator
-    end_loss = (end * weight).sum() / denominator
+    sample_weight = batch.get(
+        "sample_weight",
+        torch.ones(output["start_logit"].shape[0], device=output["start_logit"].device),
+    )
+
+    def endpoint_term(name: str) -> torch.Tensor:
+        logits = output[f"{name}_logit"]
+        target = batch[f"{name}_target"].to(logits.dtype)
+        mask = batch[f"{name}_mask"].bool()
+        endpoint_weight = batch.get(f"{name}_weight", torch.ones_like(sample_weight))
+        active = endpoint_weight > 0
+        target_sum = target.sum(dim=-1)
+        if active.any() and not torch.allclose(
+            target_sum[active], torch.ones_like(target_sum[active]), atol=1e-5, rtol=1e-5
+        ):
+            raise RuntimeError(f"{name} boundary target must sum to one for active endpoints")
+        invalid_mass = torch.where(~mask, target, torch.zeros_like(target)).sum(dim=-1)
+        if torch.any(invalid_mass > 1e-7):
+            raise RuntimeError(f"{name} boundary target assigns mass to invalid bins")
+        safe_logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
+        safe_logits = torch.where(
+            mask.any(dim=-1, keepdim=True), safe_logits, torch.zeros_like(safe_logits)
+        )
+        log_probability = torch.log_softmax(safe_logits, dim=-1)
+        element = -torch.where(target > 0, target * log_probability, torch.zeros_like(target)).sum(
+            dim=-1
+        )
+        weight = sample_weight * endpoint_weight
+        loss = (element * weight).sum() / weight.sum().clamp_min(1.0)
+        if not torch.isfinite(loss):
+            raise RuntimeError(f"{name} boundary loss is not finite")
+        return loss
+
+    start_loss = endpoint_term("start")
+    end_loss = endpoint_term("end")
     return 0.5 * (start_loss + end_loss), {"start": start_loss, "end": end_loss}
 
 
@@ -183,6 +240,8 @@ class EndpointFeatureBatch:
     start_target: np.ndarray | None
     end_target: np.ndarray | None
     sample_weight: np.ndarray | None
+    start_weight: np.ndarray | None
+    end_weight: np.ndarray | None
     start_offsets_seconds: np.ndarray
     end_offsets_seconds: np.ndarray
 
@@ -254,7 +313,10 @@ def build_endpoint_features(
     end_masks: list[np.ndarray] = []
     start_targets: list[np.ndarray] = []
     end_targets: list[np.ndarray] = []
-    for proposal in proposals.itertuples(index=False):
+    start_weights: list[float] = []
+    end_weights: list[float] = []
+    kept_indices: list[int] = []
+    for proposal_index, proposal in enumerate(proposals.itertuples(index=False)):
         group = groups[(str(proposal.subject_key), str(proposal.session_id))]
         observation_end = min(
             int(group["timestamp_ms"].max()), int(proposal.coarse_end_ms) + 60_000
@@ -263,22 +325,49 @@ def build_endpoint_features(
         end_grid = int(proposal.coarse_end_ms) + (end_offsets * 1000).astype(np.int64)
         start_values, start_valid = _nearest_features(group, start_grid, columns, observation_end)
         end_values, end_valid = _nearest_features(group, end_grid, columns, observation_end)
-        if not start_valid.any():
-            start_valid[int(np.argmin(np.abs(start_offsets)))] = True
-        if not end_valid.any():
-            end_valid[int(np.argmin(np.abs(end_offsets)))] = True
         start_relative = (start_offsets / max(boundary_range.start_seconds, 1))[:, None]
         end_relative = (end_offsets / max(boundary_range.end_seconds, 1))[:, None]
+        start_weight = 1.0
+        end_weight = 1.0
+        start_distribution: np.ndarray | None = None
+        end_distribution: np.ndarray | None = None
+        if hasattr(proposal, "truth_start_ms"):
+            start_target = (int(proposal.truth_start_ms) - int(proposal.coarse_start_ms)) / 1000.0
+            end_target = (int(proposal.truth_end_ms) - int(proposal.coarse_end_ms)) / 1000.0
+            start_weight = float(
+                start_valid.any()
+                and np.min(np.abs(start_offsets[start_valid] - start_target)) <= bin_seconds
+            )
+            end_weight = float(
+                end_valid.any()
+                and np.min(np.abs(end_offsets[end_valid] - end_target)) <= bin_seconds
+            )
+            if not start_weight and not end_weight:
+                continue
+            start_distribution = (
+                truncated_gaussian_target(start_offsets, start_target, sigma, start_valid)
+                if start_weight
+                else np.zeros_like(start_offsets, dtype=np.float32)
+            )
+            end_distribution = (
+                truncated_gaussian_target(end_offsets, end_target, sigma, end_valid)
+                if end_weight
+                else np.zeros_like(end_offsets, dtype=np.float32)
+            )
         start_sequences.append(np.concatenate((start_values, start_relative), axis=1))
         end_sequences.append(np.concatenate((end_values, end_relative), axis=1))
         start_masks.append(start_valid)
         end_masks.append(end_valid)
-        if hasattr(proposal, "truth_start_ms"):
-            start_target = (int(proposal.truth_start_ms) - int(proposal.coarse_start_ms)) / 1000.0
-            end_target = (int(proposal.truth_end_ms) - int(proposal.coarse_end_ms)) / 1000.0
-            start_targets.append(truncated_gaussian_target(start_offsets, start_target, sigma))
-            end_targets.append(truncated_gaussian_target(end_offsets, end_target, sigma))
-    sample_ids = proposals.get("boundary_sample_id", proposals["proposal_id"]).astype(str).to_numpy()
+        kept_indices.append(proposal_index)
+        if start_distribution is not None and end_distribution is not None:
+            start_targets.append(start_distribution)
+            end_targets.append(end_distribution)
+            start_weights.append(start_weight)
+            end_weights.append(end_weight)
+    source_ids = (
+        proposals.get("boundary_sample_id", proposals["proposal_id"]).astype(str).to_numpy()
+    )
+    sample_ids = source_ids[np.asarray(kept_indices, dtype=np.int64)]
     feature_dim = len(columns) + 1
     if not start_sequences:
         return EndpointFeatureBatch(
@@ -290,6 +379,8 @@ def build_endpoint_features(
             start_target=None,
             end_target=None,
             sample_weight=None,
+            start_weight=None,
+            end_weight=None,
             start_offsets_seconds=start_offsets,
             end_offsets_seconds=end_offsets,
         )
@@ -302,26 +393,38 @@ def build_endpoint_features(
         start_target=np.stack(start_targets) if start_targets else None,
         end_target=np.stack(end_targets) if end_targets else None,
         sample_weight=(
-            proposals["sample_weight"].to_numpy(dtype=np.float32)
+            proposals.iloc[kept_indices]["sample_weight"].to_numpy(dtype=np.float32)
             if "sample_weight" in proposals
             else None
         ),
+        start_weight=np.asarray(start_weights, dtype=np.float32) if start_targets else None,
+        end_weight=np.asarray(end_weights, dtype=np.float32) if end_targets else None,
         start_offsets_seconds=start_offsets,
         end_offsets_seconds=end_offsets,
     )
 
 
 def local_soft_argmax(
-    logits: torch.Tensor, offsets: torch.Tensor, radius_bins: int = 2
+    logits: torch.Tensor,
+    offsets: torch.Tensor,
+    radius_bins: int = 2,
+    valid_mask: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    probability = torch.softmax(logits, dim=-1)
+    valid = torch.isfinite(logits) if valid_mask is None else valid_mask.bool()
+    safe_logits = logits.masked_fill(~valid, torch.finfo(logits.dtype).min)
+    has_valid = valid.any(dim=-1, keepdim=True)
+    safe_logits = torch.where(has_valid, safe_logits, torch.zeros_like(safe_logits))
+    probability = torch.softmax(safe_logits, dim=-1) * valid.to(logits.dtype)
+    probability /= probability.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     mode = probability.argmax(dim=-1)
     index = torch.arange(logits.shape[-1], device=logits.device).unsqueeze(0)
     local = (index - mode.unsqueeze(-1)).abs() <= int(radius_bins)
     local_probability = probability * local
     local_probability /= local_probability.sum(dim=-1, keepdim=True).clamp_min(1e-8)
     prediction = (local_probability * offsets.unsqueeze(0)).sum(dim=-1)
-    return prediction, normalized_entropy(probability)
+    valid_count = valid.sum(dim=-1)
+    prediction = torch.where(valid_count >= 2, prediction, torch.zeros_like(prediction))
+    return prediction, normalized_entropy(probability, valid)
 
 
 def apply_boundary_refinement(
@@ -353,7 +456,9 @@ def apply_boundary_refinement(
     ).astype(np.int64)
     output["start_entropy"] = np.asarray(start_entropy, dtype=float)
     output["end_entropy"] = np.asarray(end_entropy, dtype=float)
-    output["boundary_fallback"] = ~(start_use & end_use)
+    output["start_fallback"] = ~start_use
+    output["end_fallback"] = ~end_use
+    output["boundary_fallback"] = output["start_fallback"] | output["end_fallback"]
     safety_gap_ms = int(safety_gap_seconds) * 1000
     for indices in output.groupby(["subject_key", "session_id"], sort=False).groups.values():
         ordered = sorted(
@@ -371,27 +476,24 @@ def apply_boundary_refinement(
             end = int(output.at[index, "refined_end_ms"])
             if start >= end:
                 start, end = coarse_start, coarse_end
+                output.at[index, "start_fallback"] = True
+                output.at[index, "end_fallback"] = True
                 output.at[index, "boundary_fallback"] = True
             output.at[index, "refined_start_ms"] = start
             output.at[index, "refined_end_ms"] = end
         for previous_index, index in pairwise(ordered):
-            previous_start = int(output.at[previous_index, "refined_start_ms"])
             previous_end = int(output.at[previous_index, "refined_end_ms"])
             start = int(output.at[index, "refined_start_ms"])
-            end = int(output.at[index, "refined_end_ms"])
             if previous_end + safety_gap_ms <= start:
                 continue
-            earliest_split = previous_start + 1
-            latest_split = end - safety_gap_ms - 1
-            if earliest_split > latest_split:
-                raise RuntimeError(
-                    "Accepted neighboring events cannot satisfy the boundary safety gap"
-                )
-            split = int(np.clip((previous_end + start - safety_gap_ms) // 2, earliest_split, latest_split))
-            output.at[previous_index, "refined_end_ms"] = split
-            output.at[index, "refined_start_ms"] = split + safety_gap_ms
+            output.at[previous_index, "refined_end_ms"] = int(
+                output.at[previous_index, "coarse_end_ms"]
+            )
+            output.at[index, "refined_start_ms"] = int(output.at[index, "coarse_start_ms"])
             output.at[previous_index, "boundary_fallback"] = True
             output.at[index, "boundary_fallback"] = True
+            output.at[previous_index, "end_fallback"] = True
+            output.at[index, "start_fallback"] = True
     if len(output) != len(accepted) or set(output["proposal_id"]) != set(accepted["proposal_id"]):
         raise RuntimeError("Boundary refinement changed proposal identity or count")
     if (output["refined_start_ms"] >= output["refined_end_ms"]).any():
@@ -399,9 +501,10 @@ def apply_boundary_refinement(
     for indices in output.groupby(["subject_key", "session_id"], sort=False).groups.values():
         ordered = output.loc[list(indices)].sort_values("refined_start_ms")
         if len(ordered) > 1:
-            gaps = ordered["refined_start_ms"].to_numpy()[1:] - ordered[
-                "refined_end_ms"
-            ].to_numpy()[:-1]
+            gaps = (
+                ordered["refined_start_ms"].to_numpy()[1:]
+                - ordered["refined_end_ms"].to_numpy()[:-1]
+            )
             if np.any(gaps < safety_gap_ms):
                 raise RuntimeError("Boundary refinement violated the neighboring-event gap")
     return output

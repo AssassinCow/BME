@@ -8,6 +8,7 @@ import pytest
 from bme_eating.hierarchical_v4_gates import (
     evaluate_crossfold_gate,
     evaluate_fold0_ablations,
+    evaluate_ppg_promotion,
     verify_gate_evidence,
 )
 
@@ -21,6 +22,7 @@ def _candidate(root, run: str, metrics: dict[str, float]) -> None:
     fold = root / "experiments" / run / "fold_0"
     _json(fold / "run_manifest.json", {"stage": "PROPOSALS_COMPLETE"})
     _json(fold / "decoder" / "candidate_metrics.json", metrics)
+    (fold / "resolved_config.yaml").write_text("model:\n  use_ppg: true\n", encoding="utf-8")
 
 
 def _state_metrics(
@@ -101,7 +103,32 @@ def test_fold0_ablation_gate_enforces_statistics_long_context_and_candidate_rule
         verify_gate_evidence(root.parent, report)
 
 
-def _evaluated_fold(root, run: str, fold: int, *, tp: int, fp: int, fn: int) -> None:
+def test_ppg_promotion_resolves_s4_to_s2_path_when_ppg_fails(tmp_path) -> None:
+    root = tmp_path / "v4"
+    _candidate(
+        root,
+        "s2",
+        _state_metrics(f1=0.52, fp=10, recall=0.87, same=0.86, different=0.60, fragments=90),
+    )
+    _candidate(
+        root,
+        "s3",
+        _state_metrics(f1=0.50, fp=12, recall=0.87, same=0.86, different=0.55, fragments=90),
+    )
+    report = evaluate_ppg_promotion(
+        root,
+        s2_run="s2",
+        s3_run="s3",
+        gate={"maximum_fp_per_hour_ratio": 1.05},
+    )
+    assert not report["passed"]
+    assert report["resolved_use_ppg"] is False
+    verify_gate_evidence(root.parent, report)
+
+
+def _evaluated_fold(
+    root, run: str, fold: int, *, tp: int, fp: int, fn: int, observed_hours: float = 10.0
+) -> None:
     f1 = 2 * tp / (2 * tp + fp + fn)
     directory = root / "experiments" / run / f"fold_{fold}" / "evaluation"
     _json(
@@ -114,14 +141,14 @@ def _evaluated_fold(root, run: str, fold: int, *, tp: int, fp: int, fn: int) -> 
                 "false_negative": fn,
             },
             "hand": {"different_sensitivity": tp / (tp + fn)},
-            "fp_per_hour": fp / 10,
+            "fp_per_hour": fp / observed_hours,
             "state_only": {
                 "f1": f1,
                 "true_positive": tp,
                 "false_positive": fp,
                 "false_negative": fn,
                 "different_sensitivity": tp / (tp + fn),
-                "fp_per_hour": fp / 10,
+                "fp_per_hour": fp / observed_hours,
             },
         },
     )
@@ -131,7 +158,7 @@ def _evaluated_fold(root, run: str, fold: int, *, tp: int, fp: int, fn: int) -> 
             "true_positive": [tp],
             "false_positive": [fp],
             "false_negative": [fn],
-            "observed_hours": [10.0],
+            "observed_hours": [observed_hours],
         }
     )
     per_subject.to_csv(directory / "per_subject_metrics.csv", index=False)
@@ -158,3 +185,26 @@ def test_development_gate_uses_subject_paired_evidence(tmp_path) -> None:
     )
     assert report["passed"]
     assert report["paired_bootstrap_probability_delta_f1_positive"] == 1.0
+
+
+def test_crossfold_gate_uses_total_false_positives_over_total_hours(tmp_path) -> None:
+    root = tmp_path / "v4"
+    _evaluated_fold(root, "candidate", 0, tp=10, fp=10, fn=0, observed_hours=1.0)
+    _evaluated_fold(root, "candidate", 1, tp=10, fp=0, fn=0, observed_hours=100.0)
+    _evaluated_fold(root, "baseline", 0, tp=10, fp=1, fn=0, observed_hours=1.0)
+    _evaluated_fold(root, "baseline", 1, tp=10, fp=100, fn=0, observed_hours=100.0)
+    report = evaluate_crossfold_gate(
+        root,
+        candidate_run="candidate",
+        s0_run="baseline",
+        folds=(0, 1),
+        gate={
+            "maximum_fp_per_hour_ratio": 1.05,
+            "maximum_stress_fold_f1_drop": 1.0,
+            "maximum_stress_different_sensitivity_drop": 1.0,
+        },
+        mode="stress",
+    )
+    assert report["candidate_pooled"]["fp_per_hour"] == pytest.approx(10 / 101)
+    assert report["baseline_pooled"]["fp_per_hour"] == pytest.approx(1.0)
+    assert report["checks"]["fp_per_hour"]
