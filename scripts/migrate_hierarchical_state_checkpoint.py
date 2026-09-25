@@ -14,7 +14,11 @@ from bme_eating.training.hierarchical_trainer import migrate_completed_state_par
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Migrate a completed state checkpoint across permitted configuration changes"
+        description=(
+            "Migrate a state checkpoint across compatible configuration changes without "
+            "changing the learned model weights; incomplete checkpoints only permit "
+            "execution-only worker and inference changes"
+        )
     )
     parser.add_argument("--config", default="configs/hierarchical_v3.yaml")
     parser.add_argument("--source-run", required=True)

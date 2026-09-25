@@ -19,6 +19,7 @@ from bme_eating.calibration import crossfit_calibrate_scores, proposal_nms
 from bme_eating.config import feature_artifact_name
 from bme_eating.fusion import align_prediction_frames
 from bme_eating.hierarchical_artifacts import (
+    RESUMABLE_STATE_ARTIFACT_NAMES,
     RUN_STAGES,
     HierarchicalRun,
     OuterLabelGuard,
@@ -67,10 +68,8 @@ ALIGNMENT_KEYS = ["subject_key", "session_id", "timestamp_ms"]
 RUNTIME_INFERENCE_TRAINING_KEYS = frozenset(
     {"inference_batch_size", "inference_num_workers", "inference_resume_chunk_rows"}
 )
+RESUMABLE_STATE_TRAINING_KEYS = RUNTIME_INFERENCE_TRAINING_KEYS | {"num_workers"}
 EARLY_STOPPING_TRAINING_KEY = "early_stopping_patience_checks"
-MIGRATABLE_STATE_TRAINING_KEYS = RUNTIME_INFERENCE_TRAINING_KEYS | {
-    EARLY_STOPPING_TRAINING_KEY
-}
 
 
 @dataclass(frozen=True)
@@ -488,30 +487,25 @@ def _without_runtime_inference_settings(config: dict[str, Any]) -> dict[str, Any
     return normalized
 
 
-def _without_migratable_state_settings(config: dict[str, Any]) -> dict[str, Any]:
+def _without_training_settings(config: dict[str, Any]) -> dict[str, Any]:
     normalized = _public_resolved_config(config)
-    training = normalized.get("training")
-    if isinstance(training, dict):
-        for key in MIGRATABLE_STATE_TRAINING_KEYS:
-            training.pop(key, None)
+    normalized.pop("training", None)
     return normalized
 
 
 def _migration_config_changes(
     source_config: dict[str, Any], target_config: dict[str, Any]
 ) -> dict[str, dict[str, Any]]:
-    if _without_migratable_state_settings(
-        source_config
-    ) != _without_migratable_state_settings(target_config):
+    if _without_training_settings(source_config) != _without_training_settings(target_config):
         raise RuntimeError(
-            "Checkpoint migration only permits inference batch, worker, chunk, and "
-            "early-stopping patience settings to change"
+            "Checkpoint migration permits any compatible training setting to change, "
+            "but model, loss, data, and other non-training settings must remain identical"
         )
     source_training = source_config.get("training", {})
     target_training = target_config.get("training", {})
     return {
         key: {"source": source_training.get(key), "target": target_training.get(key)}
-        for key in sorted(MIGRATABLE_STATE_TRAINING_KEYS)
+        for key in sorted(set(source_training) | set(target_training))
         if source_training.get(key) != target_training.get(key)
     }
 
@@ -663,20 +657,39 @@ def migrate_completed_state_partition(
             _without_runtime_inference_settings(expected_training)
         ):
             raise RuntimeError(f"{name} training configuration differs from the source run")
-    early_stopping_compatibility = _early_stopping_migration_compatibility(
-        checkpoints,
-        source_config,
-        target_config,
-    )
     last = checkpoints["last.pt"]
     patience_checks = int(target_config["training"]["early_stopping_patience_checks"])
-    if not resume_training_is_complete(
+    training_complete = resume_training_is_complete(
         int(last["epoch"]) + 1,
         int(target_config["training"]["max_epochs"]),
         int(last.get("patience", 0)),
         patience_checks,
-    ):
-        raise RuntimeError("Only a completed or early-stopped state partition may be migrated")
+    )
+    if training_complete:
+        early_stopping_compatibility = _early_stopping_migration_compatibility(
+            checkpoints,
+            source_config,
+            target_config,
+        )
+    else:
+        incompatible_changes = sorted(
+            set(allowed_changes) - RESUMABLE_STATE_TRAINING_KEYS
+        )
+        if incompatible_changes:
+            raise RuntimeError(
+                "An incomplete state partition may only migrate execution-only worker and "
+                "inference settings; finish training first before changing: "
+                + ", ".join(incompatible_changes)
+            )
+        missing_resume_state = [
+            key for key in ("optimizer", "scheduler", "scaler") if key not in last
+        ]
+        if missing_resume_state:
+            raise RuntimeError(
+                "Incomplete checkpoint cannot resume because state is missing: "
+                + ", ".join(missing_resume_state)
+            )
+        early_stopping_compatibility = None
 
     fold = int(target.payload["outer_fold"])
     seed = int(expected_target_training["random_seed"])
@@ -724,7 +737,7 @@ def migrate_completed_state_partition(
             copied_records[name] = sha256_file(target_path)
 
     migration = {
-        "version": 2,
+        "version": 4,
         "source_run": source_manifest["run_name"],
         "source_outer_fold": int(source_manifest["outer_fold"]),
         "source_commit": source_git["commit"],
@@ -735,19 +748,29 @@ def migrate_completed_state_partition(
         "target_worktree_sha256": target.payload["git"].get("worktree_sha256"),
         "partition": partition,
         "allowed_config_changes": allowed_changes,
+        "compatibility_scope": (
+            "completed_state_training_configuration"
+            if training_complete
+            else "incomplete_state_execution_configuration"
+        ),
+        "checkpoint_selection_not_recomputed": True,
         "early_stopping_compatibility": early_stopping_compatibility,
         "source_selection_signature": source_signature,
         "target_selection_signature": target_signature,
         "checkpoints": checkpoint_records,
         "copied_artifacts": copied_records,
         "model_weights_unchanged": True,
-        "training_will_not_resume": True,
+        "training_complete_at_migration": training_complete,
+        "training_will_not_resume": training_complete,
+        "training_will_resume": not training_complete,
     }
     migration_path = target_state / "checkpoint_migration.json"
     write_json_atomic(migration_path, migration)
     artifact_hashes = dict(target.payload.get("artifact_hashes", {}))
     for path in target_state.rglob("*"):
         if path.is_file():
+            if not training_complete and path.name in RESUMABLE_STATE_ARTIFACT_NAMES:
+                continue
             relative = path.relative_to(target.root).as_posix()
             artifact_hashes[relative] = sha256_file(path)
     target.payload["artifact_hashes"] = artifact_hashes

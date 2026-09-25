@@ -3,6 +3,9 @@ import json
 import subprocess
 
 import pytest
+import torch
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import LambdaLR
 
 from bme_eating import reproducibility
 from bme_eating.reproducibility import (
@@ -10,6 +13,37 @@ from bme_eating.reproducibility import (
     require_git_worktree,
     write_run_manifest,
 )
+from bme_eating.training.dtp_trainer import _apply_active_optimizer_config
+
+
+def test_resume_optimizer_uses_active_learning_rates_and_weight_decay() -> None:
+    encoder = torch.nn.Parameter(torch.tensor([1.0]))
+    head = torch.nn.Parameter(torch.tensor([2.0]))
+    optimizer = AdamW(
+        [
+            {"params": [encoder], "lr": 1e-3},
+            {"params": [head], "lr": 2e-3},
+        ],
+        weight_decay=0.01,
+    )
+    scheduler = LambdaLR(optimizer, lambda _step: 0.5)
+    optimizer.step()
+    scheduler.step()
+
+    _apply_active_optimizer_config(
+        optimizer,
+        scheduler,
+        {
+            "encoder_learning_rate": 1e-4,
+            "learning_rate": 3e-4,
+            "weight_decay": 0.02,
+        },
+    )
+
+    assert [group["lr"] for group in optimizer.param_groups] == pytest.approx(
+        [5e-5, 1.5e-4]
+    )
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.02, 0.02]
 
 
 def test_git_output_is_decoded_as_utf8(monkeypatch, tmp_path):

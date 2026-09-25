@@ -1,0 +1,13 @@
+extends: hierarchical_v4_statsfusion.yaml
+
+experiment:
+  ablation_id: S3
+
+model:
+  use_motion: true
+  use_ppg: true
+  use_statistics: true
+  use_long_context: true
+
+decoder:
+  use_semi_markov: false

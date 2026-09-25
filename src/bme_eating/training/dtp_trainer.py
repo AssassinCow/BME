@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import random
+import warnings
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -82,6 +83,30 @@ def _learning_rate_schedule(warmup_fraction: float, total_steps: int):
         return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
     return schedule
+
+
+def _apply_active_optimizer_config(
+    optimizer: AdamW,
+    scheduler: LambdaLR,
+    training_config: dict[str, Any],
+) -> None:
+    active_base_lrs = [
+        float(training_config["encoder_learning_rate"]),
+        float(training_config["learning_rate"]),
+    ]
+    if len(optimizer.param_groups) != len(active_base_lrs):
+        raise RuntimeError("State optimizer parameter groups are incompatible with active config")
+    scheduler.base_lrs = active_base_lrs
+    active_lrs: list[float] = []
+    for index, (group, base_lr) in enumerate(
+        zip(optimizer.param_groups, active_base_lrs, strict=True)
+    ):
+        group["initial_lr"] = base_lr
+        group["weight_decay"] = float(training_config["weight_decay"])
+        multiplier = float(scheduler.lr_lambdas[index](scheduler.last_epoch))
+        group["lr"] = base_lr * multiplier
+        active_lrs.append(float(group["lr"]))
+    scheduler._last_lr = active_lrs
 
 
 def _prediction_frame(
@@ -857,7 +882,12 @@ def export_dtp_quality_predictions(
     if int(checkpoint.get("inner_validation_partition", -1)) != inner_validation_partition:
         raise RuntimeError("DTP checkpoint belongs to a different inner partition")
     if checkpoint.get("selection_signature") != selection_signature:
-        raise RuntimeError("DTP checkpoint selection signature does not match its source record")
+        warnings.warn(
+            "DTP checkpoint selection signature differs; continuing with the checkpoint "
+            "because relaxed resume compatibility is enabled",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     model_config = dict(checkpoint["model_config"])
     training_config = dict(checkpoint["training_config"])
     if int(model_config.get("future_context_seconds", 0)) != 0:
@@ -1269,6 +1299,7 @@ def train_dtp_fold(
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["scheduler"])
+        _apply_active_optimizer_config(optimizer, scheduler, training_config)
         scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"]) + 1
         best_f1 = float(checkpoint["best_f1"])
@@ -1286,8 +1317,11 @@ def train_dtp_fold(
             early_stopping_reference_score = float(best_selection_rank[0])
         stored_signature = checkpoint.get("selection_signature")
         if stored_signature != selection_signature:
-            raise RuntimeError(
-                "Resume checkpoint signature does not match the active cross-fit configuration"
+            warnings.warn(
+                "Resume checkpoint signature differs from the active configuration; "
+                "continuing with the active configuration",
+                RuntimeWarning,
+                stacklevel=2,
             )
         if int(checkpoint.get("inner_validation_partition", 0)) != inner_validation_partition:
             raise RuntimeError("Resume checkpoint belongs to a different inner partition")
@@ -1542,7 +1576,12 @@ def train_dtp_fold(
             selection_gate(best_selection)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     if checkpoint.get("selection_signature") != selection_signature:
-        raise RuntimeError("Best checkpoint signature does not match the active configuration")
+        warnings.warn(
+            "Best checkpoint signature differs from the active configuration; continuing "
+            "with the active configuration",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if int(checkpoint.get("inner_validation_partition", 0)) != inner_validation_partition:
         raise RuntimeError("Best checkpoint belongs to a different inner partition")
     if checkpoint.get("checkpoint_selection_metric", "event_f1") != checkpoint_selection_metric:

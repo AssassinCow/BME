@@ -24,6 +24,8 @@ def _config(
     inference_batch_size: int,
     include_chunks: bool,
     patience_checks: int = 4,
+    num_workers: int = 8,
+    learning_rate: float = 3e-4,
 ) -> dict[str, object]:
     training = {
         "random_seed": 2026,
@@ -32,6 +34,8 @@ def _config(
         "inference_batch_size": inference_batch_size,
         "inference_num_workers": 2,
         "batch_size": 16,
+        "num_workers": num_workers,
+        "learning_rate": learning_rate,
     }
     if include_chunks:
         training["inference_resume_chunk_rows"] = 32768
@@ -65,7 +69,13 @@ def _run(root: Path, payload: dict[str, object]) -> HierarchicalRun:
 
 def test_completed_state_checkpoint_migration_preserves_weights(tmp_path) -> None:
     source_config = _config(16, include_chunks=False)
-    target_config = _config(64, include_chunks=True, patience_checks=3)
+    target_config = _config(
+        64,
+        include_chunks=True,
+        patience_checks=3,
+        num_workers=16,
+        learning_rate=1e-4,
+    )
     source_root = tmp_path / "source" / "fold_0"
     source_state = source_root / "crossfit_0" / "state"
     source_state.mkdir(parents=True)
@@ -150,6 +160,8 @@ def test_completed_state_checkpoint_migration_preserves_weights(tmp_path) -> Non
         "early_stopping_patience_checks": {"source": 4, "target": 3},
         "inference_batch_size": {"source": 16, "target": 64},
         "inference_resume_chunk_rows": {"source": None, "target": 32768},
+        "learning_rate": {"source": 3e-4, "target": 1e-4},
+        "num_workers": {"source": 8, "target": 16},
     }
     assert migration["early_stopping_compatibility"] == {
         "source_patience_checks": 4,
@@ -163,7 +175,7 @@ def test_completed_state_checkpoint_migration_preserves_weights(tmp_path) -> Non
     target.verify_artifacts()
 
 
-def test_checkpoint_migration_rejects_non_runtime_changes(tmp_path) -> None:
+def test_checkpoint_migration_rejects_non_training_changes(tmp_path) -> None:
     source_config = _config(16, include_chunks=False)
     target_config = _config(64, include_chunks=True)
     target_config["model"] = {"architecture": "different"}
@@ -194,7 +206,128 @@ def test_checkpoint_migration_rejects_non_runtime_changes(tmp_path) -> None:
         },
     )
 
-    with pytest.raises(RuntimeError, match="only permits inference"):
+    with pytest.raises(RuntimeError, match="non-training settings must remain identical"):
+        migrate_completed_state_partition(
+            source_root,
+            target,
+            source_config,
+            target_config,
+            partition=0,
+        )
+
+
+def test_incomplete_checkpoint_migration_allows_worker_changes(tmp_path) -> None:
+    source_config = _config(16, include_chunks=True, num_workers=8)
+    target_config = _config(64, include_chunks=True, num_workers=16)
+    target_config["training"]["inference_num_workers"] = 16
+    source_root = tmp_path / "source"
+    source_state = source_root / "crossfit_0" / "state"
+    source_state.mkdir(parents=True)
+    resolved = source_root / "resolved_config.yaml"
+    resolved.write_text(yaml.safe_dump(source_config), encoding="utf-8")
+    write_json_atomic(
+        source_root / "run_manifest.json",
+        {
+            "run_name": "source",
+            "outer_fold": 0,
+            "stage": "CREATED",
+            "git": {"commit": "old", "dirty": False},
+            "input_hashes": {"anchors": "same"},
+            "artifact_hashes": {"resolved_config.yaml": sha256_file(resolved)},
+        },
+    )
+    best = _checkpoint(source_config, epoch=7, patience=0)
+    last = _checkpoint(source_config, epoch=8, patience=1)
+    last.update({"optimizer": {}, "scheduler": {}, "scaler": {}})
+    torch.save(best, source_state / "best.pt")
+    torch.save(last, source_state / "last.pt")
+
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    target = _run(
+        target_root,
+        {
+            "run_name": "target",
+            "outer_fold": 0,
+            "stage": "CREATED",
+            "git": {"commit": "new", "dirty": False},
+            "input_hashes": {"anchors": "same"},
+            "artifact_hashes": {},
+        },
+    )
+
+    migration = migrate_completed_state_partition(
+        source_root,
+        target,
+        source_config,
+        target_config,
+        partition=0,
+    )
+
+    migrated = torch.load(
+        target_root / "crossfit_0" / "state" / "last.pt",
+        map_location="cpu",
+        weights_only=False,
+    )
+    assert migrated["training_config"]["num_workers"] == 16
+    assert migrated["training_config"]["inference_num_workers"] == 16
+    assert migration["training_complete_at_migration"] is False
+    assert migration["training_will_resume"] is True
+    assert migration["training_will_not_resume"] is False
+    persisted = json.loads(target.manifest_path.read_text(encoding="utf-8"))
+    assert "crossfit_0/state/last.pt" not in persisted["artifact_hashes"]
+    assert "crossfit_0/state/best.pt" not in persisted["artifact_hashes"]
+    assert (
+        "crossfit_0/state/checkpoint_migration.json" in persisted["artifact_hashes"]
+    )
+
+    (target_root / "crossfit_0" / "state" / "last.pt").write_bytes(
+        b"continued training"
+    )
+    target.verify_artifacts()
+
+
+def test_incomplete_checkpoint_migration_rejects_training_dynamics_changes(
+    tmp_path,
+) -> None:
+    source_config = _config(16, include_chunks=True)
+    target_config = _config(16, include_chunks=True, learning_rate=1e-4)
+    source_root = tmp_path / "source"
+    source_state = source_root / "crossfit_0" / "state"
+    source_state.mkdir(parents=True)
+    resolved = source_root / "resolved_config.yaml"
+    resolved.write_text(yaml.safe_dump(source_config), encoding="utf-8")
+    write_json_atomic(
+        source_root / "run_manifest.json",
+        {
+            "run_name": "source",
+            "outer_fold": 0,
+            "stage": "CREATED",
+            "git": {"commit": "old", "dirty": False},
+            "input_hashes": {"anchors": "same"},
+            "artifact_hashes": {"resolved_config.yaml": sha256_file(resolved)},
+        },
+    )
+    best = _checkpoint(source_config, epoch=7, patience=0)
+    last = _checkpoint(source_config, epoch=8, patience=1)
+    last.update({"optimizer": {}, "scheduler": {}, "scaler": {}})
+    torch.save(best, source_state / "best.pt")
+    torch.save(last, source_state / "last.pt")
+    target_root = tmp_path / "target"
+    target_root.mkdir()
+    target = _run(
+        target_root,
+        {
+            "run_name": "target",
+            "outer_fold": 0,
+            "stage": "CREATED",
+            "git": {"commit": "new", "dirty": False},
+            "input_hashes": {"anchors": "same"},
+            "artifact_hashes": {},
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="finish training first.*learning_rate"):
         migrate_completed_state_partition(
             source_root,
             target,

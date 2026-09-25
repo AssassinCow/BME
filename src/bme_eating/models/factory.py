@@ -14,4 +14,8 @@ def build_state_model(config: dict[str, Any]) -> nn.Module:
         return DTPSQF(config)
     if architecture == "hierarchical_state":
         return HierarchicalStateModel(config)
+    if architecture == "stats_fusion_state":
+        from bme_eating.models.stats_fusion_state import StatsFusionStateModel
+
+        return StatsFusionStateModel(config)
     raise ValueError(f"Unknown state model architecture: {architecture}")

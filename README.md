@@ -533,3 +533,15 @@ fold 0 开发 OOF 重合，不能直接拿 fold 0 拟合的部署参数评估 fo
 自己的 outer-train OOF 重做同一冻结协议，再对其 outer 留出作跨折压力测试。
 失败即停止后续折并保留 XGBoost。
 目前没有自动 outer 评价入口，不得把本次开发门禁通过当作可提交证明。
+
+## 15. StatsFusion v4 分层模型
+
+新主线配置为 `configs/hierarchical_v4_statsfusion.yaml`。它用连续 clip、多尺度因果 TCN、
+12 项折内 robust-scaled 统计特征、GMU 门控、Platt 校准、fixed-lag semi-Markov、真实
+proposal-aligned pooling 和 endpoint-local boundary distribution，替换 v3 的单 anchor、
+跨折 latent embedding、bin 中点采样与全局边界先验。
+
+v4 不加载 XGBoost 模型，也不使用其概率、事件、候选或蒸馏目标。完整命令、阶段门禁、
+冻结协议与最终 bundle 见 `docs/hierarchical_v4_statsfusion_runbook.md`。S0–S4 与 PPG-only
+均有独立配置，`scripts/check_hierarchical_v4_gates.py` 负责 fold 0 消融、folds 0–1 开发
+晋级和 folds 2–4 冻结压力门禁；门禁未通过时会阻止冻结或最终全量训练。

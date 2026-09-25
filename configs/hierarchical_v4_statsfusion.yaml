@@ -1,0 +1,195 @@
+extends: base.yaml
+
+project:
+  input_artifact_schema_version: v2
+  artifact_schema_version: v4
+  strict_resume_identity: true
+
+experiment:
+  name: hierarchical_v4_statsfusion
+  protocol_version: 4
+  ablation_id: S4
+
+features:
+  artifact_name: baseline
+
+model:
+  architecture: stats_fusion_state
+  motion_block_seconds: 3
+  ppg_block_seconds: 15
+  motion_dilations: [1, 2, 4, 8, 16, 32]
+  ppg_dilations: [1, 2, 4, 8]
+  statistics_dilations: [1, 2, 4, 8]
+  long_dilations: [1, 2, 4, 8, 16, 32]
+  motion_embedding_dim: 64
+  ppg_embedding_dim: 48
+  hidden_dim: 64
+  statistics_dim: 32
+  long_pool_factor: 5
+  dropout: 0.1
+  gate_initial_bias: -2.0
+  use_motion: true
+  use_ppg: true
+  use_statistics: true
+  use_long_context: true
+  future_context_seconds: 0
+  stable_feature_columns: &stable_features
+    - local_acc_y_mean
+    - local_acc_z_zero_crossing_rate
+    - local_gyro_z_mad
+    - local_acc_mag_std
+    - local_gyro_z_zero_crossing_rate
+    - local_acc_mag_iqr
+    - local_acc_mag_jerk_rms
+    - local_gyro_y_mad
+    - local_acc_y_median
+    - local_ppg_valid_fraction
+    - local_gyro_mag_jerk_p95
+    - local_acc_x_median
+
+sequence:
+  supervised_steps: 256
+  short_receptive_field_steps: 127
+  long_receptive_field_tokens: 127
+  long_pool_factor: 5
+  step_seconds: 3
+  sampling_mixture:
+    uniform: 0.50
+    event: 0.25
+    boundary: 0.25
+
+training:
+  device: cuda
+  amp_dtype: bfloat16
+  batch_size: 4
+  gradient_accumulation: 4
+  steps_per_epoch: 250
+  inference_batch_size: 4
+  num_workers: 4
+  max_epochs: 32
+  selector_fraction: 0.20
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  warmup_fraction: 0.05
+  gradient_clip_norm: 1.0
+  ppg_modality_dropout: 0.20
+  random_seed: 2026
+
+loss:
+  smooth_weight: 0.05
+  smooth_tau: 0.25
+  boundary_weight: 0.1
+  boundary_mask_seconds: 30
+
+calibration:
+  partitions: 3
+  ece_bins: 15
+  maximum_ece: 0.10
+  maximum_prevalence_ratio: 2.0
+  matching_reversal_tolerance: 0.005
+  nms_iou_thresholds: [0.3, 0.5, 0.7]
+  acceptance_quantiles: [0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+
+decoder:
+  use_semi_markov: true
+  ema_half_life_seconds: 12
+  high_threshold: 0.35
+  low_threshold: 0.15
+  gap_merge_seconds: 60
+  transition_threshold: 0.35
+  grid_seconds: 15
+  fixed_lag_seconds: 60
+  duration_lower_quantile: 0.005
+  duration_upper_quantile: 0.995
+  minimum_duration_floor_seconds: 15
+  maximum_duration_ceiling_seconds: 14400
+  jitter_seconds: [-30, -15, 0, 15, 30]
+  maximum_variants_per_event: 12
+  maximum_candidates_per_hour: 20
+  deduplication_iou: 0.9
+
+verifier:
+  left_context_seconds: 60
+  right_context_seconds: 60
+  left_bins: 4
+  event_bins: 16
+  right_bins: 4
+  hidden_channels: 64
+  hidden_dim: 128
+  dropout: 0.1
+  batch_size: 128
+  batch_composition:
+    positive: 0.30
+    near_miss: 0.25
+    hard_false_positive: 0.30
+    random_background: 0.15
+  iou_loss_weight: 0.5
+  max_epochs: 80
+  patience: 10
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  seeds: [2026, 2027, 2028]
+
+boundary:
+  minimum_independent_events: 60
+  maximum_jitters_per_event: 4
+  jitter_seconds: 60
+  residual_quantile: 0.99
+  minimum_range_seconds: 60
+  maximum_range_seconds: 300
+  bin_seconds: 3
+  gaussian_sigma_seconds: 9
+  local_softargmax_radius_bins: 2
+  maximum_clipped_fraction: 0.05
+  entropy_thresholds: [0.55, 0.65, 0.75, 0.85]
+  safety_gap_seconds: 3
+  hidden_dim: 64
+  dropout: 0.1
+  batch_size: 128
+  max_epochs: 80
+  patience: 10
+  learning_rate: 0.001
+  weight_decay: 0.0001
+  seeds: [2026, 2027, 2028]
+
+hierarchical:
+  maximum_event_latency_seconds: 60
+  verifier_crossfit_partitions: 3
+  boundary_crossfit_partitions: 3
+  stable_feature_columns: *stable_features
+
+promotion_gate:
+  maximum_state_ece: 0.10
+  maximum_state_prevalence_ratio: 2.0
+  minimum_candidate_recall: 0.83
+  target_candidate_recall: 0.88
+  minimum_statistics_f1_improvement: 0.010
+  maximum_statistics_different_sensitivity_drop: 0.02
+  minimum_long_context_recall_improvement: 0.020
+  minimum_long_context_f1_improvement: 0.010
+  minimum_fragment_reduction: 0.20
+  minimum_verifier_f1_improvement: 0.010
+  maximum_verifier_f1_drop: 0.005
+  minimum_verifier_fp_reduction: 0.10
+  minimum_mean_f1_improvement: 0.020
+  maximum_fp_per_hour_ratio: 1.05
+  maximum_different_sensitivity_drop: 0.03
+  maximum_stress_fold_f1_drop: 0.03
+  maximum_stress_different_sensitivity_drop: 0.05
+  minimum_positive_bootstrap_probability: 0.80
+  minimum_boundary_mae_improvement: 0.10
+  maximum_boundary_f1_drop: 0.005
+  maximum_tp_to_fp_fraction: 0.01
+
+feature_provenance:
+  source_paths:
+    - experiments/baseline/fold_0/metadata.json
+    - experiments/baseline/fold_1/metadata.json
+    - experiments/baseline/fold_2/metadata.json
+    - experiments/baseline/fold_3/metadata.json
+    - experiments/baseline/fold_4/metadata.json
+  selection_note_path: docs/问题排查与当前诊断记录.md
+  assumed_used_all_outer_folds: true
+
+final_training:
+  state_seeds: [2026, 2027, 2028]

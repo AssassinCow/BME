@@ -1,0 +1,13 @@
+extends: hierarchical_v4_statsfusion.yaml
+
+experiment:
+  ablation_id: PPG_ONLY
+
+model:
+  use_motion: false
+  use_ppg: true
+  use_statistics: false
+  use_long_context: false
+
+decoder:
+  use_semi_markov: false

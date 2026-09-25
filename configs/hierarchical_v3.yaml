@@ -3,6 +3,7 @@ extends: base.yaml
 project:
   input_artifact_schema_version: v2
   artifact_schema_version: v3
+  strict_resume_identity: false
 
 experiment:
   name: hierarchical_v3
@@ -48,8 +49,8 @@ training:
   inference_batch_size: 64
   inference_resume_chunk_rows: 32768
   validation_every_epochs: 2
-  num_workers: 8
-  inference_num_workers: 2
+  num_workers: 16
+  inference_num_workers: 16
   checkpoint_validation_max_rows: 32768
   checkpoint_validation_strategy: event_stratified_complete_sessions
   checkpoint_validation_min_subjects: 8

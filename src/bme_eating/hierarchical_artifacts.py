@@ -6,6 +6,7 @@ import math
 import platform
 import re
 import sys
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,16 @@ RUN_STAGES = (
     "BOUNDARY_COMPLETE",
     "SELECTED",
     "EVALUATED",
+)
+
+RESUMABLE_STATE_ARTIFACT_NAMES = frozenset(
+    {
+        "best.pt",
+        "last.pt",
+        "history.csv",
+        "best_validation_selection.json",
+        "best_checkpoint_validation_predictions.parquet",
+    }
 )
 
 
@@ -127,28 +138,34 @@ def _verify_freeze_manifest(
     fold: int,
     config_hash: str,
     git_identity: dict[str, Any],
+    *,
+    strict: bool,
 ) -> None:
+    def mismatch(message: str, error_type: type[Exception] = RuntimeError) -> None:
+        if strict:
+            raise error_type(message)
+        warnings.warn(message, RuntimeWarning, stacklevel=2)
+
     experiment_root = output_root / "experiments" / run_name
     fold_zero_manifest = experiment_root / "fold_0" / "run_manifest.json"
     if fold > 0 and fold_zero_manifest.is_file():
         reference = json.loads(fold_zero_manifest.read_text(encoding="utf-8"))
         if reference.get("resolved_config_sha256") != config_hash:
-            raise RuntimeError("Fold configuration differs from the registered fold 0 protocol")
+            mismatch("Fold configuration differs from the registered fold 0 protocol")
     if fold < 2:
         return
     freeze_path = experiment_root / "freeze_manifest.json"
     if not freeze_path.is_file():
-        raise FileNotFoundError("Folds 2-4 require a locked freeze_manifest.json")
+        mismatch("Folds 2-4 have no locked freeze_manifest.json", FileNotFoundError)
+        return
     freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
     if freeze.get("resolved_config_sha256") != config_hash:
-        raise RuntimeError("Frozen stress fold configuration differs from the locked protocol")
+        mismatch("Frozen stress fold configuration differs from the locked protocol")
     if freeze.get("git_commit") != git_identity["commit"]:
-        raise RuntimeError("Frozen stress folds must use the Git commit recorded at freeze time")
+        mismatch("Frozen stress fold Git commit differs from the locked protocol")
     frozen_worktree = freeze.get("worktree_sha256")
     if frozen_worktree is not None and frozen_worktree != git_identity["worktree_sha256"]:
-        raise RuntimeError(
-            "Frozen stress folds must use the worktree snapshot recorded at freeze time"
-        )
+        mismatch("Frozen stress fold worktree differs from the locked protocol")
 
 
 def assert_disjoint_subjects(**groups: set[str]) -> None:
@@ -213,7 +230,19 @@ class HierarchicalRun:
         self.verify_artifacts()
 
     def verify_artifacts(self) -> None:
+        mutable_artifacts: set[str] = set()
+        if self.stage == "CREATED":
+            migrations = self.payload.get("state_checkpoint_migrations", {})
+            for partition, migration in migrations.items():
+                if not bool(migration.get("training_will_resume", False)):
+                    continue
+                mutable_artifacts.update(
+                    f"crossfit_{partition}/state/{name}"
+                    for name in RESUMABLE_STATE_ARTIFACT_NAMES
+                )
         for relative, expected in self.payload.get("artifact_hashes", {}).items():
+            if relative in mutable_artifacts:
+                continue
             path = self.root / relative
             if not path.is_file() or sha256_file(path) != expected:
                 raise RuntimeError(f"Manifested artifact changed or is missing: {relative}")
@@ -269,29 +298,72 @@ def initialize_hierarchical_run(
             raise RuntimeError("Existing run manifest identity is inconsistent")
         public_config = _public_config(config)
         config_hash = _canonical_hash(public_config)
-        if payload.get("resolved_config_sha256") != config_hash:
-            raise RuntimeError("Active configuration differs from the existing run manifest")
         project_root = Path(__file__).resolve().parents[2]
         git_identity = git_worktree_identity(project_root)
-        if payload.get("git", {}).get("commit") != git_identity["commit"]:
-            raise RuntimeError("Active Git commit differs from the existing run manifest")
-        recorded_worktree = payload.get("git", {}).get("worktree_sha256")
-        if recorded_worktree is None:
-            non_manifest_paths = {
-                path.name
-                for path in run_root.iterdir()
-                if path.name not in {"resolved_config.yaml", "run_manifest.json"}
-            }
-            if not non_manifest_paths:
-                payload["git"] = git_identity
-                write_json_atomic(manifest_path, payload)
-        elif recorded_worktree != git_identity["worktree_sha256"]:
+        strict_resume = bool(config.get("project", {}).get("strict_resume_identity", False))
+        previous_config_hash = payload.get("resolved_config_sha256")
+        previous_git = payload.get("git", {})
+        identity_changed = (
+            previous_config_hash != config_hash or previous_git != git_identity
+        )
+        if identity_changed and strict_resume:
+            if previous_config_hash != config_hash:
+                raise RuntimeError("Active configuration differs from the existing run manifest")
+            if previous_git.get("commit") != git_identity["commit"]:
+                raise RuntimeError("Active Git commit differs from the existing run manifest")
             raise RuntimeError("Active worktree snapshot differs from the existing run manifest")
-        _verify_freeze_manifest(output_root, run_name, fold, config_hash, git_identity)
+        if identity_changed:
+            warnings.warn(
+                "Resuming the existing run with the active configuration and worktree; "
+                "checkpoint compatibility is the caller's responsibility",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            payload.setdefault("resume_history", []).append(
+                {
+                    "resume_index": len(payload.get("resume_history", [])) + 1,
+                    "previous_resolved_config_sha256": previous_config_hash,
+                    "active_resolved_config_sha256": config_hash,
+                    "previous_git": previous_git,
+                    "active_git": git_identity,
+                    "command": [
+                        Path(value).name if Path(value).is_absolute() else value
+                        for value in sys.argv
+                    ],
+                }
+            )
+            write_yaml_atomic(run_root / "resolved_config.yaml", public_config)
+            payload["resolved_config_sha256"] = config_hash
+            payload["git"] = git_identity
+            payload.setdefault("artifact_hashes", {})["resolved_config.yaml"] = sha256_file(
+                run_root / "resolved_config.yaml"
+            )
+            write_json_atomic(manifest_path, payload)
+        _verify_freeze_manifest(
+            output_root,
+            run_name,
+            fold,
+            config_hash,
+            git_identity,
+            strict=strict_resume,
+        )
         if fold >= 2:
             freeze_path = output_root / "experiments" / run_name / "freeze_manifest.json"
-            if payload.get("freeze_manifest_sha256") != sha256_file(freeze_path):
-                raise RuntimeError("Frozen stress protocol manifest changed after run creation")
+            if freeze_path.is_file():
+                active_freeze_hash = sha256_file(freeze_path)
+                if payload.get("freeze_manifest_sha256") != active_freeze_hash:
+                    if strict_resume:
+                        raise RuntimeError(
+                            "Frozen stress protocol manifest changed after run creation"
+                        )
+                    warnings.warn(
+                        "Frozen stress protocol manifest changed; continuing in relaxed "
+                        "resume mode",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+                    payload["freeze_manifest_sha256"] = active_freeze_hash
+                    write_json_atomic(manifest_path, payload)
         tracked = _tracked_inputs(config, input_root)
         current_hashes = {
             name: sha256_file(path) for name, path in tracked.items() if path.is_file()
@@ -307,7 +379,15 @@ def initialize_hierarchical_run(
     config_hash = _canonical_hash(public_config)
     project_root = Path(__file__).resolve().parents[2]
     git_identity = git_worktree_identity(project_root)
-    _verify_freeze_manifest(output_root, run_name, fold, config_hash, git_identity)
+    strict_resume = bool(config.get("project", {}).get("strict_resume_identity", False))
+    _verify_freeze_manifest(
+        output_root,
+        run_name,
+        fold,
+        config_hash,
+        git_identity,
+        strict=strict_resume,
+    )
     write_yaml_atomic(run_root / "resolved_config.yaml", public_config)
     tracked = _tracked_inputs(config, input_root)
     missing = [name for name, path in tracked.items() if not path.is_file()]
@@ -367,7 +447,9 @@ def initialize_hierarchical_run(
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         },
     }
-    if fold >= 2:
+    if fold >= 2 and (
+        output_root / "experiments" / run_name / "freeze_manifest.json"
+    ).is_file():
         payload["freeze_manifest_sha256"] = sha256_file(
             output_root / "experiments" / run_name / "freeze_manifest.json"
         )

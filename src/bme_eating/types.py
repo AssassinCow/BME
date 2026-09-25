@@ -18,6 +18,17 @@ class StateOutput:
 
 
 @dataclass(frozen=True)
+class StateSequenceOutput:
+    timestamp_ms: torch.Tensor
+    state_logit: torch.Tensor
+    onset_logit: torch.Tensor
+    offset_logit: torch.Tensor
+    ppg_gate: torch.Tensor
+    statistics_gate: torch.Tensor
+    missing_fraction: torch.Tensor
+
+
+@dataclass(frozen=True)
 class Event:
     subject_key: str
     start_ms: int
