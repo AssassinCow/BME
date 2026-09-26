@@ -17,8 +17,9 @@ def test_v4_config_is_strict_and_has_fixed_features() -> None:
     assert config["training"]["batch_size"] == 16
     assert config["training"]["gradient_accumulation"] == 2
     assert config["training"]["steps_per_epoch"] == 1250
-    assert config["training"]["inference_batch_size"] == 64
-    assert config["training"]["num_workers"] == 16
+    assert config["training"]["inference_batch_size"] == 16
+    assert config["training"]["num_workers"] == 8
+    assert config["training"]["inference_num_workers"] == 0
     assert config["training"]["selector_fraction"] == 0.35
     assert config["training"]["selector_rolling_epochs"] == 3
     assert config["training"]["validation_every_epochs"] == 2

@@ -348,7 +348,7 @@ def build_proposal_features_v4(
         for left, right, region, relative in _bin_specs(
             int(proposal.coarse_start_ms), int(proposal.coarse_end_ms), config
         ):
-            selected = (timestamps >= left) & (timestamps < right)
+            selected = (timestamps > left) & (timestamps <= right)
             selected_values = values[selected]
             valid_bins.append(bool(len(selected_values)))
             if len(selected_values):
@@ -386,7 +386,7 @@ def build_proposal_features_v4(
                 ).astype(np.float32)
             )
         duration_seconds = (int(proposal.coarse_end_ms) - int(proposal.coarse_start_ms)) / 1000.0
-        in_event = (timestamps >= int(proposal.coarse_start_ms)) & (
+        in_event = (timestamps > int(proposal.coarse_start_ms)) & (
             timestamps <= int(proposal.coarse_end_ms)
         )
         state_mean = float(np.nanmean(values[in_event, 0])) if in_event.any() else 0.0

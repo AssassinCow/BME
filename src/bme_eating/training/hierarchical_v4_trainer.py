@@ -46,7 +46,11 @@ from bme_eating.hierarchical_artifacts import (
     write_parquet_atomic,
     write_yaml_atomic,
 )
-from bme_eating.hierarchical_v4_artifacts import current_v4_identity
+from bme_eating.hierarchical_v4_artifacts import (
+    _saved_resume_config_hash,
+    current_v4_identity,
+    resume_config_hash,
+)
 from bme_eating.hierarchical_v4_gates import verify_gate_evidence
 from bme_eating.metrics import (
     evaluate_events,
@@ -565,6 +569,7 @@ def _train_state_epochs(
     progress_label: str = "state",
     total_epochs: int | None = None,
     scheduler_total_epochs: int | None = None,
+    resume_scheduler_state: dict[str, Any] | None = None,
 ) -> torch.optim.Optimizer:
     device = _device(config)
     model.to(device)
@@ -606,8 +611,13 @@ def _train_state_epochs(
             progress = (step - warmup_updates + 1) / max(total_updates - warmup_updates, 1)
             return 0.5 * (1.0 + math.cos(math.pi * min(progress, 1.0)))
 
+        active_lrs = [group["lr"] for group in optimizer.param_groups]
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=learning_rate_multiplier)
         optimizer._bme_scheduler = scheduler
+        if resume_scheduler_state is not None:
+            scheduler.load_state_dict(resume_scheduler_state)
+            for group, active_lr in zip(optimizer.param_groups, active_lrs):
+                group["lr"] = active_lr
     amp_enabled = device.type == "cuda"
     amp_dtype = (
         torch.bfloat16 if config["training"].get("amp_dtype") == "bfloat16" else torch.float16
@@ -646,6 +656,133 @@ def _train_state_epochs(
             if step == 1 or step % 10 == 0 or step == len(loader):
                 progress.set_postfix(loss=f"{float(loss.detach().cpu()) * accumulation:.4f}")
     return optimizer
+
+
+def _save_state_epoch(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    config: dict[str, Any],
+    *,
+    kind: str,
+    epoch: int,
+    seed: int,
+    subjects: dict[str, set[str]],
+    extra: dict[str, Any] | None = None,
+) -> None:
+    scheduler = getattr(optimizer, "_bme_scheduler", None)
+    if scheduler is None:
+        raise RuntimeError("Cannot save a state epoch without its LR scheduler")
+    _save_torch_atomic(
+        path,
+        {
+            "kind": kind,
+            "epoch": epoch,
+            "seed": seed,
+            "subjects": {name: sorted(group) for name, group in subjects.items()},
+            "resume_config_sha256": resume_config_hash(config),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_states": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            **(extra or {}),
+        },
+    )
+
+
+def _load_state_epoch(
+    path: Path,
+    model: torch.nn.Module,
+    config: dict[str, Any],
+    *,
+    kind: str,
+    seed: int,
+    subjects: dict[str, set[str]],
+    maximum_epochs: int,
+) -> tuple[int, torch.optim.Optimizer, dict[str, Any], dict[str, Any]]:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    expected_subjects = {name: sorted(group) for name, group in subjects.items()}
+    if (
+        checkpoint.get("kind") != kind
+        or checkpoint.get("seed") != seed
+        or checkpoint.get("subjects") != expected_subjects
+        or checkpoint.get("resume_config_sha256") != resume_config_hash(config)
+    ):
+        raise RuntimeError(f"State epoch checkpoint identity mismatch: {path.name}")
+    epoch = int(checkpoint["epoch"])
+    if epoch < 1 or epoch > maximum_epochs:
+        raise RuntimeError(f"Invalid state epoch checkpoint position: {epoch}")
+    model.to(_device(config))
+    model.load_state_dict(checkpoint["model"])
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=float(config["training"]["learning_rate"]),
+        weight_decay=float(config["training"]["weight_decay"]),
+    )
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    torch.set_rng_state(checkpoint["torch_rng_state"])
+    if checkpoint["cuda_rng_states"] is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA checkpoint requires CUDA to resume")
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
+    tqdm.write(f"[state {kind} seed={seed}] restored after epoch {epoch}/{maximum_epochs}")
+    return epoch, optimizer, checkpoint["scheduler"], checkpoint
+
+
+def _train_state_with_checkpoints(
+    model: torch.nn.Module,
+    dataset: StatsFusionSequenceDataset,
+    config: dict[str, Any],
+    *,
+    epochs: int,
+    seed: int,
+    subjects: dict[str, set[str]],
+    checkpoint_path: Path,
+    resume: bool,
+    progress_label: str,
+) -> None:
+    optimizer = None
+    scheduler_state = None
+    completed_epochs = 0
+    if resume and checkpoint_path.is_file():
+        completed_epochs, optimizer, scheduler_state, checkpoint = _load_state_epoch(
+            checkpoint_path,
+            model,
+            config,
+            kind="retrain",
+            seed=seed,
+            subjects=subjects,
+            maximum_epochs=epochs,
+        )
+        if int(checkpoint.get("target_epochs", -1)) != epochs:
+            raise RuntimeError("State retraining checkpoint target epoch count differs")
+    for epoch in range(completed_epochs + 1, epochs + 1):
+        optimizer = _train_state_epochs(
+            model,
+            dataset,
+            config,
+            epochs=1,
+            seed=seed,
+            optimizer=optimizer,
+            epoch_offset=epoch - 1,
+            progress_label=progress_label,
+            total_epochs=epochs,
+            scheduler_total_epochs=int(config["training"]["max_epochs"]),
+            resume_scheduler_state=scheduler_state,
+        )
+        scheduler_state = None
+        _save_state_epoch(
+            checkpoint_path,
+            model,
+            optimizer,
+            config,
+            kind="retrain",
+            epoch=epoch,
+            seed=seed,
+            subjects=subjects,
+            extra={"target_epochs": epochs},
+        )
 
 
 def _selector_score(
@@ -806,6 +943,9 @@ def _select_epoch(
     inputs: V4Inputs,
     config: dict[str, Any],
     seed: int,
+    *,
+    checkpoint_path: Path | None = None,
+    resume: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     scaler, transformed = _fit_scaler_and_transform(inputs, fit_subjects)
     del scaler
@@ -853,7 +993,24 @@ def _select_epoch(
     checks_without_improvement = 0
     stopped_early = False
     completed_training_epochs = 0
-    for epoch in range(1, maximum_epochs + 1):
+    scheduler_state = None
+    if resume and checkpoint_path is not None and checkpoint_path.is_file():
+        completed_training_epochs, optimizer, scheduler_state, checkpoint = _load_state_epoch(
+            checkpoint_path,
+            model,
+            config,
+            kind="selector",
+            seed=seed,
+            subjects={"fit": fit_subjects, "selector": selector_subjects},
+            maximum_epochs=maximum_epochs,
+        )
+        epoch_metrics = checkpoint["epoch_metrics"]
+        best_progress = checkpoint["best_progress"]
+        checks_without_improvement = int(checkpoint["checks_without_improvement"])
+        stopped_early = bool(checkpoint["stopped_early"])
+    for epoch in range(completed_training_epochs + 1, maximum_epochs + 1):
+        if stopped_early:
+            break
         optimizer = _train_state_epochs(
             model,
             train_dataset,
@@ -864,42 +1021,61 @@ def _select_epoch(
             epoch_offset=epoch - 1,
             progress_label=f"state select seed={seed}",
             total_epochs=maximum_epochs,
+            resume_scheduler_state=scheduler_state,
         )
+        scheduler_state = None
         completed_training_epochs = epoch
-        if epoch % validation_interval != 0 and epoch != maximum_epochs:
-            continue
-        score = _selector_score(
-            model,
-            selector_dataset,
-            config,
-            fit_events,
-            selector_events,
-            progress_label=f"state validate {epoch}/{maximum_epochs}",
-        )
-        epoch_metrics.append({"epoch": epoch, **score})
-        _add_robust_epoch_metrics(epoch_metrics, rolling_epochs)
-        current = epoch_metrics[-1]
-        if _selector_early_stopping_improved(
-            current,
-            best_progress,
-            minimum_recall=minimum_recall,
-            minimum_delta=minimum_delta,
-        ):
-            best_progress = dict(current)
-            checks_without_improvement = 0
-        else:
-            checks_without_improvement += 1
-        tqdm.write(
-            f"[state selector seed={seed}] epoch {epoch}/{maximum_epochs} "
-            f"recall={score['candidate_recall']:.4f} F1={score['event_f1']:.4f} "
-            f"ECE={score['ece']:.4f}"
-        )
-        if epoch >= minimum_training_epochs and checks_without_improvement >= patience_checks:
-            stopped_early = True
-            tqdm.write(
-                f"[state selector seed={seed}] early stop after epoch {epoch}; "
-                f"no robust improvement for {checks_without_improvement} checks"
+        if epoch % validation_interval == 0 or epoch == maximum_epochs:
+            score = _selector_score(
+                model,
+                selector_dataset,
+                config,
+                fit_events,
+                selector_events,
+                progress_label=f"state validate {epoch}/{maximum_epochs}",
             )
+            epoch_metrics.append({"epoch": epoch, **score})
+            _add_robust_epoch_metrics(epoch_metrics, rolling_epochs)
+            current = epoch_metrics[-1]
+            if _selector_early_stopping_improved(
+                current,
+                best_progress,
+                minimum_recall=minimum_recall,
+                minimum_delta=minimum_delta,
+            ):
+                best_progress = dict(current)
+                checks_without_improvement = 0
+            else:
+                checks_without_improvement += 1
+            tqdm.write(
+                f"[state selector seed={seed}] epoch {epoch}/{maximum_epochs} "
+                f"recall={score['candidate_recall']:.4f} F1={score['event_f1']:.4f} "
+                f"ECE={score['ece']:.4f}"
+            )
+            if epoch >= minimum_training_epochs and checks_without_improvement >= patience_checks:
+                stopped_early = True
+                tqdm.write(
+                    f"[state selector seed={seed}] early stop after epoch {epoch}; "
+                    f"no robust improvement for {checks_without_improvement} checks"
+                )
+        if checkpoint_path is not None:
+            _save_state_epoch(
+                checkpoint_path,
+                model,
+                optimizer,
+                config,
+                kind="selector",
+                epoch=epoch,
+                seed=seed,
+                subjects={"fit": fit_subjects, "selector": selector_subjects},
+                extra={
+                    "epoch_metrics": epoch_metrics,
+                    "best_progress": best_progress,
+                    "checks_without_improvement": checks_without_improvement,
+                    "stopped_early": stopped_early,
+                },
+            )
+        if stopped_early:
             break
     qualified = [
         value
@@ -978,7 +1154,11 @@ def infer_state_windows(
         dataset,
         batch_size=int(config["training"]["inference_batch_size"]),
         sampler=_inference_endpoints(dataset),
-        num_workers=int(config["training"].get("num_workers", 0)),
+        num_workers=int(
+            config["training"].get(
+                "inference_num_workers", config["training"].get("num_workers", 0)
+            )
+        ),
     )
     frames: list[pd.DataFrame] = []
     statistic_names = [f"stat_{name}" for name in STATS_FEATURE_COLUMNS]
@@ -1086,6 +1266,78 @@ def _save_torch_atomic(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _save_head_epoch(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    config: dict[str, Any],
+    *,
+    kind: str,
+    seed: int,
+    epoch: int,
+    target_epochs: int,
+    identity: dict[str, Any],
+    extra: dict[str, Any] | None = None,
+    numpy_rng: np.random.Generator | None = None,
+) -> None:
+    _save_torch_atomic(
+        path,
+        {
+            "kind": kind,
+            "seed": seed,
+            "epoch": epoch,
+            "target_epochs": target_epochs,
+            "identity": identity,
+            "resume_config_sha256": resume_config_hash(config),
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "torch_rng_state": torch.get_rng_state(),
+            "cuda_rng_states": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+            "numpy_rng_state": numpy_rng.bit_generator.state if numpy_rng is not None else None,
+            **(extra or {}),
+        },
+    )
+
+
+def _load_head_epoch(
+    path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    config: dict[str, Any],
+    *,
+    kind: str,
+    seed: int,
+    target_epochs: int,
+    identity: dict[str, Any],
+    numpy_rng: np.random.Generator | None = None,
+) -> dict[str, Any]:
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    if (
+        checkpoint.get("kind") != kind
+        or checkpoint.get("seed") != seed
+        or checkpoint.get("target_epochs") != target_epochs
+        or checkpoint.get("identity") != identity
+        or checkpoint.get("resume_config_sha256") != resume_config_hash(config)
+    ):
+        raise RuntimeError(f"Training checkpoint identity mismatch: {path.name}")
+    epoch = int(checkpoint["epoch"])
+    if epoch < 1 or epoch > target_epochs:
+        raise RuntimeError(f"Invalid training checkpoint epoch: {epoch}")
+    model.load_state_dict(checkpoint["model"])
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    torch.set_rng_state(checkpoint["torch_rng_state"])
+    if checkpoint["cuda_rng_states"] is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA checkpoint requires CUDA to resume")
+        torch.cuda.set_rng_state_all(checkpoint["cuda_rng_states"])
+    if numpy_rng is not None:
+        if checkpoint["numpy_rng_state"] is None:
+            raise RuntimeError("Boundary checkpoint has no NumPy random state")
+        numpy_rng.bit_generator.state = checkpoint["numpy_rng_state"]
+    tqdm.write(f"[{kind} seed={seed}] restored after epoch {epoch}/{target_epochs}")
+    return checkpoint
+
+
 def _average_state_prediction_frames(
     frames: list[pd.DataFrame], *, primary_seed_index: int = 0
 ) -> pd.DataFrame:
@@ -1142,7 +1394,12 @@ def train_state_crossfit_v4(
         partition_root = run.root / "crossfit" / f"partition_{partition}" / "state"
         scaler_path = partition_root / "statistics_scaler.json"
         normalization_path = partition_root / "sensor_normalization.json"
-        if resume and scaler_path.is_file() and normalization_path.is_file():
+        if (
+            resume
+            and not run.payload.get("recompute_pretraining_scalers", False)
+            and scaler_path.is_file()
+            and normalization_path.is_file()
+        ):
             scaler = FoldRobustScaler.from_json(json.loads(scaler_path.read_text(encoding="utf-8")))
             normalization = load_normalization(normalization_path)
             transformed = _transform_with_scaler(inputs, scaler)
@@ -1175,23 +1432,36 @@ def train_state_crossfit_v4(
                 model = build_state_model(checkpoint["model_config"])
                 model.load_state_dict(checkpoint["model"])
             else:
-                epochs, selector_report = _select_epoch(
-                    inputs.anchors[inputs.anchors["subject_key"].astype(str).isin(fit_subjects)],
-                    inputs.anchors[
-                        inputs.anchors["subject_key"].astype(str).isin(selector_subjects)
-                    ],
-                    fit_subjects,
-                    inputs,
-                    config,
-                    seed + partition * 10_000,
-                )
-                selector_report = {
-                    **selector_report,
-                    "fit_subjects": sorted(fit_subjects),
-                    "selector_subjects": sorted(selector_subjects),
-                    "selector_split": selector_split_report,
-                }
-                write_json_atomic(selector_report_path, selector_report)
+                if resume and selector_report_path.is_file():
+                    selector_report = json.loads(selector_report_path.read_text(encoding="utf-8"))
+                    if (
+                        selector_report.get("fit_subjects") != sorted(fit_subjects)
+                        or selector_report.get("selector_subjects") != sorted(selector_subjects)
+                    ):
+                        raise RuntimeError("Saved state selector subjects differ from this run")
+                    epochs = int(selector_report["selected_epoch"])
+                else:
+                    epochs, selector_report = _select_epoch(
+                        inputs.anchors[
+                            inputs.anchors["subject_key"].astype(str).isin(fit_subjects)
+                        ],
+                        inputs.anchors[
+                            inputs.anchors["subject_key"].astype(str).isin(selector_subjects)
+                        ],
+                        fit_subjects,
+                        inputs,
+                        config,
+                        seed + partition * 10_000,
+                        checkpoint_path=partition_root / f"selector_seed_{seed}_last.pt",
+                        resume=resume,
+                    )
+                    selector_report = {
+                        **selector_report,
+                        "fit_subjects": sorted(fit_subjects),
+                        "selector_subjects": sorted(selector_subjects),
+                        "selector_split": selector_split_report,
+                    }
+                    write_json_atomic(selector_report_path, selector_report)
                 train_rows = transformed[
                     transformed["subject_key"].astype(str).isin(training_subjects)
                 ].reset_index(drop=True)
@@ -1209,15 +1479,16 @@ def train_state_crossfit_v4(
                 )
                 torch.manual_seed(seed)
                 model = build_state_model(config["model"])
-                _train_state_epochs(
+                _train_state_with_checkpoints(
                     model,
                     dataset,
                     config,
                     epochs=epochs,
                     seed=seed + partition * 10_000,
+                    subjects={"train": training_subjects, "holdout": holdout},
+                    checkpoint_path=partition_root / f"retrain_seed_{seed}_last.pt",
+                    resume=resume,
                     progress_label=f"state partition={partition} seed={seed} retrain",
-                    total_epochs=epochs,
-                    scheduler_total_epochs=int(config["training"]["max_epochs"]),
                 )
                 _save_torch_atomic(
                     checkpoint_path,
@@ -1303,33 +1574,44 @@ def train_state_crossfit_v4(
         torch.manual_seed(seed)
         outer_model = build_state_model(config["model"])
         epochs = fixed_outer_epochs[seed]
-        _train_state_epochs(
-            outer_model,
-            outer_dataset,
-            config,
-            epochs=epochs,
-            seed=seed + 50_000,
-            progress_label=f"state outer seed={seed} retrain",
-            total_epochs=epochs,
-            scheduler_total_epochs=int(config["training"]["max_epochs"]),
-        )
         checkpoint_path = outer_state_root / f"state_seed_{seed}.pt"
-        _save_torch_atomic(
-            checkpoint_path,
-            {
-                "model": outer_model.state_dict(),
-                "model_config": config["model"],
-                "epochs": epochs,
-                "seed": seed,
-                "training_subjects": sorted(outer_train),
-                "prediction_subjects": sorted(outer_test),
-                "globally_excluded_subjects": sorted(outer_test),
-                "parent_artifact_sha256": {
-                    "statistics_scaler": sha256_file(outer_scaler_path),
-                    "sensor_normalization": sha256_file(outer_normalization_path),
+        if resume and checkpoint_path.is_file():
+            saved = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+            if (
+                saved.get("model_config") != config["model"]
+                or saved.get("epochs") != epochs
+                or saved.get("training_subjects") != sorted(outer_train)
+            ):
+                raise RuntimeError("Saved outer state model differs from this run")
+            outer_model.load_state_dict(saved["model"])
+        else:
+            _train_state_with_checkpoints(
+                outer_model,
+                outer_dataset,
+                config,
+                epochs=epochs,
+                seed=seed + 50_000,
+                subjects={"train": outer_train, "holdout": outer_test},
+                checkpoint_path=outer_state_root / f"retrain_seed_{seed}_last.pt",
+                resume=resume,
+                progress_label=f"state outer seed={seed} retrain",
+            )
+            _save_torch_atomic(
+                checkpoint_path,
+                {
+                    "model": outer_model.state_dict(),
+                    "model_config": config["model"],
+                    "epochs": epochs,
+                    "seed": seed,
+                    "training_subjects": sorted(outer_train),
+                    "prediction_subjects": sorted(outer_test),
+                    "globally_excluded_subjects": sorted(outer_test),
+                    "parent_artifact_sha256": {
+                        "statistics_scaler": sha256_file(outer_scaler_path),
+                        "sensor_normalization": sha256_file(outer_normalization_path),
+                    },
                 },
-            },
-        )
+            )
         outer_checkpoints.append(checkpoint_path)
         outer_frames.append(
             infer_state_windows(
@@ -1863,16 +2145,45 @@ def _prepare_nested_meta_cache(
         save_normalization(normalization, normalization_path)
         artifacts.extend((scaler_path, normalization_path))
         for seed in state_seeds:
-            epochs, selector_report = _select_epoch(
-                inputs.anchors[inputs.anchors["subject_key"].astype(str).isin(fit_subjects)],
-                inputs.anchors[
-                    inputs.anchors["subject_key"].astype(str).isin(selector_subjects)
-                ],
-                fit_subjects,
-                inputs,
-                config,
-                seed + meta_partition * 100_000 + inner_partition * 10_000,
-            )
+            checkpoint = inner_root / f"seed_{seed}.pt"
+            selector_path = inner_root / f"selector_seed_{seed}.json"
+            parent_hashes = {
+                "statistics_scaler": sha256_file(scaler_path),
+                "sensor_normalization": sha256_file(normalization_path),
+            }
+            if selector_path.is_file():
+                selector_report = json.loads(selector_path.read_text(encoding="utf-8"))
+                if (
+                    selector_report.get("fit_subjects") != sorted(fit_subjects)
+                    or selector_report.get("selector_subjects") != sorted(selector_subjects)
+                    or selector_report.get("parent_artifact_sha256") != parent_hashes
+                ):
+                    raise RuntimeError("Nested state selector report identity mismatch")
+                epochs = int(selector_report["selected_epoch"])
+            else:
+                epochs, selector_report = _select_epoch(
+                    inputs.anchors[inputs.anchors["subject_key"].astype(str).isin(fit_subjects)],
+                    inputs.anchors[
+                        inputs.anchors["subject_key"].astype(str).isin(selector_subjects)
+                    ],
+                    fit_subjects,
+                    inputs,
+                    config,
+                    seed + meta_partition * 100_000 + inner_partition * 10_000,
+                    checkpoint_path=inner_root / f"selector_seed_{seed}_last.pt",
+                    resume=True,
+                )
+                selector_report = {
+                    **selector_report,
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "selector_split": selector_split_report,
+                    "training_subjects": sorted(model_subjects),
+                    "prediction_subjects": sorted(prediction_subjects),
+                    "globally_excluded_subjects": sorted(holdout_subjects),
+                    "parent_artifact_sha256": parent_hashes,
+                }
+                write_json_atomic(selector_path, selector_report)
             dataset = _make_dataset(
                 train_rows,
                 inputs,
@@ -1884,20 +2195,31 @@ def _prepare_nested_meta_cache(
             )
             torch.manual_seed(seed)
             model = build_state_model(config["model"])
-            _train_state_epochs(
-                model,
-                dataset,
-                config,
-                epochs=epochs,
-                seed=seed + meta_partition * 100_000 + inner_partition * 10_000,
-                progress_label=(
-                    f"nested state meta={meta_partition} inner={inner_partition} seed={seed}"
-                ),
-                total_epochs=epochs,
-                scheduler_total_epochs=int(config["training"]["max_epochs"]),
-            )
-            checkpoint = inner_root / f"seed_{seed}.pt"
-            selector_path = inner_root / f"selector_seed_{seed}.json"
+            if checkpoint.is_file():
+                saved = torch.load(checkpoint, map_location="cpu", weights_only=False)
+                if (
+                    saved.get("model_config") != config["model"]
+                    or saved.get("epochs") != epochs
+                    or saved.get("training_subjects") != sorted(model_subjects)
+                    or saved.get("prediction_subjects") != sorted(prediction_subjects)
+                    or saved.get("parent_artifact_sha256") != parent_hashes
+                ):
+                    raise RuntimeError("Nested state model checkpoint identity mismatch")
+                model.load_state_dict(saved["model"])
+            else:
+                _train_state_with_checkpoints(
+                    model,
+                    dataset,
+                    config,
+                    epochs=epochs,
+                    seed=seed + meta_partition * 100_000 + inner_partition * 10_000,
+                    subjects={"train": model_subjects, "holdout": prediction_subjects},
+                    checkpoint_path=inner_root / f"retrain_seed_{seed}_last.pt",
+                    resume=True,
+                    progress_label=(
+                        f"nested state meta={meta_partition} inner={inner_partition} seed={seed}"
+                    ),
+                )
             checkpoint_payload = {
                 "model": model.state_dict(),
                 "model_config": config["model"],
@@ -1906,28 +2228,10 @@ def _prepare_nested_meta_cache(
                 "training_subjects": sorted(model_subjects),
                 "prediction_subjects": sorted(prediction_subjects),
                 "globally_excluded_subjects": sorted(holdout_subjects),
-                "parent_artifact_sha256": {
-                    "statistics_scaler": sha256_file(scaler_path),
-                    "sensor_normalization": sha256_file(normalization_path),
-                },
+                "parent_artifact_sha256": parent_hashes,
             }
-            _save_torch_atomic(checkpoint, checkpoint_payload)
-            write_json_atomic(
-                selector_path,
-                {
-                    **selector_report,
-                    "fit_subjects": sorted(fit_subjects),
-                    "selector_subjects": sorted(selector_subjects),
-                    "selector_split": selector_split_report,
-                    "training_subjects": sorted(model_subjects),
-                    "prediction_subjects": sorted(prediction_subjects),
-                    "globally_excluded_subjects": sorted(holdout_subjects),
-                    "parent_artifact_sha256": {
-                        "statistics_scaler": sha256_file(scaler_path),
-                        "sensor_normalization": sha256_file(normalization_path),
-                    },
-                },
-            )
+            if not checkpoint.is_file():
+                _save_torch_atomic(checkpoint, checkpoint_payload)
             artifacts.extend((checkpoint, selector_path))
             model_lineage.append(
                 {
@@ -2070,6 +2374,9 @@ def _train_verifier_model_v4(
     *,
     seed: int,
     epochs: int | None = None,
+    checkpoint_path: Path | None = None,
+    resume: bool = False,
+    identity: dict[str, Any] | None = None,
 ) -> EventVerifierV4:
     torch.manual_seed(seed)
     device = _device(config)
@@ -2094,8 +2401,18 @@ def _train_verifier_model_v4(
         weight_decay=float(config["verifier"]["weight_decay"]),
     )
     maximum_epochs = int(epochs or config["verifier"]["max_epochs"])
+    completed_epochs = 0
+    if checkpoint_path is not None and identity is None:
+        raise ValueError("Verifier checkpoint requires an identity")
+    if resume and checkpoint_path is not None and checkpoint_path.is_file():
+        saved = _load_head_epoch(
+            checkpoint_path, model, optimizer, config,
+            kind="verifier_retrain", seed=seed, target_epochs=maximum_epochs,
+            identity=identity,
+        )
+        completed_epochs = int(saved["epoch"])
     progress = tqdm(
-        range(maximum_epochs),
+        range(completed_epochs, maximum_epochs),
         desc=f"verifier seed={seed}",
         unit="epoch",
         dynamic_ncols=True,
@@ -2120,6 +2437,12 @@ def _train_verifier_model_v4(
             loss.backward()
             optimizer.step()
         progress.set_postfix(loss=f"{float(epoch_loss_total.cpu()) / max(epoch_steps, 1):.4f}")
+        if checkpoint_path is not None:
+            _save_head_epoch(
+                checkpoint_path, model, optimizer, config,
+                kind="verifier_retrain", seed=seed, epoch=epoch + 1,
+                target_epochs=maximum_epochs, identity=identity,
+            )
     return model
 
 
@@ -2134,6 +2457,9 @@ def _select_verifier_epoch(
     config: dict[str, Any],
     *,
     seed: int,
+    checkpoint_path: Path | None = None,
+    resume: bool = False,
+    identity: dict[str, Any] | None = None,
 ) -> tuple[int, list[dict[str, float]]]:
     torch.manual_seed(seed)
     device = _device(config)
@@ -2160,7 +2486,24 @@ def _select_verifier_epoch(
     best_key = (-math.inf, -math.inf)
     patience = 0
     history: list[dict[str, float]] = []
-    for epoch in range(1, int(config["verifier"]["max_epochs"]) + 1):
+    maximum_epochs = int(config["verifier"]["max_epochs"])
+    completed_epochs = 0
+    if checkpoint_path is not None and identity is None:
+        raise ValueError("Verifier selector checkpoint requires an identity")
+    if resume and checkpoint_path is not None and checkpoint_path.is_file():
+        saved = _load_head_epoch(
+            checkpoint_path, model, optimizer, config,
+            kind="verifier_selector", seed=seed, target_epochs=maximum_epochs,
+            identity=identity,
+        )
+        completed_epochs = int(saved["epoch"])
+        best_epoch = int(saved["best_epoch"])
+        best_key = tuple(saved["best_key"])
+        patience = int(saved["patience"])
+        history = saved["history"]
+    for epoch in range(completed_epochs + 1, maximum_epochs + 1):
+        if patience >= int(config["verifier"]["patience"]):
+            break
         sampler.set_epoch(epoch - 1)
         model.train()
         for batch in loader:
@@ -2202,6 +2545,16 @@ def _select_verifier_epoch(
             patience = 0
         else:
             patience += 1
+        if checkpoint_path is not None:
+            _save_head_epoch(
+                checkpoint_path, model, optimizer, config,
+                kind="verifier_selector", seed=seed, epoch=epoch,
+                target_epochs=maximum_epochs, identity=identity,
+                extra={
+                    "best_epoch": best_epoch, "best_key": best_key,
+                    "patience": patience, "history": history,
+                },
+            )
         if patience >= int(config["verifier"]["patience"]):
             break
     return best_epoch, history
@@ -2422,14 +2775,22 @@ def _nested_verifier_oof_scores(
         seed_predictions: list[tuple[np.ndarray, np.ndarray]] = []
         for seed in config["verifier"]["seeds"]:
             seed = int(seed)
+            checkpoint = root / "verifier_oof" / f"partition_{partition}_seed_{seed}.pt"
             model = _train_verifier_model_v4(
                 train_features,
                 categories[train_indices],
                 config,
                 seed=seed + meta_partition * 10_000 + partition * 100,
                 epochs=int(selected_epochs[seed]),
+                checkpoint_path=checkpoint.with_name(checkpoint.stem + "_last.pt"),
+                resume=True,
+                identity={
+                    "training_subjects": sorted(training_subjects),
+                    "prediction_subjects": sorted(prediction_subjects),
+                    "globally_excluded_subjects": sorted(globally_excluded_subjects),
+                    "parent_artifact_sha256": parent_artifact_sha256,
+                },
             )
-            checkpoint = root / "verifier_oof" / f"partition_{partition}_seed_{seed}.pt"
             _save_torch_atomic(
                 checkpoint,
                 {
@@ -2574,6 +2935,17 @@ def train_verifier_crossfit_v4(
         holdout_seed_predictions: list[tuple[np.ndarray, np.ndarray]] = []
         for seed in config["verifier"]["seeds"]:
             seed = int(seed)
+            checkpoint = run.root / "verifier" / f"partition_{partition}_seed_{seed}.pt"
+            selector_identity = {
+                "fit_subjects": sorted(fit_subjects),
+                "selector_subjects": sorted(selector_subjects),
+                "parent_artifact_sha256": nested_parent_sha256,
+            }
+            retrain_identity = {
+                "training_subjects": sorted(train_subjects),
+                "prediction_subjects": sorted(holdout_subjects),
+                "parent_artifact_sha256": nested_parent_sha256,
+            }
             selected_epoch, selection_history = _select_verifier_epoch(
                 fit_features,
                 categories[fit_indices],
@@ -2584,6 +2956,9 @@ def train_verifier_crossfit_v4(
                 selector_windows,
                 config,
                 seed=seed + int(partition) * 100,
+                checkpoint_path=checkpoint.with_name(checkpoint.stem + "_selector_last.pt"),
+                resume=True,
+                identity=selector_identity,
             )
             selected_epochs[seed] = selected_epoch
             selected_verifier_epochs[seed].append(selected_epoch)
@@ -2593,8 +2968,10 @@ def train_verifier_crossfit_v4(
                 config,
                 seed=seed + int(partition) * 100,
                 epochs=selected_epoch,
+                checkpoint_path=checkpoint.with_name(checkpoint.stem + "_last.pt"),
+                resume=True,
+                identity=retrain_identity,
             )
-            checkpoint = run.root / "verifier" / f"partition_{partition}_seed_{seed}.pt"
             selector_path = (
                 run.root / "verifier" / f"partition_{partition}_seed_{seed}_selector.json"
             )
@@ -2722,14 +3099,21 @@ def train_verifier_crossfit_v4(
     for seed in config["verifier"]["seeds"]:
         seed = int(seed)
         final_epochs = int(np.median(selected_verifier_epochs[seed]))
+        checkpoint = run.root / "verifier" / f"final_seed_{seed}.pt"
         model = _train_verifier_model_v4(
             global_features,
             global_categories,
             config,
             seed=seed + 90_000,
             epochs=final_epochs,
+            checkpoint_path=checkpoint.with_name(checkpoint.stem + "_last.pt"),
+            resume=True,
+            identity={
+                "training_subjects": sorted(outer_train_subjects),
+                "prediction_subjects": sorted(set(run.payload["outer_test_subjects"])),
+                "parent_artifact_sha256": final_verifier_parent_sha256,
+            },
         )
-        checkpoint = run.root / "verifier" / f"final_seed_{seed}.pt"
         _save_torch_atomic(
             checkpoint,
             {
@@ -3130,6 +3514,9 @@ def _train_endpoint_model(
     *,
     seed: int,
     epochs: int | None = None,
+    checkpoint_path: Path | None = None,
+    resume: bool = False,
+    identity: dict[str, Any] | None = None,
 ) -> EndpointRefiner:
     torch.manual_seed(seed)
     device = _device(config)
@@ -3142,13 +3529,23 @@ def _train_endpoint_model(
     rng = np.random.default_rng(seed)
     batch_size = int(config["boundary"]["batch_size"])
     maximum_epochs = int(epochs or config["boundary"]["max_epochs"])
+    completed_epochs = 0
+    if checkpoint_path is not None and identity is None:
+        raise ValueError("Boundary checkpoint requires an identity")
+    if resume and checkpoint_path is not None and checkpoint_path.is_file():
+        saved = _load_head_epoch(
+            checkpoint_path, model, optimizer, config,
+            kind="boundary_retrain", seed=seed, target_epochs=maximum_epochs,
+            identity=identity, numpy_rng=rng,
+        )
+        completed_epochs = int(saved["epoch"])
     progress = tqdm(
-        range(maximum_epochs),
+        range(completed_epochs, maximum_epochs),
         desc=f"boundary seed={seed}",
         unit="epoch",
         dynamic_ncols=True,
     )
-    for _ in progress:
+    for epoch in progress:
         order = rng.permutation(len(features.sample_ids))
         model.train()
         epoch_loss_total = torch.zeros((), device=device)
@@ -3174,6 +3571,12 @@ def _train_endpoint_model(
             loss.backward()
             optimizer.step()
         progress.set_postfix(loss=f"{float(epoch_loss_total.cpu()) / max(epoch_steps, 1):.4f}")
+        if checkpoint_path is not None:
+            _save_head_epoch(
+                checkpoint_path, model, optimizer, config,
+                kind="boundary_retrain", seed=seed, epoch=epoch + 1,
+                target_epochs=maximum_epochs, identity=identity, numpy_rng=rng,
+            )
     return model
 
 
@@ -3183,6 +3586,9 @@ def _select_boundary_epoch(
     config: dict[str, Any],
     *,
     seed: int,
+    checkpoint_path: Path | None = None,
+    resume: bool = False,
+    identity: dict[str, Any] | None = None,
 ) -> tuple[int, list[dict[str, float]]]:
     if not len(fit_features.sample_ids) or not len(selector_features.sample_ids):
         raise ValueError("Boundary selector requires non-empty fit and selector samples")
@@ -3201,7 +3607,24 @@ def _select_boundary_epoch(
     best_mae = math.inf
     patience = 0
     history: list[dict[str, float]] = []
-    for epoch in range(1, int(config["boundary"]["max_epochs"]) + 1):
+    maximum_epochs = int(config["boundary"]["max_epochs"])
+    completed_epochs = 0
+    if checkpoint_path is not None and identity is None:
+        raise ValueError("Boundary selector checkpoint requires an identity")
+    if resume and checkpoint_path is not None and checkpoint_path.is_file():
+        saved = _load_head_epoch(
+            checkpoint_path, model, optimizer, config,
+            kind="boundary_selector", seed=seed, target_epochs=maximum_epochs,
+            identity=identity, numpy_rng=rng,
+        )
+        completed_epochs = int(saved["epoch"])
+        best_epoch = int(saved["best_epoch"])
+        best_mae = float(saved["best_mae"])
+        patience = int(saved["patience"])
+        history = saved["history"]
+    for epoch in range(completed_epochs + 1, maximum_epochs + 1):
+        if patience >= patience_limit:
+            break
         order = rng.permutation(len(fit_features.sample_ids))
         model.train()
         for start in range(0, len(order), batch_size):
@@ -3250,6 +3673,16 @@ def _select_boundary_epoch(
             patience = 0
         else:
             patience += 1
+        if checkpoint_path is not None:
+            _save_head_epoch(
+                checkpoint_path, model, optimizer, config,
+                kind="boundary_selector", seed=seed, epoch=epoch,
+                target_epochs=maximum_epochs, identity=identity, numpy_rng=rng,
+                extra={
+                    "best_epoch": best_epoch, "best_mae": best_mae,
+                    "patience": patience, "history": history,
+                },
+            )
         if patience >= patience_limit:
             break
     if not np.isfinite(best_mae):
@@ -3462,19 +3895,35 @@ def train_boundary_crossfit_v4(
         seed_outputs: dict[int, tuple[np.ndarray, ...]] = {}
         for seed in config["boundary"]["seeds"]:
             seed = int(seed)
+            checkpoint = run.root / "boundary" / f"partition_{partition}_seed_{seed}.pt"
             selected_epoch, selection_history = _select_boundary_epoch(
                 fit_features,
                 selector_features,
                 config,
                 seed=seed + partition * 100,
+                checkpoint_path=checkpoint.with_name(checkpoint.stem + "_selector_last.pt"),
+                resume=True,
+                identity={
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "range": selection_range.__dict__,
+                    "parent_artifact_sha256": boundary_parent_sha256,
+                },
             )
             model = _train_endpoint_model(
                 train_features,
                 config,
                 seed=seed + partition * 100,
                 epochs=selected_epoch,
+                checkpoint_path=checkpoint.with_name(checkpoint.stem + "_last.pt"),
+                resume=True,
+                identity={
+                    "training_subjects": sorted(set(train["subject_key"].astype(str))),
+                    "prediction_subjects": sorted(holdout_subjects),
+                    "range": boundary_range.__dict__,
+                    "parent_artifact_sha256": boundary_parent_sha256,
+                },
             )
-            checkpoint = run.root / "boundary" / f"partition_{partition}_seed_{seed}.pt"
             _save_torch_atomic(
                 checkpoint,
                 {
@@ -3601,10 +4050,21 @@ def train_boundary_crossfit_v4(
     for seed in config["boundary"]["seeds"]:
         seed = int(seed)
         final_epochs = int(np.median(selected_boundary_epochs[seed]))
-        model = _train_endpoint_model(
-            final_features, config, seed=seed + 90_000, epochs=final_epochs
-        )
         checkpoint = run.root / "boundary" / f"final_seed_{seed}.pt"
+        model = _train_endpoint_model(
+            final_features,
+            config,
+            seed=seed + 90_000,
+            epochs=final_epochs,
+            checkpoint_path=checkpoint.with_name(checkpoint.stem + "_last.pt"),
+            resume=True,
+            identity={
+                "training_subjects": sorted(set(positive["subject_key"].astype(str))),
+                "prediction_subjects": sorted(set(run.payload["outer_test_subjects"])),
+                "range": final_range.__dict__,
+                "parent_artifact_sha256": final_boundary_parent_sha256,
+            },
+        )
         _save_torch_atomic(
             checkpoint,
             {
@@ -4137,6 +4597,8 @@ def train_hierarchical_final_v4(
         if fresh:
             raise FileExistsError(f"V4 final run already exists: {final_root}")
         existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if existing_manifest.get("stage") not in {"IN_PROGRESS", "COMPLETE"}:
+            raise RuntimeError("V4 final manifest has an invalid stage")
         for relative, expected in existing_manifest.get("artifact_hashes", {}).items():
             if (
                 not (final_root / relative).is_file()
@@ -4163,7 +4625,7 @@ def train_hierarchical_final_v4(
             raise RuntimeError(f"V4 fold {fold} must be EVALUATED before final training")
         if manifest.get("protocol_version") != "statsfusion-r2":
             raise RuntimeError(f"V4 fold {fold} was not produced by statsfusion-r2")
-        if manifest.get("resolved_config_sha256") != identity["resolved_config_sha256"]:
+        if _saved_resume_config_hash(root, manifest) != identity["resolved_config_sha256"]:
             raise RuntimeError(f"V4 fold {fold} configuration differs from final training")
         if manifest.get("git") != identity["git"]:
             raise RuntimeError(f"V4 fold {fold} worktree differs from final training")
@@ -4225,8 +4687,21 @@ def train_hierarchical_final_v4(
             raise RuntimeError("Legacy or blocked v4 final runs cannot be resumed")
         if existing_manifest.get("resume_identity") != resume_identity:
             raise RuntimeError("V4 final resume identity differs from its locked evidence")
-        return final_root
-    final_root.mkdir(parents=True, exist_ok=True)
+        if existing_manifest["stage"] == "COMPLETE":
+            return final_root
+    else:
+        final_root.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(
+            manifest_path,
+            {
+                "version": 4,
+                "stage": "IN_PROGRESS",
+                "run_name": run_name,
+                "protocol_version": "statsfusion-r2",
+                "resume_identity": resume_identity,
+                "artifact_hashes": {},
+            },
+        )
     inputs = load_v4_inputs(
         config,
         input_root,
@@ -4286,29 +4761,41 @@ def train_hierarchical_final_v4(
         )
         torch.manual_seed(int(seed))
         model = build_state_model(config["model"])
-        _train_state_epochs(
-            model,
-            full_dataset,
-            config,
-            epochs=fixed_epochs[seed],
-            seed=int(seed),
-            total_epochs=fixed_epochs[seed],
-            scheduler_total_epochs=int(config["training"]["max_epochs"]),
-        )
         path = final_root / f"state_seed_{seed}.pt"
-        _save_torch_atomic(
-            path,
-            {
-                "model": model.state_dict(),
-                "model_config": config["model"],
-                "epochs": fixed_epochs[seed],
-                "training_subject_count": int(inputs.anchors["subject_key"].nunique()),
-                "training_subjects": sorted(final_training_subjects),
-                "prediction_subjects": [],
-                "globally_excluded_subjects": [],
-                "parent_artifact_sha256": final_state_parent_sha256,
-            },
-        )
+        if resume and path.is_file():
+            saved = torch.load(path, map_location="cpu", weights_only=False)
+            if (
+                saved.get("model_config") != config["model"]
+                or saved.get("epochs") != fixed_epochs[seed]
+                or saved.get("training_subjects") != sorted(final_training_subjects)
+                or saved.get("parent_artifact_sha256") != final_state_parent_sha256
+            ):
+                raise RuntimeError("Saved final state model differs from this run")
+        else:
+            _train_state_with_checkpoints(
+                model,
+                full_dataset,
+                config,
+                epochs=fixed_epochs[seed],
+                seed=seed,
+                subjects={"train": final_training_subjects},
+                checkpoint_path=final_root / f"retrain_seed_{seed}_last.pt",
+                resume=resume,
+                progress_label=f"final state seed={seed}",
+            )
+            _save_torch_atomic(
+                path,
+                {
+                    "model": model.state_dict(),
+                    "model_config": config["model"],
+                    "epochs": fixed_epochs[seed],
+                    "training_subject_count": int(inputs.anchors["subject_key"].nunique()),
+                    "training_subjects": sorted(final_training_subjects),
+                    "prediction_subjects": [],
+                    "globally_excluded_subjects": [],
+                    "parent_artifact_sha256": final_state_parent_sha256,
+                },
+            )
         artifacts.append(path)
 
     outer_logits_parts: list[pd.DataFrame] = []
@@ -4464,14 +4951,20 @@ def train_hierarchical_final_v4(
                 raise RuntimeError(f"Missing verifier selector evidence for seed {seed}")
             epochs = int(np.median(selected_epochs))
             verifier_epoch_by_seed[seed] = epochs
+            verifier_path = final_root / f"verifier_seed_{seed}.pt"
             verifier = _train_verifier_model_v4(
                 verifier_features,
                 categories,
                 config,
                 seed=seed + 120_000,
                 epochs=epochs,
+                checkpoint_path=verifier_path.with_name(verifier_path.stem + "_last.pt"),
+                resume=resume,
+                identity={
+                    "training_subjects": sorted(pooled_verifier_subjects),
+                    "parent_artifact_sha256": pooled_verifier_parent_sha256,
+                },
             )
-            verifier_path = final_root / f"verifier_seed_{seed}.pt"
             _save_torch_atomic(
                 verifier_path,
                 {
@@ -4705,13 +5198,20 @@ def train_hierarchical_final_v4(
         if not boundary_epochs:
             raise RuntimeError("Missing pooled boundary selector evidence")
         fixed_boundary_epoch = int(np.median(boundary_epochs))
+        boundary_path = final_root / "boundary.pt"
         boundary = _train_endpoint_model(
             boundary_features,
             config,
             seed=boundary_seed + 120_000,
             epochs=fixed_boundary_epoch,
+            checkpoint_path=final_root / "boundary_last.pt",
+            resume=resume,
+            identity={
+                "training_subjects": sorted(set(positive["subject_key"].astype(str))),
+                "range": boundary_range.__dict__,
+                "parent_artifact_sha256": parent_artifact_hashes,
+            },
         )
-        boundary_path = final_root / "boundary.pt"
         range_path = final_root / "boundary_range.json"
         _save_torch_atomic(
             boundary_path,

@@ -620,7 +620,10 @@ def test_proposal_pooling_uses_all_rows_and_masks_empty_bins() -> None:
         "right_bins": 4,
     }
     features = build_proposal_features_v4(proposals, windows, ["stat"], config)
-    assert features.sequence[0, 4, 0] == 2.0
+    assert features.sequence[0, 3, 0] == 1.0
+    assert features.sequence[0, 4, 0] == 4.0
+    assert features.sequence[0, 5, 0] == 7.0
+    assert features.scalar[0, 2] == 5.0
     assert not features.sequence_mask[0, 0]
     assert features.sequence_mask[0, 4]
 
@@ -1102,7 +1105,7 @@ def test_nested_single_seed_epoch_pipeline_replay(tmp_path, monkeypatch) -> None
     monkeypatch.setattr(trainer_module, "_make_dataset", fake_dataset)
     monkeypatch.setattr(trainer_module, "_select_epoch", lambda *_args, **_kwargs: (1, {}))
     monkeypatch.setattr(trainer_module, "build_state_model", lambda *_args: StubStateModel())
-    monkeypatch.setattr(trainer_module, "_train_state_epochs", fake_train)
+    monkeypatch.setattr(trainer_module, "_train_state_with_checkpoints", fake_train)
     monkeypatch.setattr(trainer_module, "infer_state_windows", fake_infer)
     monkeypatch.setattr(trainer_module, "generate_event_candidates_v4", fake_candidates)
     root, artifacts = _prepare_nested_meta_cache(

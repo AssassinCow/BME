@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 
 import pandas as pd
 import pytest
@@ -18,7 +19,7 @@ from bme_eating.data.stats_fusion_inputs import (
     verify_canonical_statsfusion_inputs,
 )
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
-from bme_eating.hierarchical_v4_artifacts import initialize_v4_run
+from bme_eating.hierarchical_v4_artifacts import initialize_v4_run, resume_config_hash
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, audit_feature_provenance
 
 
@@ -115,7 +116,7 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
         "experiment": {"protocol_version": "statsfusion-r2"},
         "features": {"artifact_name": "baseline"},
         "model": {},
-        "training": {"random_seed": 2026},
+        "training": {"random_seed": 2026, "num_workers": 8},
         "verifier": {"seeds": [2026]},
         "boundary": {"seeds": [2026]},
         "hierarchical": {"maximum_event_latency_seconds": 60},
@@ -128,20 +129,75 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
     identities = iter(
         (
             {"commit": "a", "dirty": False, "worktree_sha256": "one"},
-            {"commit": "b", "dirty": True, "worktree_sha256": "two"},
+            {"commit": "a", "dirty": False, "worktree_sha256": "one"},
+            {"commit": "a", "dirty": True, "worktree_sha256": "two"},
+            {"commit": "b", "dirty": True, "worktree_sha256": "three"},
         )
     )
     monkeypatch.setattr(v4_artifacts, "git_worktree_identity", lambda _root: next(identities))
     monkeypatch.setattr(
         "bme_eating.models.factory.build_state_model", lambda _config: torch.nn.Linear(1, 1)
     )
-    initialize_v4_run(config, input_root, output_root, "strict-v4", 0, fresh=True)
+    initial = initialize_v4_run(config, input_root, output_root, "strict-v4", 0, fresh=True)
+    legacy = dict(initial.payload)
+    legacy.pop("runtime_config")
+    legacy.pop("resume_config_sha256")
+    write_json_atomic(initial.manifest_path, legacy)
+    runtime_changed = deepcopy(config)
+    runtime_changed["training"]["num_workers"] = 0
+    resumed = initialize_v4_run(
+        runtime_changed, input_root, output_root, "strict-v4", 0, fresh=False
+    )
+    assert resumed.payload["runtime_config"]["training.num_workers"] == 0
+    assert resumed.payload["runtime_config_history"] == [
+        {"previous": {"training.num_workers": 8}, "active": {"training.num_workers": 0}}
+    ]
+    original_config_hash = resumed.payload["resolved_config_sha256"]
+    migrated = initialize_v4_run(
+        runtime_changed, input_root, output_root, "strict-v4", 0, fresh=False
+    )
+    assert migrated.payload["recompute_pretraining_scalers"] is True
+    assert migrated.payload["resolved_config_sha256"] == original_config_hash
+    assert len(migrated.payload["pretraining_worktree_history"]) == 1
+    checkpoint_path = migrated.root / "crossfit" / "partition_0" / "state" / "seed_2026.pt"
+    checkpoint_path.parent.mkdir(parents=True)
+    checkpoint_path.write_bytes(b"model")
+    before = migrated.manifest_path.read_bytes()
     try:
-        initialize_v4_run(config, input_root, output_root, "strict-v4", 0, fresh=False)
+        initialize_v4_run(
+            runtime_changed, input_root, output_root, "strict-v4", 0, fresh=False
+        )
     except RuntimeError as error:
         assert "worktree differs" in str(error)
     else:
         raise AssertionError("V4 resume accepted a changed worktree identity")
+    assert migrated.manifest_path.read_bytes() == before
+
+
+def test_v4_resume_hash_ignores_execution_only_settings() -> None:
+    config = {
+        "project": {"strict_resume_identity": True},
+        "training": {
+            "batch_size": 16,
+            "learning_rate": 0.0003,
+            "num_workers": 8,
+            "inference_batch_size": 16,
+        },
+        "model": {"hidden_dim": 64},
+    }
+    runtime_changed = deepcopy(config)
+    runtime_changed["training"].update(
+        {
+            "num_workers": 0,
+            "inference_batch_size": 64,
+            "inference_num_workers": 0,
+        }
+    )
+    assert resume_config_hash(runtime_changed) == resume_config_hash(config)
+
+    result_changed = deepcopy(config)
+    result_changed["training"]["learning_rate"] = 0.0001
+    assert resume_config_hash(result_changed) != resume_config_hash(config)
 
 
 def test_v4_rejects_r1_protocol(tmp_path) -> None:
@@ -156,6 +212,20 @@ def test_v4_rejects_r1_protocol(tmp_path) -> None:
     }
     with pytest.raises(ValueError, match="statsfusion-r2"):
         v4_artifacts.current_v4_identity(config, tmp_path)
+
+
+def test_v4_identity_rejects_unresolved_s4_config(tmp_path) -> None:
+    config = {
+        "project": {
+            "artifact_schema_version": "v4",
+            "input_artifact_schema_version": "v2",
+            "strict_resume_identity": True,
+        },
+        "experiment": {"protocol_version": "statsfusion-r2", "ablation_id": "S4"},
+        "model": {"use_ppg": True},
+    }
+    with pytest.raises(RuntimeError, match="prepare_hierarchical_v4_s4.py"):
+        v4_artifacts.current_v4_identity(config, tmp_path / "v2")
 
 
 def test_session_cache_key_uses_archive_content_not_size_or_mtime(tmp_path) -> None:

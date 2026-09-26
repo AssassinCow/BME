@@ -65,8 +65,9 @@ training:
   batch_size: 16
   gradient_accumulation: 2
   steps_per_epoch: 1250
-  inference_batch_size: 64
-  num_workers: 16
+  inference_batch_size: 16
+  num_workers: 12
+  inference_num_workers: 12
   max_epochs: 32
   selector_fraction: 0.35
   selector_rolling_epochs: 3

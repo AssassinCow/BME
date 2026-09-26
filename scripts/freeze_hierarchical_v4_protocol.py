@@ -7,6 +7,7 @@ import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.hierarchical_artifacts import _canonical_hash, sha256_file, write_json_atomic
+from bme_eating.hierarchical_v4_artifacts import resume_config_hash
 from bme_eating.hierarchical_v4_gates import verify_gate_evidence
 from bme_eating.reproducibility import git_worktree_identity, require_git_worktree
 
@@ -55,6 +56,7 @@ def main() -> None:
         path,
         {
             "resolved_config_sha256": _canonical_hash(public),
+            "resume_config_sha256": resume_config_hash(config),
             "git": git_worktree_identity(project_root),
             "locked_after_folds": [0, 1],
             "evidence_sha256": evidence,

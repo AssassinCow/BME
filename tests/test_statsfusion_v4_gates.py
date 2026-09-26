@@ -5,6 +5,7 @@ import json
 import pandas as pd
 import pytest
 
+from bme_eating.hierarchical_v4_artifacts import _validate_s4_promotion
 from bme_eating.hierarchical_v4_gates import (
     evaluate_crossfold_gate,
     evaluate_fold0_ablations,
@@ -18,11 +19,26 @@ def _json(path, payload) -> None:
     path.write_text(json.dumps(payload), encoding="utf-8")
 
 
-def _candidate(root, run: str, metrics: dict[str, float]) -> None:
+def _candidate(
+    root,
+    run: str,
+    metrics: dict[str, float],
+    *,
+    ablation_id: str | None = None,
+) -> None:
     fold = root / "experiments" / run / "fold_0"
     _json(fold / "run_manifest.json", {"stage": "PROPOSALS_COMPLETE"})
     _json(fold / "decoder" / "candidate_metrics.json", metrics)
-    (fold / "resolved_config.yaml").write_text("model:\n  use_ppg: true\n", encoding="utf-8")
+    resolved_ablation = ablation_id or ("PPG_ONLY" if run == "ppg" else run.upper())
+    use_ppg = resolved_ablation in {"S3", "S4", "PPG_ONLY"}
+    (fold / "resolved_config.yaml").write_text(
+        "experiment:\n"
+        "  protocol_version: statsfusion-r2\n"
+        f"  ablation_id: {resolved_ablation}\n"
+        "model:\n"
+        f"  use_ppg: {str(use_ppg).lower()}\n",
+        encoding="utf-8",
+    )
 
 
 def _state_metrics(
@@ -124,6 +140,78 @@ def test_ppg_promotion_resolves_s4_to_s2_path_when_ppg_fails(tmp_path) -> None:
     assert not report["passed"]
     assert report["resolved_use_ppg"] is False
     verify_gate_evidence(root.parent, report)
+
+
+def test_s4_requires_hash_locked_ppg_promotion_evidence(tmp_path) -> None:
+    root = tmp_path / "v4"
+    _candidate(
+        root,
+        "s2",
+        _state_metrics(f1=0.52, fp=10, recall=0.87, same=0.86, different=0.60, fragments=90),
+    )
+    _candidate(
+        root,
+        "s3",
+        _state_metrics(f1=0.50, fp=12, recall=0.87, same=0.86, different=0.55, fragments=90),
+    )
+    config = {
+        "experiment": {"protocol_version": "statsfusion-r2", "ablation_id": "S4"},
+        "model": {"use_ppg": False},
+        "promotion_gate": {"maximum_fp_per_hour_ratio": 1.05},
+    }
+    with pytest.raises(RuntimeError, match="prepare_hierarchical_v4_s4.py"):
+        _validate_s4_promotion(config, root)
+
+    decision = evaluate_ppg_promotion(
+        root,
+        s2_run="s2",
+        s3_run="s3",
+        gate={"maximum_fp_per_hour_ratio": 1.05},
+    )
+    config["experiment"]["ppg_promotion"] = decision
+    _validate_s4_promotion(config, root)
+
+    config["model"]["use_ppg"] = True
+    with pytest.raises(RuntimeError, match="differs from its locked"):
+        _validate_s4_promotion(config, root)
+    config["model"]["use_ppg"] = False
+
+    evidence = root / "experiments" / "s2" / "fold_0" / "decoder" / "candidate_metrics.json"
+    evidence.write_text("{}", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Gate evidence changed"):
+        _validate_s4_promotion(config, root)
+
+
+def test_s4_recomputes_decision_and_validates_source_runs(tmp_path) -> None:
+    root = tmp_path / "v4"
+    metrics = _state_metrics(
+        f1=0.52,
+        fp=10,
+        recall=0.87,
+        same=0.86,
+        different=0.60,
+        fragments=90,
+    )
+    _candidate(root, "s2", metrics)
+    _candidate(root, "s3", metrics)
+    gate = {"maximum_fp_per_hour_ratio": 1.05}
+    decision = evaluate_ppg_promotion(root, s2_run="s2", s3_run="s3", gate=gate)
+    decision["resolved_use_ppg"] = not decision["resolved_use_ppg"]
+    config = {
+        "experiment": {
+            "protocol_version": "statsfusion-r2",
+            "ablation_id": "S4",
+            "ppg_promotion": decision,
+        },
+        "model": {"use_ppg": decision["resolved_use_ppg"]},
+        "promotion_gate": gate,
+    }
+    with pytest.raises(RuntimeError, match="does not match its locked evidence"):
+        _validate_s4_promotion(config, root)
+
+    _candidate(root, "not_s2", metrics, ablation_id="S1")
+    with pytest.raises(RuntimeError, match="wrong ablation_id"):
+        evaluate_ppg_promotion(root, s2_run="not_s2", s3_run="s3", gate=gate)
 
 
 def _evaluated_fold(

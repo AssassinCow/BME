@@ -7,7 +7,11 @@
   全新 run name，禁止 resume 任何旧 v4 产物。
 - v4 不加载 XGBoost 模型，不读取 XGBoost 概率、事件或候选，也不使用蒸馏目标。
 - 唯一保留的是配置中固定顺序的 12 项 trailing 15 秒统计特征。
-- `strict_resume_identity` 固定为 `true`；代码、配置、输入或 scaler 改变后必须使用新 run name。
+- `strict_resume_identity` 固定为 `true`；数据、模型结构、采样、优化参数及标签/评估规则变化时拒绝恢复。
+  仅 `training.num_workers`、`training.inference_num_workers`、
+  `training.inference_batch_size`、`training.inference_resume_chunk_rows` 可在同一 run 中调整。
+  旧版 run 首次恢复时通过保存的 `resolved_config.yaml` 核对结果相关配置，并把运行参数变化记录在
+  `run_manifest.json`；模型 checkpoint 一旦存在，代码指纹变化仍会拒绝恢复。
 - folds 2–4 需要先写入 `freeze_manifest.json`。
 - 训练阶段对 outer-test anchors 只读取时间轴与文件定位列，并注入零值占位；真实窗口/事件标签
   只由 `evaluate_hierarchical_v4.py` 在 `SELECTED` 阶段读取。
@@ -52,6 +56,23 @@ python scripts/train_boundary_refiner_v4.py --config $config --run-name $run --f
 python scripts/select_hierarchical_v4_pipeline.py --config $config --run-name $run --fold $fold --resume
 python scripts/evaluate_hierarchical_v4.py --config $config --run-name $run --fold $fold --resume
 ```
+
+Windows 推理阶段默认 `inference_num_workers=0`，训练继续使用 `num_workers=8`。
+只调整上述执行参数后，保留原 run name，把 state 命令末尾改为 `--resume` 即可。
+v4 state 每完成一轮，即以原子替换保存 `crossfit/partition_*/state/selector_seed_*_last.pt`
+或 `retrain_seed_*_last.pt`；outer 全训练也保存 `outer/state/retrain_seed_*_last.pt`。
+checkpoint 包含模型、优化器、学习率调度器、随机状态、已完成轮次、受试者集合及配置身份；
+selector 还记录历史指标与早停状态。`--resume` 从最近完整的一轮继续。轮内中断时重做当前轮。
+嵌套 meta-crossfit 的状态 selector / retrain 同样逐轮保存到
+`nested/meta_*/state/inner_*/`；最终全数据状态训练保存到
+`final/<run-name>/retrain_seed_*_last.pt`。最终训练会先写 `IN_PROGRESS` manifest，
+完成后改为 `COMPLETE`，因此中途中断后可用同一 run name 和 `--resume` 继续训练。
+verifier 与 boundary 的 selector 和重训也每轮保存 `*_selector_last.pt` / `*_last.pt`，
+覆盖各 outer partition、嵌套 verifier OOF、outer 全训练及最终全数据训练。
+boundary checkpoint 额外保存 NumPy 采样器状态；恢复时核对训练受试者、父产物哈希、
+边界搜索范围和结果相关配置。各阶段中断后沿用原脚本与 run name、传入 `--resume`。
+旧代码运行期间未曾写出这些文件的轮次无法追溯恢复。对于只有 scaler 的旧 run，恢复时会重新拟合
+scaler，并记录代码指纹迁移；已有训练产物的 run 仍须匹配原 Git 指纹。
 
 阶段固定为：
 

@@ -63,6 +63,27 @@ def _candidate_metrics(output_root: Path, run_name: str, fold: int = 0) -> dict[
     return _read_json(root / "decoder" / "candidate_metrics.json")
 
 
+def _validate_ppg_source_run(
+    output_root: Path,
+    run_name: str,
+    *,
+    expected_ablation: str,
+    expected_use_ppg: bool,
+) -> Path:
+    config_path = output_root / "experiments" / run_name / "fold_0" / "resolved_config.yaml"
+    if not config_path.is_file():
+        raise FileNotFoundError(config_path)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    experiment = config.get("experiment", {})
+    if experiment.get("protocol_version") != "statsfusion-r2":
+        raise RuntimeError(f"{expected_ablation} source run must use statsfusion-r2")
+    if str(experiment.get("ablation_id", "")) != expected_ablation:
+        raise RuntimeError(f"{expected_ablation} source run has the wrong ablation_id")
+    if bool(config.get("model", {}).get("use_ppg", True)) != expected_use_ppg:
+        raise RuntimeError(f"{expected_ablation} source run has the wrong model.use_ppg value")
+    return config_path
+
+
 def evaluate_ppg_promotion(
     output_root: Path,
     *,
@@ -70,10 +91,27 @@ def evaluate_ppg_promotion(
     s3_run: str,
     gate: dict[str, Any],
 ) -> dict[str, Any]:
+    if s2_run == s3_run:
+        raise RuntimeError("S2 and S3 promotion evidence must come from distinct runs")
+    source_configs = {
+        "S2": _validate_ppg_source_run(
+            output_root,
+            s2_run,
+            expected_ablation="S2",
+            expected_use_ppg=False,
+        ),
+        "S3": _validate_ppg_source_run(
+            output_root,
+            s3_run,
+            expected_ablation="S3",
+            expected_use_ppg=True,
+        ),
+    }
     s2 = _candidate_metrics(output_root, s2_run)
     s3 = _candidate_metrics(output_root, s3_run)
     evidence = {
         name: {
+            "resolved_config": _evidence_file(source_configs[name], output_root.parent),
             "run_manifest": _evidence_file(
                 output_root / "experiments" / run / "fold_0" / "run_manifest.json",
                 output_root.parent,
