@@ -1,0 +1,8 @@
+extends: hierarchical_v4_s2.yaml
+
+experiment:
+  name: hierarchical_v4_s2_ablation_C
+  variant: reduced_optimizer_updates
+
+training:
+  steps_per_epoch: 504

@@ -1,0 +1,9 @@
+extends: hierarchical_v4_s2.yaml
+
+experiment:
+  name: hierarchical_v4_s2_ablation_B
+  variant: lower_learning_rate
+
+training:
+  learning_rate: 0.00015
+  warmup_fraction: 0.10

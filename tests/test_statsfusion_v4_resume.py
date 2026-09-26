@@ -106,6 +106,8 @@ def test_retraining_resume_matches_uninterrupted_and_checks_identity(tmp_path, m
         continuous, dataset, config, epochs=4, seed=45, subjects=subjects,
         checkpoint_path=continuous_path, resume=False, progress_label="continuous",
     )
+    assert len(_weights(continuous_path)[0]["training_metrics"]) == 4
+    assert _weights(continuous_path)[0]["training_metrics"][0]["optimizer_updates"] == 2
 
     original = trainer._train_state_epochs
 
@@ -213,6 +215,16 @@ def test_selector_resume_preserves_epoch_metrics(tmp_path, monkeypatch):
     )
     assert resumed_selected == selected
     assert resumed_report == report
+    assert len(resumed_report["training_metrics"]) == 4
+    assert set(resumed_report["training_metrics"][0]) >= {
+        "train_loss_mean",
+        "state_loss_mean",
+        "onset_loss_mean",
+        "offset_loss_mean",
+        "smooth_loss_mean",
+        "learning_rate_last",
+        "gradient_norm_mean",
+    }
     for name, value in _weights(continuous_path)[1].items():
         assert torch.equal(value, _weights(interrupted_path)[1][name])
 

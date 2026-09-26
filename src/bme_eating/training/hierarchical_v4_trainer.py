@@ -570,6 +570,7 @@ def _train_state_epochs(
     total_epochs: int | None = None,
     scheduler_total_epochs: int | None = None,
     resume_scheduler_state: dict[str, Any] | None = None,
+    monitor_history: list[dict[str, Any]] | None = None,
 ) -> torch.optim.Optimizer:
     device = _device(config)
     model.to(device)
@@ -625,6 +626,13 @@ def _train_state_epochs(
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(epoch_offset, epoch_offset + int(epochs)):
         sampler.set_epoch(epoch)
+        loss_sums = {name: 0.0 for name in ("total", "state", "onset", "offset", "smooth")}
+        gradient_norm_sum = 0.0
+        gradient_norm_max = 0.0
+        learning_rate_sum = 0.0
+        learning_rate_last = float(optimizer.param_groups[0]["lr"])
+        batch_count = 0
+        optimizer_updates = 0
         progress = tqdm(
             loader,
             desc=f"{progress_label} epoch {epoch + 1}/{display_total}",
@@ -641,20 +649,55 @@ def _train_state_epochs(
             }
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
                 output = model(tensors)
-                loss, _ = criterion(output, tensors)
+                loss, components = criterion(output, tensors)
+                loss_sums["total"] += float(loss.detach().cpu())
+                for name in ("state", "onset", "offset", "smooth"):
+                    value = components.get(name)
+                    if value is not None:
+                        loss_sums[name] += float(value.detach().cpu())
                 group_start = ((step - 1) // accumulation) * accumulation + 1
                 group_size = min(accumulation, len(loader) - group_start + 1)
                 loss = loss / group_size
+            batch_count += 1
             loss.backward()
             if step % accumulation == 0 or step == len(loader):
-                torch.nn.utils.clip_grad_norm_(
+                gradient_norm = float(
+                    torch.nn.utils.clip_grad_norm_(
                     model.parameters(), float(config["training"]["gradient_clip_norm"])
+                    ).detach().cpu()
                 )
+                gradient_norm_sum += gradient_norm
+                gradient_norm_max = max(gradient_norm_max, gradient_norm)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_updates += 1
+                learning_rate_last = float(optimizer.param_groups[0]["lr"])
+                learning_rate_sum += learning_rate_last
             if step == 1 or step % 10 == 0 or step == len(loader):
                 progress.set_postfix(loss=f"{float(loss.detach().cpu()) * accumulation:.4f}")
+        monitor = {
+            "epoch": int(epoch + 1),
+            "train_loss_mean": loss_sums["total"] / max(batch_count, 1),
+            "state_loss_mean": loss_sums["state"] / max(batch_count, 1),
+            "onset_loss_mean": loss_sums["onset"] / max(batch_count, 1),
+            "offset_loss_mean": loss_sums["offset"] / max(batch_count, 1),
+            "smooth_loss_mean": loss_sums["smooth"] / max(batch_count, 1),
+            "gradient_norm_mean": gradient_norm_sum / max(optimizer_updates, 1),
+            "gradient_norm_max": gradient_norm_max,
+            "learning_rate_mean": learning_rate_sum / max(optimizer_updates, 1),
+            "learning_rate_last": learning_rate_last,
+            "batch_count": int(batch_count),
+            "optimizer_updates": int(optimizer_updates),
+        }
+        if monitor_history is not None:
+            monitor_history.append(monitor)
+        tqdm.write(
+            f"[{progress_label}] epoch {epoch + 1}/{display_total} "
+            f"train_loss={monitor['train_loss_mean']:.5f} "
+            f"lr={monitor['learning_rate_last']:.3e} "
+            f"grad_norm={monitor['gradient_norm_mean']:.3f}"
+        )
     return optimizer
 
 
@@ -745,6 +788,7 @@ def _train_state_with_checkpoints(
     optimizer = None
     scheduler_state = None
     completed_epochs = 0
+    training_metrics: list[dict[str, Any]] = []
     if resume and checkpoint_path.is_file():
         completed_epochs, optimizer, scheduler_state, checkpoint = _load_state_epoch(
             checkpoint_path,
@@ -757,6 +801,7 @@ def _train_state_with_checkpoints(
         )
         if int(checkpoint.get("target_epochs", -1)) != epochs:
             raise RuntimeError("State retraining checkpoint target epoch count differs")
+        training_metrics = list(checkpoint.get("training_metrics", []))
     for epoch in range(completed_epochs + 1, epochs + 1):
         optimizer = _train_state_epochs(
             model,
@@ -770,6 +815,7 @@ def _train_state_with_checkpoints(
             total_epochs=epochs,
             scheduler_total_epochs=int(config["training"]["max_epochs"]),
             resume_scheduler_state=scheduler_state,
+            monitor_history=training_metrics,
         )
         scheduler_state = None
         _save_state_epoch(
@@ -781,7 +827,7 @@ def _train_state_with_checkpoints(
             epoch=epoch,
             seed=seed,
             subjects=subjects,
-            extra={"target_epochs": epochs},
+            extra={"target_epochs": epochs, "training_metrics": training_metrics},
         )
 
 
@@ -994,6 +1040,7 @@ def _select_epoch(
     stopped_early = False
     completed_training_epochs = 0
     scheduler_state = None
+    training_metrics: list[dict[str, Any]] = []
     if resume and checkpoint_path is not None and checkpoint_path.is_file():
         completed_training_epochs, optimizer, scheduler_state, checkpoint = _load_state_epoch(
             checkpoint_path,
@@ -1008,6 +1055,7 @@ def _select_epoch(
         best_progress = checkpoint["best_progress"]
         checks_without_improvement = int(checkpoint["checks_without_improvement"])
         stopped_early = bool(checkpoint["stopped_early"])
+        training_metrics = list(checkpoint.get("training_metrics", []))
     for epoch in range(completed_training_epochs + 1, maximum_epochs + 1):
         if stopped_early:
             break
@@ -1022,6 +1070,7 @@ def _select_epoch(
             progress_label=f"state select seed={seed}",
             total_epochs=maximum_epochs,
             resume_scheduler_state=scheduler_state,
+            monitor_history=training_metrics,
         )
         scheduler_state = None
         completed_training_epochs = epoch
@@ -1073,6 +1122,7 @@ def _select_epoch(
                     "best_progress": best_progress,
                     "checks_without_improvement": checks_without_improvement,
                     "stopped_early": stopped_early,
+                    "training_metrics": training_metrics,
                 },
             )
         if stopped_early:
@@ -1124,6 +1174,7 @@ def _select_epoch(
         "validation_checks": len(epoch_metrics),
         "selected_metrics": dict(best),
         "epochs": epoch_metrics,
+        "training_metrics": training_metrics,
     }
 
 

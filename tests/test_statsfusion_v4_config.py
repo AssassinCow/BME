@@ -18,8 +18,8 @@ def test_v4_config_is_strict_and_has_fixed_features() -> None:
     assert config["training"]["gradient_accumulation"] == 2
     assert config["training"]["steps_per_epoch"] == 1250
     assert config["training"]["inference_batch_size"] == 16
-    assert config["training"]["num_workers"] == 8
-    assert config["training"]["inference_num_workers"] == 0
+    assert config["training"]["num_workers"] == 12
+    assert config["training"]["inference_num_workers"] == 12
     assert config["training"]["selector_fraction"] == 0.35
     assert config["training"]["selector_rolling_epochs"] == 3
     assert config["training"]["validation_every_epochs"] == 2
@@ -58,3 +58,37 @@ def test_v4_ablation_configs_change_only_registered_components() -> None:
         )
         assert config["experiment"]["ablation_id"] == name
         assert actual == expected
+
+
+def test_training_monitoring_ablation_configs_are_reproducible() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    base = load_config(root / "hierarchical_v4_s2.yaml")
+    validation = load_config(root / "hierarchical_v4_s2_ablation_A.yaml")
+    lower_lr = load_config(root / "hierarchical_v4_s2_ablation_B.yaml")
+    fewer_updates = load_config(root / "hierarchical_v4_s2_ablation_C.yaml")
+
+    assert validation["experiment"]["variant"] == "validation_every_epoch"
+    assert validation["training"]["validation_every_epochs"] == 1
+    assert validation["training"]["learning_rate"] == base["training"]["learning_rate"]
+
+    assert lower_lr["experiment"]["variant"] == "lower_learning_rate"
+    assert lower_lr["training"]["learning_rate"] == 0.00015
+    assert lower_lr["training"]["warmup_fraction"] == 0.10
+    assert lower_lr["training"]["validation_every_epochs"] == base["training"]["validation_every_epochs"]
+
+    assert fewer_updates["experiment"]["variant"] == "reduced_optimizer_updates"
+    assert fewer_updates["training"]["steps_per_epoch"] == 504
+    assert fewer_updates["training"]["gradient_accumulation"] == base["training"]["gradient_accumulation"]
+
+
+def test_training_monitoring_abc_combined_config() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_s2_ablation_ABC.yaml")
+
+    assert config["experiment"]["ablation_id"] == "S2"
+    assert config["experiment"]["variant"] == "validation_every_epoch_lower_lr_reduced_updates"
+    assert config["training"]["validation_every_epochs"] == 1
+    assert config["training"]["learning_rate"] == 0.00015
+    assert config["training"]["warmup_fraction"] == 0.10
+    assert config["training"]["steps_per_epoch"] == 252
+    assert config["training"]["gradient_accumulation"] == 1

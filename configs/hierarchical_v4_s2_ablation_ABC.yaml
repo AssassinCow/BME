@@ -1,0 +1,12 @@
+extends: hierarchical_v4_s2.yaml
+
+experiment:
+  name: hierarchical_v4_s2_ablation_ABC
+  variant: validation_every_epoch_lower_lr_reduced_updates
+
+training:
+  validation_every_epochs: 1
+  learning_rate: 0.00015
+  warmup_fraction: 0.10
+  steps_per_epoch: 252
+  gradient_accumulation: 1
