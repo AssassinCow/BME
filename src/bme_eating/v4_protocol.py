@@ -24,6 +24,7 @@ R3_ABLATION_IDS = frozenset(
         "R3-D2c",
         "R3-P1",
         "R3-M1",
+        "R3-DIRECT",
     }
 )
 
@@ -60,6 +61,23 @@ def validate_r3_config(config: dict[str, Any]) -> None:
     ablation_id = str(experiment.get("ablation_id", ""))
     if ablation_id not in R3_ABLATION_IDS:
         raise ValueError(f"StatsFusion-r3 uses an unsupported ablation_id: {ablation_id!r}")
+    if ablation_id == "R3-DIRECT":
+        if experiment.get("variant") != "time_constrained_direct_d2c_ppg_semimarkov":
+            raise ValueError("R3-DIRECT requires the registered time-constrained variant")
+        if not bool(experiment.get("time_constrained_direct", False)):
+            raise ValueError("R3-DIRECT must explicitly declare time_constrained_direct: true")
+        model = config.get("model", {})
+        required_model_flags = (
+            "use_ppg",
+            "use_statistics",
+            "use_long_context",
+            "separate_motion_branches",
+            "use_invariant_motion_branch",
+        )
+        if not all(bool(model.get(key, False)) for key in required_model_flags):
+            raise ValueError("R3-DIRECT requires the registered D2c+PPG state architecture")
+        if not bool(config.get("decoder", {}).get("use_semi_markov", False)):
+            raise ValueError("R3-DIRECT requires the coherent Semi-Markov decoder")
     if tuple(experiment.get("blocked_protocols", ())) != BLOCKED_PREDECESSORS:
         raise ValueError("StatsFusion-r3 must declare all blocked predecessor protocols")
     public_keys = {key for key in config if not key.startswith("_")}

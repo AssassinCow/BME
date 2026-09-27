@@ -79,6 +79,39 @@ def test_r3_architecture_configs_change_registered_components() -> None:
         assert config["decoder"]["use_semi_markov"] is (ablation == "R3-M1")
 
 
+def test_r3_time_constrained_direct_config_enables_robust_full_state_path() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r3_direct_best.yaml")
+    validate_r3_config(config)
+    assert config["experiment"]["ablation_id"] == "R3-DIRECT"
+    assert config["experiment"]["variant"] == "time_constrained_direct_d2c_ppg_semimarkov"
+    assert config["experiment"]["time_constrained_direct"] is True
+    assert config["model"]["use_statistics"] is True
+    assert config["model"]["use_long_context"] is True
+    assert config["model"]["separate_motion_branches"] is True
+    assert config["model"]["use_invariant_motion_branch"] is True
+    assert config["model"]["use_ppg"] is True
+    assert config["training"]["gyro_modality_dropout"] == 0.20
+    assert config["training"]["ppg_modality_dropout"] == 0.20
+    assert config["training"]["rotation_augmentation_probability"] == 0.50
+    assert config["training"]["batch_size"] == 8
+    assert config["training"]["gradient_accumulation"] == 4
+    assert config["training"]["inference_batch_size"] == 8
+    assert config["training"]["validation_every_epochs"] == 2
+    assert config["training"]["learning_rate"] == 0.00015
+    assert config["training"]["warmup_fraction"] == 0.10
+    assert config["training"]["gradient_clip_norm"] == 5.0
+    assert config["decoder"]["use_semi_markov"] is True
+
+
+def test_r3_direct_config_cannot_silently_masquerade_as_a_registered_ablation() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r3_direct_best.yaml")
+    config["experiment"].pop("time_constrained_direct")
+    with pytest.raises(ValueError, match="time_constrained_direct"):
+        validate_r3_config(config)
+
+
 def test_r3_training_ablations_change_only_declared_factors() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
     base = load_config(root / "hierarchical_v4_r3_s2.yaml")
