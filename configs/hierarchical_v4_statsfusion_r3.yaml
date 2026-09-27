@@ -83,6 +83,7 @@ training:
   selector_fraction: 0.35
   selector_rolling_epochs: 3
   validation_every_epochs: 2
+  selector_decoder_search: full
   early_stopping_min_epochs: 12
   early_stopping_patience_checks: 3
   early_stopping_min_delta: 0.003

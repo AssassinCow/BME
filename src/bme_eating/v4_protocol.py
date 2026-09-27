@@ -21,6 +21,8 @@ RAW_INPUT_SCHEMA = "statsfusion-raw-v2"
 IGNORE_PROTOCOL = "prediction-overlap-fraction-0.5-causal-support-v2"
 OBSERVATION_GAP_PROTOCOL = "active_sensor_valid_runs_v1"
 RUNTIME_SOURCE_BINDING = "exact_runtime_sha_v1"
+FULL_STATE_SEEDS = (2026, 2027, 2028)
+DIRECT_STATE_SEEDS = (2026,)
 RUNTIME_SOURCE_FILES = (
     "__init__.py",
     "calibration_v4.py",
@@ -86,6 +88,30 @@ R3_ROOT_CONFIG_KEYS = frozenset(
 )
 
 
+def configured_state_seeds(config: dict[str, Any]) -> list[int]:
+    actual = [int(value) for value in config.get("final_training", {}).get("state_seeds", [])]
+    expected = (
+        list(DIRECT_STATE_SEEDS)
+        if str(config.get("experiment", {}).get("ablation_id", "")) == "R3-DIRECT"
+        else list(FULL_STATE_SEEDS)
+    )
+    if actual != expected:
+        raise ValueError(
+            f"{config.get('experiment', {}).get('ablation_id', 'StatsFusion-r3')} "
+            f"requires state seeds {expected}"
+        )
+    return actual
+
+
+def validate_serialized_state_seeds(values: Any) -> list[int]:
+    seeds = [int(value) for value in values]
+    if tuple(seeds) not in {DIRECT_STATE_SEEDS, FULL_STATE_SEEDS}:
+        raise RuntimeError(
+            "V4 state seeds must match a registered single-seed or three-seed profile"
+        )
+    return seeds
+
+
 def runtime_source_identity(package_root: Path) -> dict[str, Any]:
     files: dict[str, str] = {}
     for relative in RUNTIME_SOURCE_FILES:
@@ -128,6 +154,8 @@ def validate_r3_config(config: dict[str, Any]) -> None:
             raise ValueError("R3-DIRECT requires the registered D2c+PPG state architecture")
         if not bool(config.get("decoder", {}).get("use_semi_markov", False)):
             raise ValueError("R3-DIRECT requires the coherent Semi-Markov decoder")
+        if config.get("training", {}).get("selector_decoder_search") != "fixed":
+            raise ValueError("R3-DIRECT requires fixed decoder search during state selection")
     if tuple(experiment.get("blocked_protocols", ())) != BLOCKED_PREDECESSORS:
         raise ValueError("StatsFusion-r3 must declare all blocked predecessor protocols")
     public_keys = {key for key in config if not key.startswith("_")}
@@ -152,7 +180,12 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         raise ValueError("StatsFusion-r3 uses smooth_beta, not the blocked smooth_tau loss")
     if float(config.get("loss", {}).get("smooth_beta", 0)) != 0.5:
         raise ValueError("StatsFusion-r3 Huber smooth_beta must be 0.5")
-    state_seeds = [int(value) for value in config.get("final_training", {}).get("state_seeds", [])]
+    selector_decoder_search = str(
+        config.get("training", {}).get("selector_decoder_search", "full")
+    )
+    if selector_decoder_search not in {"full", "fixed"}:
+        raise ValueError("training.selector_decoder_search must be 'full' or 'fixed'")
+    configured_state_seeds(config)
     verifier_seeds = [int(value) for value in config.get("verifier", {}).get("seeds", [])]
-    if state_seeds != [2026, 2027, 2028] or verifier_seeds != [2026, 2027, 2028]:
-        raise ValueError("StatsFusion-r3 requires state and verifier seeds 2026/2027/2028")
+    if verifier_seeds != [2026, 2027, 2028]:
+        raise ValueError("StatsFusion-r3 requires verifier seeds 2026/2027/2028")

@@ -3,123 +3,103 @@
   "question_id": "BME",
   "language": "python",
   "reviewed_files": [
-    "README.md",
-    "configs/base.yaml",
-    "configs/baseline.yaml",
-    "configs/dtp_sqf.yaml",
-    "configs/dtp_fusion.yaml",
-    "scripts/compare_models.py",
-    "src/bme_eating/cli.py",
-    "src/bme_eating/data/deep_dataset.py",
-    "src/bme_eating/data/labels.py",
-    "src/bme_eating/data/quality.py",
-    "src/bme_eating/data/splits.py",
-    "src/bme_eating/fusion.py",
-    "src/bme_eating/metrics.py",
-    "src/bme_eating/models/dtp_sqf.py",
-    "src/bme_eating/models/losses.py",
-    "src/bme_eating/models/xgb_baseline.py",
-    "src/bme_eating/postprocess.py",
-    "src/bme_eating/reproducibility.py",
-    "src/bme_eating/training/dtp_trainer.py"
+    "configs/hierarchical_v4_r31_direct_best.yaml",
+    "configs/hierarchical_v4_statsfusion_r3.yaml",
+    "src/bme_eating/data/stats_fusion_inputs.py",
+    "src/bme_eating/data/stats_fusion_preprocess.py",
+    "src/bme_eating/data/stats_fusion_sequence.py",
+    "src/bme_eating/hierarchical_v4_artifacts.py",
+    "src/bme_eating/hierarchical_v4_export.py",
+    "src/bme_eating/hierarchical_v4_pipeline.py",
+    "src/bme_eating/models/endpoint_refiner.py",
+    "src/bme_eating/models/event_verifier_v4.py",
+    "src/bme_eating/models/stats_fusion_loss.py",
+    "src/bme_eating/models/stats_fusion_state.py",
+    "src/bme_eating/proposals_v4.py",
+    "src/bme_eating/structured_decoder.py",
+    "src/bme_eating/training/hierarchical_v4_trainer.py",
+    "src/bme_eating/v4_protocol.py"
   ],
-  "decision_id": "baseline_dtp_fusion_v3_crossfit_candidate",
+  "decision_id": "statsfusion_r31_direct_single_state_seed_preflight",
   "checks": {
     "syntax": {
       "status": "PASS",
       "evidence": [
-        "bme-model Python 3.11 compileall passed for src and scripts",
-        "full pytest suite passed with 116 tests after the cross-fit and clean-worktree changes",
-        "Ruff passed after the review changes",
-        "DTP fusion CUDA smoke passed on an NVIDIA GeForce RTX 4080 Laptop GPU with 32776192 peak allocated bytes"
+        "Full pytest suite passed after the single-state-seed and decoder-search changes",
+        "Ruff, compileall, and git diff --check passed",
+        "RTX 4080 Laptop bf16 smoke passed at batch 8 with 7.84 GB peak memory and zero repeated-inference probability error"
       ]
     },
     "input_contract": {
       "status": "PASS",
       "evidence": [
-        "quality_report.json records 1112 attachments, 39 subjects, 1078 preprocessed attachments, 34 quarantined attachments, and 161 evaluable events",
-        "quality expectations, subject split fingerprints, source hashes, and schema/multisection counts are enforced before training",
-        "39-versus-40 subject identity and official partial-event scoring remain external UNKNOWNs and are documented as limitations"
+        "Current identity preflight verified 13 immutable v2/canonical input hashes",
+        "Real nine-fragment session replay produced zero error for motion, PPG, quality, validity, alignment, long-context indices, and statistics tensors",
+        "Raw-session replay inferred 100 Hz motion and 50 Hz PPG without gaps over three seconds"
       ]
     },
     "method_alignment": {
       "status": "PASS",
       "evidence": [
-        "each outer fold now trains three subject-disjoint DTP models, merges their held-out predictions into complete outer-training OOF, and averages their outer-test probabilities",
-        "each DTP checkpoint is selected by masked window AUPRC before fusion is tuned once on the combined cross-fit OOF",
-        "50 percent positive batch sampling requires explicit focal_positive_alpha 0.5 and records the actual alpha in metadata",
-        "fusion selection records the best beta-only comparator and requires incremental DTP F1 with no different-hand recall or FP-per-hour degradation",
-        "outer-fold diagnostics and zero recall no longer stop later folds; five-fold promotion is the only final decision"
+        "Strict IoU greater than 0.25, subject-disjoint nested OOF, ignore masking, 60-second maximum future context, and no-XGBoost prediction constraints remain enforced",
+        "Direct state training now uses seed 2026 only while preserving three verifier and boundary seeds for the cheaper downstream stability checks",
+        "State selector uses one fixed decoder configuration; nested and pooled OOF use a compact 48-configuration preregistered decoder search"
       ]
     },
     "reproducibility": {
       "status": "PASS",
       "evidence": [
-        "subject-level outer folds, all three inner partitions, per-model seeds, data/config hashes, cross-fit checkpoint hashes, artifact hashes, and resume signatures are recorded or checked",
-        "run manifest schema 2 now records experiment name and fold and the comparator rejects dirty, mixed-commit, mixed-config, mutated-artifact, mutated-input, or duplicate-subject evidence",
-        "formal training remains blocked until the current dirty working tree is reviewed, committed, and synchronized"
+        "Resolved config and manifests record the single state seed, three downstream seeds, subject lineage, parent hashes, and worktree fingerprint",
+        "Bundle export and loading accept only registered one-state-seed or three-state-seed profiles and cross-check resolved config when available",
+        "Interrupted prior run names cannot resume because result-affecting config hashes changed"
       ]
     },
     "output_contract": {
-      "status": "FAIL",
+      "status": "NOT_APPLICABLE",
       "evidence": [
-        "frozen baseline has complete five-fold local metrics with micro F1 0.4701",
-        "baseline_dyadic has only fold 0 and F1 0.4000 versus baseline fold 0 F1 0.4783",
-        "baseline_boundary has no held-out test metrics because postprocessing search hit boundaries",
-        "no real baseline_dtp_fusion experiment output exists, so the new candidate has no empirical improvement evidence"
+        "This is a pre-training readiness review; no completed full-fold result is claimed",
+        "Bundle privacy, hash-manifest, and no-XGBoost replay paths remain covered by the passing test suite"
       ]
     }
   },
   "findings": [
     {
-      "id": "BME-P0-001",
-      "severity": "P0",
-      "title": "DTP final model does not use the full outer-training cohort",
-      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
-    },
-    {
-      "id": "BME-P0-002",
-      "severity": "P0",
-      "title": "Balanced sampling and focal alpha double-compensate the positive class",
-      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
-    },
-    {
-      "id": "BME-P0-003",
-      "severity": "P0",
-      "title": "Fusion gate does not prove incremental DTP value over beta-only calibration",
-      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
-    },
-    {
-      "id": "BME-P1-001",
+      "id": "BME-R31-P1-001",
       "severity": "P1",
-      "title": "Epoch and fusion pair selection reuse one small validation partition",
-      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
+      "title": "Direct state training multiplied the dominant compute by three seeds",
+      "status": "FIXED_SINGLE_STATE_SEED_2026"
     },
     {
-      "id": "BME-P1-002",
+      "id": "BME-R31-P1-002",
       "severity": "P1",
-      "title": "Fold 0 held-out gate conditionally selects the reported five-fold candidate",
-      "status": "FIXED_STATIC_AND_UNIT_VERIFIED"
+      "title": "Reducing physical batch size silently halved clips and optimizer updates per epoch",
+      "status": "FIXED_20000_CLIPS_625_UPDATES"
     },
     {
-      "id": "BME-P1-003",
+      "id": "BME-R31-P1-003",
       "severity": "P1",
-      "title": "Baseline OOF and final-model probability calibration may differ",
-      "status": "OPEN_DIAGNOSTIC_NEEDED"
+      "title": "The 1620-case decoder grid repeated inside nested OOF and made the direct route impractical",
+      "status": "FIXED_48_CASE_OOF_GRID_AND_FIXED_SELECTOR"
     },
     {
-      "id": "BME-P1-004",
-      "severity": "P1",
-      "title": "Final comparison accepted incomplete provenance",
-      "status": "FIXED"
-    },
-    {
-      "id": "BME-P2-001",
+      "id": "BME-R31-P2-001",
       "severity": "P2",
-      "title": "Training validation and test DataLoaders could retain 24 Windows workers",
-      "status": "FIXED"
+      "title": "Single-seed training was incompatible with final export and bundle loading",
+      "status": "FIXED_AND_REGRESSION_TESTED"
+    },
+    {
+      "id": "BME-R31-RISK-001",
+      "severity": "RISK",
+      "title": "A single state seed removes ensemble variance reduction",
+      "status": "ACCEPTED_BY_USER_FOR_COMPUTE_BUDGET"
+    },
+    {
+      "id": "BME-R31-RISK-002",
+      "severity": "RISK",
+      "title": "Official one-to-one matching and submission adapter remain unknown",
+      "status": "EXTERNAL_UNKNOWN_NOT_A_TRAINING_BLOCKER"
     }
   ],
-  "verdict": "FAILED",
-  "reviewed_at": "2026-09-20T23:36:51.6609865+08:00"
+  "verdict": "PASSED_PRETRAINING",
+  "reviewed_at": "2026-09-27T22:27:35.0339307+08:00"
 }

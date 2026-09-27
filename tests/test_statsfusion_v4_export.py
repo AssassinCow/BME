@@ -93,6 +93,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
             "right_bins": 4,
         },
         "boundary": {"safety_gap_seconds": 3},
+        "final_training": {"state_seeds": [2026]},
     }
     for name in REQUIRED_MODEL_FILES:
         path = final_root / name
@@ -105,7 +106,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
     model = StatsFusionStateModel(model_config)
     for parameter in model.parameters():
         parameter.data.zero_()
-    for seed in (2026, 2027, 2028):
+    for seed in (2026,):
         torch.save(
             {
                 "model": model.state_dict(),
@@ -181,7 +182,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
                         "stress_gate",
                     )
                 },
-                "state_seeds": [2026, 2027, 2028],
+                "state_seeds": [2026],
                 "verifier_seeds": [2026, 2027, 2028],
                 "verifier_kind": "logistic",
                 "boundary_enabled": False,
@@ -220,7 +221,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
         json.loads((bundle / "statistics_scaler.json").read_text(encoding="utf-8"))
     )
     assert exported_scaler.training_subjects == ()
-    for seed in (2026, 2027, 2028):
+    for seed in (2026,):
         checkpoint = torch.load(
             bundle / f"state_seed_{seed}.pt", map_location="cpu", weights_only=False
         )
@@ -331,6 +332,8 @@ def test_v4_export_rejects_incomplete_deep_verifier_seed_mirror(tmp_path) -> Non
         encoding="utf-8",
     )
     (final_root / "proposal_calibration.json").write_text("{}", encoding="utf-8")
+    for seed in (2026, 2027, 2028):
+        (final_root / f"state_seed_{seed}.pt").write_bytes(b"model")
     (final_root / "verifier_seed_2026.pt").write_bytes(b"model")
     project_root = Path(__file__).resolve().parents[1]
     (final_root / "final_manifest.json").write_text(

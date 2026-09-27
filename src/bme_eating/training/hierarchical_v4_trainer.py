@@ -106,6 +106,7 @@ from bme_eating.v4_protocol import (
     RAW_INPUT_SCHEMA,
     RUNTIME_SOURCE_BINDING,
     TARGET_SEMANTICS,
+    configured_state_seeds,
     runtime_source_identity,
 )
 
@@ -1029,12 +1030,13 @@ def _selector_score(
         maximum_ceiling_seconds=float(base_decoder_config["maximum_duration_ceiling_seconds"]),
     )
     truth, ignore = partition_evaluation_events(selector_events, set(subjects))
+    selector_decoder_config = _selector_decoder_search_config(config)
     decoder_config, decoder_search = _select_decoder_configuration(
         calibrated,
         truth,
         ignore,
         prior,
-        config,
+        selector_decoder_config,
         split_role="state_selector_decoder_search",
     )
     decoder = FixedLagSemiMarkovDecoder(
@@ -1093,6 +1095,9 @@ def _selector_score(
         "subject_macro_soft_bce": subject_macro_soft_bce,
         "soft_bce_standard_error": float(bootstrap.std(ddof=1)),
         "center_window_auprc": auprc,
+        "selector_decoder_search_mode": str(
+            config["training"].get("selector_decoder_search", "full")
+        ),
         "decoder_config_json": json.dumps(decoder_config, sort_keys=True),
         "decoder_search_rows": float(len(decoder_search)),
     }
@@ -1658,9 +1663,7 @@ def train_state_crossfit_v4(
         int(config["hierarchical"]["verifier_crossfit_partitions"]),
         int(config["training"]["random_seed"]),
     )
-    state_seeds = [int(value) for value in config["final_training"]["state_seeds"]]
-    if state_seeds != [2026, 2027, 2028]:
-        raise ValueError(f"{PROTOCOL_VERSION} requires state seeds 2026/2027/2028")
+    state_seeds = configured_state_seeds(config)
     all_predictions: list[pd.DataFrame] = []
     artifacts: list[Path] = []
     selected_epochs: dict[int, list[int]] = {seed: [] for seed in state_seeds}
@@ -2066,6 +2069,17 @@ def _decoder_configurations(config: dict[str, Any]) -> list[dict[str, Any]]:
     return configurations
 
 
+def _selector_decoder_search_config(config: dict[str, Any]) -> dict[str, Any]:
+    mode = str(config["training"].get("selector_decoder_search", "full"))
+    if mode == "full":
+        return config
+    if mode == "fixed":
+        selector_config = dict(config)
+        selector_config["decoder_search"] = None
+        return selector_config
+    raise ValueError(f"Unsupported training.selector_decoder_search mode: {mode!r}")
+
+
 def _select_decoder_configuration(
     windows: pd.DataFrame,
     truth: pd.DataFrame,
@@ -2077,7 +2091,14 @@ def _select_decoder_configuration(
 ) -> tuple[dict[str, Any], pd.DataFrame]:
     rows: list[dict[str, Any]] = []
     maximum_per_hour = float(config["decoder"]["maximum_candidates_per_hour"])
-    for decoder_config in _decoder_configurations(config):
+    configurations = _decoder_configurations(config)
+    for decoder_config in tqdm(
+        configurations,
+        desc=f"decoder search {split_role}",
+        unit="config",
+        leave=False,
+        dynamic_ncols=True,
+    ):
         decoder = FixedLagSemiMarkovDecoder(
             prior,
             grid_seconds=int(decoder_config["grid_seconds"]),

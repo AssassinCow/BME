@@ -8,6 +8,10 @@ import pytest
 from bme_eating.config import load_config
 from bme_eating.data.stats_fusion_sequence import sequence_geometry_from_config
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS
+from bme_eating.training.hierarchical_v4_trainer import (
+    _decoder_configurations,
+    _selector_decoder_search_config,
+)
 from bme_eating.v4_protocol import validate_r3_config
 
 
@@ -97,12 +101,27 @@ def test_r3_time_constrained_direct_config_enables_robust_full_state_path() -> N
     assert config["training"]["rotation_augmentation_probability"] == 0.50
     assert config["training"]["batch_size"] == 8
     assert config["training"]["gradient_accumulation"] == 4
+    assert config["training"]["steps_per_epoch"] == 2500
+    assert (
+        config["training"]["batch_size"]
+        * config["training"]["steps_per_epoch"]
+        == 20_000
+    )
+    assert (
+        config["training"]["steps_per_epoch"]
+        // config["training"]["gradient_accumulation"]
+        == 625
+    )
     assert config["training"]["inference_batch_size"] == 8
     assert config["training"]["validation_every_epochs"] == 1
+    assert config["training"]["selector_decoder_search"] == "fixed"
     assert config["training"]["learning_rate"] == 0.00015
     assert config["training"]["warmup_fraction"] == 0.10
     assert config["training"]["gradient_clip_norm"] == 5.0
     assert config["decoder"]["use_semi_markov"] is True
+    assert config["final_training"]["state_seeds"] == [2026]
+    assert len(_decoder_configurations(config)) == 48
+    assert len(_decoder_configurations(_selector_decoder_search_config(config))) == 1
     geometry = sequence_geometry_from_config(config)
     assert geometry.fused_short_receptive_field_steps == 155
     assert geometry.history_steps == 793
@@ -114,6 +133,14 @@ def test_r3_direct_config_cannot_silently_masquerade_as_a_registered_ablation() 
     config = load_config(root / "hierarchical_v4_r31_direct_best.yaml")
     config["experiment"].pop("time_constrained_direct")
     with pytest.raises(ValueError, match="time_constrained_direct"):
+        validate_r3_config(config)
+
+
+def test_r3_direct_config_requires_fixed_selector_decoder_search() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r31_direct_best.yaml")
+    config["training"]["selector_decoder_search"] = "full"
+    with pytest.raises(ValueError, match="fixed decoder search"):
         validate_r3_config(config)
 
 

@@ -52,6 +52,7 @@ from bme_eating.v4_protocol import (
     PROTOCOL_VERSION,
     RAW_INPUT_SCHEMA,
     RUNTIME_SOURCE_BINDING,
+    validate_serialized_state_seeds,
 )
 
 
@@ -477,9 +478,10 @@ def load_hierarchical_v4_bundle(
         raise RuntimeError(
             f"V4 bundle has incompatible protocol bindings: {mismatched_protocols}"
         )
-    state_seeds = [int(value) for value in selection.get("state_seeds", [])]
-    if state_seeds != [2026, 2027, 2028]:
-        raise RuntimeError("V4 bundle requires state seeds 2026/2027/2028")
+    state_seeds = validate_serialized_state_seeds(selection.get("state_seeds", []))
+    configured_state = config.get("final_training", {}).get("state_seeds")
+    if configured_state is not None and [int(value) for value in configured_state] != state_seeds:
+        raise RuntimeError("V4 bundle state seeds differ from resolved config")
     state_models: list[torch.nn.Module] = []
     for seed in state_seeds:
         checkpoint = torch.load(
@@ -495,6 +497,11 @@ def load_hierarchical_v4_bundle(
         verifier_seeds = [int(value) for value in selection.get("verifier_seeds", [])]
         if verifier_seeds != [2026, 2027, 2028]:
             raise RuntimeError("Deep v4 bundle requires verifier seeds 2026/2027/2028")
+        configured_verifier = config.get("verifier", {}).get("seeds")
+        if configured_verifier is not None and [
+            int(value) for value in configured_verifier
+        ] != verifier_seeds:
+            raise RuntimeError("V4 bundle verifier seeds differ from resolved config")
         verifier_paths = [root / f"verifier_seed_{seed}.pt" for seed in verifier_seeds]
         missing = [path.name for path in verifier_paths if not path.is_file()]
         if missing:

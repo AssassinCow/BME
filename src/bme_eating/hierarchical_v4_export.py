@@ -7,6 +7,7 @@ import zipfile
 from pathlib import Path
 
 import torch
+import yaml
 
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.reproducibility import git_worktree_identity
@@ -20,12 +21,10 @@ from bme_eating.v4_protocol import (
     RUNTIME_SOURCE_BINDING,
     RUNTIME_SOURCE_FILES,
     runtime_source_identity,
+    validate_serialized_state_seeds,
 )
 
 REQUIRED_MODEL_FILES = (
-    "state_seed_2026.pt",
-    "state_seed_2027.pt",
-    "state_seed_2028.pt",
     "state_calibration.json",
     "statistics_scaler.json",
     "sensor_normalization.json",
@@ -155,6 +154,7 @@ def export_hierarchical_v4_bundle(
         "candidate_maximum_seconds"
     ) != 14_400:
         raise RuntimeError("V4 selection has invalid candidate duration bounds")
+    config = yaml.safe_load((final_root / "resolved_config.yaml").read_text(encoding="utf-8"))
     promotion_hashes = selection.get("promotion_evidence_sha256", {})
     required_promotion = {"fold0_ablation", "development_gate", "freeze_manifest", "stress_gate"}
     if set(promotion_hashes) != required_promotion or any(
@@ -162,15 +162,28 @@ def export_hierarchical_v4_bundle(
         for value in promotion_hashes.values()
     ):
         raise RuntimeError("V4 selection has incomplete promotion evidence hashes")
-    state_seeds = [int(value) for value in selection.get("state_seeds", [])]
-    if state_seeds != [2026, 2027, 2028]:
-        raise RuntimeError("V4 export requires state seeds 2026/2027/2028")
+    state_seeds = validate_serialized_state_seeds(selection.get("state_seeds", []))
+    configured_state = config.get("final_training", {}).get("state_seeds")
+    if configured_state is not None and [int(value) for value in configured_state] != state_seeds:
+        raise RuntimeError("V4 selection state seeds differ from resolved config")
+    manifest_state = manifest.get("state_seeds")
+    if manifest_state is not None and [int(value) for value in manifest_state] != state_seeds:
+        raise RuntimeError("V4 final manifest state seeds differ from selection")
+    selected_state_files = [f"state_seed_{seed}.pt" for seed in state_seeds]
+    missing_state = [name for name in selected_state_files if not (final_root / name).is_file()]
+    if missing_state:
+        raise FileNotFoundError(f"V4 state artifacts are missing: {missing_state}")
     verifier_kind = str(selection.get("verifier_kind", ""))
     selected_verifier_files: list[str] = []
     if verifier_kind == "deep":
         verifier_seeds = [int(value) for value in selection.get("verifier_seeds", [])]
         if verifier_seeds != [2026, 2027, 2028]:
             raise RuntimeError("Deep v4 export requires verifier seeds 2026/2027/2028")
+        configured_verifier = config.get("verifier", {}).get("seeds")
+        if configured_verifier is not None and [
+            int(value) for value in configured_verifier
+        ] != verifier_seeds:
+            raise RuntimeError("V4 selection verifier seeds differ from resolved config")
         selected_verifier_files = [f"verifier_seed_{seed}.pt" for seed in verifier_seeds]
         missing_verifier = [
             name for name in (*selected_verifier_files, "proposal_calibration.json")
@@ -222,7 +235,7 @@ def export_hierarchical_v4_bundle(
     if temporary.exists():
         raise RuntimeError("Stale V4 model_bundle.tmp exists")
     temporary.mkdir(parents=True)
-    for name in (*REQUIRED_MODEL_FILES, *OPTIONAL_MODEL_FILES):
+    for name in (*REQUIRED_MODEL_FILES, *selected_state_files, *OPTIONAL_MODEL_FILES):
         source = final_root / name
         if not source.is_file():
             continue
