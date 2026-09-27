@@ -31,6 +31,7 @@ from bme_eating.v4_protocol import (
     CALIBRATION_PROTOCOL,
     CODE_VERSION,
     DECODER_PROTOCOL,
+    INPUT_SNAPSHOT_FILENAME,
     PROTOCOL_VERSION,
     RAW_INPUT_SCHEMA,
     TARGET_SEMANTICS,
@@ -375,8 +376,6 @@ def initialize_v4_run(
         raise FileNotFoundError("V4 run does not exist; initialize it with --fresh")
     if run_root.exists() and any(run_root.iterdir()):
         raise RuntimeError("V4 run directory exists without a valid manifest")
-    run_root.mkdir(parents=True, exist_ok=True)
-    write_yaml_atomic(run_root / "resolved_config.yaml", public_config)
     snapshot = {
         "version": 5,
         "code_version": CODE_VERSION,
@@ -384,12 +383,11 @@ def initialize_v4_run(
         "input_artifact_schema_version": "v2",
         "hashes": input_hashes,
     }
-    snapshot_path = output_root / "input_snapshot_r3.json"
-    if snapshot_path.is_file():
-        if json.loads(snapshot_path.read_text(encoding="utf-8")) != snapshot:
-            raise RuntimeError("V4 input snapshot conflicts with current v2 artifacts")
-    else:
-        write_json_atomic(snapshot_path, snapshot)
+    snapshot_path = output_root / INPUT_SNAPSHOT_FILENAME
+    if snapshot_path.is_file() and (
+        json.loads(snapshot_path.read_text(encoding="utf-8")) != snapshot
+    ):
+        raise RuntimeError("V4 input snapshot conflicts with current v2 artifacts")
     provenance_config = config["feature_provenance"]
     provenance = audit_feature_provenance(
         project_root=project_root,
@@ -401,11 +399,10 @@ def initialize_v4_run(
         ),
     )
     provenance_path = output_root / "feature_provenance.json"
-    if provenance_path.is_file():
-        if json.loads(provenance_path.read_text(encoding="utf-8")) != provenance:
-            raise RuntimeError("V4 feature provenance changed after initialization")
-    else:
-        write_json_atomic(provenance_path, provenance)
+    if provenance_path.is_file() and (
+        json.loads(provenance_path.read_text(encoding="utf-8")) != provenance
+    ):
+        raise RuntimeError("V4 feature provenance changed after initialization")
     from bme_eating.models.factory import build_state_model
 
     state_model = build_state_model(config["model"])
@@ -413,6 +410,12 @@ def initialize_v4_run(
     canonical_manifest = json.loads(
         tracked["canonical_manifest"].read_text(encoding="utf-8")
     )
+    if not snapshot_path.is_file():
+        write_json_atomic(snapshot_path, snapshot)
+    if not provenance_path.is_file():
+        write_json_atomic(provenance_path, provenance)
+    run_root.mkdir(parents=True, exist_ok=True)
+    write_yaml_atomic(run_root / "resolved_config.yaml", public_config)
     payload = {
         "version": 5,
         "code_version": CODE_VERSION,

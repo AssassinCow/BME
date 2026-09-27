@@ -7,6 +7,7 @@ from typing import Any
 
 CODE_VERSION = "v4.3.1"
 PROTOCOL_VERSION = "statsfusion-r3.1"
+INPUT_SNAPSHOT_FILENAME = "input_snapshot_r3_1.json"
 BLOCKED_PREDECESSORS = (
     "statsfusion-r0-blocked",
     "statsfusion-r1-blocked",

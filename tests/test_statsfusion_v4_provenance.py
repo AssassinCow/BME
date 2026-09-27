@@ -23,6 +23,7 @@ from bme_eating.data.stats_fusion_inputs import (
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.hierarchical_v4_artifacts import initialize_v4_run, resume_config_hash
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, audit_feature_provenance
+from bme_eating.v4_protocol import INPUT_SNAPSHOT_FILENAME
 
 
 def _r3_config() -> dict:
@@ -154,7 +155,13 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
     monkeypatch.setattr(
         "bme_eating.models.factory.build_state_model", lambda _config: torch.nn.Linear(1, 1)
     )
+    legacy_snapshot = {"code_version": "v4.3", "protocol_version": "statsfusion-r3"}
+    write_json_atomic(output_root / "input_snapshot_r3.json", legacy_snapshot)
     initial = initialize_v4_run(config, input_root, output_root, "strict-v4", 0, fresh=True)
+    assert json.loads((output_root / "input_snapshot_r3.json").read_text(encoding="utf-8")) == (
+        legacy_snapshot
+    )
+    assert (output_root / INPUT_SNAPSHOT_FILENAME).is_file()
     legacy = dict(initial.payload)
     legacy.pop("runtime_config")
     legacy.pop("resume_config_sha256")
@@ -189,6 +196,33 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
     else:
         raise AssertionError("V4 resume accepted a changed worktree identity")
     assert migrated.manifest_path.read_bytes() == before
+
+
+def test_v4_snapshot_conflict_does_not_create_partial_run(tmp_path, monkeypatch) -> None:
+    input_root = tmp_path / "v2"
+    output_root = tmp_path / "v4"
+    input_root.mkdir()
+    output_root.mkdir()
+    tracked = {}
+    for name in ("anchors", "canonical_manifest"):
+        path = tmp_path / f"{name}.json"
+        path.write_text("{}", encoding="utf-8")
+        tracked[name] = path
+    monkeypatch.setattr(v4_artifacts, "_tracked_inputs", lambda _config, _root: tracked)
+    monkeypatch.setattr(
+        v4_artifacts,
+        "git_worktree_identity",
+        lambda _root: {"commit": "test", "dirty": False, "worktree_sha256": "clean"},
+    )
+    write_json_atomic(output_root / INPUT_SNAPSHOT_FILENAME, {"conflict": True})
+
+    run_root = output_root / "experiments" / "snapshot-conflict" / "fold_0"
+    with pytest.raises(RuntimeError, match="input snapshot conflicts"):
+        initialize_v4_run(
+            _r3_config(), input_root, output_root, "snapshot-conflict", 0, fresh=True
+        )
+
+    assert not run_root.exists()
 
 
 def test_v4_resume_hash_ignores_execution_only_settings() -> None:
