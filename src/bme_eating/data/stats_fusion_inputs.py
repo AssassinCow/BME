@@ -14,8 +14,9 @@ from bme_eating.features.baseline import build_segment_features
 from bme_eating.fusion import ALIGNMENT_KEYS
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS
+from bme_eating.v4_protocol import PROTOCOL_VERSION
 
-CANONICAL_INPUT_DIRECTORY = "canonical_input_r3"
+CANONICAL_INPUT_DIRECTORY = "canonical_input_r3_1"
 CANONICAL_ANCHORS_FILE = "anchors.parquet"
 CANONICAL_STATISTICS_FILE = "statistics.parquet"
 CANONICAL_EVENTS_FILE = "events_with_session.parquet"
@@ -24,8 +25,11 @@ CANONICAL_PREPARATION_IDENTITY_FILE = "preparation_identity.json"
 CANONICAL_ANCHORS_IDENTITY_FILE = "anchors.sha256.json"
 
 FEATURE_IMPLEMENTATION_FILES = (
+    "data/deep_dataset.py",
     "data/labels.py",
+    "data/session.py",
     "data/stats_fusion_preprocess.py",
+    "data/stats_fusion_sequence.py",
     "features/baseline.py",
     "features/signal.py",
     "stats_features.py",
@@ -111,7 +115,7 @@ def _session_cache_path(
     subject_key: str | None = None,
 ) -> Path:
     digest = hashlib.sha256()
-    digest.update(b"statsfusion-r3-canonical-statistics-v2")
+    digest.update(b"statsfusion-r3.1-canonical-statistics-v3")
     digest.update((feature_code_sha256 or feature_implementation_identity()["sha256"]).encode())
     digest.update(str(subject_key or "").encode("utf-8"))
     digest.update(str(session_id).encode("utf-8"))
@@ -143,8 +147,8 @@ def _preparation_identity(
         separators=(",", ":"),
     ).encode("utf-8")
     return {
-        "version": 2,
-        "protocol_version": "statsfusion-r3",
+        "version": 3,
+        "protocol_version": PROTOCOL_VERSION,
         "anchor_semantics": "right_endpoint_half_open",
         "step_seconds": 3,
         "statistics_window_seconds": 15,
@@ -166,7 +170,7 @@ def _require_matching_preparation_identity(
     if not path.is_file():
         raise RuntimeError(
             "Partial StatsFusion canonical inputs lack preparation_identity.json; "
-            "refuse resume and rebuild with --fresh in a clean canonical_input_r3 directory"
+            "refuse resume and rebuild with --fresh in a clean canonical_input_r3_1 directory"
         )
     stored = json.loads(path.read_text(encoding="utf-8"))
     if stored != current:
@@ -234,7 +238,7 @@ def verify_canonical_statsfusion_inputs(
             f"{missing}; run prepare_statsfusion_v4_inputs.py first"
         )
     manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
-    if manifest.get("protocol_version") != "statsfusion-r3":
+    if manifest.get("protocol_version") != PROTOCOL_VERSION:
         raise RuntimeError("StatsFusion canonical inputs use an incompatible protocol")
     if manifest.get("anchor_semantics") != "right_endpoint_half_open":
         raise RuntimeError("StatsFusion canonical inputs use incompatible anchor semantics")
@@ -387,7 +391,7 @@ def prepare_canonical_statsfusion_inputs(
     temporary.replace(paths["statistics"])
     manifest = {
         "version": 3,
-        "protocol_version": "statsfusion-r3",
+        "protocol_version": PROTOCOL_VERSION,
         "anchor_semantics": "right_endpoint_half_open",
         "anchor_scope": "session",
         "step_seconds": 3,

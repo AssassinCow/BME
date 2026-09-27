@@ -9,7 +9,7 @@ import torch
 
 from bme_eating.config import load_config
 from bme_eating.data.stats_fusion_preprocess import causal_completed_block_layout
-from bme_eating.data.stats_fusion_sequence import SequenceGeometry
+from bme_eating.data.stats_fusion_sequence import sequence_geometry_from_config
 from bme_eating.models.factory import build_state_model
 from bme_eating.models.stats_fusion_loss import StatsFusionStateLoss
 
@@ -23,13 +23,7 @@ def main() -> None:
     device = torch.device(config["training"]["device"])
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA is required by the v4 smoke configuration")
-    geometry = SequenceGeometry(
-        supervised_steps=int(config["sequence"]["supervised_steps"]),
-        short_receptive_field_steps=int(config["sequence"]["short_receptive_field_steps"]),
-        long_receptive_field_tokens=int(config["sequence"]["long_receptive_field_tokens"]),
-        long_pool_factor=int(config["sequence"]["long_pool_factor"]),
-        step_seconds=int(config["sequence"]["step_seconds"]),
-    )
+    geometry = sequence_geometry_from_config(config)
     batch_size = args.batch_size or int(config["training"]["batch_size"])
     steps = geometry.total_steps
     timestamps = np.arange(1, steps + 1, dtype=np.int64) * geometry.step_seconds * 1000
@@ -43,6 +37,9 @@ def main() -> None:
     batch = {
         "motion_blocks": torch.randn(batch_size, steps, 12, 300, device=device),
         "motion_valid": torch.ones(batch_size, steps, device=device),
+        "motion_invariant_blocks": torch.randn(
+            batch_size, steps, 6, 300, device=device
+        ),
         "ppg_blocks": torch.randn(batch_size, ppg_steps, 2, 750, device=device),
         "ppg_quality": torch.randn(batch_size, ppg_steps, 8, device=device),
         "ppg_valid": torch.ones(batch_size, ppg_steps, device=device),

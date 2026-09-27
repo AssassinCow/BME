@@ -487,14 +487,16 @@ def apply_boundary_refinement(
             start = int(output.at[index, "refined_start_ms"])
             if previous_end + safety_gap_ms <= start:
                 continue
-            output.at[previous_index, "refined_end_ms"] = int(
-                output.at[previous_index, "coarse_end_ms"]
-            )
-            output.at[index, "refined_start_ms"] = int(output.at[index, "coarse_start_ms"])
-            output.at[previous_index, "boundary_fallback"] = True
-            output.at[index, "boundary_fallback"] = True
-            output.at[previous_index, "end_fallback"] = True
-            output.at[index, "start_fallback"] = True
+            for affected in (previous_index, index):
+                output.at[affected, "refined_start_ms"] = int(
+                    output.at[affected, "coarse_start_ms"]
+                )
+                output.at[affected, "refined_end_ms"] = int(
+                    output.at[affected, "coarse_end_ms"]
+                )
+                output.at[affected, "start_fallback"] = True
+                output.at[affected, "end_fallback"] = True
+                output.at[affected, "boundary_fallback"] = True
     if len(output) != len(accepted) or set(output["proposal_id"]) != set(accepted["proposal_id"]):
         raise RuntimeError("Boundary refinement changed proposal identity or count")
     if (output["refined_start_ms"] >= output["refined_end_ms"]).any():

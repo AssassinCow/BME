@@ -288,9 +288,14 @@ def build_anchor_index(
                 ppg_time = payload["ppg_timestamp_ms"].astype(np.int64)
                 ppg_mask = payload["ppg_mask"].astype(bool)
             acc_valid = motion_mask[:, :3].all(axis=1)
-            positions = np.searchsorted(motion_time, anchor_time, side="left")
-            positions = np.clip(positions, 0, max(len(motion_time) - 1, 0))
-            observable = acc_valid[positions].astype(np.float32) if len(motion_time) else np.zeros(len(anchor_time), dtype=np.float32)
+            acc_prefix = np.concatenate(([0], np.cumsum(acc_valid, dtype=np.int64)))
+            left_positions = np.searchsorted(
+                motion_time, anchor_time - step_ms, side="right"
+            )
+            right_positions = np.searchsorted(motion_time, anchor_time, side="right")
+            observable = (
+                (acc_prefix[right_positions] - acc_prefix[left_positions]) > 0
+            ).astype(np.float32)
             motion_valid = motion_mask.any(axis=1)
             ppg_valid = ppg_mask.any(axis=1)
             motion_period_seconds = (
@@ -509,10 +514,20 @@ def build_statsfusion_session_anchor_index(
                     ppg_history[in_segment] = accumulated_ppg + (
                         ppg_prefix[ppg_positions] * ppg_period
                     ).astype(np.float32)
-                    nearest = np.searchsorted(motion_time, selected_times, side="left")
-                    nearest = np.clip(nearest, 0, max(len(motion_time) - 1, 0))
+                    selected_left = np.searchsorted(
+                        motion_time, selected_times - step_ms, side="right"
+                    )
+                    selected_right = np.searchsorted(
+                        motion_time, selected_times, side="right"
+                    )
+                    acc_valid = motion_mask[:, :3].all(axis=1)
+                    acc_prefix = np.concatenate(
+                        ([0], np.cumsum(acc_valid, dtype=np.int64))
+                    )
                     observable[in_segment] = (
-                        motion_mask[nearest, :3].all(axis=1).astype(np.float32)
+                        (
+                            acc_prefix[selected_right] - acc_prefix[selected_left]
+                        ).astype(bool).astype(np.float32)
                         if len(motion_time)
                         else 0.0
                     )

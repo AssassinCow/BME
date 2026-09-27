@@ -165,7 +165,9 @@ def test_selector_resume_preserves_epoch_metrics(tmp_path, monkeypatch):
     events = pd.DataFrame({"subject_key": ["fit", "selector"]})
     inputs = trainer.V4Inputs(anchors, pd.DataFrame(), events, pd.DataFrame(), {})
     monkeypatch.setattr(trainer, "_fit_scaler_and_transform", lambda *_args: (None, anchors))
-    monkeypatch.setattr(trainer, "compute_normalization", lambda *_args: None)
+    monkeypatch.setattr(
+        trainer, "compute_normalization", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(trainer, "_make_dataset", lambda *_args, **_kwargs: ToyDataset())
 
     def seeded(_config, seed):

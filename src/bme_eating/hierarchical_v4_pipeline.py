@@ -21,7 +21,7 @@ from bme_eating.data.stats_fusion_preprocess import (
     RawSessionInput,
     StatsFusionRawSessionPreprocessor,
 )
-from bme_eating.data.stats_fusion_sequence import SequenceGeometry
+from bme_eating.data.stats_fusion_sequence import sequence_geometry_from_config
 from bme_eating.models.endpoint_refiner import (
     BoundaryRange,
     EndpointRefiner,
@@ -35,15 +35,24 @@ from bme_eating.models.event_verifier_v4 import (
     build_proposal_features_v4,
 )
 from bme_eating.models.factory import build_state_model
-from bme_eating.proposals_v4 import generate_event_candidates_v4
+from bme_eating.proposals_v4 import (
+    configured_decoder_valid_mask,
+    generate_event_candidates_v4,
+)
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
 from bme_eating.structured_decoder import (
     FixedLagSemiMarkovDecoder,
     TruncatedLogNormalDurationPrior,
 )
-from bme_eating.timeline import deduplicate_consistent_timeline
+from bme_eating.timeline import claim_new_timeline_rows, deduplicate_consistent_timeline
 from bme_eating.types import Event
-from bme_eating.v4_protocol import PROTOCOL_VERSION, RAW_INPUT_SCHEMA
+from bme_eating.v4_protocol import (
+    IGNORE_PROTOCOL,
+    OBSERVATION_GAP_PROTOCOL,
+    PROTOCOL_VERSION,
+    RAW_INPUT_SCHEMA,
+    RUNTIME_SOURCE_BINDING,
+)
 
 
 def _sha256_file(path: Path) -> str:
@@ -249,6 +258,12 @@ class HierarchicalEatingDetectorV4:
         )
         for index, name in enumerate(self.statistics_columns):
             frame[name] = statistics[:, index]
+        model_config = getattr(self, "config", {}).get("model", {})
+        frame["decode_valid"] = configured_decoder_valid_mask(
+            frame,
+            use_motion=bool(model_config.get("use_motion", True)),
+            use_ppg=bool(model_config.get("use_ppg", True)),
+        )
         frame["state_probability_derivative"] = frame["state_probability"].diff().fillna(0.0)
         return frame.loc[selected].reset_index(drop=True)
 
@@ -389,27 +404,23 @@ class HierarchicalEatingDetectorV4:
     def predict_session(self, session: RawSessionInput) -> list[Event]:
         session = session.validated()
         self.last_raw_input_diagnostics = session.sampling_diagnostics()
-        sequence = self.config["sequence"]
-        geometry = SequenceGeometry(
-            supervised_steps=int(sequence["supervised_steps"]),
-            short_receptive_field_steps=int(sequence["short_receptive_field_steps"]),
-            long_receptive_field_tokens=int(sequence["long_receptive_field_tokens"]),
-            long_pool_factor=int(sequence["long_pool_factor"]),
-            step_seconds=int(sequence["step_seconds"]),
-        )
+        geometry = sequence_geometry_from_config(self.config)
         preprocessor = StatsFusionRawSessionPreprocessor(
             normalization=self.sensor_normalization,
             statistics_scaler=self.statistics_scaler,
             geometry=geometry,
         )
-        frames = [
-            self.predict_state_sequence(
+        frames: list[pd.DataFrame] = []
+        previous_chunks: dict[tuple[str, str], pd.DataFrame] = {}
+        for batch in preprocessor.iter_state_batches(session):
+            frame = self.predict_state_sequence(
                 batch,
                 subject_key=session.subject_key,
                 session_id=session.session_id,
             )
-            for batch in preprocessor.iter_state_batches(session)
-        ]
+            claimed = claim_new_timeline_rows(frame, previous_chunks)
+            if not claimed.empty:
+                frames.append(claimed)
         if not frames:
             return []
         windows, duplicate_diagnostics = deduplicate_consistent_timeline(
@@ -452,6 +463,20 @@ def load_hierarchical_v4_bundle(
     config = {**config, "decoder": dict(selected_decoder)}
     if selection.get("selection_source") != "pooled_outer_oof":
         raise RuntimeError("V4 bundle selection must come from pooled outer OOF")
+    required_protocols = {
+        "ignore_protocol_version": IGNORE_PROTOCOL,
+        "observation_gap_protocol": OBSERVATION_GAP_PROTOCOL,
+        "runtime_source_binding": RUNTIME_SOURCE_BINDING,
+    }
+    mismatched_protocols = {
+        key: selection.get(key)
+        for key, expected in required_protocols.items()
+        if selection.get(key) != expected
+    }
+    if mismatched_protocols:
+        raise RuntimeError(
+            f"V4 bundle has incompatible protocol bindings: {mismatched_protocols}"
+        )
     state_seeds = [int(value) for value in selection.get("state_seeds", [])]
     if state_seeds != [2026, 2027, 2028]:
         raise RuntimeError("V4 bundle requires state seeds 2026/2027/2028")

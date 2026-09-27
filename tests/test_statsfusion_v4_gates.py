@@ -34,7 +34,7 @@ def _candidate(
     use_ppg = resolved_ablation == "R3-P1"
     (fold / "resolved_config.yaml").write_text(
         "experiment:\n"
-        "  protocol_version: statsfusion-r3\n"
+        "  protocol_version: statsfusion-r3.1\n"
         f"  ablation_id: {resolved_ablation}\n"
         "model:\n"
         f"  use_ppg: {str(use_ppg).lower()}\n"
@@ -134,7 +134,7 @@ def test_ppg_promotion_keeps_motion_path_when_ppg_fails(tmp_path) -> None:
 
 def test_p1_rejects_unresolved_motion_parent(tmp_path) -> None:
     config = {
-        "experiment": {"protocol_version": "statsfusion-r3", "ablation_id": "R3-P1"},
+        "experiment": {"protocol_version": "statsfusion-r3.1", "ablation_id": "R3-P1"},
         "model": {"use_ppg": True},
     }
     with pytest.raises(TypeError, match="prepare_hierarchical_v4_p1.py"):
@@ -157,7 +157,7 @@ def test_m1_requires_hash_locked_state_promotion_evidence(tmp_path) -> None:
     )
     gate = {"maximum_fp_per_hour_ratio": 1.05}
     config = {
-        "experiment": {"protocol_version": "statsfusion-r3", "ablation_id": "R3-M1"},
+        "experiment": {"protocol_version": "statsfusion-r3.1", "ablation_id": "R3-M1"},
         "model": {"use_ppg": False},
         "decoder": {"use_semi_markov": True},
         "promotion_gate": gate,
@@ -202,7 +202,7 @@ def test_m1_recomputes_decision_and_validates_source_runs(tmp_path) -> None:
     decision["resolved_use_ppg"] = not decision["resolved_use_ppg"]
     config = {
         "experiment": {
-            "protocol_version": "statsfusion-r3",
+            "protocol_version": "statsfusion-r3.1",
             "ablation_id": "R3-M1",
             "state_promotion": decision,
         },

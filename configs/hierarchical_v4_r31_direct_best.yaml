@@ -1,7 +1,14 @@
 extends: hierarchical_v4_r3_d2c.yaml
 
 experiment:
-  name: hierarchical_v4_r3_direct_best
+  name: hierarchical_v4_r31_direct_best
+  code_version: v4.3.1
+  protocol_version: statsfusion-r3.1
+  blocked_protocols:
+    - statsfusion-r0-blocked
+    - statsfusion-r1-blocked
+    - statsfusion-r2-blocked
+    - statsfusion-r3-blocked
   ablation_id: R3-DIRECT
   variant: time_constrained_direct_d2c_ppg_semimarkov
   time_constrained_direct: true

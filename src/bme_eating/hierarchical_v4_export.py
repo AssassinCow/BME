@@ -9,8 +9,18 @@ from pathlib import Path
 import torch
 
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
+from bme_eating.reproducibility import git_worktree_identity
 from bme_eating.stats_features import FoldRobustScaler
-from bme_eating.v4_protocol import BLOCKED_PREDECESSORS, CODE_VERSION, PROTOCOL_VERSION
+from bme_eating.v4_protocol import (
+    BLOCKED_PREDECESSORS,
+    CODE_VERSION,
+    IGNORE_PROTOCOL,
+    OBSERVATION_GAP_PROTOCOL,
+    PROTOCOL_VERSION,
+    RUNTIME_SOURCE_BINDING,
+    RUNTIME_SOURCE_FILES,
+    runtime_source_identity,
+)
 
 REQUIRED_MODEL_FILES = (
     "state_seed_2026.pt",
@@ -31,33 +41,7 @@ OPTIONAL_MODEL_FILES = (
     "boundary_range.json",
 )
 
-RUNTIME_FILES = (
-    "__init__.py",
-    "calibration_v4.py",
-    "hierarchical_v4_pipeline.py",
-    "metrics.py",
-    "proposals_v4.py",
-    "stats_features.py",
-    "structured_decoder.py",
-    "timeline.py",
-    "types.py",
-    "v4_protocol.py",
-    "data/__init__.py",
-    "data/deep_dataset.py",
-    "data/session.py",
-    "data/stats_fusion_preprocess.py",
-    "data/stats_fusion_sequence.py",
-    "features/__init__.py",
-    "features/baseline.py",
-    "features/signal.py",
-    "models/__init__.py",
-    "models/dtp_sqf.py",
-    "models/endpoint_refiner.py",
-    "models/event_verifier_v4.py",
-    "models/factory.py",
-    "models/hierarchical_state.py",
-    "models/stats_fusion_state.py",
-)
+RUNTIME_FILES = RUNTIME_SOURCE_FILES
 
 
 def _copy_sanitized_checkpoint(source: Path, target: Path, allowed: set[str]) -> None:
@@ -104,6 +88,17 @@ def _privacy_scan(root: Path) -> None:
             )
 
 
+def _write_bundle_zip(bundle: Path, target: Path) -> None:
+    temporary = target.with_name(target.name + ".tmp")
+    if temporary.exists():
+        temporary.unlink()
+    with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+        for path in sorted(bundle.rglob("*")):
+            if path.is_file():
+                archive.write(path, Path("model_bundle") / path.relative_to(bundle))
+    temporary.replace(target)
+
+
 def export_hierarchical_v4_bundle(
     project_root: Path, final_root: Path, *, fresh: bool, resume: bool
 ) -> Path:
@@ -116,6 +111,8 @@ def export_hierarchical_v4_bundle(
     if manifest.get("protocol_version") != PROTOCOL_VERSION:
         raise RuntimeError(f"Only {PROTOCOL_VERSION} final artifacts may be exported")
     for relative, expected in manifest.get("artifact_hashes", {}).items():
+        if relative == "model_bundle.zip":
+            continue
         artifact = final_root / relative
         if not artifact.is_file() or sha256_file(artifact) != expected:
             raise RuntimeError(f"V4 final artifact changed before export: {relative}")
@@ -131,6 +128,29 @@ def export_hierarchical_v4_bundle(
         raise RuntimeError("V4 selection does not block every predecessor protocol")
     if selection.get("selection_source") != "pooled_outer_oof":
         raise RuntimeError("V4 export requires pooled outer-OOF selection")
+    required_protocols = {
+        "ignore_protocol_version": IGNORE_PROTOCOL,
+        "observation_gap_protocol": OBSERVATION_GAP_PROTOCOL,
+        "runtime_source_binding": RUNTIME_SOURCE_BINDING,
+    }
+    mismatched_protocols = {
+        key: selection.get(key)
+        for key, expected in required_protocols.items()
+        if selection.get(key) != expected
+    }
+    if mismatched_protocols:
+        raise RuntimeError(
+            f"V4 selection has incompatible protocol bindings: {mismatched_protocols}"
+        )
+    resume_identity = manifest.get("resume_identity", {})
+    expected_git = resume_identity.get("git")
+    active_git = git_worktree_identity(project_root)
+    if expected_git != active_git:
+        raise RuntimeError("V4 export runtime worktree differs from final training")
+    source_root = project_root / "src" / "bme_eating"
+    active_runtime_source = runtime_source_identity(source_root)
+    if resume_identity.get("runtime_source_identity") != active_runtime_source:
+        raise RuntimeError("V4 export runtime source differs from final training")
     if selection.get("candidate_minimum_seconds") != 3 or selection.get(
         "candidate_maximum_seconds"
     ) != 14_400:
@@ -180,6 +200,21 @@ def export_hierarchical_v4_bundle(
         for relative, expected in hashes.items():
             if sha256_file(bundle / relative) != expected:
                 raise RuntimeError(f"V4 bundle artifact changed: {relative}")
+        zip_path = final_root / "model_bundle.zip"
+        expected_zip = manifest.get("artifact_hashes", {}).get("model_bundle.zip")
+        if zip_path.is_file():
+            actual_zip = sha256_file(zip_path)
+            if expected_zip is not None and actual_zip != expected_zip:
+                raise RuntimeError("V4 model_bundle.zip changed after export")
+            if expected_zip is None:
+                manifest.setdefault("artifact_hashes", {})["model_bundle.zip"] = actual_zip
+                manifest["stage"] = "EXPORTED"
+                write_json_atomic(manifest_path, manifest)
+        else:
+            _write_bundle_zip(bundle, zip_path)
+            manifest.setdefault("artifact_hashes", {})["model_bundle.zip"] = sha256_file(zip_path)
+            manifest["stage"] = "EXPORTED"
+            write_json_atomic(manifest_path, manifest)
         return bundle
     if resume:
         raise FileNotFoundError("V4 bundle does not exist; start with --fresh")
@@ -212,7 +247,6 @@ def export_hierarchical_v4_bundle(
             temporary / name,
             {"model", "sequence_dim", "scalar_dim", "config", "seed", "epochs"},
         )
-    source_root = project_root / "src" / "bme_eating"
     runtime_root = temporary / "runtime" / "bme_eating"
     for relative in RUNTIME_FILES:
         target = runtime_root / relative
@@ -232,12 +266,7 @@ def export_hierarchical_v4_bundle(
     }
     write_json_atomic(temporary / "SHA256SUMS.json", {"version": 1, "files": files})
     temporary.replace(bundle)
-    zip_temporary = final_root / "model_bundle.tmp.zip"
-    with zipfile.ZipFile(zip_temporary, "w", zipfile.ZIP_DEFLATED) as archive:
-        for path in sorted(bundle.rglob("*")):
-            if path.is_file():
-                archive.write(path, Path("model_bundle") / path.relative_to(bundle))
-    zip_temporary.replace(final_root / "model_bundle.zip")
+    _write_bundle_zip(bundle, final_root / "model_bundle.zip")
     manifest["stage"] = "EXPORTED"
     manifest.setdefault("artifact_hashes", {})["model_bundle.zip"] = sha256_file(
         final_root / "model_bundle.zip"

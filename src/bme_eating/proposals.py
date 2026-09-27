@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks
 
+from bme_eating.metrics import prediction_ignore_mask
+
 SOURCE_STATE = 1
 SOURCE_HINT = 2
 SOURCE_JITTER = 4
@@ -394,25 +396,18 @@ def label_event_candidates(
 def exclude_ignored_candidates(
     proposals: pd.DataFrame,
     ignored_events: pd.DataFrame,
+    *,
+    minimum_prediction_overlap_fraction: float = 0.5,
 ) -> pd.DataFrame:
     if proposals.empty or ignored_events.empty:
         return proposals.copy()
-    session_aware = "session_id" in proposals.columns and "session_id" in ignored_events.columns
-    group_columns = ["subject_key", "session_id"] if session_aware else ["subject_key"]
-    grouped = {
-        tuple(str(value) for value in (key if isinstance(key, tuple) else (key,))): group
-        for key, group in ignored_events.groupby(group_columns, sort=False)
-    }
-    keep: list[bool] = []
-    for proposal in proposals.itertuples(index=False):
-        key = (str(proposal.subject_key),)
-        if session_aware:
-            key += (str(proposal.session_id),)
-        ignored = grouped.get(key, pd.DataFrame())
-        overlaps = any(
-            min(int(proposal.coarse_end_ms), int(event.end_ms))
-            > max(int(proposal.coarse_start_ms), int(event.start_ms))
-            for event in ignored.itertuples(index=False)
-        )
-        keep.append(not overlaps)
-    return proposals.loc[np.asarray(keep, dtype=bool)].reset_index(drop=True)
+    prediction = proposals.rename(
+        columns={"coarse_start_ms": "start_ms", "coarse_end_ms": "end_ms"}
+    )
+    ignored = prediction_ignore_mask(
+        prediction,
+        ignored_events,
+        policy="prediction_overlap_fraction",
+        threshold=float(minimum_prediction_overlap_fraction),
+    )
+    return proposals.loc[~ignored].reset_index(drop=True)

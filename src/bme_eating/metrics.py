@@ -67,7 +67,13 @@ def evaluation_event_partition_summary(events: pd.DataFrame) -> dict[str, int]:
     }
 
 
-def prediction_ignore_mask(prediction: pd.DataFrame, ignore: pd.DataFrame) -> np.ndarray:
+def prediction_ignore_mask(
+    prediction: pd.DataFrame,
+    ignore: pd.DataFrame,
+    *,
+    policy: str = "prediction_overlap_fraction",
+    threshold: float = 0.5,
+) -> np.ndarray:
     if prediction.empty or ignore.empty:
         return np.zeros(len(prediction), dtype=bool)
     required = {"subject_key", "start_ms", "end_ms"}
@@ -75,6 +81,10 @@ def prediction_ignore_mask(prediction: pd.DataFrame, ignore: pd.DataFrame) -> np
         missing = required - set(frame.columns)
         if missing:
             raise ValueError(f"{name} is missing columns: {sorted(missing)}")
+    if policy not in {"prediction_overlap_fraction", "any_overlap", "iou"}:
+        raise ValueError(f"Unknown ignore-overlap policy: {policy}")
+    if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("Ignore-overlap threshold must be in [0, 1]")
     session_aware = "session_id" in prediction.columns and "session_id" in ignore.columns
     grouping = ["subject_key", "session_id"] if session_aware else ["subject_key"]
     grouped = {
@@ -92,7 +102,20 @@ def prediction_ignore_mask(prediction: pd.DataFrame, ignore: pd.DataFrame) -> np
         overlap = np.minimum(int(row.end_ms), intervals[:, 1]) - np.maximum(
             int(row.start_ms), intervals[:, 0]
         )
-        mask[position] = bool(np.any(overlap > 0))
+        overlap = np.maximum(overlap, 0)
+        if policy == "any_overlap":
+            mask[position] = bool(np.any(overlap > 0))
+        elif policy == "prediction_overlap_fraction":
+            duration = int(row.end_ms) - int(row.start_ms)
+            if duration <= 0:
+                raise ValueError("Predictions must have positive duration")
+            mask[position] = bool(np.any(overlap / duration >= threshold))
+        else:
+            duration = int(row.end_ms) - int(row.start_ms)
+            ignore_duration = intervals[:, 1] - intervals[:, 0]
+            union = duration + ignore_duration - overlap
+            iou = np.divide(overlap, union, out=np.zeros_like(overlap, dtype=float), where=union > 0)
+            mask[position] = bool(np.any(iou > threshold))
     return mask
 
 
@@ -183,6 +206,8 @@ def evaluate_events(
     iou_threshold: float = 0.25,
     method: str = "max_cardinality_iou",
     ignore: pd.DataFrame | None = None,
+    ignore_policy: str = "prediction_overlap_fraction",
+    ignore_threshold: float = 0.5,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     for name, frame in (("truth", truth), ("prediction", prediction)):
         required = {"subject_key", "start_ms", "end_ms"}
@@ -235,19 +260,17 @@ def evaluate_events(
         matches = match_events(truth_intervals, prediction_intervals, iou_threshold, method)
         matched_prediction_indices = {match.prediction_index for match in matches}
         subject_ignore = ignore.loc[ignore_mask]
-        ignored_indices: set[int] = set()
-        if len(subject_ignore):
-            ignore_intervals = subject_ignore[["start_ms", "end_ms"]].to_numpy(dtype=np.float64)
-            for prediction_index, interval in enumerate(prediction_intervals):
-                if prediction_index in matched_prediction_indices:
-                    continue
-                overlap = np.maximum(
-                    0.0,
-                    np.minimum(interval[1], ignore_intervals[:, 1])
-                    - np.maximum(interval[0], ignore_intervals[:, 0]),
-                )
-                if np.any(overlap > 0):
-                    ignored_indices.add(prediction_index)
+        ignored = prediction_ignore_mask(
+            subject_prediction,
+            subject_ignore,
+            policy=ignore_policy,
+            threshold=ignore_threshold,
+        )
+        ignored_indices = {
+            int(index)
+            for index in np.flatnonzero(ignored)
+            if int(index) not in matched_prediction_indices
+        }
         true_positive += len(matches)
         total_truth += len(subject_truth)
         total_prediction += len(subject_prediction) - len(ignored_indices)

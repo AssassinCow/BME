@@ -215,35 +215,117 @@ def _proposal_id(subject: str, session: str, start: int, end: int, source: int) 
     return hashlib.sha256(payload).hexdigest()[:24]
 
 
+def decoder_valid_mask(windows: pd.DataFrame) -> np.ndarray:
+    if windows.empty:
+        return np.zeros(0, dtype=bool)
+    if "decode_valid" in windows:
+        return windows["decode_valid"].fillna(False).to_numpy(dtype=bool)
+    validity_columns = [
+        column
+        for column in ("acc_valid_fraction", "gyro_valid_fraction", "ppg_valid_fraction")
+        if column in windows
+    ]
+    if validity_columns:
+        validity = np.nan_to_num(
+            windows[validity_columns].to_numpy(dtype=np.float64), nan=0.0
+        )
+        return validity.max(axis=1) > 0.0
+    if "active_modality_missing_fraction" in windows:
+        missing = windows["active_modality_missing_fraction"].to_numpy(dtype=np.float64)
+        return np.isfinite(missing) & (missing < 1.0 - 1e-6)
+    return np.ones(len(windows), dtype=bool)
+
+
+def configured_decoder_valid_mask(
+    windows: pd.DataFrame,
+    *,
+    use_motion: bool,
+    use_ppg: bool,
+) -> np.ndarray:
+    masks: list[np.ndarray] = []
+    if use_motion:
+        motion_columns = [
+            column
+            for column in ("acc_valid_fraction", "gyro_valid_fraction")
+            if column in windows
+        ]
+        if motion_columns:
+            motion = np.nan_to_num(
+                windows[motion_columns].to_numpy(dtype=np.float64), nan=0.0
+            )
+            masks.append(motion.max(axis=1) > 0.0)
+        elif "motion_valid_fraction" in windows:
+            masks.append(
+                windows["motion_valid_fraction"].fillna(0.0).to_numpy(dtype=float) > 0.0
+            )
+    if use_ppg and "ppg_valid_fraction" in windows:
+        masks.append(windows["ppg_valid_fraction"].fillna(0.0).to_numpy(dtype=float) > 0.0)
+    if not masks:
+        return decoder_valid_mask(windows)
+    return np.logical_or.reduce(masks)
+
+
+def _valid_timeline_runs(windows: pd.DataFrame) -> tuple[list[pd.DataFrame], int]:
+    ordered = windows.sort_values("timestamp_ms", kind="stable").reset_index(drop=True)
+    if ordered.empty:
+        return [], 3000
+    timestamps = ordered["timestamp_ms"].to_numpy(dtype=np.int64)
+    positive_differences = np.diff(timestamps)
+    positive_differences = positive_differences[positive_differences > 0]
+    step_ms = int(np.median(positive_differences)) if len(positive_differences) else 3000
+    valid = decoder_valid_mask(ordered)
+    positions = np.flatnonzero(valid)
+    if not len(positions):
+        return [], step_ms
+    split = np.flatnonzero(
+        (np.diff(positions) != 1)
+        | (np.diff(timestamps[positions]) != step_ms)
+    ) + 1
+    runs = [
+        ordered.iloc[indices].reset_index(drop=True)
+        for indices in np.split(positions, split)
+        if len(indices)
+    ]
+    return runs, step_ms
+
+
+def observed_hours_v4(windows: pd.DataFrame) -> float:
+    milliseconds = 0
+    for _, group in windows.groupby(["subject_key", "session_id"], sort=False):
+        _, step_ms = _valid_timeline_runs(group)
+        milliseconds += int(decoder_valid_mask(group).sum()) * step_ms
+    return milliseconds / 3_600_000.0
+
+
 def hysteresis_fragment_diagnostics(
     windows: pd.DataFrame, config: dict[str, Any]
 ) -> dict[str, float]:
     count = 0
     observed_hours = 0.0
     for _, group in windows.groupby(["subject_key", "session_id"], sort=False):
-        group = group.sort_values("timestamp_ms")
-        timestamps = group["timestamp_ms"].to_numpy(dtype=np.int64)
-        if len(timestamps) < 2:
-            continue
-        probabilities = group["state_probability"].to_numpy(dtype=np.float64)
-        step_ms = int(np.median(np.diff(timestamps)))
-        smoothed = causal_ema(
-            probabilities,
-            float(config["ema_half_life_seconds"]),
-            step_ms / 1000.0,
-        )
-        fragments = _merge_gaps(
-            _hysteresis(
-                timestamps,
-                smoothed,
-                high=float(config["high_threshold"]),
-                low=float(config["low_threshold"]),
-                step_ms=step_ms,
-            ),
-            int(config["gap_merge_seconds"]) * 1000,
-        )
-        count += len(fragments)
-        observed_hours += (timestamps[-1] - timestamps[0] + step_ms) / 3_600_000.0
+        runs, step_ms = _valid_timeline_runs(group)
+        observed_hours += sum(len(run) for run in runs) * step_ms / 3_600_000.0
+        for run in runs:
+            timestamps = run["timestamp_ms"].to_numpy(dtype=np.int64)
+            if len(timestamps) < 2:
+                continue
+            probabilities = run["state_probability"].to_numpy(dtype=np.float64)
+            smoothed = causal_ema(
+                probabilities,
+                float(config["ema_half_life_seconds"]),
+                step_ms / 1000.0,
+            )
+            fragments = _merge_gaps(
+                _hysteresis(
+                    timestamps,
+                    smoothed,
+                    high=float(config["high_threshold"]),
+                    low=float(config["low_threshold"]),
+                    step_ms=step_ms,
+                ),
+                int(config["gap_merge_seconds"]) * 1000,
+            )
+            count += len(fragments)
     return {
         "state_fragment_count": float(count),
         "state_fragments_per_hour": float(count / max(observed_hours, 1e-9)),
@@ -271,90 +353,90 @@ def generate_event_candidates_v4(
     rows: list[dict[str, Any]] = []
     observed_hours: dict[tuple[str, str], float] = {}
     for (subject, session), group in windows.groupby(["subject_key", "session_id"], sort=False):
-        group = group.sort_values("timestamp_ms")
-        timestamps = group["timestamp_ms"].to_numpy(dtype=np.int64)
-        state = group["state_probability"].to_numpy(dtype=np.float64)
-        onset = group["onset_probability"].to_numpy(dtype=np.float64)
-        offset = group["offset_probability"].to_numpy(dtype=np.float64)
-        if len(timestamps) < 2:
-            continue
-        step_ms = int(np.median(np.diff(timestamps)))
         session_key = (str(subject), str(session))
-        observed_hours[session_key] = (
-            timestamps[-1] - timestamps[0] + step_ms
-        ) / 3_600_000.0
-        smoothed = causal_ema(
-            state,
-            float(config["ema_half_life_seconds"]),
-            step_ms / 1000.0,
-        )
+        runs, step_ms = _valid_timeline_runs(group)
+        observed_hours[session_key] = sum(len(run) for run in runs) * step_ms / 3_600_000.0
         minimum_ms = round(float(config.get("candidate_minimum_seconds", 3)) * 1000)
         maximum_ms = round(float(config.get("candidate_maximum_seconds", 14_400)) * 1000)
         if minimum_ms <= 0 or maximum_ms < minimum_ms:
             raise ValueError("Candidate duration limits are invalid")
-        seeds = _hysteresis(
-            timestamps,
-            smoothed,
-            high=float(config["high_threshold"]),
-            low=float(config["low_threshold"]),
-            step_ms=step_ms,
-        )
-        seeds = _merge_gaps(seeds, int(config["gap_merge_seconds"]) * 1000)
-        grid_ms = int(config["grid_seconds"]) * 1000
-        grid_start = int(-(-int(timestamps[0]) // grid_ms) * grid_ms)
-        grid_end = int(timestamps[-1] // grid_ms * grid_ms)
-        grid = np.arange(grid_start, grid_end + 1, grid_ms, dtype=np.int64)
-        if len(grid) and bool(config.get("use_semi_markov", True)):
-            if grid[0] < timestamps[0] or grid[-1] > timestamps[-1]:
-                raise RuntimeError("Semi-Markov grid extends beyond observed timestamps")
-            sampled = np.interp(grid, timestamps, smoothed)
-            seeds.extend(
-                (
-                    start,
-                    end,
-                    score,
-                    int(ProposalSource.SEMI_MARKOV),
-                )
-                for start, end, score in decoder.decode_events(grid, sampled)
+        for run in runs:
+            timestamps = run["timestamp_ms"].to_numpy(dtype=np.int64)
+            state = run["state_probability"].to_numpy(dtype=np.float64)
+            onset = run["onset_probability"].to_numpy(dtype=np.float64)
+            offset = run["offset_probability"].to_numpy(dtype=np.float64)
+            if len(timestamps) < 2:
+                continue
+            smoothed = causal_ema(
+                state,
+                float(config["ema_half_life_seconds"]),
+                step_ms / 1000.0,
             )
-        seeds.extend(
-            _transition_candidates(
+            seeds = _hysteresis(
                 timestamps,
-                onset,
-                offset,
-                threshold=float(config["transition_threshold"]),
-                minimum_ms=minimum_ms,
-                maximum_ms=maximum_ms,
+                smoothed,
+                high=float(config["high_threshold"]),
+                low=float(config["low_threshold"]),
+                step_ms=step_ms,
             )
-        )
-        seeds = [event for event in seeds if minimum_ms <= event[1] - event[0] <= maximum_ms]
-        family_seeds = [
-            (
-                *event,
-                _proposal_id(
-                    str(subject),
-                    str(session),
-                    int(event[0]),
-                    int(event[1]),
-                    int(event[3]),
-                ),
+            seeds = _merge_gaps(seeds, int(config["gap_merge_seconds"]) * 1000)
+            grid_ms = int(config["grid_seconds"]) * 1000
+            grid_start = int(-(-int(timestamps[0]) // grid_ms) * grid_ms)
+            grid_end = int(timestamps[-1] // grid_ms * grid_ms)
+            grid = np.arange(grid_start, grid_end + 1, grid_ms, dtype=np.int64)
+            if len(grid) and bool(config.get("use_semi_markov", True)):
+                if grid[0] < timestamps[0] or grid[-1] > timestamps[-1]:
+                    raise RuntimeError("Semi-Markov grid extends beyond observed timestamps")
+                sampled = np.interp(grid, timestamps, smoothed)
+                seeds.extend(
+                    (
+                        start,
+                        end,
+                        score,
+                        int(ProposalSource.SEMI_MARKOV),
+                    )
+                    for start, end, score in decoder.decode_events(grid, sampled)
+                )
+            seeds.extend(
+                _transition_candidates(
+                    timestamps,
+                    onset,
+                    offset,
+                    threshold=float(config["transition_threshold"]),
+                    minimum_ms=minimum_ms,
+                    maximum_ms=maximum_ms,
+                )
             )
-            for event in seeds
-        ]
-        variants = _jitter(
-            family_seeds,
-            [int(value) for value in config["jitter_seconds"]],
-            int(config["maximum_variants_per_event"]),
-            minimum_ms,
-            maximum_ms,
-            observation_start_ms=int(timestamps[0] - step_ms),
-            observation_end_ms=int(timestamps[-1]),
-        )
-        deduplicated = _deduplicate(variants, float(config["deduplication_iou"]))
-        for start, end, score, source, family_id in deduplicated:
-            if source & ~ALLOWED_SOURCE_MASK:
-                raise RuntimeError("A non-deep proposal source entered the v4 pipeline")
-            rows.append(
+            seeds = [
+                event for event in seeds if minimum_ms <= event[1] - event[0] <= maximum_ms
+            ]
+            family_seeds = [
+                (
+                    *event,
+                    _proposal_id(
+                        str(subject),
+                        str(session),
+                        int(event[0]),
+                        int(event[1]),
+                        int(event[3]),
+                    ),
+                )
+                for event in seeds
+            ]
+            variants = _jitter(
+                family_seeds,
+                [int(value) for value in config["jitter_seconds"]],
+                int(config["maximum_variants_per_event"]),
+                minimum_ms,
+                maximum_ms,
+                observation_start_ms=int(timestamps[0] - step_ms),
+                observation_end_ms=int(timestamps[-1]),
+            )
+            deduplicated = _deduplicate(variants, float(config["deduplication_iou"]))
+            for start, end, score, source, family_id in deduplicated:
+                if source & ~ALLOWED_SOURCE_MASK:
+                    raise RuntimeError("A non-deep proposal source entered the v4 pipeline")
+                rows.append(
                 {
                     "proposal_id": _proposal_id(str(subject), str(session), start, end, source),
                     "proposal_family_id": family_id,
@@ -367,7 +449,7 @@ def generate_event_candidates_v4(
                     "rank_within_session": 0,
                     "split_role": split_role,
                 }
-            )
+                )
     columns = [
         "proposal_id",
         "proposal_family_id",

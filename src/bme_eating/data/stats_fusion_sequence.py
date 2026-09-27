@@ -21,23 +21,83 @@ from bme_eating.metrics import partition_evaluation_events
 class SequenceGeometry:
     supervised_steps: int = 256
     short_receptive_field_steps: int = 127
+    fused_short_receptive_field_steps: int = 155
     long_receptive_field_tokens: int = 127
     long_pool_factor: int = 5
     step_seconds: int = 3
+    use_long_context: bool = True
 
     @property
     def history_steps(self) -> int:
-        short_history = self.short_receptive_field_steps - 1
-        long_history = (
-            self.long_receptive_field_tokens * self.long_pool_factor
+        short_history = max(
+            self.short_receptive_field_steps,
+            self.fused_short_receptive_field_steps,
+        ) - 1
+        if not self.use_long_context:
+            return short_history
+        nested_long_history = (
+            short_history
+            + self.long_receptive_field_tokens * self.long_pool_factor
             + self.long_pool_factor
             - 1
         )
-        return max(short_history, long_history)
+        return nested_long_history
 
     @property
     def total_steps(self) -> int:
         return self.history_steps + self.supervised_steps
+
+
+def _temporal_receptive_field(dilations: Sequence[int], kernel_size: int = 3) -> int:
+    values = tuple(int(value) for value in dilations)
+    if kernel_size <= 0 or not values or min(values) <= 0:
+        raise ValueError("Temporal receptive fields require positive dilations and kernel size")
+    return 1 + (kernel_size - 1) * sum(values)
+
+
+def sequence_geometry_from_config(config: dict[str, object]) -> SequenceGeometry:
+    sequence = config["sequence"]
+    model = config["model"]
+    if not isinstance(sequence, dict) or not isinstance(model, dict):
+        raise TypeError("StatsFusion geometry requires mapping-valued sequence and model config")
+
+    pool_factor = int(sequence["long_pool_factor"])
+    configured_short = int(sequence["short_receptive_field_steps"])
+    configured_long = int(sequence["long_receptive_field_tokens"])
+    motion_receptive_field = (
+        _temporal_receptive_field(model.get("motion_dilations", (1, 2, 4, 8, 16, 32)))
+        if bool(model.get("use_motion", True))
+        else 1
+    )
+    statistics_receptive_field = (
+        _temporal_receptive_field(model.get("statistics_dilations", (1, 2, 4, 8)))
+        if bool(model.get("use_statistics", True))
+        else 1
+    )
+    ppg_receptive_field = (
+        _temporal_receptive_field(model.get("ppg_dilations", (1, 2, 4, 8))) * pool_factor
+        if bool(model.get("use_ppg", True))
+        else 1
+    )
+    fused_short_receptive_field = max(
+        configured_short,
+        motion_receptive_field,
+        statistics_receptive_field,
+        ppg_receptive_field,
+    )
+    long_receptive_field = max(
+        configured_long,
+        _temporal_receptive_field(model.get("long_dilations", (1, 2, 4, 8, 16, 32))),
+    )
+    return SequenceGeometry(
+        supervised_steps=int(sequence["supervised_steps"]),
+        short_receptive_field_steps=configured_short,
+        fused_short_receptive_field_steps=fused_short_receptive_field,
+        long_receptive_field_tokens=long_receptive_field,
+        long_pool_factor=pool_factor,
+        step_seconds=int(sequence["step_seconds"]),
+        use_long_context=bool(model.get("use_long_context", True)),
+    )
 
 
 class ClipMixtureSampler(Sampler[tuple[int, int, np.ndarray]]):
@@ -342,7 +402,7 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         first_timestamp_ms: int,
         steps: int,
         rng: np.random.Generator,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         rotation = None
         if self.training and rng.random() < self.rotation_augmentation_probability:
             rotations = self._proper_signed_permutations()
@@ -357,6 +417,7 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             step_seconds=self.geometry.step_seconds,
             rotation_matrix=rotation,
             gyro_dropout=(self.training and rng.random() < self.gyro_modality_dropout),
+            return_invariant=True,
         )
 
     def _ppg_blocks(
@@ -449,7 +510,7 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             subject_key=subject_key,
         )
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, row_index, int(epoch)]))
-        motion, motion_valid = self._motion_blocks(
+        motion, motion_valid, motion_invariant = self._motion_blocks(
             payload, int(timestamps[0]), len(timestamps), rng
         )
         ppg, ppg_quality, ppg_valid, ppg_mapping, block_end_indices = self._ppg_blocks(
@@ -470,6 +531,7 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         result: dict[str, torch.Tensor | str | int] = {
             "motion_blocks": torch.from_numpy(motion),
             "motion_valid": torch.from_numpy(motion_valid),
+            "motion_invariant_blocks": torch.from_numpy(motion_invariant),
             "ppg_blocks": torch.from_numpy(ppg),
             "ppg_quality": torch.from_numpy(ppg_quality),
             "ppg_valid": torch.from_numpy(ppg_valid),

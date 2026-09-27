@@ -7,7 +7,7 @@ import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.data.stats_fusion_inputs import prepare_canonical_statsfusion_inputs
-from bme_eating.v4_protocol import validate_r3_config
+from bme_eating.v4_protocol import PROTOCOL_VERSION, validate_r3_config
 
 
 def main() -> None:
@@ -22,8 +22,10 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config(args.config)
     validate_r3_config(config)
-    if config.get("experiment", {}).get("protocol_version") != "statsfusion-r3":
-        raise RuntimeError("Canonical StatsFusion preparation requires statsfusion-r3")
+    if config.get("experiment", {}).get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(
+            f"Canonical StatsFusion preparation requires {PROTOCOL_VERSION}"
+        )
     _, input_root, output_root = resolve_artifact_roots(config)
     manifest = prepare_canonical_statsfusion_inputs(
         input_root,

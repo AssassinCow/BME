@@ -79,7 +79,8 @@ def build_motion_blocks(
     step_seconds: int,
     rotation_matrix: np.ndarray | None = None,
     gyro_dropout: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+    return_invariant: bool = False,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
     sampled, sampled_mask = _sample_grid(
         timestamp_ms,
         values,
@@ -100,6 +101,41 @@ def build_motion_blocks(
     if gyro_dropout:
         sampled[:, 3:6] = 0.0
         sampled_mask[:, 3:6] = False
+    acc_valid = sampled_mask[:, :3].all(axis=1)
+    gyro_valid = sampled_mask[:, 3:6].all(axis=1)
+    acc_physical = np.where(sampled_mask[:, :3], sampled[:, :3], 0.0)
+    gyro_physical = np.where(sampled_mask[:, 3:6], sampled[:, 3:6], 0.0)
+    acc_pair_valid = acc_valid & np.r_[False, acc_valid[:-1]]
+    gyro_pair_valid = gyro_valid & np.r_[False, gyro_valid[:-1]]
+    invariant_raw = np.stack(
+        (
+            np.linalg.norm(acc_physical, axis=1),
+            np.linalg.norm(gyro_physical, axis=1),
+            np.linalg.norm(
+                np.diff(acc_physical, axis=0, prepend=acc_physical[:1]) * 100.0,
+                axis=1,
+            ),
+            np.linalg.norm(
+                np.diff(gyro_physical, axis=0, prepend=gyro_physical[:1]) * 100.0,
+                axis=1,
+            ),
+        ),
+        axis=1,
+    )
+    invariant_valid = np.stack(
+        (acc_valid, gyro_valid, acc_pair_valid, gyro_pair_valid), axis=1
+    )
+    invariant_values = np.clip(
+        (invariant_raw - normalization.motion_invariant_median)
+        / normalization.motion_invariant_iqr,
+        -10.0,
+        10.0,
+    )
+    invariant_values[~invariant_valid] = 0.0
+    invariant_samples = np.concatenate(
+        (invariant_values, np.stack((acc_valid, gyro_valid), axis=1).astype(np.float32)),
+        axis=1,
+    )
     sampled = np.clip(
         (sampled - normalization.motion_median) / normalization.motion_iqr,
         -10.0,
@@ -110,7 +146,11 @@ def build_motion_blocks(
     sampled = sampled.reshape(steps, samples, 6)
     sampled_mask = sampled_mask.reshape(steps, samples, 6)
     blocks = np.concatenate((sampled, sampled_mask.astype(np.float32)), axis=2).transpose(0, 2, 1)
-    return blocks.astype(np.float32), sampled_mask.mean(axis=(1, 2)).astype(np.float32)
+    valid_fraction = sampled_mask.mean(axis=(1, 2)).astype(np.float32)
+    if not return_invariant:
+        return blocks.astype(np.float32), valid_fraction
+    invariant_blocks = invariant_samples.reshape(steps, samples, 6).transpose(0, 2, 1)
+    return blocks.astype(np.float32), valid_fraction, invariant_blocks.astype(np.float32)
 
 
 def build_ppg_blocks(
@@ -198,6 +238,23 @@ class RawSessionInput:
                 return None
             return float(1000.0 / np.median(np.diff(values)))
 
+        def gap_summary(timestamps: np.ndarray) -> tuple[float | None, int, float]:
+            values = np.asarray(timestamps, dtype=np.int64).reshape(-1)
+            if len(values) < 2:
+                return None, 0, 0.0
+            differences = np.diff(values)
+            long_gaps = differences[differences > 3_000]
+            return (
+                float(differences.max()),
+                len(long_gaps),
+                float(long_gaps.sum() / 1000.0),
+            )
+
+        motion_max_gap, motion_long_gaps, motion_gap_seconds = gap_summary(
+            self.motion_timestamp_ms
+        )
+        ppg_max_gap, ppg_long_gaps, ppg_gap_seconds = gap_summary(self.ppg_timestamp_ms)
+
         return {
             "schema_version": self.schema_version,
             "timestamp_unit": self.timestamp_unit,
@@ -207,6 +264,12 @@ class RawSessionInput:
             "ppg_samples": len(self.ppg_timestamp_ms),
             "motion_inferred_hz": inferred(self.motion_timestamp_ms),
             "ppg_inferred_hz": inferred(self.ppg_timestamp_ms),
+            "motion_max_gap_ms": motion_max_gap,
+            "ppg_max_gap_ms": ppg_max_gap,
+            "motion_gaps_over_3s": motion_long_gaps,
+            "ppg_gaps_over_3s": ppg_long_gaps,
+            "motion_gap_seconds_over_3s": motion_gap_seconds,
+            "ppg_gap_seconds_over_3s": ppg_gap_seconds,
         }
 
     def validated(self) -> RawSessionInput:
@@ -328,7 +391,7 @@ class StatsFusionRawSessionPreprocessor:
 
     def _motion_blocks(
         self, session: RawSessionInput, first_timestamp_ms: int, steps: int
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         return build_motion_blocks(
             timestamp_ms=session.motion_timestamp_ms,
             values=session.motion_values,
@@ -337,6 +400,7 @@ class StatsFusionRawSessionPreprocessor:
             first_timestamp_ms=first_timestamp_ms,
             steps=steps,
             step_seconds=self.geometry.step_seconds,
+            return_invariant=True,
         )
 
     def _ppg_blocks(
@@ -373,7 +437,9 @@ class StatsFusionRawSessionPreprocessor:
                 end_timestamp
                 - np.arange(self.geometry.total_steps - 1, -1, -1, dtype=np.int64) * step_ms
             )
-            motion, motion_valid = self._motion_blocks(session, int(timestamps[0]), len(timestamps))
+            motion, motion_valid, motion_invariant = self._motion_blocks(
+                session, int(timestamps[0]), len(timestamps)
+            )
             ppg, ppg_quality, ppg_valid, ppg_mapping, block_end_indices = self._ppg_blocks(
                 session,
                 timestamps,
@@ -392,6 +458,7 @@ class StatsFusionRawSessionPreprocessor:
             yield {
                 "motion_blocks": torch.from_numpy(motion).unsqueeze(0),
                 "motion_valid": torch.from_numpy(motion_valid).unsqueeze(0),
+                "motion_invariant_blocks": torch.from_numpy(motion_invariant).unsqueeze(0),
                 "motion_present": torch.from_numpy((motion_valid > 0).astype(np.float32)).unsqueeze(
                     0
                 ),

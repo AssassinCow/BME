@@ -370,29 +370,12 @@ class StatsFusionStateModel(nn.Module):
             gyro_gate = torch.zeros_like(motion)
         invariant_gate = torch.zeros_like(motion)
         if self.use_invariant_motion_branch:
-            values = motion_blocks[:, :, :6]
-            masks = motion_blocks[:, :, 6:12]
-            acc_values = values[:, :, :3] * masks[:, :, :3]
-            gyro_values = values[:, :, 3:6] * masks[:, :, 3:6]
-            acc_magnitude = torch.linalg.vector_norm(acc_values, dim=2)
-            gyro_magnitude = torch.linalg.vector_norm(gyro_values, dim=2)
-            acc_jerk = torch.linalg.vector_norm(
-                torch.diff(acc_values, dim=-1, prepend=acc_values[..., :1]), dim=2
-            )
-            gyro_jerk = torch.linalg.vector_norm(
-                torch.diff(gyro_values, dim=-1, prepend=gyro_values[..., :1]), dim=2
-            )
-            invariant_blocks = torch.stack(
-                (
-                    acc_magnitude,
-                    gyro_magnitude,
-                    acc_jerk,
-                    gyro_jerk,
-                    masks[:, :, :3].mean(dim=2),
-                    masks[:, :, 3:6].mean(dim=2),
-                ),
-                dim=2,
-            )
+            invariant_blocks = batch.get("motion_invariant_blocks")
+            if invariant_blocks is None:
+                raise ValueError(
+                    "The physical-unit invariant motion branch requires motion_invariant_blocks"
+                )
+            invariant_blocks = invariant_blocks.to(motion_blocks.dtype)
             invariant = self.invariant_motion_tcn(
                 self._encode_blocks(self.invariant_motion_encoder, invariant_blocks)
                 * motion_fusion_valid.unsqueeze(-1)

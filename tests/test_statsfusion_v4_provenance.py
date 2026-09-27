@@ -27,7 +27,25 @@ from bme_eating.stats_features import STATS_FEATURE_COLUMNS, audit_feature_prove
 
 def _r3_config() -> dict:
     root = Path(__file__).resolve().parents[1]
-    return load_config(root / "configs" / "hierarchical_v4_statsfusion_r3.yaml")
+    return load_config(root / "configs" / "hierarchical_v4_statsfusion_r31.yaml")
+
+
+def test_canonical_identity_includes_archive_reader_and_session_dependencies(
+    monkeypatch,
+) -> None:
+    assert "data/deep_dataset.py" in statsfusion_inputs.FEATURE_IMPLEMENTATION_FILES
+    assert "data/session.py" in statsfusion_inputs.FEATURE_IMPLEMENTATION_FILES
+    baseline = statsfusion_inputs.feature_implementation_identity()
+    original = statsfusion_inputs.sha256_file
+
+    def changed(path):
+        if Path(path).name == "deep_dataset.py":
+            return "f" * 64
+        return original(path)
+
+    monkeypatch.setattr(statsfusion_inputs, "sha256_file", changed)
+    modified = statsfusion_inputs.feature_implementation_identity()
+    assert modified["sha256"] != baseline["sha256"]
 
 
 def test_feature_provenance_hashes_sources_and_marks_stress_evidence(tmp_path) -> None:
@@ -76,7 +94,7 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
         }
     )
     segment_frame.to_parquet(input_root / "indices" / "segments.parquet", index=False)
-    canonical_root = output_root / "canonical_input_r3"
+    canonical_root = output_root / "canonical_input_r3_1"
     canonical_root.mkdir(parents=True)
     canonical_anchors = canonical_root / "anchors.parquet"
     canonical_statistics = canonical_root / "statistics.parquet"
@@ -102,7 +120,7 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
     (canonical_root / "manifest.json").write_text(
         json.dumps(
             {
-                "protocol_version": "statsfusion-r3",
+                "protocol_version": "statsfusion-r3.1",
                 "anchor_semantics": "right_endpoint_half_open",
                 "feature_code_sha256": preparation_identity["feature_implementation"]["sha256"],
                 "preparation_identity_sha256": sha256_file(preparation_path),
@@ -209,7 +227,7 @@ def test_v4_rejects_blocked_predecessor_protocol(tmp_path) -> None:
         "experiment": {"protocol_version": "statsfusion-r1"},
         "features": {"artifact_name": "baseline"},
     }
-    with pytest.raises(ValueError, match="statsfusion-r3"):
+    with pytest.raises(ValueError, match="statsfusion-r3.1"):
         v4_artifacts.current_v4_identity(config, tmp_path)
 
 
@@ -220,7 +238,7 @@ def test_v4_rejects_blocked_predecessor_protocol(tmp_path) -> None:
 def test_v4_identity_rejects_all_blocked_predecessors(tmp_path, blocked_protocol) -> None:
     config = _r3_config()
     config["experiment"]["protocol_version"] = blocked_protocol
-    with pytest.raises(ValueError, match="statsfusion-r3"):
+    with pytest.raises(ValueError, match="statsfusion-r3.1"):
         v4_artifacts.current_v4_identity(config, tmp_path / "v2")
 
 
@@ -234,12 +252,13 @@ def test_r3_freeze_manifest_hash_locks_promotion_and_selection_evidence(tmp_path
     config = {"decoder": {"candidate_minimum_seconds": 3, "candidate_maximum_seconds": 14_400}}
     freeze_path = experiment_root / "freeze_manifest.json"
     payload = {
-        "code_version": "v4.3",
-        "protocol_version": "statsfusion-r3",
+        "code_version": "v4.3.1",
+        "protocol_version": "statsfusion-r3.1",
         "blocked_predecessors": [
             "statsfusion-r0-blocked",
             "statsfusion-r1-blocked",
             "statsfusion-r2-blocked",
+            "statsfusion-r3-blocked",
         ],
         "selected_run": "winner",
         "locked_after_folds": [0, 1],
@@ -333,7 +352,7 @@ def _partial_canonical_fixture(tmp_path):
     events_path = indices / "events.parquet"
     segments.to_parquet(segments_path, index=False)
     events.to_parquet(events_path, index=False)
-    root = output_root / "canonical_input_r3"
+    root = output_root / "canonical_input_r3_1"
     root.mkdir(parents=True)
     anchors = pd.DataFrame(
         {
@@ -420,7 +439,7 @@ def test_partial_canonical_resume_reuses_matching_anchors(tmp_path, monkeypatch)
     monkeypatch.setattr(statsfusion_inputs, "ProcessPoolExecutor", ImmediateExecutor)
     monkeypatch.setattr(statsfusion_inputs, "as_completed", lambda futures: list(futures))
     monkeypatch.setattr(statsfusion_inputs, "_build_session_statistics", build_statistics)
-    before = sha256_file(output_root / "canonical_input_r3" / "anchors.parquet")
+    before = sha256_file(output_root / "canonical_input_r3_1" / "anchors.parquet")
     manifest = prepare_canonical_statsfusion_inputs(
         input_root,
         output_root,
@@ -428,7 +447,7 @@ def test_partial_canonical_resume_reuses_matching_anchors(tmp_path, monkeypatch)
         fresh=False,
         resume=True,
     )
-    assert sha256_file(output_root / "canonical_input_r3" / "anchors.parquet") == before
+    assert sha256_file(output_root / "canonical_input_r3_1" / "anchors.parquet") == before
     assert manifest == verify_canonical_statsfusion_inputs(input_root, output_root)
     archive = statsfusion_inputs.Path(
         pd.read_parquet(input_root / "indices" / "segments.parquet").iloc[0].segment_path

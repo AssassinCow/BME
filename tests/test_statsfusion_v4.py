@@ -20,7 +20,7 @@ from bme_eating.calibration_v4 import (
     state_calibration_metrics,
     subject_crossfit_platt,
 )
-from bme_eating.data.deep_dataset import Normalization
+from bme_eating.data.deep_dataset import Normalization, compute_normalization
 from bme_eating.data.labels import assign_event_sessions, build_statsfusion_session_anchor_index
 from bme_eating.data.stats_fusion_preprocess import (
     RawSessionInput,
@@ -69,6 +69,7 @@ from bme_eating.proposals_v4 import (
     _hysteresis,
     _jitter,
     generate_event_candidates_v4,
+    observed_hours_v4,
 )
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
 from bme_eating.structured_decoder import (
@@ -76,6 +77,7 @@ from bme_eating.structured_decoder import (
     TruncatedLogNormalDurationPrior,
     right_endpoint_run_to_interval,
 )
+from bme_eating.timeline import claim_new_timeline_rows, deduplicate_consistent_timeline
 from bme_eating.training.hierarchical_v4_trainer import (
     UNLABELED_ANCHOR_COLUMNS,
     V4Inputs,
@@ -97,6 +99,7 @@ from bme_eating.training.hierarchical_v4_trainer import (
     _selector_early_stopping_improved,
     _selector_split,
     _truth_event_durations,
+    infer_state_windows,
     load_v4_inputs,
 )
 
@@ -277,7 +280,7 @@ def test_r3_loads_session_statistics_without_segment_id(tmp_path, monkeypatch) -
     input_root = tmp_path / "v2"
     output_root = tmp_path / "v4"
     (input_root / "indices").mkdir(parents=True)
-    canonical_root = output_root / "canonical_input_r3"
+    canonical_root = output_root / "canonical_input_r3_1"
     canonical_root.mkdir(parents=True)
     anchors = pd.DataFrame(
         {
@@ -338,7 +341,7 @@ def test_r3_loads_session_statistics_without_segment_id(tmp_path, monkeypatch) -
 
     inputs = load_v4_inputs(
         {
-            "experiment": {"protocol_version": "statsfusion-r3"},
+            "experiment": {"protocol_version": "statsfusion-r3.1"},
             "project": {"artifact_schema_version": "v4"},
             "features": {"artifact_name": "baseline"},
         },
@@ -684,6 +687,53 @@ def test_candidate_budget_is_independent_per_session() -> None:
     )
     assert len(proposals) == 20
     assert proposals.groupby("session_id").size().eq(1).all()
+
+
+def test_candidates_do_not_cross_fully_unobserved_timeline_gap() -> None:
+    prior = TruncatedLogNormalDurationPrior.fit(np.asarray([30.0, 60.0]))
+    decoder = FixedLagSemiMarkovDecoder(prior, fixed_lag_seconds=60)
+    timestamps = np.arange(40, dtype=np.int64) * 3_000
+    decode_valid = np.ones(len(timestamps), dtype=bool)
+    decode_valid[10:20] = False
+    windows = pd.DataFrame(
+        {
+            "subject_key": "s",
+            "session_id": "d",
+            "timestamp_ms": timestamps,
+            "state_probability": 0.9,
+            "onset_probability": 0.0,
+            "offset_probability": 0.0,
+            "decode_valid": decode_valid,
+        }
+    )
+    proposals = generate_event_candidates_v4(
+        windows,
+        decoder,
+        {
+            "use_semi_markov": True,
+            "ema_half_life_seconds": 0,
+            "high_threshold": 0.5,
+            "low_threshold": 0.2,
+            "gap_merge_seconds": 60,
+            "transition_threshold": 0.5,
+            "grid_seconds": 15,
+            "jitter_seconds": [0],
+            "maximum_variants_per_event": 1,
+            "maximum_candidates_per_hour": 20,
+            "deduplication_iou": 0.9,
+            "candidate_minimum_seconds": 3,
+            "candidate_maximum_seconds": 14_400,
+        },
+        split_role="test",
+    )
+    gap_start = int(timestamps[10] - 3_000)
+    gap_end = int(timestamps[19])
+    assert len(proposals)
+    assert observed_hours_v4(windows) == pytest.approx(30 * 3 / 3600)
+    assert not (
+        (proposals["coarse_start_ms"] < gap_end)
+        & (proposals["coarse_end_ms"] > gap_start)
+    ).any()
 
 
 def test_candidate_recall_counts_each_recalled_truth_event() -> None:
@@ -1174,7 +1224,7 @@ def test_nested_single_seed_epoch_cache_dependency_replay(tmp_path) -> None:
         )
     lineage_path = root / "lineage.json"
     lineage = {
-        "protocol_version": "statsfusion-r3",
+        "protocol_version": "statsfusion-r3.1",
         "meta_crossfit_protocol": "fully_nested_v1",
         "cache_key": cache_key,
         "training_subjects": sorted(training_subjects),
@@ -1384,7 +1434,9 @@ def test_nested_single_seed_epoch_pipeline_replay(tmp_path, monkeypatch) -> None
     )
     trainer_module = importlib.import_module("bme_eating.training.hierarchical_v4_trainer")
     monkeypatch.setattr(trainer_module, "_fit_scaler_and_transform", fake_scaler_transform)
-    monkeypatch.setattr(trainer_module, "compute_normalization", lambda *_args: normalization)
+    monkeypatch.setattr(
+        trainer_module, "compute_normalization", lambda *_args, **_kwargs: normalization
+    )
     monkeypatch.setattr(trainer_module, "_make_dataset", fake_dataset)
     monkeypatch.setattr(trainer_module, "_select_epoch", lambda *_args, **_kwargs: (1, {}))
     monkeypatch.setattr(trainer_module, "build_state_model", lambda *_args: StubStateModel())
@@ -1562,8 +1614,33 @@ def test_boundary_refinement_enforces_neighbor_safety_gap() -> None:
     assert set(refined["proposal_id"]) == {"left", "right"}
     assert refined.iloc[0].refined_end_ms == refined.iloc[0].coarse_end_ms
     assert refined.iloc[1].refined_start_ms == refined.iloc[1].coarse_start_ms
-    assert bool(refined.iloc[0].end_fallback)
-    assert bool(refined.iloc[1].start_fallback)
+    assert refined.iloc[0].refined_start_ms == refined.iloc[0].coarse_start_ms
+    assert refined.iloc[1].refined_end_ms == refined.iloc[1].coarse_end_ms
+    assert refined[["start_fallback", "end_fallback", "boundary_fallback"]].all().all()
+
+
+def test_boundary_neighbor_conflict_cannot_create_non_positive_event() -> None:
+    accepted = pd.DataFrame(
+        {
+            "proposal_id": ["left", "right"],
+            "subject_key": ["s", "s"],
+            "session_id": ["d", "d"],
+            "coarse_start_ms": [0, 123_000],
+            "coarse_end_ms": [100_000, 200_000],
+        }
+    )
+    refined = apply_boundary_refinement(
+        accepted,
+        np.asarray([95.0, -120.0]),
+        np.asarray([150.0, -75.0]),
+        np.zeros(2),
+        np.zeros(2),
+        entropy_threshold=0.5,
+        safety_gap_seconds=3,
+    )
+    assert refined["refined_start_ms"].tolist() == accepted["coarse_start_ms"].tolist()
+    assert refined["refined_end_ms"].tolist() == accepted["coarse_end_ms"].tolist()
+    assert (refined["refined_start_ms"] < refined["refined_end_ms"]).all()
 
 
 def test_v4_pipeline_import_does_not_import_xgboost(monkeypatch) -> None:
@@ -1678,6 +1755,36 @@ def test_truth_ignore_partition_and_ignore_predictions() -> None:
     metrics, _ = evaluate_events(truth, prediction, ignore=ignore)
     assert metrics["false_positive"] == 0
     assert metrics["ignored_predictions"] == 1
+
+
+def test_small_ignore_overlap_does_not_exempt_long_false_prediction() -> None:
+    truth = pd.DataFrame(columns=["subject_key", "session_id", "start_ms", "end_ms"])
+    prediction = pd.DataFrame(
+        {
+            "subject_key": ["s"],
+            "session_id": ["d"],
+            "start_ms": [0],
+            "end_ms": [100_000],
+        }
+    )
+    ignore = pd.DataFrame(
+        {
+            "subject_key": ["s"],
+            "session_id": ["d"],
+            "start_ms": [50_000],
+            "end_ms": [51_000],
+        }
+    )
+    primary, _ = evaluate_events(truth, prediction, ignore=ignore)
+    sensitivity, _ = evaluate_events(
+        truth,
+        prediction,
+        ignore=ignore,
+        ignore_policy="any_overlap",
+        ignore_threshold=0.0,
+    )
+    assert primary["false_positive"] == 1
+    assert sensitivity["ignored_predictions"] == 1
 
 
 def test_ignore_overlap_is_removed_even_if_truth_label_is_positive() -> None:
@@ -1821,8 +1928,8 @@ def test_session_phased_completed_blocks_are_chunk_invariant_at_903_seconds() ->
 
 def test_sequence_geometry_reserves_global_block_phase_margin() -> None:
     geometry = SequenceGeometry()
-    assert geometry.history_steps == 127 * 5 + 4
-    assert geometry.total_steps == 895
+    assert geometry.history_steps == 154 + 127 * 5 + 4
+    assert geometry.total_steps == 1049
     for endpoint_phase in range(5):
         timestamps = (
             endpoint_phase - np.arange(geometry.total_steps - 1, -1, -1)
@@ -1839,10 +1946,112 @@ def test_sequence_geometry_reserves_global_block_phase_margin() -> None:
         assert int(complete_history.sum()) >= geometry.long_receptive_field_tokens
 
 
+def test_state_inference_tail_chunk_emits_each_anchor_once() -> None:
+    anchors = np.arange(0, 18_000, 3_000, dtype=np.int64)
+
+    class Dataset:
+        def __init__(self) -> None:
+            self.geometry = SequenceGeometry(
+                supervised_steps=4,
+                short_receptive_field_steps=1,
+                fused_short_receptive_field_steps=1,
+                long_receptive_field_tokens=1,
+                long_pool_factor=1,
+                step_seconds=3,
+                use_long_context=False,
+            )
+            self.session_groups = {
+                ("subject", "session"): pd.DataFrame(
+                    {"_row_id": np.arange(len(anchors), dtype=np.int64)}
+                )
+            }
+
+        def __len__(self) -> int:
+            return len(anchors)
+
+        def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+            end_timestamp = int(anchors[index])
+            timestamps = end_timestamp - np.arange(3, -1, -1, dtype=np.int64) * 3_000
+            return {
+                "timestamp_ms": torch.from_numpy(timestamps),
+                "supervision_mask": torch.ones(4),
+                "state_target": torch.zeros(4),
+                "state_loss_mask": torch.ones(4),
+                "statistics": torch.zeros((4, 24)),
+                "subject_key": "subject",
+                "session_id": "session",
+            }
+
+    class PositionModel(torch.nn.Module):
+        def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+            absolute_position = batch["timestamp_ms"].to(torch.float32) / 3_000.0
+            names = (
+                "state_logit",
+                "onset_logit",
+                "offset_logit",
+                "ppg_gate",
+                "statistics_gate",
+                "long_gate",
+                "missing_fraction",
+                "active_modality_missing_fraction",
+                "motion_valid_fraction",
+                "acc_valid_fraction",
+                "gyro_valid_fraction",
+                "gyro_gate",
+                "invariant_gate",
+                "ppg_valid_fraction",
+                "statistics_missing_fraction",
+            )
+            return {name: absolute_position for name in names}
+
+    output = infer_state_windows(
+        PositionModel(),
+        Dataset(),
+        {"training": {"device": "cpu", "inference_batch_size": 2, "num_workers": 0}},
+        stacking_partition=0,
+    )
+    assert output["timestamp_ms"].tolist() == anchors.tolist()
+    assert not output.duplicated(["subject_key", "session_id", "timestamp_ms"]).any()
+
+
+def test_timeline_ownership_compares_overlap_before_claiming_rows() -> None:
+    first = pd.DataFrame(
+        {
+            "subject_key": ["subject"] * 4,
+            "session_id": ["session"] * 4,
+            "timestamp_ms": [0, 3_000, 6_000, 9_000],
+            "state_logit": [0.0, 1.0, 2.0, 3.0],
+        }
+    )
+    tail = pd.DataFrame(
+        {
+            "subject_key": ["subject"] * 3,
+            "session_id": ["session"] * 3,
+            "timestamp_ms": [6_000, 9_000, 12_000],
+            "state_logit": [20.0, 30.0, 40.0],
+        }
+    )
+    ownership: dict[tuple[str, str], pd.DataFrame] = {}
+    claimed_first = claim_new_timeline_rows(first, ownership)
+    with pytest.raises(RuntimeError, match="disagree at duplicate anchors"):
+        claim_new_timeline_rows(tail, ownership)
+    consistent_tail = tail.copy()
+    consistent_tail["state_logit"] = [2.0, 3.0, 4.0]
+    claimed_tail = claim_new_timeline_rows(consistent_tail, ownership)
+    assert claimed_tail["timestamp_ms"].tolist() == [12_000]
+    combined = pd.concat((claimed_first, claimed_tail), ignore_index=True)
+    deduplicated, diagnostics = deduplicate_consistent_timeline(combined)
+    assert deduplicated["timestamp_ms"].tolist() == [0, 3_000, 6_000, 9_000, 12_000]
+    assert diagnostics["duplicate_groups"] == 0
+    with pytest.raises(RuntimeError, match="disagree at duplicate anchors"):
+        deduplicate_consistent_timeline(pd.concat((first, tail), ignore_index=True))
+
+
 def test_dataset_and_raw_preprocessor_share_completed_block_phase(tmp_path) -> None:
     geometry = SequenceGeometry(
         supervised_steps=8,
         short_receptive_field_steps=3,
+        fused_short_receptive_field_steps=3,
         long_receptive_field_tokens=3,
         long_pool_factor=5,
         step_seconds=3,
@@ -1917,6 +2126,12 @@ def test_dataset_and_raw_preprocessor_share_completed_block_phase(tmp_path) -> N
     )
     raw_batch = list(preprocessor.iter_state_batches(raw_session))[-1]
     torch.testing.assert_close(
+        raw_batch["motion_invariant_blocks"][0],
+        dataset_batch["motion_invariant_blocks"],
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
         raw_batch["ppg_blocks"][0], dataset_batch["ppg_blocks"], atol=0, rtol=0
     )
     torch.testing.assert_close(
@@ -1950,6 +2165,97 @@ def test_motion_validity_is_a_true_sampling_ratio() -> None:
     assert valid[0] == pytest.approx(0.5)
 
 
+def test_physical_motion_invariants_survive_signed_permutation_rotation() -> None:
+    timestamps = np.arange(300, dtype=np.int64) * 10
+    rng = np.random.default_rng(2026)
+    values = rng.normal(0.0, 0.05, size=(300, 6)).astype(np.float32)
+    mask = np.ones_like(values, dtype=bool)
+    normalization = Normalization(np.zeros(6), np.ones(6), 0.0, 1.0)
+    rotation = np.asarray(
+        [[0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]],
+        dtype=np.float32,
+    )
+    _, _, baseline = build_motion_blocks(
+        timestamp_ms=timestamps,
+        values=values,
+        mask=mask,
+        normalization=normalization,
+        first_timestamp_ms=3_000,
+        steps=1,
+        step_seconds=3,
+        return_invariant=True,
+    )
+    _, _, rotated = build_motion_blocks(
+        timestamp_ms=timestamps,
+        values=values,
+        mask=mask,
+        normalization=normalization,
+        first_timestamp_ms=3_000,
+        steps=1,
+        step_seconds=3,
+        rotation_matrix=rotation,
+        return_invariant=True,
+    )
+    np.testing.assert_allclose(rotated, baseline, atol=1e-6, rtol=1e-6)
+
+
+def test_motion_only_normalization_does_not_require_ppg(tmp_path) -> None:
+    archive = tmp_path / "motion-only.npz"
+    timestamps = np.arange(300, dtype=np.int64) * 10
+    values = np.ones((300, 6), dtype=np.float32)
+    np.savez(
+        archive,
+        motion_timestamp_ms=timestamps,
+        motion_values=values,
+        motion_mask=np.ones_like(values, dtype=bool),
+        ppg_timestamp_ms=np.asarray([], dtype=np.int64),
+        ppg_values=np.asarray([], dtype=np.float32),
+        ppg_mask=np.asarray([], dtype=bool),
+    )
+    segments = pd.DataFrame(
+        {"subject_key": ["s"], "segment_path": [str(archive)]}
+    )
+    normalization = compute_normalization(
+        segments, {"s"}, require_motion=True, require_ppg=False
+    )
+    assert normalization.ppg_median == 0.0
+    assert normalization.ppg_iqr == 1.0
+    with pytest.raises(ValueError, match="PPG"):
+        compute_normalization(segments, {"s"}, require_motion=True, require_ppg=True)
+
+
+def test_normalization_ignores_nonfinite_valid_samples_and_empty_invariant_channels(
+    tmp_path,
+) -> None:
+    archive = tmp_path / "partial-modalities.npz"
+    timestamps = np.arange(300, dtype=np.int64) * 10
+    values = np.ones((300, 6), dtype=np.float32)
+    values[5, 0] = np.nan
+    motion_mask = np.ones_like(values, dtype=bool)
+    motion_mask[:, 3:] = False
+    ppg_values = np.ones(150, dtype=np.float32)
+    ppg_values[7] = np.inf
+    np.savez(
+        archive,
+        motion_timestamp_ms=timestamps,
+        motion_values=values,
+        motion_mask=motion_mask,
+        ppg_timestamp_ms=np.arange(150, dtype=np.int64) * 20,
+        ppg_values=ppg_values,
+        ppg_mask=np.ones(150, dtype=bool),
+    )
+    segments = pd.DataFrame({"subject_key": ["s"], "segment_path": [str(archive)]})
+    normalization = compute_normalization(
+        segments, {"s"}, require_motion=True, require_ppg=True
+    )
+    assert np.isfinite(normalization.motion_median).all()
+    assert np.isfinite(normalization.motion_iqr).all()
+    assert np.isfinite(normalization.motion_invariant_median).all()
+    assert np.isfinite(normalization.motion_invariant_iqr).all()
+    assert np.isfinite(normalization.ppg_median)
+    assert np.isfinite(normalization.ppg_iqr)
+
+
 def test_raw_session_validation_rejects_nonfinite_valid_values() -> None:
     with pytest.raises(ValueError, match="finite"):
         RawSessionInput(
@@ -1962,6 +2268,25 @@ def test_raw_session_validation_rejects_nonfinite_valid_values() -> None:
             ppg_values=np.asarray([], dtype=np.float32),
             ppg_mask=np.asarray([], dtype=bool),
         ).validated()
+
+
+def test_raw_session_reports_long_sensor_gaps_without_hiding_them() -> None:
+    motion_time = np.concatenate(
+        (np.arange(200, dtype=np.int64) * 10, 3_600_000 + np.arange(200) * 10)
+    )
+    session = RawSessionInput(
+        subject_key="s",
+        session_id="d",
+        motion_timestamp_ms=motion_time,
+        motion_values=np.zeros((len(motion_time), 6), dtype=np.float32),
+        motion_mask=np.ones((len(motion_time), 6), dtype=bool),
+        ppg_timestamp_ms=np.asarray([], dtype=np.int64),
+        ppg_values=np.asarray([], dtype=np.float32),
+        ppg_mask=np.asarray([], dtype=bool),
+    ).validated()
+    diagnostics = session.sampling_diagnostics()
+    assert diagnostics["motion_gaps_over_3s"] == 1
+    assert float(diagnostics["motion_max_gap_ms"]) > 3_000_000
 
 
 @pytest.mark.parametrize(
@@ -2109,6 +2434,47 @@ def test_canonical_session_grid_does_not_restart_at_fragment_boundaries(tmp_path
         geometry=SequenceGeometry(),
     )
     assert preprocessor.anchors(session).tolist() == expected.tolist()
+
+
+def test_canonical_anchor_inside_raw_motion_gap_is_not_supervised(tmp_path) -> None:
+    first = np.arange(0, 3_001, 10, dtype=np.int64)
+    second = np.arange(60_000, 63_001, 10, dtype=np.int64)
+    motion_time = np.concatenate((first, second))
+    motion_values = np.ones((len(motion_time), 6), dtype=np.float32)
+    archive = tmp_path / "gapped.npz"
+    np.savez(
+        archive,
+        motion_timestamp_ms=motion_time,
+        motion_values=motion_values,
+        motion_mask=np.ones_like(motion_values, dtype=bool),
+        ppg_timestamp_ms=np.asarray([], dtype=np.int64),
+        ppg_values=np.asarray([], dtype=np.float32),
+        ppg_mask=np.asarray([], dtype=bool),
+    )
+    segments = pd.DataFrame(
+        {
+            "segment_id": ["g0"],
+            "session_id": ["d"],
+            "segment_path": [str(archive)],
+            "subject_key": ["s"],
+            "start_ms": [0],
+            "end_ms": [63_000],
+        }
+    )
+    events = pd.DataFrame(
+        columns=[
+            "event_id",
+            "subject_key",
+            "session_id",
+            "start_ms",
+            "end_ms",
+            "valid_duration",
+        ]
+    )
+    anchors = build_statsfusion_session_anchor_index(segments, events)
+    gap_anchor = anchors.loc[anchors["timestamp_ms"].eq(30_000)].iloc[0]
+    assert gap_anchor.state_loss_mask == 0.0
+    assert gap_anchor.censor_mask == 1.0
 
 
 def test_canonical_targets_do_not_cross_sessions_for_same_subject(tmp_path) -> None:
@@ -2513,14 +2879,22 @@ def test_current_anchor_snapshot_mask_count_when_available() -> None:
 def test_outer_state_labels_mask_ignore_intervals() -> None:
     frame = pd.DataFrame(
         {
-            "subject_key": ["s", "s", "s"],
-            "timestamp_ms": [3_000, 6_000, 12_000],
-            "state_loss_mask": [1.0, 1.0, 1.0],
+            "subject_key": ["s", "s", "s", "s"],
+            "session_id": ["d0", "d0", "d0", "d1"],
+            "timestamp_ms": [3_000, 6_000, 12_000, 6_000],
+            "state_loss_mask": [1.0, 1.0, 1.0, 1.0],
         }
     )
-    ignore = pd.DataFrame({"subject_key": ["s"], "start_ms": [0], "end_ms": [9_000]})
+    ignore = pd.DataFrame(
+        {
+            "subject_key": ["s"],
+            "session_id": ["d0"],
+            "start_ms": [0],
+            "end_ms": [9_000],
+        }
+    )
     masked = _mask_ignored_state_rows(frame, ignore, step_ms=3_000)
-    assert masked["state_loss_mask"].tolist() == [0.0, 0.0, 1.0]
+    assert masked["state_loss_mask"].tolist() == [0.0, 0.0, 0.0, 1.0]
 
 
 def test_pooled_proposal_alignment_rejects_reordered_rows() -> None:

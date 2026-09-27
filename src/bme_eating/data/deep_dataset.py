@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections import OrderedDict
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,12 @@ class Normalization:
     motion_iqr: np.ndarray
     ppg_median: float
     ppg_iqr: float
+    motion_invariant_median: np.ndarray = field(
+        default_factory=lambda: np.zeros(4, dtype=np.float32)
+    )
+    motion_invariant_iqr: np.ndarray = field(
+        default_factory=lambda: np.ones(4, dtype=np.float32)
+    )
 
     def to_json(self) -> dict[str, object]:
         return {
@@ -29,6 +35,8 @@ class Normalization:
             "motion_iqr": self.motion_iqr.tolist(),
             "ppg_median": self.ppg_median,
             "ppg_iqr": self.ppg_iqr,
+            "motion_invariant_median": self.motion_invariant_median.tolist(),
+            "motion_invariant_iqr": self.motion_invariant_iqr.tolist(),
         }
 
     @classmethod
@@ -38,6 +46,12 @@ class Normalization:
             motion_iqr=np.asarray(payload["motion_iqr"], dtype=np.float32),
             ppg_median=float(payload["ppg_median"]),
             ppg_iqr=float(payload["ppg_iqr"]),
+            motion_invariant_median=np.asarray(
+                payload.get("motion_invariant_median", np.zeros(4)), dtype=np.float32
+            ),
+            motion_invariant_iqr=np.asarray(
+                payload.get("motion_invariant_iqr", np.ones(4)), dtype=np.float32
+            ),
         )
 
 
@@ -82,8 +96,27 @@ def compute_normalization(
     segments: pd.DataFrame,
     subject_keys: set[str],
     maximum_samples_per_segment: int = 10_000,
+    *,
+    require_motion: bool = True,
+    require_ppg: bool = True,
 ) -> Normalization:
+    def robust_columns(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        array = np.asarray(values, dtype=np.float64)
+        if array.ndim != 2:
+            raise ValueError("Normalization samples must be a 2D array")
+        centers = np.zeros(array.shape[1], dtype=np.float64)
+        scales = np.ones(array.shape[1], dtype=np.float64)
+        for column in range(array.shape[1]):
+            finite = array[np.isfinite(array[:, column]), column]
+            if not len(finite):
+                continue
+            centers[column] = float(np.median(finite))
+            scale = float(np.percentile(finite, 75) - np.percentile(finite, 25))
+            scales[column] = scale if np.isfinite(scale) and scale > 1e-6 else 1.0
+        return centers, scales
+
     motion_samples: list[np.ndarray] = []
+    invariant_samples: list[np.ndarray] = []
     ppg_samples: list[np.ndarray] = []
     selected = segments[segments["subject_key"].isin(subject_keys)]
     for segment in selected.itertuples(index=False):
@@ -92,32 +125,67 @@ def compute_normalization(
         motion_mask = payload["motion_mask"].astype(bool)
         ppg = payload["ppg_values"].reshape(-1)
         ppg_mask = payload["ppg_mask"].astype(bool).reshape(-1)
-        motion_stride = max(1, len(motion) // maximum_samples_per_segment)
-        motion_subset = motion[::motion_stride].copy()
-        motion_subset[~motion_mask[::motion_stride]] = np.nan
-        motion_samples.append(motion_subset)
+        if require_motion:
+            motion_stride = max(1, len(motion) // maximum_samples_per_segment)
+            motion_subset = motion[::motion_stride].copy()
+            motion_subset[~motion_mask[::motion_stride]] = np.nan
+            motion_samples.append(motion_subset)
+            acc_valid = motion_mask[:, :3].all(axis=1)
+            gyro_valid = motion_mask[:, 3:6].all(axis=1)
+            acc = np.where(motion_mask[:, :3], motion[:, :3], 0.0)
+            gyro = np.where(motion_mask[:, 3:6], motion[:, 3:6], 0.0)
+            acc_magnitude = np.linalg.norm(acc, axis=1)
+            gyro_magnitude = np.linalg.norm(gyro, axis=1)
+            acc_jerk = np.linalg.norm(
+                np.diff(acc, axis=0, prepend=acc[:1]) * 100.0, axis=1
+            )
+            gyro_jerk = np.linalg.norm(
+                np.diff(gyro, axis=0, prepend=gyro[:1]) * 100.0, axis=1
+            )
+            acc_pair_valid = acc_valid & np.r_[False, acc_valid[:-1]]
+            gyro_pair_valid = gyro_valid & np.r_[False, gyro_valid[:-1]]
+            invariant = np.stack(
+                (acc_magnitude, gyro_magnitude, acc_jerk, gyro_jerk), axis=1
+            ).astype(np.float32)
+            invariant[~np.stack((acc_valid, gyro_valid, acc_pair_valid, gyro_pair_valid), axis=1)] = np.nan
+            invariant_samples.append(invariant[::motion_stride])
         valid_ppg = ppg[ppg_mask]
-        ppg_stride = max(1, len(valid_ppg) // maximum_samples_per_segment)
-        ppg_samples.append(valid_ppg[::ppg_stride])
-    if not motion_samples or not ppg_samples:
-        raise ValueError("No valid training samples available for normalization")
-    motion_all = np.concatenate(motion_samples, axis=0)
-    ppg_all = np.concatenate(ppg_samples)
-    if not np.isfinite(motion_all).any() or len(ppg_all) == 0 or not np.isfinite(ppg_all).any():
-        raise ValueError("No finite training sensor samples available for normalization")
-    motion_median = np.nanmedian(motion_all, axis=0)
-    motion_median = np.nan_to_num(motion_median, nan=0.0, posinf=0.0, neginf=0.0)
-    motion_iqr = np.nanpercentile(motion_all, 75, axis=0) - np.nanpercentile(
-        motion_all, 25, axis=0
-    )
-    motion_iqr = np.where(motion_iqr > 1e-6, motion_iqr, 1.0)
-    ppg_median = float(np.median(ppg_all))
-    ppg_iqr = float(np.percentile(ppg_all, 75) - np.percentile(ppg_all, 25))
+        if require_ppg and len(valid_ppg):
+            ppg_stride = max(1, len(valid_ppg) // maximum_samples_per_segment)
+            ppg_samples.append(valid_ppg[::ppg_stride])
+    if require_motion:
+        if not motion_samples:
+            raise ValueError("No motion samples available for normalization")
+        motion_all = np.concatenate(motion_samples, axis=0)
+        invariant_all = np.concatenate(invariant_samples, axis=0)
+        if not np.isfinite(motion_all).any() or not np.isfinite(invariant_all).any():
+            raise ValueError("No finite training motion samples available for normalization")
+        motion_median, motion_iqr = robust_columns(motion_all)
+        invariant_median, invariant_iqr = robust_columns(invariant_all)
+    else:
+        motion_median = np.zeros(6, dtype=np.float32)
+        motion_iqr = np.ones(6, dtype=np.float32)
+        invariant_median = np.zeros(4, dtype=np.float32)
+        invariant_iqr = np.ones(4, dtype=np.float32)
+    if require_ppg:
+        if not ppg_samples:
+            raise ValueError("No finite PPG samples available for normalization")
+        ppg_all = np.concatenate(ppg_samples)
+        ppg_all = ppg_all[np.isfinite(ppg_all)]
+        if len(ppg_all) == 0:
+            raise ValueError("No finite PPG samples available for normalization")
+        ppg_median = float(np.median(ppg_all))
+        ppg_iqr = float(np.percentile(ppg_all, 75) - np.percentile(ppg_all, 25))
+    else:
+        ppg_median = 0.0
+        ppg_iqr = 1.0
     return Normalization(
         motion_median=motion_median.astype(np.float32),
         motion_iqr=motion_iqr.astype(np.float32),
         ppg_median=ppg_median,
         ppg_iqr=max(ppg_iqr, 1.0),
+        motion_invariant_median=np.asarray(invariant_median, dtype=np.float32),
+        motion_invariant_iqr=np.asarray(invariant_iqr, dtype=np.float32),
     )
 
 

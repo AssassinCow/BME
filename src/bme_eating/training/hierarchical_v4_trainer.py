@@ -37,6 +37,7 @@ from bme_eating.data.stats_fusion_sequence import (
     ClipMixtureSampler,
     SequenceGeometry,
     StatsFusionSequenceDataset,
+    sequence_geometry_from_config,
 )
 from bme_eating.hierarchical_artifacts import (
     HierarchicalRun,
@@ -82,24 +83,30 @@ from bme_eating.models.factory import build_state_model
 from bme_eating.models.stats_fusion_loss import StatsFusionStateLoss
 from bme_eating.proposals import exclude_ignored_candidates, label_event_candidates
 from bme_eating.proposals_v4 import (
+    configured_decoder_valid_mask,
     generate_event_candidates_v4,
     hysteresis_fragment_diagnostics,
     interval_iou,
+    observed_hours_v4,
 )
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
 from bme_eating.structured_decoder import (
     FixedLagSemiMarkovDecoder,
     TruncatedLogNormalDurationPrior,
 )
-from bme_eating.timeline import deduplicate_consistent_timeline
+from bme_eating.timeline import claim_new_timeline_rows, deduplicate_consistent_timeline
 from bme_eating.v4_protocol import (
     BLOCKED_PREDECESSORS,
     CALIBRATION_PROTOCOL,
     CODE_VERSION,
     DECODER_PROTOCOL,
+    IGNORE_PROTOCOL,
+    OBSERVATION_GAP_PROTOCOL,
     PROTOCOL_VERSION,
     RAW_INPUT_SCHEMA,
+    RUNTIME_SOURCE_BINDING,
     TARGET_SEMANTICS,
+    runtime_source_identity,
 )
 
 LEGACY_ALIGNMENT_KEYS = ["segment_id", "session_id", "subject_key", "timestamp_ms"]
@@ -152,11 +159,16 @@ def _mask_ignored_state_rows(
     output = frame.copy()
     if "state_loss_mask" not in output:
         output["state_loss_mask"] = 1.0
+    required = {"subject_key", "session_id", "start_ms", "end_ms"}
+    missing = required - set(ignore.columns)
+    if len(ignore) and missing:
+        raise ValueError(f"Ignored events are missing columns: {sorted(missing)}")
+    timestamps = output["timestamp_ms"].to_numpy(dtype=np.int64)
     for event in ignore.itertuples(index=False):
         selected = output["subject_key"].astype(str).eq(str(event.subject_key))
-        timestamps = output["timestamp_ms"].to_numpy(dtype=np.int64)
+        selected &= output["session_id"].astype(str).eq(str(event.session_id))
         selected &= (timestamps > int(event.start_ms)) & (
-            timestamps - int(step_ms) < int(event.end_ms)
+            timestamps <= int(event.end_ms) + 60_000
         )
         output.loc[selected, "state_loss_mask"] = 0.0
     return output
@@ -482,13 +494,20 @@ def _selector_split(
 
 
 def _geometry(config: dict[str, Any]) -> SequenceGeometry:
-    values = config["sequence"]
-    return SequenceGeometry(
-        supervised_steps=int(values["supervised_steps"]),
-        short_receptive_field_steps=int(values["short_receptive_field_steps"]),
-        long_receptive_field_tokens=int(values["long_receptive_field_tokens"]),
-        long_pool_factor=int(values["long_pool_factor"]),
-        step_seconds=int(values["step_seconds"]),
+    return sequence_geometry_from_config(config)
+
+
+def _compute_sensor_normalization(
+    segments: pd.DataFrame,
+    subjects: set[str],
+    config: dict[str, Any],
+) -> Normalization:
+    model = config["model"]
+    return compute_normalization(
+        segments,
+        subjects,
+        require_motion=bool(model.get("use_motion", True)),
+        require_ppg=bool(model.get("use_ppg", True)),
     )
 
 
@@ -1162,7 +1181,7 @@ def _select_epoch(
     selector_rows = transformed[
         transformed["subject_key"].astype(str).isin(selector_subjects)
     ].reset_index(drop=True)
-    normalization = compute_normalization(inputs.segments, fit_subjects)
+    normalization = _compute_sensor_normalization(inputs.segments, fit_subjects, config)
     fit_events = inputs.events[inputs.events["subject_key"].astype(str).isin(fit_subjects)]
     selector_events = inputs.events[
         inputs.events["subject_key"].astype(str).isin(selector_subjects)
@@ -1287,11 +1306,16 @@ def _select_epoch(
             )
         if stopped_early:
             break
+    clipping_by_epoch = {
+        int(value["epoch"]): bool(value.get("clipping_gate_passed", False))
+        for value in training_metrics
+    }
     qualified = [
         value
         for value in epoch_metrics
         if value["robust_candidate_recall"] >= minimum_recall
         and bool(value["robust_calibration_passed"])
+        and clipping_by_epoch.get(int(value["epoch"]), False)
     ]
     if qualified:
         minimum_bce = min(qualified, key=lambda value: value["robust_subject_macro_soft_bce"])
@@ -1329,6 +1353,10 @@ def _select_epoch(
         "selected_epoch": int(best["epoch"]),
         "promotion_eligible": promotion_eligible,
         "minimum_candidate_recall": minimum_recall,
+        "gradient_clipping_gate": "selected_epoch_clipping_fraction_lte_0.20",
+        "selected_epoch_clipping_gate_passed": clipping_by_epoch.get(
+            int(best["epoch"]), False
+        ),
         "selector_calibration_protocol": "subject_crossfit_soft_platt_v1",
         "selection_rule": "earliest_epoch_within_one_standard_error_soft_bce",
         "selector_rolling_epochs": rolling_epochs,
@@ -1379,6 +1407,7 @@ def infer_state_windows(
         ),
     )
     frames: list[pd.DataFrame] = []
+    previous_chunks: dict[tuple[str, str], pd.DataFrame] = {}
     statistic_names = [f"stat_{name}" for name in STATS_FEATURE_COLUMNS]
     for batch in tqdm(
         loader,
@@ -1452,7 +1481,17 @@ def infer_state_windows(
             statistics = tensors["statistics"][sample].float().cpu().numpy()[mask]
             for index, name in enumerate(statistic_names):
                 frame[name] = statistics[:, index]
-            frames.append(frame)
+            model_config = config.get("model", {})
+            frame["decode_valid"] = configured_decoder_valid_mask(
+                frame,
+                use_motion=bool(model_config.get("use_motion", True)),
+                use_ppg=bool(model_config.get("use_ppg", True)),
+            )
+            claimed = claim_new_timeline_rows(frame, previous_chunks)
+            if not claimed.empty:
+                frames.append(claimed)
+    if not frames:
+        return pd.DataFrame()
     output, _ = deduplicate_consistent_timeline(pd.concat(frames, ignore_index=True))
     return output
 
@@ -1655,7 +1694,9 @@ def train_state_crossfit_v4(
             transformed = _transform_with_scaler(inputs, scaler)
         else:
             scaler, transformed = _fit_scaler_and_transform(inputs, training_subjects)
-            normalization = compute_normalization(inputs.segments, training_subjects)
+            normalization = _compute_sensor_normalization(
+                inputs.segments, training_subjects, config
+            )
             write_json_atomic(scaler_path, scaler.to_json())
             save_normalization(normalization, normalization_path)
         artifacts.extend((scaler_path, normalization_path))
@@ -1822,7 +1863,7 @@ def train_state_crossfit_v4(
     )
     fixed_outer_epochs = {seed: int(np.median(values)) for seed, values in selected_epochs.items()}
     outer_scaler, outer_transformed = _fit_scaler_and_transform(inputs, outer_train)
-    outer_normalization = compute_normalization(inputs.segments, outer_train)
+    outer_normalization = _compute_sensor_normalization(inputs.segments, outer_train, config)
     outer_train_rows = outer_transformed[
         outer_transformed["subject_key"].astype(str).isin(outer_train)
     ].reset_index(drop=True)
@@ -2646,7 +2687,7 @@ def _prepare_nested_meta_cache(
             anchors=inputs.anchors,
         )
         scaler, transformed = _fit_scaler_and_transform(inputs, model_subjects)
-        normalization = compute_normalization(inputs.segments, model_subjects)
+        normalization = _compute_sensor_normalization(inputs.segments, model_subjects, config)
         train_rows = transformed[
             transformed["subject_key"].astype(str).isin(model_subjects)
         ].reset_index(drop=True)
@@ -3267,12 +3308,7 @@ def _prediction_events(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def _observed_hours(windows: pd.DataFrame) -> float:
-    milliseconds = 0
-    for _, group in windows.groupby(["subject_key", "session_id"], sort=False):
-        if len(group):
-            step = int(np.median(np.diff(group["timestamp_ms"]))) if len(group) > 1 else 3000
-            milliseconds += int(group["timestamp_ms"].max() - group["timestamp_ms"].min() + step)
-    return milliseconds / 3_600_000.0
+    return observed_hours_v4(windows)
 
 
 def _best_verifier_operating_point(
@@ -5031,6 +5067,9 @@ def select_v4_pipeline(
         "masking_protocol": "zero_mask_layernorm_v1",
         "candidate_budget_scope": "session",
         "meta_crossfit_protocol": "fully_nested_v1",
+        "ignore_protocol_version": IGNORE_PROTOCOL,
+        "observation_gap_protocol": OBSERVATION_GAP_PROTOCOL,
+        "runtime_source_binding": RUNTIME_SOURCE_BINDING,
         "minimum_event_gap_seconds": int(config["boundary"]["safety_gap_seconds"]),
         "candidate_minimum_seconds": int(config["decoder"]["candidate_minimum_seconds"]),
         "candidate_maximum_seconds": int(config["decoder"]["candidate_maximum_seconds"]),
@@ -5367,6 +5406,9 @@ def train_hierarchical_final_v4(
         **identity,
         "state_seeds": expected_state_seeds,
         "verifier_seeds": expected_verifier_seeds,
+        "runtime_source_identity": runtime_source_identity(
+            Path(__file__).resolve().parents[1]
+        ),
         "parent_artifact_hashes": parent_artifact_hashes,
     }
     if existing_manifest is not None:
@@ -5415,8 +5457,10 @@ def train_hierarchical_final_v4(
     scaler, transformed = _fit_scaler_and_transform(
         inputs, set(inputs.anchors["subject_key"].astype(str))
     )
-    normalization = compute_normalization(
-        inputs.segments, set(inputs.anchors["subject_key"].astype(str))
+    normalization = _compute_sensor_normalization(
+        inputs.segments,
+        set(inputs.anchors["subject_key"].astype(str)),
+        config,
     )
     epochs_by_seed: dict[int, list[int]] = {
         int(seed): [] for seed in config["final_training"]["state_seeds"]
@@ -5785,7 +5829,9 @@ def train_hierarchical_final_v4(
         "boundary_entropy_threshold": None,
         "state_seeds": [int(value) for value in config["final_training"]["state_seeds"]],
         "verifier_seeds": [int(value) for value in config["verifier"]["seeds"]],
-        "ignore_protocol_version": "valid-duration-truth-ignore-v1",
+        "ignore_protocol_version": IGNORE_PROTOCOL,
+        "observation_gap_protocol": OBSERVATION_GAP_PROTOCOL,
+        "runtime_source_binding": RUNTIME_SOURCE_BINDING,
         "strict_iou_operator": ">",
         "strict_iou_threshold": 0.25,
         "maximum_future_context_seconds": 60,

@@ -53,7 +53,7 @@ def main() -> None:
         if payload.get("stage") != "EVALUATED":
             raise RuntimeError(f"Fold {fold} must be EVALUATED before protocol freeze")
         if payload.get("code_version") != CODE_VERSION or payload.get("protocol_version") != PROTOCOL_VERSION:
-            raise RuntimeError(f"Fold {fold} is not a StatsFusion-r3/v4.3 artifact")
+            raise RuntimeError(f"Fold {fold} is not a StatsFusion-r3.1/v4.3.1 artifact")
         if payload.get("resume_config_sha256") != resume_config_hash(config):
             raise RuntimeError(f"Fold {fold} configuration differs from the freeze configuration")
         for name, relative in (

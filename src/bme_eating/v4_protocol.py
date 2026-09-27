@@ -1,18 +1,52 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
 from typing import Any
 
-CODE_VERSION = "v4.3"
-PROTOCOL_VERSION = "statsfusion-r3"
+CODE_VERSION = "v4.3.1"
+PROTOCOL_VERSION = "statsfusion-r3.1"
 BLOCKED_PREDECESSORS = (
     "statsfusion-r0-blocked",
     "statsfusion-r1-blocked",
     "statsfusion-r2-blocked",
+    "statsfusion-r3-blocked",
 )
 TARGET_SEMANTICS = "soft_interval_occupancy"
 CALIBRATION_PROTOCOL = "soft_platt_v1"
 DECODER_PROTOCOL = "coherent_fixed_lag_segment_v1"
 RAW_INPUT_SCHEMA = "statsfusion-raw-v2"
+IGNORE_PROTOCOL = "prediction-overlap-fraction-0.5-causal-support-v2"
+OBSERVATION_GAP_PROTOCOL = "active_sensor_valid_runs_v1"
+RUNTIME_SOURCE_BINDING = "exact_runtime_sha_v1"
+RUNTIME_SOURCE_FILES = (
+    "__init__.py",
+    "calibration_v4.py",
+    "hierarchical_v4_pipeline.py",
+    "metrics.py",
+    "proposals_v4.py",
+    "stats_features.py",
+    "structured_decoder.py",
+    "timeline.py",
+    "types.py",
+    "v4_protocol.py",
+    "data/__init__.py",
+    "data/deep_dataset.py",
+    "data/session.py",
+    "data/stats_fusion_preprocess.py",
+    "data/stats_fusion_sequence.py",
+    "features/__init__.py",
+    "features/baseline.py",
+    "features/signal.py",
+    "models/__init__.py",
+    "models/dtp_sqf.py",
+    "models/endpoint_refiner.py",
+    "models/event_verifier_v4.py",
+    "models/factory.py",
+    "models/hierarchical_state.py",
+    "models/stats_fusion_state.py",
+)
 R3_ABLATION_IDS = frozenset(
     {
         "R3-S0",
@@ -51,13 +85,28 @@ R3_ROOT_CONFIG_KEYS = frozenset(
 )
 
 
+def runtime_source_identity(package_root: Path) -> dict[str, Any]:
+    files: dict[str, str] = {}
+    for relative in RUNTIME_SOURCE_FILES:
+        path = Path(package_root) / relative
+        if not path.is_file():
+            raise FileNotFoundError(f"StatsFusion runtime source is missing: {relative}")
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        files[relative] = digest.hexdigest()
+    payload = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"files": files, "sha256": hashlib.sha256(payload).hexdigest()}
+
+
 def validate_r3_config(config: dict[str, Any]) -> None:
     experiment = config.get("experiment", {})
     protocol = experiment.get("protocol_version")
     if protocol != PROTOCOL_VERSION:
-        raise ValueError(f"Formal v4.3 runs require protocol_version: {PROTOCOL_VERSION}")
+        raise ValueError(f"Formal {CODE_VERSION} runs require protocol_version: {PROTOCOL_VERSION}")
     if experiment.get("code_version") != CODE_VERSION:
-        raise ValueError(f"Formal StatsFusion-r3 runs require code_version: {CODE_VERSION}")
+        raise ValueError(f"Formal {PROTOCOL_VERSION} runs require code_version: {CODE_VERSION}")
     ablation_id = str(experiment.get("ablation_id", ""))
     if ablation_id not in R3_ABLATION_IDS:
         raise ValueError(f"StatsFusion-r3 uses an unsupported ablation_id: {ablation_id!r}")

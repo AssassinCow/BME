@@ -4,21 +4,37 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
 
+import bme_eating.hierarchical_v4_export as export_module
+from bme_eating.hierarchical_artifacts import sha256_file
 from bme_eating.hierarchical_v4_export import (
     REQUIRED_MODEL_FILES,
     export_hierarchical_v4_bundle,
 )
 from bme_eating.hierarchical_v4_pipeline import load_hierarchical_v4_bundle
 from bme_eating.models.stats_fusion_state import StatsFusionStateModel
+from bme_eating.reproducibility import git_worktree_identity
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
+from bme_eating.v4_protocol import runtime_source_identity
 
 
-def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path) -> None:
+def _resume_identity(project_root: Path) -> dict[str, object]:
+    return {
+        "git": git_worktree_identity(project_root),
+        "runtime_source_identity": runtime_source_identity(
+            project_root / "src" / "bme_eating"
+        ),
+    }
+
+
+def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
+    tmp_path, monkeypatch
+) -> None:
     final_root = tmp_path / "final"
     final_root.mkdir()
     model_config = {
@@ -141,15 +157,19 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path) -> 
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "code_version": "v4.3",
-                "protocol_version": "statsfusion-r3",
+                "code_version": "v4.3.1",
+                "protocol_version": "statsfusion-r3.1",
                 "blocked_predecessors": [
                     "statsfusion-r0-blocked",
                     "statsfusion-r1-blocked",
                     "statsfusion-r2-blocked",
+                    "statsfusion-r3-blocked",
                 ],
                 "raw_input_schema": "statsfusion-raw-v2",
                 "selection_source": "pooled_outer_oof",
+                "ignore_protocol_version": "prediction-overlap-fraction-0.5-causal-support-v2",
+                "observation_gap_protocol": "active_sensor_valid_runs_v1",
+                "runtime_source_binding": "exact_runtime_sha_v1",
                 "candidate_minimum_seconds": 3,
                 "candidate_maximum_seconds": 14_400,
                 "promotion_evidence_sha256": {
@@ -181,17 +201,18 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path) -> 
         ),
         encoding="utf-8",
     )
+    project_root = Path(__file__).resolve().parents[1]
     (final_root / "final_manifest.json").write_text(
         json.dumps(
             {
                 "stage": "COMPLETE",
-                "protocol_version": "statsfusion-r3",
+                "protocol_version": "statsfusion-r3.1",
                 "artifact_hashes": {},
+                "resume_identity": _resume_identity(project_root),
             }
         ),
         encoding="utf-8",
     )
-    project_root = __import__("pathlib").Path(__file__).resolve().parents[1]
     bundle = export_hierarchical_v4_bundle(project_root, final_root, fresh=True, resume=False)
     names = {path.name.lower() for path in bundle.rglob("*") if path.is_file()}
     assert not any("xgboost" in name for name in names)
@@ -234,6 +255,27 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path) -> 
         capture_output=True,
         text=True,
     )
+    zip_path = final_root / "model_bundle.zip"
+    manifest_path = final_root / "final_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifact_hashes"].pop("model_bundle.zip")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    export_hierarchical_v4_bundle(project_root, final_root, fresh=False, resume=True)
+    repaired_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert repaired_manifest["artifact_hashes"]["model_bundle.zip"] == sha256_file(zip_path)
+    zip_path.unlink()
+    resumed = export_hierarchical_v4_bundle(
+        project_root, final_root, fresh=False, resume=True
+    )
+    assert resumed == bundle
+    assert zip_path.is_file()
+    monkeypatch.setattr(
+        export_module,
+        "runtime_source_identity",
+        lambda _root: {"files": {}, "sha256": "f" * 64},
+    )
+    with pytest.raises(RuntimeError, match="runtime source"):
+        export_hierarchical_v4_bundle(project_root, final_root, fresh=False, resume=True)
 
 
 def test_v4_bundle_loader_fails_closed_without_hash_manifest(tmp_path) -> None:
@@ -255,15 +297,19 @@ def test_v4_export_rejects_incomplete_deep_verifier_seed_mirror(tmp_path) -> Non
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "code_version": "v4.3",
-                "protocol_version": "statsfusion-r3",
+                "code_version": "v4.3.1",
+                "protocol_version": "statsfusion-r3.1",
                 "blocked_predecessors": [
                     "statsfusion-r0-blocked",
                     "statsfusion-r1-blocked",
                     "statsfusion-r2-blocked",
+                    "statsfusion-r3-blocked",
                 ],
                 "raw_input_schema": "statsfusion-raw-v2",
                 "selection_source": "pooled_outer_oof",
+                "ignore_protocol_version": "prediction-overlap-fraction-0.5-causal-support-v2",
+                "observation_gap_protocol": "active_sensor_valid_runs_v1",
+                "runtime_source_binding": "exact_runtime_sha_v1",
                 "candidate_minimum_seconds": 3,
                 "candidate_maximum_seconds": 14_400,
                 "promotion_evidence_sha256": {
@@ -286,16 +332,17 @@ def test_v4_export_rejects_incomplete_deep_verifier_seed_mirror(tmp_path) -> Non
     )
     (final_root / "proposal_calibration.json").write_text("{}", encoding="utf-8")
     (final_root / "verifier_seed_2026.pt").write_bytes(b"model")
+    project_root = Path(__file__).resolve().parents[1]
     (final_root / "final_manifest.json").write_text(
         json.dumps(
             {
                 "stage": "COMPLETE",
-                "protocol_version": "statsfusion-r3",
+                "protocol_version": "statsfusion-r3.1",
                 "artifact_hashes": {},
+                "resume_identity": _resume_identity(project_root),
             }
         ),
         encoding="utf-8",
     )
-    project_root = __import__("pathlib").Path(__file__).resolve().parents[1]
     with pytest.raises(FileNotFoundError, match="verifier artifacts"):
         export_hierarchical_v4_bundle(project_root, final_root, fresh=True, resume=False)

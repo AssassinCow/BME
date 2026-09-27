@@ -1,11 +1,58 @@
 from __future__ import annotations
 
+from collections.abc import MutableMapping
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 TIMELINE_KEYS = ("subject_key", "session_id", "timestamp_ms")
+
+
+def claim_new_timeline_rows(
+    frame: pd.DataFrame,
+    previous_chunks: MutableMapping[tuple[str, str], pd.DataFrame],
+    *,
+    tolerance: float = 1e-6,
+) -> pd.DataFrame:
+    missing = set(TIMELINE_KEYS) - set(frame.columns)
+    if missing:
+        raise ValueError(f"Timeline is missing alignment keys: {sorted(missing)}")
+    claimed: list[pd.DataFrame] = []
+    for (subject_key, session_id), group in frame.groupby(
+        ["subject_key", "session_id"], sort=False
+    ):
+        ordered = group.sort_values("timestamp_ms", kind="stable")
+        if ordered["timestamp_ms"].duplicated().any():
+            raise RuntimeError("A single inference chunk contains duplicate anchor timestamps")
+        key = (str(subject_key), str(session_id))
+        previous = previous_chunks.get(key)
+        previous_maximum: int | None = None
+        if previous is not None:
+            previous_maximum = int(previous["timestamp_ms"].max())
+            overlap = ordered.loc[ordered["timestamp_ms"] <= previous_maximum]
+            if not overlap.empty:
+                previous_overlap = previous[
+                    previous["timestamp_ms"].isin(overlap["timestamp_ms"])
+                ]
+                if len(previous_overlap) != len(overlap):
+                    raise RuntimeError("Inference chunks are not monotonically aligned")
+                deduplicate_consistent_timeline(
+                    pd.concat((previous_overlap, overlap), ignore_index=True),
+                    tolerance=tolerance,
+                )
+        previous_chunks[key] = ordered.copy()
+        new_rows = (
+            ordered
+            if previous_maximum is None
+            else ordered.loc[ordered["timestamp_ms"] > previous_maximum]
+        )
+        if new_rows.empty:
+            continue
+        claimed.append(new_rows)
+    if not claimed:
+        return frame.iloc[0:0].copy()
+    return pd.concat(claimed, ignore_index=True)
 
 
 def deduplicate_consistent_timeline(

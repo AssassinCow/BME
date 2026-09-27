@@ -326,7 +326,7 @@ def initialize_v4_run(
             raise FileExistsError(f"V4 run already exists: {run_root}")
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if payload.get("protocol_version") != PROTOCOL_VERSION:
-            raise RuntimeError("Blocked predecessor runs cannot be resumed as statsfusion-r3")
+            raise RuntimeError("Blocked predecessor runs cannot be resumed as statsfusion-r3.1")
         saved_config_hash = _saved_resume_config_hash(run_root, payload)
         if saved_config_hash != config_hash:
             raise RuntimeError("Active v4 configuration differs from the run manifest")

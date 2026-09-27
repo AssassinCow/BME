@@ -22,7 +22,10 @@ from bme_eating.data.stats_fusion_preprocess import (
     RawSessionInput,
     StatsFusionRawSessionPreprocessor,
 )
-from bme_eating.data.stats_fusion_sequence import SequenceGeometry, StatsFusionSequenceDataset
+from bme_eating.data.stats_fusion_sequence import (
+    StatsFusionSequenceDataset,
+    sequence_geometry_from_config,
+)
 from bme_eating.hierarchical_artifacts import write_json_atomic
 from bme_eating.models.factory import build_state_model
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
@@ -85,15 +88,13 @@ def main() -> None:
     transformed = scaler.transform_frame(merged)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        normalization = compute_normalization(selected, {subject})
-    sequence = config["sequence"]
-    geometry = SequenceGeometry(
-        supervised_steps=int(sequence["supervised_steps"]),
-        short_receptive_field_steps=int(sequence["short_receptive_field_steps"]),
-        long_receptive_field_tokens=int(sequence["long_receptive_field_tokens"]),
-        long_pool_factor=int(sequence["long_pool_factor"]),
-        step_seconds=int(sequence["step_seconds"]),
-    )
+        normalization = compute_normalization(
+            selected,
+            {subject},
+            require_motion=bool(config["model"].get("use_motion", True)),
+            require_ppg=bool(config["model"].get("use_ppg", True)),
+        )
+    geometry = sequence_geometry_from_config(config)
     dataset = StatsFusionSequenceDataset(
         transformed,
         selected,
@@ -194,7 +195,7 @@ def main() -> None:
     if repeat_error > 1e-6:
         raise RuntimeError(f"Real-session repeated inference differs by {repeat_error}")
     report = {
-        "protocol_version": "statsfusion-r3",
+        "protocol_version": "statsfusion-r3.1",
         "session_id": session_id,
         "fragment_count": len(selected),
         "subject_key": subject,
