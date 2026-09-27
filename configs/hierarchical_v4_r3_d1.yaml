@@ -1,0 +1,7 @@
+extends: hierarchical_v4_r3_s2.yaml
+experiment:
+  ablation_id: R3-D1
+model:
+  separate_motion_branches: true
+training:
+  gyro_modality_dropout: 0.20

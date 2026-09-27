@@ -53,10 +53,17 @@ def evaluation_event_partition_summary(events: pd.DataFrame) -> dict[str, int]:
     subjects = set(events["subject_key"].astype(str))
     truth, ignore = partition_evaluation_events(events, subjects)
     valid = events["valid_duration"].fillna(False).astype(bool)
+    def unique_count(frame: pd.DataFrame) -> int:
+        if "source_event_key" in frame:
+            return int(frame["source_event_key"].astype(str).nunique())
+        identity = [column for column in ("subject_key", "session_id", "event_id") if column in frame]
+        return len(frame.drop_duplicates(identity)) if identity else len(frame)
+
+    invalid = events[~valid]
     return {
-        "truth": len(truth),
-        "ignore": len(ignore),
-        "invalid_duration": int((~valid).sum()),
+        "truth": unique_count(truth),
+        "ignore": unique_count(ignore),
+        "invalid_duration": unique_count(invalid),
     }
 
 
@@ -68,13 +75,18 @@ def prediction_ignore_mask(prediction: pd.DataFrame, ignore: pd.DataFrame) -> np
         missing = required - set(frame.columns)
         if missing:
             raise ValueError(f"{name} is missing columns: {sorted(missing)}")
+    session_aware = "session_id" in prediction.columns and "session_id" in ignore.columns
+    grouping = ["subject_key", "session_id"] if session_aware else ["subject_key"]
     grouped = {
-        str(subject): group[["start_ms", "end_ms"]].to_numpy(dtype=np.int64)
-        for subject, group in ignore.groupby("subject_key", sort=False)
+        tuple(str(value) for value in key)
+        if isinstance(key, tuple)
+        else (str(key),): group[["start_ms", "end_ms"]].to_numpy(dtype=np.int64)
+        for key, group in ignore.groupby(grouping, sort=False)
     }
     mask = np.zeros(len(prediction), dtype=bool)
     for position, row in enumerate(prediction.itertuples(index=False)):
-        intervals = grouped.get(str(row.subject_key))
+        key = (str(row.subject_key), str(row.session_id)) if session_aware else (str(row.subject_key),)
+        intervals = grouped.get(key)
         if intervals is None:
             continue
         overlap = np.minimum(int(row.end_ms), intervals[:, 1]) - np.maximum(
@@ -188,21 +200,41 @@ def evaluate_events(
     total_truth = 0
     total_prediction = 0
     ignored_predictions = 0
-    subjects = (
-        set(truth.get("subject_key", []))
-        | set(prediction.get("subject_key", []))
-        | set(ignore.get("subject_key", []))
-    )
-    for subject_key in sorted(subjects):
-        subject_truth = truth[truth["subject_key"] == subject_key].reset_index(drop=True)
-        subject_prediction = prediction[prediction["subject_key"] == subject_key].reset_index(
-            drop=True
-        )
+    session_aware = all(
+        "session_id" in frame.columns for frame in (truth, prediction, ignore) if len(frame)
+    ) and any("session_id" in frame.columns for frame in (truth, prediction, ignore))
+    prepared = []
+    for frame in (truth, prediction, ignore):
+        current = frame.copy()
+        if session_aware and "session_id" not in current:
+            current["session_id"] = pd.Series(dtype=object)
+        prepared.append(current)
+    truth, prediction, ignore = prepared
+    grouping = ["subject_key", "session_id"] if session_aware else ["subject_key"]
+    keys: set[tuple[str, ...]] = set()
+    for frame in (truth, prediction, ignore):
+        if len(frame):
+            keys.update(
+                tuple(str(value) for value in row)
+                for row in frame[grouping].drop_duplicates().itertuples(index=False, name=None)
+            )
+    for key in sorted(keys):
+        subject_key = key[0]
+        session_id = key[1] if session_aware else None
+        truth_mask = truth["subject_key"].astype(str).eq(subject_key)
+        prediction_mask = prediction["subject_key"].astype(str).eq(subject_key)
+        ignore_mask = ignore["subject_key"].astype(str).eq(subject_key)
+        if session_aware:
+            truth_mask &= truth["session_id"].astype(str).eq(str(session_id))
+            prediction_mask &= prediction["session_id"].astype(str).eq(str(session_id))
+            ignore_mask &= ignore["session_id"].astype(str).eq(str(session_id))
+        subject_truth = truth.loc[truth_mask].reset_index(drop=True)
+        subject_prediction = prediction.loc[prediction_mask].reset_index(drop=True)
         truth_intervals = subject_truth[["start_ms", "end_ms"]].to_numpy(dtype=np.float64)
         prediction_intervals = subject_prediction[["start_ms", "end_ms"]].to_numpy(dtype=np.float64)
         matches = match_events(truth_intervals, prediction_intervals, iou_threshold, method)
         matched_prediction_indices = {match.prediction_index for match in matches}
-        subject_ignore = ignore[ignore["subject_key"] == subject_key]
+        subject_ignore = ignore.loc[ignore_mask]
         ignored_indices: set[int] = set()
         if len(subject_ignore):
             ignore_intervals = subject_ignore[["start_ms", "end_ms"]].to_numpy(dtype=np.float64)
@@ -226,6 +258,7 @@ def evaluate_events(
             matches_output.append(
                 {
                     "subject_key": subject_key,
+                    "session_id": session_id if session_aware else "",
                     "event_id": truth_row.get("event_id", ""),
                     "hand_relation": truth_row.get("hand_relation", "unknown"),
                     "truth_start_ms": int(truth_row.start_ms),

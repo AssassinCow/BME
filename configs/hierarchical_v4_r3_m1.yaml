@@ -1,0 +1,5 @@
+extends: hierarchical_v4_r3_p1.yaml
+experiment:
+  ablation_id: R3-M1
+decoder:
+  use_semi_markov: true

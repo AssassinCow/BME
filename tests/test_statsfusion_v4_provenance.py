@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from copy import deepcopy
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -10,6 +11,7 @@ import torch
 
 import bme_eating.data.stats_fusion_inputs as statsfusion_inputs
 import bme_eating.hierarchical_v4_artifacts as v4_artifacts
+from bme_eating.config import load_config
 from bme_eating.data.stats_fusion_inputs import (
     _preparation_identity,
     _segment_archive_digest,
@@ -21,6 +23,11 @@ from bme_eating.data.stats_fusion_inputs import (
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.hierarchical_v4_artifacts import initialize_v4_run, resume_config_hash
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, audit_feature_provenance
+
+
+def _r3_config() -> dict:
+    root = Path(__file__).resolve().parents[1]
+    return load_config(root / "configs" / "hierarchical_v4_statsfusion_r3.yaml")
 
 
 def test_feature_provenance_hashes_sources_and_marks_stress_evidence(tmp_path) -> None:
@@ -69,12 +76,14 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
         }
     )
     segment_frame.to_parquet(input_root / "indices" / "segments.parquet", index=False)
-    canonical_root = output_root / "canonical_input"
+    canonical_root = output_root / "canonical_input_r3"
     canonical_root.mkdir(parents=True)
     canonical_anchors = canonical_root / "anchors.parquet"
     canonical_statistics = canonical_root / "statistics.parquet"
+    canonical_events = canonical_root / "events_with_session.parquet"
     canonical_anchors.write_bytes(b"canonical anchors")
     canonical_statistics.write_bytes(b"canonical statistics")
+    canonical_events.write_bytes(b"canonical events")
     preparation_identity = _preparation_identity(
         input_root / "indices" / "segments.parquet",
         input_root / "indices" / "events.parquet",
@@ -93,38 +102,27 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
     (canonical_root / "manifest.json").write_text(
         json.dumps(
             {
-                "protocol_version": "statsfusion-r2",
+                "protocol_version": "statsfusion-r3",
                 "anchor_semantics": "right_endpoint_half_open",
+                "feature_code_sha256": preparation_identity["feature_implementation"]["sha256"],
                 "preparation_identity_sha256": sha256_file(preparation_path),
                 "source_sha256": preparation_identity["source_sha256"],
                 "output_sha256": {
                     "anchors": sha256_file(canonical_anchors),
                     "statistics": sha256_file(canonical_statistics),
+                    "events": sha256_file(canonical_events),
                     "anchors_identity": sha256_file(anchors_identity_path),
                 },
             }
         ),
         encoding="utf-8",
     )
-    config = {
-        "project": {
-            "artifact_schema_version": "v4",
-            "input_artifact_schema_version": "v2",
-            "strict_resume_identity": True,
-        },
-        "data": {"subject_folds": 5},
-        "experiment": {"protocol_version": "statsfusion-r2"},
-        "features": {"artifact_name": "baseline"},
-        "model": {},
-        "training": {"random_seed": 2026, "num_workers": 8},
-        "verifier": {"seeds": [2026]},
-        "boundary": {"seeds": [2026]},
-        "hierarchical": {"maximum_event_latency_seconds": 60},
-        "feature_provenance": {
-            "source_paths": ["experiments/baseline/fold_0/metadata.json"],
-            "selection_note_path": None,
-            "assumed_used_all_outer_folds": True,
-        },
+    config = _r3_config()
+    config["training"]["num_workers"] = 8
+    config["feature_provenance"] = {
+        "source_paths": ["experiments/baseline/fold_0/metadata.json"],
+        "selection_note_path": None,
+        "assumed_used_all_outer_folds": True,
     }
     identities = iter(
         (
@@ -149,9 +147,10 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
         runtime_changed, input_root, output_root, "strict-v4", 0, fresh=False
     )
     assert resumed.payload["runtime_config"]["training.num_workers"] == 0
-    assert resumed.payload["runtime_config_history"] == [
-        {"previous": {"training.num_workers": 8}, "active": {"training.num_workers": 0}}
-    ]
+    runtime_history = resumed.payload["runtime_config_history"]
+    assert len(runtime_history) == 1
+    assert runtime_history[0]["previous"]["training.num_workers"] == 8
+    assert runtime_history[0]["active"]["training.num_workers"] == 0
     original_config_hash = resumed.payload["resolved_config_sha256"]
     migrated = initialize_v4_run(
         runtime_changed, input_root, output_root, "strict-v4", 0, fresh=False
@@ -200,7 +199,7 @@ def test_v4_resume_hash_ignores_execution_only_settings() -> None:
     assert resume_config_hash(result_changed) != resume_config_hash(config)
 
 
-def test_v4_rejects_r1_protocol(tmp_path) -> None:
+def test_v4_rejects_blocked_predecessor_protocol(tmp_path) -> None:
     config = {
         "project": {
             "artifact_schema_version": "v4",
@@ -210,22 +209,71 @@ def test_v4_rejects_r1_protocol(tmp_path) -> None:
         "experiment": {"protocol_version": "statsfusion-r1"},
         "features": {"artifact_name": "baseline"},
     }
-    with pytest.raises(ValueError, match="statsfusion-r2"):
+    with pytest.raises(ValueError, match="statsfusion-r3"):
         v4_artifacts.current_v4_identity(config, tmp_path)
 
 
-def test_v4_identity_rejects_unresolved_s4_config(tmp_path) -> None:
-    config = {
-        "project": {
-            "artifact_schema_version": "v4",
-            "input_artifact_schema_version": "v2",
-            "strict_resume_identity": True,
-        },
-        "experiment": {"protocol_version": "statsfusion-r2", "ablation_id": "S4"},
-        "model": {"use_ppg": True},
-    }
-    with pytest.raises(RuntimeError, match="prepare_hierarchical_v4_s4.py"):
+@pytest.mark.parametrize(
+    "blocked_protocol",
+    ("statsfusion-r0-blocked", "statsfusion-r1-blocked", "statsfusion-r2-blocked"),
+)
+def test_v4_identity_rejects_all_blocked_predecessors(tmp_path, blocked_protocol) -> None:
+    config = _r3_config()
+    config["experiment"]["protocol_version"] = blocked_protocol
+    with pytest.raises(ValueError, match="statsfusion-r3"):
         v4_artifacts.current_v4_identity(config, tmp_path / "v2")
+
+
+def test_r3_freeze_manifest_hash_locks_promotion_and_selection_evidence(tmp_path) -> None:
+    output_root = tmp_path / "outputs" / "v4"
+    experiment_root = output_root / "experiments" / "winner"
+    evidence_path = experiment_root / "fold_0" / "selection" / "selected_pipeline.json"
+    evidence_path.parent.mkdir(parents=True)
+    evidence_path.write_text("{}", encoding="utf-8")
+    git_identity = {"commit": "abc", "dirty": False}
+    config = {"decoder": {"candidate_minimum_seconds": 3, "candidate_maximum_seconds": 14_400}}
+    freeze_path = experiment_root / "freeze_manifest.json"
+    payload = {
+        "code_version": "v4.3",
+        "protocol_version": "statsfusion-r3",
+        "blocked_predecessors": [
+            "statsfusion-r0-blocked",
+            "statsfusion-r1-blocked",
+            "statsfusion-r2-blocked",
+        ],
+        "selected_run": "winner",
+        "locked_after_folds": [0, 1],
+        "candidate_minimum_seconds": 3,
+        "candidate_maximum_seconds": 14_400,
+        "resume_config_sha256": "config-sha",
+        "git": git_identity,
+        "evidence_sha256": {
+            "fold_0_selected_pipeline": {
+                "relative_path": evidence_path.relative_to(output_root.parent).as_posix(),
+                "sha256": sha256_file(evidence_path),
+            }
+        },
+    }
+    write_json_atomic(freeze_path, payload)
+    assert (
+        v4_artifacts.validate_v4_freeze_manifest(
+            freeze_path,
+            output_root,
+            expected_resume_config_sha256="config-sha",
+            expected_git=git_identity,
+            config=config,
+        )
+        == payload
+    )
+    evidence_path.write_text('{"changed": true}', encoding="utf-8")
+    with pytest.raises(RuntimeError, match="Gate evidence changed"):
+        v4_artifacts.validate_v4_freeze_manifest(
+            freeze_path,
+            output_root,
+            expected_resume_config_sha256="config-sha",
+            expected_git=git_identity,
+            config=config,
+        )
 
 
 def test_session_cache_key_uses_archive_content_not_size_or_mtime(tmp_path) -> None:
@@ -272,13 +320,20 @@ def _partial_canonical_fixture(tmp_path):
         }
     )
     events = pd.DataFrame(
-        columns=["event_id", "subject_key", "start_ms", "end_ms", "valid_duration"]
+        columns=[
+            "event_id",
+            "subject_key",
+            "session_id",
+            "start_ms",
+            "end_ms",
+            "valid_duration",
+        ]
     )
     segments_path = indices / "segments.parquet"
     events_path = indices / "events.parquet"
     segments.to_parquet(segments_path, index=False)
     events.to_parquet(events_path, index=False)
-    root = output_root / "canonical_input"
+    root = output_root / "canonical_input_r3"
     root.mkdir(parents=True)
     anchors = pd.DataFrame(
         {
@@ -309,7 +364,7 @@ def test_partial_canonical_resume_rejects_changed_source(tmp_path, changed_sourc
     input_root, output_root, segments, events = _partial_canonical_fixture(tmp_path)
     if changed_source == "events":
         changed = events.copy()
-        changed.loc[0] = ["event", "subject", 0, 3_000, True]
+        changed.loc[0] = ["event", "subject", "session", 0, 3_000, True]
         changed.to_parquet(input_root / "indices" / "events.parquet", index=False)
     elif changed_source == "segments":
         changed = segments.copy()
@@ -365,7 +420,7 @@ def test_partial_canonical_resume_reuses_matching_anchors(tmp_path, monkeypatch)
     monkeypatch.setattr(statsfusion_inputs, "ProcessPoolExecutor", ImmediateExecutor)
     monkeypatch.setattr(statsfusion_inputs, "as_completed", lambda futures: list(futures))
     monkeypatch.setattr(statsfusion_inputs, "_build_session_statistics", build_statistics)
-    before = sha256_file(output_root / "canonical_input" / "anchors.parquet")
+    before = sha256_file(output_root / "canonical_input_r3" / "anchors.parquet")
     manifest = prepare_canonical_statsfusion_inputs(
         input_root,
         output_root,
@@ -373,7 +428,7 @@ def test_partial_canonical_resume_reuses_matching_anchors(tmp_path, monkeypatch)
         fresh=False,
         resume=True,
     )
-    assert sha256_file(output_root / "canonical_input" / "anchors.parquet") == before
+    assert sha256_file(output_root / "canonical_input_r3" / "anchors.parquet") == before
     assert manifest == verify_canonical_statsfusion_inputs(input_root, output_root)
     archive = statsfusion_inputs.Path(
         pd.read_parquet(input_root / "indices" / "segments.parquet").iloc[0].segment_path

@@ -264,10 +264,13 @@ def normalized_proposal_weights(frame: pd.DataFrame) -> np.ndarray:
     missing = required - set(frame.columns)
     if missing:
         raise ValueError(f"Proposal weights are missing columns: {sorted(missing)}")
+    if frame.empty:
+        return np.empty(0, dtype=np.float32)
     positive = frame["max_iou"].to_numpy(dtype=np.float64) > 0.25
     matched = frame.get("matched_event_id", pd.Series("", index=frame.index)).astype(str)
+    session = frame.get("session_id", pd.Series("", index=frame.index)).astype(str)
     family = frame.get("proposal_family_id", frame["proposal_id"]).astype(str)
-    group = np.where(positive, "event:" + matched, "family:" + family)
+    group = np.where(positive, "event:" + session + ":" + matched, "family:" + family)
     work = pd.DataFrame(
         {
             "subject_key": frame["subject_key"].astype(str).to_numpy(),

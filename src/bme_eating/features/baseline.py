@@ -232,7 +232,10 @@ def build_segment_features(
         end_ms = int(anchor.timestamp_ms)
         session_id = str(getattr(anchor, "session_id", anchor.segment_id))
         payload = reader.read(
-            session_id, end_ms - maximum_history_seconds * 1000, end_ms
+            session_id,
+            end_ms - maximum_history_seconds * 1000,
+            end_ms,
+            subject_key=str(anchor.subject_key) if "subject_key" in context_segments else None,
         )
         motion_time = payload["motion_timestamp_ms"]
         motion_values = payload["motion_values"]

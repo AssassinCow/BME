@@ -9,18 +9,27 @@ from typing import Any
 import pandas as pd
 from tqdm import tqdm
 
-from bme_eating.data.labels import build_statsfusion_session_anchor_index
+from bme_eating.data.labels import assign_event_sessions, build_statsfusion_session_anchor_index
 from bme_eating.features.baseline import build_segment_features
 from bme_eating.fusion import ALIGNMENT_KEYS
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS
 
-CANONICAL_INPUT_DIRECTORY = "canonical_input"
+CANONICAL_INPUT_DIRECTORY = "canonical_input_r3"
 CANONICAL_ANCHORS_FILE = "anchors.parquet"
 CANONICAL_STATISTICS_FILE = "statistics.parquet"
+CANONICAL_EVENTS_FILE = "events_with_session.parquet"
 CANONICAL_MANIFEST_FILE = "manifest.json"
 CANONICAL_PREPARATION_IDENTITY_FILE = "preparation_identity.json"
 CANONICAL_ANCHORS_IDENTITY_FILE = "anchors.sha256.json"
+
+FEATURE_IMPLEMENTATION_FILES = (
+    "data/labels.py",
+    "data/stats_fusion_preprocess.py",
+    "features/baseline.py",
+    "features/signal.py",
+    "stats_features.py",
+)
 
 
 def canonical_input_paths(output_root: Path) -> dict[str, Path]:
@@ -29,9 +38,23 @@ def canonical_input_paths(output_root: Path) -> dict[str, Path]:
         "root": root,
         "anchors": root / CANONICAL_ANCHORS_FILE,
         "statistics": root / CANONICAL_STATISTICS_FILE,
+        "events": root / CANONICAL_EVENTS_FILE,
         "manifest": root / CANONICAL_MANIFEST_FILE,
         "preparation_identity": root / CANONICAL_PREPARATION_IDENTITY_FILE,
         "anchors_identity": root / CANONICAL_ANCHORS_IDENTITY_FILE,
+    }
+
+
+def feature_implementation_identity() -> dict[str, Any]:
+    package_root = Path(__file__).resolve().parents[1]
+    files = {
+        relative: sha256_file(package_root / relative)
+        for relative in FEATURE_IMPLEMENTATION_FILES
+    }
+    payload = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {
+        "files": files,
+        "sha256": hashlib.sha256(payload).hexdigest(),
     }
 
 
@@ -84,9 +107,13 @@ def _session_cache_path(
     anchors: pd.DataFrame,
     segments: pd.DataFrame,
     archive_sha256: dict[tuple[str, str], str] | None = None,
+    feature_code_sha256: str | None = None,
+    subject_key: str | None = None,
 ) -> Path:
     digest = hashlib.sha256()
-    digest.update(b"statsfusion-canonical-statistics-v1")
+    digest.update(b"statsfusion-r3-canonical-statistics-v2")
+    digest.update((feature_code_sha256 or feature_implementation_identity()["sha256"]).encode())
+    digest.update(str(subject_key or "").encode("utf-8"))
     digest.update(str(session_id).encode("utf-8"))
     digest.update(pd.util.hash_pandas_object(anchors, index=False).to_numpy().tobytes())
     for row in segments.sort_values("segment_id", kind="stable").itertuples(index=False):
@@ -108,6 +135,7 @@ def _preparation_identity(
     segments: pd.DataFrame,
 ) -> dict[str, Any]:
     archives = _segment_archive_identities(segments)
+    implementation = feature_implementation_identity()
     archive_payload = json.dumps(
         archives,
         ensure_ascii=False,
@@ -115,12 +143,13 @@ def _preparation_identity(
         separators=(",", ":"),
     ).encode("utf-8")
     return {
-        "version": 1,
-        "protocol_version": "statsfusion-r2",
+        "version": 2,
+        "protocol_version": "statsfusion-r3",
         "anchor_semantics": "right_endpoint_half_open",
         "step_seconds": 3,
         "statistics_window_seconds": 15,
         "feature_order": list(STATS_FEATURE_COLUMNS),
+        "feature_implementation": implementation,
         "source_sha256": {
             "segments": sha256_file(segments_path),
             "events": sha256_file(events_path),
@@ -137,7 +166,7 @@ def _require_matching_preparation_identity(
     if not path.is_file():
         raise RuntimeError(
             "Partial StatsFusion canonical inputs lack preparation_identity.json; "
-            "refuse resume and rebuild with --fresh in a clean canonical_input directory"
+            "refuse resume and rebuild with --fresh in a clean canonical_input_r3 directory"
         )
     stored = json.loads(path.read_text(encoding="utf-8"))
     if stored != current:
@@ -193,6 +222,7 @@ def verify_canonical_statsfusion_inputs(
     required = (
         "anchors",
         "statistics",
+        "events",
         "manifest",
         "preparation_identity",
         "anchors_identity",
@@ -204,7 +234,7 @@ def verify_canonical_statsfusion_inputs(
             f"{missing}; run prepare_statsfusion_v4_inputs.py first"
         )
     manifest = json.loads(paths["manifest"].read_text(encoding="utf-8"))
-    if manifest.get("protocol_version") != "statsfusion-r2":
+    if manifest.get("protocol_version") != "statsfusion-r3":
         raise RuntimeError("StatsFusion canonical inputs use an incompatible protocol")
     if manifest.get("anchor_semantics") != "right_endpoint_half_open":
         raise RuntimeError("StatsFusion canonical inputs use incompatible anchor semantics")
@@ -229,7 +259,7 @@ def verify_canonical_statsfusion_inputs(
         raise RuntimeError("StatsFusion canonical source hashes differ from preparation identity")
     _verify_anchor_identity(paths)
     expected_output = manifest.get("output_sha256", {})
-    for name in ("anchors", "statistics", "anchors_identity"):
+    for name in ("anchors", "statistics", "events", "anchors_identity"):
         if expected_output.get(name) != sha256_file(paths[name]):
             raise RuntimeError(f"StatsFusion canonical artifact changed: {name}")
     return manifest
@@ -251,6 +281,7 @@ def prepare_canonical_statsfusion_inputs(
     events_path = Path(input_root) / "indices" / "events.parquet"
     segments = pd.read_parquet(segments_path)
     events = pd.read_parquet(events_path)
+    session_events = assign_event_sessions(events, segments, causal_support_seconds=60)
     current_identity = _preparation_identity(segments_path, events_path, segments)
     if paths["manifest"].is_file():
         if fresh:
@@ -267,10 +298,18 @@ def prepare_canonical_statsfusion_inputs(
     else:
         root.mkdir(parents=True, exist_ok=True)
         write_json_atomic(paths["preparation_identity"], current_identity)
+    if not paths["events"].is_file():
+        temporary_events = paths["events"].with_name(paths["events"].name + ".tmp")
+        session_events.to_parquet(temporary_events, index=False)
+        temporary_events.replace(paths["events"])
+    else:
+        cached_events = pd.read_parquet(paths["events"])
+        if not cached_events.equals(session_events):
+            raise RuntimeError("Cached canonical sessionized events differ from their source mapping")
     if not paths["anchors"].is_file():
         anchors = build_statsfusion_session_anchor_index(
             segments,
-            events,
+            session_events,
             output_step_seconds=3,
             output_path=paths["anchors"],
         )
@@ -291,19 +330,26 @@ def prepare_canonical_statsfusion_inputs(
         (str(record["session_id"]), str(record["segment_id"])): str(record["sha256"])
         for record in current_identity["segment_archives"]
     }
+    feature_code_sha256 = str(current_identity["feature_implementation"]["sha256"])
     jobs: list[tuple[pd.DataFrame, pd.DataFrame, Path]] = []
     grouped_segments = {
-        str(session): group.copy()
-        for session, group in segments.groupby("session_id", sort=False)
+        (str(subject), str(session)): group.copy()
+        for (subject, session), group in segments.groupby(
+            ["subject_key", "session_id"], sort=False
+        )
     }
-    for session_id, group in anchors.groupby("session_id", sort=False):
-        context = grouped_segments[str(session_id)]
+    for (subject_key, session_id), group in anchors.groupby(
+        ["subject_key", "session_id"], sort=False
+    ):
+        context = grouped_segments[(str(subject_key), str(session_id))]
         cache_path = _session_cache_path(
             cache_root,
             str(session_id),
             group,
             context,
             archive_sha256,
+            feature_code_sha256,
+            str(subject_key),
         )
         jobs.append((group.copy(), context, cache_path))
     cache_paths: list[Path] = []
@@ -340,12 +386,14 @@ def prepare_canonical_statsfusion_inputs(
     statistics.to_parquet(temporary, index=False)
     temporary.replace(paths["statistics"])
     manifest = {
-        "version": 2,
-        "protocol_version": "statsfusion-r2",
+        "version": 3,
+        "protocol_version": "statsfusion-r3",
         "anchor_semantics": "right_endpoint_half_open",
         "anchor_scope": "session",
         "step_seconds": 3,
         "statistics_window_seconds": 15,
+        "feature_code_sha256": feature_code_sha256,
+        "feature_implementation": current_identity["feature_implementation"],
         "preparation_identity_sha256": sha256_file(paths["preparation_identity"]),
         "source_sha256": current_identity["source_sha256"],
         "source_diagnostics": {
@@ -354,12 +402,15 @@ def prepare_canonical_statsfusion_inputs(
         "output_sha256": {
             "anchors": sha256_file(paths["anchors"]),
             "statistics": sha256_file(paths["statistics"]),
+            "events": sha256_file(paths["events"]),
             "anchors_identity": sha256_file(paths["anchors_identity"]),
         },
         "counts": {
             "anchors": len(anchors),
             "sessions": int(anchors["session_id"].nunique()),
             "subjects": int(anchors["subject_key"].nunique()),
+            "sessionized_event_rows": len(session_events),
+            "source_events": int(session_events["source_event_key"].nunique()),
             "state_loss_masked_anchors": int(
                 (anchors["state_loss_mask"].fillna(0.0).astype(float) <= 0).sum()
             ),

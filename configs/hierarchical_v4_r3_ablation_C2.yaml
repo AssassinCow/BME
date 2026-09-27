@@ -1,0 +1,6 @@
+extends: hierarchical_v4_r3_s2.yaml
+experiment:
+  ablation_id: R3-S2
+  variant: larger_effective_batch
+training:
+  gradient_accumulation: 4

@@ -41,7 +41,9 @@ from bme_eating.structured_decoder import (
     FixedLagSemiMarkovDecoder,
     TruncatedLogNormalDurationPrior,
 )
+from bme_eating.timeline import deduplicate_consistent_timeline
 from bme_eating.types import Event
+from bme_eating.v4_protocol import PROTOCOL_VERSION, RAW_INPUT_SCHEMA
 
 
 def _sha256_file(path: Path) -> str:
@@ -165,6 +167,8 @@ class HierarchicalEatingDetectorV4:
         self.boundary_range = boundary_range
         self.config = config
         self.selection = selection
+        self.last_raw_input_diagnostics: dict[str, Any] | None = None
+        self.last_duplicate_anchor_diagnostics: dict[str, Any] | None = None
         self.statistics_columns = [f"stat_{name}" for name in STATS_FEATURE_COLUMNS]
         for model in self.state_models:
             model.to(self.device).eval()
@@ -179,6 +183,9 @@ class HierarchicalEatingDetectorV4:
             self.duration_prior,
             grid_seconds=int(self.config["decoder"]["grid_seconds"]),
             fixed_lag_seconds=int(self.config["decoder"]["fixed_lag_seconds"]),
+            duration_weight=float(
+                self.config["decoder"].get("semi_markov_duration_weight", 1.0)
+            ),
         )
 
     @torch.no_grad()
@@ -209,6 +216,14 @@ class HierarchicalEatingDetectorV4:
         state_logit = averaged["state_logit"][0].cpu().numpy()
         state_probability = self.state_calibration.transform(state_logit)
         statistics = batch["statistics"][0].float().cpu().numpy()
+        def diagnostic(name: str, fallback: str | None = None) -> np.ndarray:
+            value = primary.get(name)
+            if value is None and fallback is not None:
+                value = primary.get(fallback)
+            if value is None:
+                return np.zeros(len(timestamps), dtype=np.float32)
+            return value[0].float().cpu().numpy()
+
         frame = pd.DataFrame(
             {
                 "subject_key": subject_key,
@@ -218,9 +233,18 @@ class HierarchicalEatingDetectorV4:
                 "state_probability": state_probability,
                 "onset_probability": torch.sigmoid(averaged["onset_logit"][0]).cpu().numpy(),
                 "offset_probability": torch.sigmoid(averaged["offset_logit"][0]).cpu().numpy(),
-                "ppg_gate": primary["ppg_gate"][0].float().cpu().numpy(),
-                "statistics_gate": primary["statistics_gate"][0].float().cpu().numpy(),
-                "missing_fraction": primary["missing_fraction"][0].float().cpu().numpy(),
+                "ppg_gate": diagnostic("ppg_gate"),
+                "statistics_gate": diagnostic("statistics_gate"),
+                "missing_fraction": diagnostic("missing_fraction"),
+                "active_modality_missing_fraction": diagnostic(
+                    "active_modality_missing_fraction", "missing_fraction"
+                ),
+                "acc_valid_fraction": diagnostic("acc_valid_fraction"),
+                "gyro_valid_fraction": diagnostic("gyro_valid_fraction"),
+                "ppg_valid_fraction": diagnostic("ppg_valid_fraction"),
+                "statistics_missing_fraction": diagnostic("statistics_missing_fraction"),
+                "gyro_gate": diagnostic("gyro_gate"),
+                "invariant_gate": diagnostic("invariant_gate"),
             }
         )
         for index, name in enumerate(self.statistics_columns):
@@ -363,6 +387,8 @@ class HierarchicalEatingDetectorV4:
         return self._events_from_windows(windows)
 
     def predict_session(self, session: RawSessionInput) -> list[Event]:
+        session = session.validated()
+        self.last_raw_input_diagnostics = session.sampling_diagnostics()
         sequence = self.config["sequence"]
         geometry = SequenceGeometry(
             supervised_steps=int(sequence["supervised_steps"]),
@@ -386,12 +412,10 @@ class HierarchicalEatingDetectorV4:
         ]
         if not frames:
             return []
-        windows = (
+        windows, duplicate_diagnostics = deduplicate_consistent_timeline(
             pd.concat(frames, ignore_index=True)
-            .sort_values("timestamp_ms")
-            .drop_duplicates(["subject_key", "session_id", "timestamp_ms"], keep="last")
-            .reset_index(drop=True)
         )
+        self.last_duplicate_anchor_diagnostics = duplicate_diagnostics
         return self._events_from_windows(windows)
 
 
@@ -418,8 +442,14 @@ def load_hierarchical_v4_bundle(
             raise RuntimeError(f"V4 bundle artifact hash mismatch: {relative}")
     config = yaml.safe_load((root / "resolved_config.yaml").read_text(encoding="utf-8"))
     selection = json.loads((root / "selected_pipeline.json").read_text(encoding="utf-8"))
-    if selection.get("protocol_version") != "statsfusion-r2":
-        raise RuntimeError("Only statsfusion-r2 bundles are supported")
+    if selection.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(f"Only {PROTOCOL_VERSION} bundles are supported")
+    if selection.get("raw_input_schema") != RAW_INPUT_SCHEMA:
+        raise RuntimeError("V4 bundle raw input schema is incompatible")
+    selected_decoder = selection.get("decoder_config")
+    if not isinstance(selected_decoder, dict):
+        raise TypeError("V4 bundle selection has no hash-locked decoder configuration")
+    config = {**config, "decoder": dict(selected_decoder)}
     if selection.get("selection_source") != "pooled_outer_oof":
         raise RuntimeError("V4 bundle selection must come from pooled outer OOF")
     state_seeds = [int(value) for value in selection.get("state_seeds", [])]

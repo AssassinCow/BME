@@ -26,6 +26,16 @@ from bme_eating.hierarchical_artifacts import (
 from bme_eating.hierarchical_v4_gates import evaluate_ppg_promotion, verify_gate_evidence
 from bme_eating.reproducibility import git_worktree_identity
 from bme_eating.stats_features import audit_feature_provenance
+from bme_eating.v4_protocol import (
+    BLOCKED_PREDECESSORS,
+    CALIBRATION_PROTOCOL,
+    CODE_VERSION,
+    DECODER_PROTOCOL,
+    PROTOCOL_VERSION,
+    RAW_INPUT_SCHEMA,
+    TARGET_SEMANTICS,
+    validate_r3_config,
+)
 
 RESUME_RUNTIME_CONFIG_PATHS = frozenset(
     {
@@ -120,64 +130,150 @@ def _tracked_inputs(config: dict[str, Any], input_root: Path) -> dict[str, Path]
         "features": input_root / "features" / f"{feature_name}.parquet",
         "canonical_anchors": canonical["anchors"],
         "canonical_statistics": canonical["statistics"],
+        "canonical_events": canonical["events"],
         "canonical_preparation_identity": canonical["preparation_identity"],
         "canonical_anchors_identity": canonical["anchors_identity"],
         "canonical_manifest": canonical["manifest"],
     }
 
 
-def _validate_s4_promotion(config: dict[str, Any], output_root: Path) -> None:
+def _m1_comparison_identity(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(_public_config(config))
+    experiment = normalized.get("experiment", {})
+    for key in ("name", "ablation_id", "variant", "state_promotion"):
+        experiment.pop(key, None)
+    normalized.setdefault("decoder", {})["use_semi_markov"] = False
+    return normalized
+
+
+def _p1_comparison_identity(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(_public_config(config))
+    experiment = normalized.get("experiment", {})
+    for key in ("name", "ablation_id", "variant", "motion_parent"):
+        experiment.pop(key, None)
+    normalized.setdefault("model", {})["use_ppg"] = False
+    return normalized
+
+
+def _validate_p1_parent(config: dict[str, Any], output_root: Path) -> None:
     experiment = config.get("experiment", {})
-    if str(experiment.get("ablation_id", "")) != "S4":
+    if str(experiment.get("ablation_id", "")) != "R3-P1":
         return
-    decision = experiment.get("ppg_promotion")
+    parent = experiment.get("motion_parent")
+    if not isinstance(parent, dict):
+        raise TypeError(
+            "R3-P1 must be built from the passing motion winner with "
+            "prepare_hierarchical_v4_p1.py"
+        )
+    run_name = str(parent.get("run_name", ""))
+    source_root = output_root / "experiments" / run_name
+    source_config_path = source_root / "fold_0" / "resolved_config.yaml"
+    gate_path = source_root / "ablation" / "fold_0_report.json"
+    expected = {
+        "run_name": run_name,
+        "resolved_config_sha256": sha256_file(source_config_path),
+        "fold0_gate_sha256": sha256_file(gate_path),
+    }
+    if parent != expected:
+        raise RuntimeError("R3-P1 motion-parent hashes do not match the selected run")
+    gate_report = json.loads(gate_path.read_text(encoding="utf-8"))
+    if not bool(gate_report.get("passed", False)) or gate_report.get("selected_run") != run_name:
+        raise RuntimeError("R3-P1 motion parent is not the passing selected fold-0 run")
+    verify_gate_evidence(output_root.parent, gate_report)
+    source_config = yaml.safe_load(source_config_path.read_text(encoding="utf-8")) or {}
+    if bool(source_config.get("model", {}).get("use_ppg", False)):
+        raise RuntimeError("R3-P1 motion parent must not use PPG")
+    if _p1_comparison_identity(config) != _p1_comparison_identity(source_config):
+        raise RuntimeError("R3-P1 differs from its motion parent beyond PPG enablement")
+
+
+def _validate_m1_promotion(config: dict[str, Any], output_root: Path) -> None:
+    experiment = config.get("experiment", {})
+    if str(experiment.get("ablation_id", "")) != "R3-M1":
+        return
+    decision = experiment.get("state_promotion")
     if decision is None:
         raise RuntimeError(
-            "S4 requires hash-locked S2/S3 PPG promotion evidence; "
-            "run prepare_hierarchical_v4_s4.py first"
+            "R3-M1 requires hash-locked motion/PPG promotion evidence; "
+            "run prepare_hierarchical_v4_m1.py first"
         )
     if not isinstance(decision, dict):
-        raise TypeError("S4 PPG promotion evidence must be a mapping")
-    if decision.get("protocol_version") != "statsfusion-r2":
-        raise RuntimeError("S4 PPG promotion evidence uses a different protocol")
-    if set(decision.get("source_runs", {})) != {"S2", "S3"}:
-        raise RuntimeError("S4 PPG promotion evidence must identify S2 and S3 source runs")
+        raise TypeError("R3-M1 state promotion evidence must be a mapping")
+    if decision.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError("R3-M1 state promotion evidence uses a different protocol")
+    if set(decision.get("source_runs", {})) != {"MOTION", "PPG"}:
+        raise RuntimeError("PPG promotion evidence must identify motion and PPG source runs")
     if "resolved_use_ppg" not in decision:
-        raise RuntimeError("S4 PPG promotion evidence has no resolved PPG decision")
+        raise RuntimeError("R3-M1 state promotion evidence has no resolved PPG decision")
     verify_gate_evidence(output_root.parent, decision)
     source_runs = decision["source_runs"]
     recomputed = evaluate_ppg_promotion(
         output_root,
-        s2_run=str(source_runs["S2"]),
-        s3_run=str(source_runs["S3"]),
+        s2_run=str(source_runs["MOTION"]),
+        s3_run=str(source_runs["PPG"]),
         gate=config["promotion_gate"],
     )
     if decision != recomputed:
-        raise RuntimeError("S4 PPG promotion decision does not match its locked evidence")
+        raise RuntimeError("R3-M1 state promotion decision does not match its locked evidence")
     configured_use_ppg = bool(config.get("model", {}).get("use_ppg", True))
     if configured_use_ppg != bool(decision["resolved_use_ppg"]):
-        raise RuntimeError("S4 model.use_ppg differs from its locked PPG promotion decision")
+        raise RuntimeError("R3-M1 model.use_ppg differs from its locked state promotion decision")
+    selected_key = "PPG" if bool(decision["resolved_use_ppg"]) else "MOTION"
+    selected_run = str(source_runs[selected_key])
+    selected_path = output_root / "experiments" / selected_run / "fold_0" / "resolved_config.yaml"
+    selected_config = yaml.safe_load(selected_path.read_text(encoding="utf-8")) or {}
+    if _m1_comparison_identity(config) != _m1_comparison_identity(selected_config):
+        raise RuntimeError("R3-M1 differs from the promoted state architecture beyond Semi-Markov")
+    if not bool(config.get("decoder", {}).get("use_semi_markov", False)):
+        raise RuntimeError("R3-M1 must enable the coherent Semi-Markov decoder")
 
 
 def current_v4_identity(config: dict[str, Any], input_root: Path) -> dict[str, Any]:
-    if config["project"].get("artifact_schema_version") != "v4":
-        raise ValueError("StatsFusion runs must write to artifact schema v4")
-    if config.get("experiment", {}).get("protocol_version") != "statsfusion-r2":
-        raise ValueError("Formal v4 runs require protocol_version: statsfusion-r2")
-    if not bool(config["project"].get("strict_resume_identity", False)):
-        raise ValueError("StatsFusion v4 requires strict_resume_identity: true")
+    validate_r3_config(config)
     output_root = input_root.parent / str(config["project"]["artifact_schema_version"])
-    _validate_s4_promotion(config, output_root)
+    _validate_p1_parent(config, output_root)
+    _validate_m1_promotion(config, output_root)
     tracked = _tracked_inputs(config, input_root)
     missing = [name for name, path in tracked.items() if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Required StatsFusion inputs are missing: {missing}")
     return {
-        "protocol_version": "statsfusion-r2",
+        "protocol_version": PROTOCOL_VERSION,
         "resolved_config_sha256": resume_config_hash(config),
         "git": git_worktree_identity(Path(__file__).resolve().parents[2]),
         "input_hashes": {name: sha256_file(path) for name, path in tracked.items()},
     }
+
+
+def validate_v4_freeze_manifest(
+    freeze_path: Path,
+    output_root: Path,
+    *,
+    expected_resume_config_sha256: str,
+    expected_git: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    if not freeze_path.is_file():
+        raise FileNotFoundError("V4 folds 2-4 require freeze_manifest.json")
+    payload = json.loads(freeze_path.read_text(encoding="utf-8"))
+    expected_fields = {
+        "code_version": CODE_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "blocked_predecessors": list(BLOCKED_PREDECESSORS),
+        "candidate_minimum_seconds": int(config["decoder"]["candidate_minimum_seconds"]),
+        "candidate_maximum_seconds": int(config["decoder"]["candidate_maximum_seconds"]),
+        "resume_config_sha256": expected_resume_config_sha256,
+        "git": expected_git,
+    }
+    for key, expected in expected_fields.items():
+        if payload.get(key) != expected:
+            raise RuntimeError(f"V4 freeze manifest has an invalid {key}")
+    if payload.get("locked_after_folds") != [0, 1]:
+        raise RuntimeError("V4 freeze manifest must be locked after folds 0 and 1")
+    if payload.get("selected_run") != freeze_path.parent.name:
+        raise RuntimeError("V4 freeze manifest identifies a different selected run")
+    verify_gate_evidence(output_root.parent, payload)
+    return payload
 
 
 def initialize_v4_run(
@@ -190,15 +286,11 @@ def initialize_v4_run(
     fresh: bool,
 ) -> HierarchicalRun:
     validate_run_name(run_name)
+    validate_r3_config(config)
     if fold not in range(int(config["data"]["subject_folds"])):
         raise ValueError("Outer fold is outside the configured fold range")
-    if config["project"].get("artifact_schema_version") != "v4":
-        raise ValueError("StatsFusion runs must write to artifact schema v4")
-    if config.get("experiment", {}).get("protocol_version", "statsfusion-r2") != "statsfusion-r2":
-        raise ValueError("Formal v4 runs require protocol_version: statsfusion-r2")
-    if not bool(config["project"].get("strict_resume_identity", False)):
-        raise ValueError("StatsFusion v4 requires strict_resume_identity: true")
-    _validate_s4_promotion(config, output_root)
+    _validate_p1_parent(config, output_root)
+    _validate_m1_promotion(config, output_root)
     run_root = output_root / "experiments" / run_name / f"fold_{fold}"
     manifest_path = run_root / "run_manifest.json"
     public_config = _public_config(config)
@@ -217,18 +309,13 @@ def initialize_v4_run(
             raise RuntimeError("V4 fold configuration differs from fold 0")
     freeze_path = experiment_root / "freeze_manifest.json"
     if fold >= 2:
-        if not freeze_path.is_file():
-            raise FileNotFoundError("V4 folds 2-4 require freeze_manifest.json")
-        freeze = json.loads(freeze_path.read_text(encoding="utf-8"))
-        freeze_hash = freeze.get("resume_config_sha256")
-        if freeze_hash is None and reference is not None:
-            if freeze.get("resolved_config_sha256") != reference.get("resolved_config_sha256"):
-                raise RuntimeError("V4 frozen configuration differs from fold 0")
-            freeze_hash = _saved_resume_config_hash(fold_zero_manifest.parent, reference)
-        if freeze_hash != config_hash:
-            raise RuntimeError("V4 frozen configuration differs from the locked protocol")
-        if freeze.get("git") != git_identity:
-            raise RuntimeError("V4 frozen worktree differs from the locked protocol")
+        validate_v4_freeze_manifest(
+            freeze_path,
+            output_root,
+            expected_resume_config_sha256=config_hash,
+            expected_git=git_identity,
+            config=config,
+        )
     tracked = _tracked_inputs(config, input_root)
     missing = [name for name, path in tracked.items() if not path.is_file()]
     if missing:
@@ -238,6 +325,8 @@ def initialize_v4_run(
         if fresh:
             raise FileExistsError(f"V4 run already exists: {run_root}")
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if payload.get("protocol_version") != PROTOCOL_VERSION:
+            raise RuntimeError("Blocked predecessor runs cannot be resumed as statsfusion-r3")
         saved_config_hash = _saved_resume_config_hash(run_root, payload)
         if saved_config_hash != config_hash:
             raise RuntimeError("Active v4 configuration differs from the run manifest")
@@ -289,12 +378,13 @@ def initialize_v4_run(
     run_root.mkdir(parents=True, exist_ok=True)
     write_yaml_atomic(run_root / "resolved_config.yaml", public_config)
     snapshot = {
-        "version": 4,
-        "protocol_version": "statsfusion-r2",
+        "version": 5,
+        "code_version": CODE_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
         "input_artifact_schema_version": "v2",
         "hashes": input_hashes,
     }
-    snapshot_path = output_root / "input_snapshot.json"
+    snapshot_path = output_root / "input_snapshot_r3.json"
     if snapshot_path.is_file():
         if json.loads(snapshot_path.read_text(encoding="utf-8")) != snapshot:
             raise RuntimeError("V4 input snapshot conflicts with current v2 artifacts")
@@ -320,10 +410,20 @@ def initialize_v4_run(
 
     state_model = build_state_model(config["model"])
     parameter_count = sum(parameter.numel() for parameter in state_model.parameters())
+    canonical_manifest = json.loads(
+        tracked["canonical_manifest"].read_text(encoding="utf-8")
+    )
     payload = {
-        "version": 4,
-        "protocol_version": "statsfusion-r2",
-        "blocked_predecessors": ["statsfusion-r0-blocked", "statsfusion-r1-blocked"],
+        "version": 5,
+        "code_version": CODE_VERSION,
+        "protocol_version": PROTOCOL_VERSION,
+        "blocked_predecessors": list(BLOCKED_PREDECESSORS),
+        "target_semantics": TARGET_SEMANTICS,
+        "calibration_protocol": CALIBRATION_PROTOCOL,
+        "decoder_protocol": DECODER_PROTOCOL,
+        "raw_input_schema": RAW_INPUT_SCHEMA,
+        "candidate_minimum_seconds": int(config["decoder"]["candidate_minimum_seconds"]),
+        "feature_code_sha256": canonical_manifest["feature_code_sha256"],
         "run_name": run_name,
         "outer_fold": int(fold),
         "stage": "CREATED",

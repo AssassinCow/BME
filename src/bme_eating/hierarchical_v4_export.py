@@ -10,6 +10,7 @@ import torch
 
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.stats_features import FoldRobustScaler
+from bme_eating.v4_protocol import BLOCKED_PREDECESSORS, CODE_VERSION, PROTOCOL_VERSION
 
 REQUIRED_MODEL_FILES = (
     "state_seed_2026.pt",
@@ -38,7 +39,9 @@ RUNTIME_FILES = (
     "proposals_v4.py",
     "stats_features.py",
     "structured_decoder.py",
+    "timeline.py",
     "types.py",
+    "v4_protocol.py",
     "data/__init__.py",
     "data/deep_dataset.py",
     "data/session.py",
@@ -110,8 +113,8 @@ def export_hierarchical_v4_bundle(
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("stage") not in {"COMPLETE", "EXPORTED"}:
         raise RuntimeError("V4 final training must be complete before export")
-    if manifest.get("protocol_version") != "statsfusion-r2":
-        raise RuntimeError("Only statsfusion-r2 final artifacts may be exported")
+    if manifest.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(f"Only {PROTOCOL_VERSION} final artifacts may be exported")
     for relative, expected in manifest.get("artifact_hashes", {}).items():
         artifact = final_root / relative
         if not artifact.is_file() or sha256_file(artifact) != expected:
@@ -120,10 +123,25 @@ def export_hierarchical_v4_bundle(
     if required:
         raise FileNotFoundError(f"V4 final artifacts are missing: {required}")
     selection = json.loads((final_root / "selected_pipeline.json").read_text(encoding="utf-8"))
-    if selection.get("protocol_version") != "statsfusion-r2":
-        raise RuntimeError("V4 selection is not statsfusion-r2")
+    if selection.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(f"V4 selection is not {PROTOCOL_VERSION}")
+    if selection.get("code_version") != CODE_VERSION:
+        raise RuntimeError(f"V4 selection is not {CODE_VERSION}")
+    if selection.get("blocked_predecessors") != list(BLOCKED_PREDECESSORS):
+        raise RuntimeError("V4 selection does not block every predecessor protocol")
     if selection.get("selection_source") != "pooled_outer_oof":
         raise RuntimeError("V4 export requires pooled outer-OOF selection")
+    if selection.get("candidate_minimum_seconds") != 3 or selection.get(
+        "candidate_maximum_seconds"
+    ) != 14_400:
+        raise RuntimeError("V4 selection has invalid candidate duration bounds")
+    promotion_hashes = selection.get("promotion_evidence_sha256", {})
+    required_promotion = {"fold0_ablation", "development_gate", "freeze_manifest", "stress_gate"}
+    if set(promotion_hashes) != required_promotion or any(
+        not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
+        for value in promotion_hashes.values()
+    ):
+        raise RuntimeError("V4 selection has incomplete promotion evidence hashes")
     state_seeds = [int(value) for value in selection.get("state_seeds", [])]
     if state_seeds != [2026, 2027, 2028]:
         raise RuntimeError("V4 export requires state seeds 2026/2027/2028")

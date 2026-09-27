@@ -5,9 +5,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize_scalar
+from scipy.optimize import minimize, minimize_scalar
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss
 
 
 def sigmoid(values: np.ndarray) -> np.ndarray:
@@ -31,7 +30,16 @@ def binary_state_targets(targets: np.ndarray) -> np.ndarray:
         raise ValueError("State targets must be non-empty")
     if not np.isfinite(values).all() or np.any((values < 0.0) | (values > 1.0)):
         raise ValueError("State targets must be finite values in [0, 1]")
-    return (values > 0.0).astype(np.int64)
+    return (values >= 0.5).astype(np.int64)
+
+
+def soft_state_targets(targets: np.ndarray) -> np.ndarray:
+    values = np.asarray(targets, dtype=np.float64).reshape(-1)
+    if not len(values):
+        raise ValueError("State targets must be non-empty")
+    if not np.isfinite(values).all() or np.any((values < 0.0) | (values > 1.0)):
+        raise ValueError("State targets must be finite values in [0, 1]")
+    return values
 
 
 @dataclass(frozen=True)
@@ -71,23 +79,59 @@ class TemperatureCalibrationV4:
 
 
 @dataclass(frozen=True)
-class PlattCalibration:
+class SoftPlattCalibration:
     coefficient: float
     intercept: float
 
     @classmethod
     def fit(
         cls, logits: np.ndarray, targets: np.ndarray, sample_weight: np.ndarray | None = None
-    ) -> PlattCalibration:
+    ) -> SoftPlattCalibration:
         logits = np.asarray(logits, dtype=np.float64).reshape(-1)
-        targets = binary_state_targets(targets)
+        targets = soft_state_targets(targets)
         if len(logits) != len(targets) or not len(logits):
-            raise ValueError("Platt calibration requires aligned non-empty arrays")
-        if len(np.unique(targets)) != 2:
-            raise ValueError("Platt calibration requires both target classes")
-        model = LogisticRegression(C=1e6, solver="lbfgs", random_state=2026)
-        model.fit(logits[:, None], targets, sample_weight=sample_weight)
-        return cls(float(model.coef_[0, 0]), float(model.intercept_[0]))
+            raise ValueError("Soft Platt calibration requires aligned non-empty arrays")
+        if not np.isfinite(logits).all():
+            raise ValueError("Soft Platt logits must be finite")
+        weights = (
+            np.ones(len(logits), dtype=np.float64)
+            if sample_weight is None
+            else np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+        )
+        if len(weights) != len(logits) or not np.isfinite(weights).all() or np.any(weights < 0):
+            raise ValueError("Soft Platt sample weights must be finite and non-negative")
+        if weights.sum() <= 0:
+            raise ValueError("Soft Platt calibration requires positive total sample weight")
+        prevalence = float(np.average(targets, weights=weights))
+        if not 0.0 < prevalence < 1.0:
+            raise ValueError("Soft Platt calibration requires non-degenerate soft targets")
+        normalized_weight = weights / weights.sum()
+
+        def objective(parameters: np.ndarray) -> tuple[float, np.ndarray]:
+            coefficient, intercept = parameters
+            linear = coefficient * logits + intercept
+            loss = np.logaddexp(0.0, linear) - targets * linear
+            probability = sigmoid(linear)
+            residual = normalized_weight * (probability - targets)
+            gradient = np.asarray(
+                [np.sum(residual * logits), np.sum(residual)], dtype=np.float64
+            )
+            return float(np.sum(normalized_weight * loss)), gradient
+
+        initial = np.asarray(
+            [1.0, float(np.log(prevalence / (1.0 - prevalence)) - np.mean(logits))],
+            dtype=np.float64,
+        )
+        result = minimize(
+            lambda parameters: objective(parameters)[0],
+            initial,
+            jac=lambda parameters: objective(parameters)[1],
+            method="L-BFGS-B",
+            options={"ftol": 1e-12, "gtol": 1e-8, "maxiter": 1000},
+        )
+        if not result.success or not np.isfinite(result.x).all():
+            raise RuntimeError(f"Soft Platt calibration failed: {result.message}")
+        return cls(float(result.x[0]), float(result.x[1]))
 
     def transform(self, logits: np.ndarray) -> np.ndarray:
         return sigmoid(self.coefficient * np.asarray(logits, dtype=np.float64) + self.intercept)
@@ -96,8 +140,11 @@ class PlattCalibration:
         return {"coefficient": self.coefficient, "intercept": self.intercept}
 
     @classmethod
-    def from_json(cls, payload: dict[str, Any]) -> PlattCalibration:
+    def from_json(cls, payload: dict[str, Any]) -> SoftPlattCalibration:
         return cls(float(payload["coefficient"]), float(payload["intercept"]))
+
+
+PlattCalibration = SoftPlattCalibration
 
 
 def expected_calibration_error(
@@ -128,15 +175,15 @@ def state_calibration_metrics(
     low_threshold: float,
     bins: int = 15,
 ) -> dict[str, float]:
-    targets = binary_state_targets(targets).astype(np.float64)
+    targets = soft_state_targets(targets)
     raw = sigmoid(raw_logits)
     calibrated = np.asarray(calibrated, dtype=np.float64)
     prevalence = float(targets.mean())
     mean_probability = float(calibrated.mean())
     background = targets <= 0
     return {
-        "uncalibrated_brier": float(brier_score_loss(targets, raw)),
-        "brier": float(brier_score_loss(targets, calibrated)),
+        "uncalibrated_brier": float(np.mean((raw - targets) ** 2)),
+        "brier": float(np.mean((calibrated - targets) ** 2)),
         "ece": expected_calibration_error(targets, calibrated, bins),
         "prevalence": prevalence,
         "mean_probability": mean_probability,
@@ -156,7 +203,7 @@ def subject_crossfit_platt(
     logit_column: str = "state_logit",
     target_column: str = "state_target",
     fit_mask_column: str | None = None,
-) -> tuple[pd.DataFrame, PlattCalibration]:
+) -> tuple[pd.DataFrame, SoftPlattCalibration]:
     required = {"subject_key", partition_column, logit_column, target_column}
     if fit_mask_column is not None:
         required.add(fit_mask_column)
@@ -181,7 +228,7 @@ def subject_crossfit_platt(
         if fit_subjects & holdout_subjects:
             raise RuntimeError("Subject leakage in Platt crossfit")
         fit_eligible = fit.to_numpy() & eligible
-        calibrator = PlattCalibration.fit(
+        calibrator = SoftPlattCalibration.fit(
             output.loc[fit_eligible, logit_column].to_numpy(),
             output.loc[fit_eligible, target_column].to_numpy(),
         )
@@ -191,7 +238,7 @@ def subject_crossfit_platt(
     if not np.isfinite(calibrated).all():
         raise RuntimeError("Crossfit calibration left unscored rows")
     output["state_probability"] = calibrated
-    final = PlattCalibration.fit(
+    final = SoftPlattCalibration.fit(
         output.loc[eligible, logit_column].to_numpy(),
         output.loc[eligible, target_column].to_numpy(),
     )
@@ -210,7 +257,28 @@ class LogisticScoreCombiner:
         cls, features: np.ndarray, targets: np.ndarray, sample_weight: np.ndarray | None = None
     ) -> LogisticScoreCombiner:
         values = np.asarray(features, dtype=np.float64)
-        targets = np.asarray(targets, dtype=np.int64)
+        targets = np.asarray(targets, dtype=np.int64).reshape(-1)
+        if values.ndim != 2 or values.shape[0] == 0:
+            raise ValueError("Logistic score calibration requires a non-empty 2D feature matrix")
+        if len(targets) != len(values):
+            raise ValueError("Logistic score calibration requires aligned features and targets")
+        if not np.isfinite(values).all():
+            raise ValueError("Logistic score calibration features must be finite")
+        classes = np.unique(targets)
+        if not np.array_equal(classes, np.asarray([0, 1])):
+            raise ValueError("Logistic score calibration requires both positive and negative proposals")
+        if sample_weight is not None:
+            weights = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
+            if (
+                len(weights) != len(values)
+                or not np.isfinite(weights).all()
+                or np.any(weights < 0)
+                or weights.sum() <= 0
+            ):
+                raise ValueError(
+                    "Logistic score calibration weights must be aligned, finite, non-negative, and non-zero"
+                )
+            sample_weight = weights
         mean = values.mean(axis=0)
         scale = values.std(axis=0)
         scale = np.where(scale > 1e-6, scale, 1.0)
@@ -259,6 +327,15 @@ class ProposalCalibrationV4:
         missing = required - set(frame.columns)
         if missing:
             raise ValueError(f"Proposal calibration frame is missing columns: {sorted(missing)}")
+        if frame.empty:
+            raise ValueError("Proposal calibration requires at least one proposal")
+        numeric = frame[list(required)].to_numpy(dtype=np.float64)
+        if not np.isfinite(numeric).all():
+            raise ValueError("Proposal calibration inputs must be finite")
+        if not frame["max_iou"].between(0.0, 1.0).all():
+            raise ValueError("Proposal calibration IoU targets must lie in [0, 1]")
+        if set(frame["is_positive"].astype(int).unique()) != {0, 1}:
+            raise ValueError("Proposal calibration requires both positive and negative proposals")
         event = TemperatureCalibrationV4.fit(
             frame["event_logit"].to_numpy(), frame["is_positive"].to_numpy()
         )

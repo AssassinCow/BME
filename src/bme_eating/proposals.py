@@ -353,11 +353,19 @@ def label_event_candidates(
         output["negative_type"] = pd.Series(dtype=object)
         return output
     labels: list[tuple[float, str | None]] = []
-    grouped = {str(subject): group for subject, group in events.groupby("subject_key", sort=False)}
+    session_aware = "session_id" in output.columns and "session_id" in events.columns
+    group_columns = ["subject_key", "session_id"] if session_aware else ["subject_key"]
+    grouped = {
+        tuple(str(value) for value in (key if isinstance(key, tuple) else (key,))): group
+        for key, group in events.groupby(group_columns, sort=False)
+    }
     for proposal in output.itertuples(index=False):
         best_iou = 0.0
         best_id: str | None = None
-        for event in grouped.get(str(proposal.subject_key), pd.DataFrame()).itertuples(index=False):
+        key = (str(proposal.subject_key),)
+        if session_aware:
+            key += (str(proposal.session_id),)
+        for event in grouped.get(key, pd.DataFrame()).itertuples(index=False):
             value = interval_iou(
                 int(proposal.coarse_start_ms),
                 int(proposal.coarse_end_ms),
@@ -389,10 +397,18 @@ def exclude_ignored_candidates(
 ) -> pd.DataFrame:
     if proposals.empty or ignored_events.empty:
         return proposals.copy()
-    grouped = {str(subject): group for subject, group in ignored_events.groupby("subject_key")}
+    session_aware = "session_id" in proposals.columns and "session_id" in ignored_events.columns
+    group_columns = ["subject_key", "session_id"] if session_aware else ["subject_key"]
+    grouped = {
+        tuple(str(value) for value in (key if isinstance(key, tuple) else (key,))): group
+        for key, group in ignored_events.groupby(group_columns, sort=False)
+    }
     keep: list[bool] = []
     for proposal in proposals.itertuples(index=False):
-        ignored = grouped.get(str(proposal.subject_key), pd.DataFrame())
+        key = (str(proposal.subject_key),)
+        if session_aware:
+            key += (str(proposal.session_id),)
+        ignored = grouped.get(key, pd.DataFrame())
         overlaps = any(
             min(int(proposal.coarse_end_ms), int(event.end_ms))
             > max(int(proposal.coarse_start_ms), int(event.start_ms))

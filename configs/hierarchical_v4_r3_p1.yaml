@@ -1,0 +1,5 @@
+extends: hierarchical_v4_r3_d1.yaml
+experiment:
+  ablation_id: R3-P1
+model:
+  use_ppg: true

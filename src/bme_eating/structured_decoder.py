@@ -90,87 +90,135 @@ class FixedLagSemiMarkovDecoder:
         if self.fixed_lag_seconds > 60:
             raise ValueError("Decoder future latency exceeds the 60-second limit")
 
-    def _state_at(
+    def _duration_steps(self) -> tuple[int, int, np.ndarray]:
+        minimum_steps = max(1, int(np.ceil(self.prior.minimum_seconds / self.grid_seconds)))
+        maximum_steps = int(np.floor(self.prior.maximum_seconds / self.grid_seconds))
+        if maximum_steps < minimum_steps:
+            raise ValueError("Duration prior contains no legal structured-grid duration")
+        durations = np.arange(maximum_steps + 1, dtype=np.float64) * self.grid_seconds
+        log_probability = self.prior.log_probability(durations)
+        return minimum_steps, maximum_steps, log_probability
+
+    def _decode_window(
         self,
-        endpoint: int,
-        target: int,
-        state: int,
-        previous_endpoint: np.ndarray,
-        previous_state: np.ndarray,
-    ) -> bool:
-        cursor = int(endpoint)
-        cursor_state = int(state)
-        while cursor > 0:
-            start = int(previous_endpoint[cursor_state, cursor])
-            if start <= target < cursor:
-                return bool(cursor_state)
-            cursor_state = int(previous_state[cursor_state, cursor])
-            cursor = start
-        return False
+        probabilities: np.ndarray,
+        *,
+        finalize: bool,
+    ) -> np.ndarray:
+        probability = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-6, 1 - 1e-6)
+        minimum_steps, maximum_steps, duration_log_probability = self._duration_steps()
+        state_count = maximum_steps + 1
+        scores = np.full(state_count, -np.inf, dtype=np.float64)
+        scores[0] = 0.0
+        backpointers = np.full((len(probability), state_count), -1, dtype=np.int32)
+        legal_exits = np.arange(minimum_steps, maximum_steps + 1, dtype=np.int64)
+        for time_index, value in enumerate(probability):
+            log_eating = float(np.log(value))
+            log_background = float(np.log1p(-value))
+            updated = np.full_like(scores, -np.inf)
+
+            background_candidates = [float(scores[0] + log_background)]
+            background_sources = [0]
+            if len(legal_exits):
+                exit_scores = (
+                    scores[legal_exits]
+                    + log_background
+                    + self.duration_weight * duration_log_probability[legal_exits]
+                )
+                best_exit = int(np.argmax(exit_scores))
+                background_candidates.append(float(exit_scores[best_exit]))
+                background_sources.append(int(legal_exits[best_exit]))
+            best_background = int(np.argmax(background_candidates))
+            updated[0] = background_candidates[best_background]
+            backpointers[time_index, 0] = background_sources[best_background]
+
+            updated[1] = scores[0] + log_eating
+            backpointers[time_index, 1] = 0
+            if maximum_steps > 1:
+                updated[2:] = scores[1:-1] + log_eating
+                backpointers[time_index, 2:] = np.arange(1, maximum_steps, dtype=np.int32)
+            scores = updated
+
+        terminal_scores = scores.copy()
+        if len(probability):
+            eating_states = np.arange(1, maximum_steps + 1, dtype=np.int64)
+            if finalize:
+                terminal_scores[1:minimum_steps] = -np.inf
+            adjusted_duration = np.maximum(eating_states, minimum_steps)
+            terminal_scores[eating_states] += (
+                self.duration_weight * duration_log_probability[adjusted_duration]
+            )
+        terminal = int(np.argmax(terminal_scores))
+        if (
+            not finalize
+            and np.isfinite(terminal_scores[0])
+            and np.isclose(
+                terminal_scores[0],
+                terminal_scores[terminal],
+                rtol=1e-12,
+                atol=1e-12,
+            )
+        ):
+            terminal = 0
+        if not np.isfinite(terminal_scores[terminal]):
+            raise RuntimeError("Fixed-lag decoder found no legal terminal path")
+        path = np.empty(len(probability), dtype=np.int32)
+        state = terminal
+        for time_index in range(len(probability) - 1, -1, -1):
+            path[time_index] = state
+            state = int(backpointers[time_index, state])
+            if state < 0:
+                raise RuntimeError("Fixed-lag decoder produced a broken backtrace")
+        return path
+
+    @staticmethod
+    def _drop_incomplete_runs(
+        states: np.ndarray, minimum_steps: int, maximum_steps: int
+    ) -> np.ndarray:
+        output = np.asarray(states, dtype=bool).copy()
+        padded = np.concatenate(([False], output, [False])).astype(np.int8)
+        transitions = np.diff(padded)
+        for start, end in zip(
+            np.flatnonzero(transitions == 1), np.flatnonzero(transitions == -1)
+        ):
+            duration = int(end - start)
+            if duration < minimum_steps:
+                output[start:end] = False
+            elif duration > maximum_steps:
+                raise RuntimeError("Fixed-lag decoder exceeded its maximum eating duration")
+        return output
 
     def decode_states(self, probabilities: np.ndarray) -> np.ndarray:
         probability = np.clip(np.asarray(probabilities, dtype=np.float64), 1e-6, 1 - 1e-6)
-        steps = len(probability)
-        if not steps:
+        if not len(probability):
             return np.zeros(0, dtype=bool)
-        minimum_steps = max(1, int(np.ceil(self.prior.minimum_seconds / self.grid_seconds)))
-        maximum_steps = max(
-            minimum_steps, int(np.floor(self.prior.maximum_seconds / self.grid_seconds))
-        )
-        log_eating = np.log(probability)
-        eating_prefix = np.concatenate(([0.0], np.cumsum(log_eating)))
-        background = 0
-        eating = 1
-        scores = np.full((2, steps + 1), -np.inf, dtype=np.float64)
-        previous_endpoint = np.zeros((2, steps + 1), dtype=np.int64)
-        previous_state = np.zeros((2, steps + 1), dtype=np.int8)
-        scores[background, 0] = 0.0
-        finalized = np.zeros(steps, dtype=bool)
+        minimum_steps, maximum_steps, _ = self._duration_steps()
         lag_steps = int(np.ceil(self.fixed_lag_seconds / self.grid_seconds))
-        for endpoint in range(1, steps + 1):
-            background_source = int(np.argmax(scores[:, endpoint - 1]))
-            scores[background, endpoint] = (
-                scores[background_source, endpoint - 1]
-                + np.log1p(-probability[endpoint - 1])
-            )
-            previous_endpoint[background, endpoint] = endpoint - 1
-            previous_state[background, endpoint] = background_source
-            largest = min(maximum_steps, endpoint)
-            if largest >= minimum_steps:
-                durations = np.arange(minimum_steps, largest + 1, dtype=np.int64)
-                starts = endpoint - durations
-                segment_score = eating_prefix[endpoint] - eating_prefix[starts]
-                duration_seconds = durations.astype(np.float64) * self.grid_seconds
-                candidates = (
-                    scores[background, starts]
-                    + segment_score
-                    + self.duration_weight * self.prior.log_probability(duration_seconds)
-                )
-                winner = int(np.argmax(candidates))
-                if np.isfinite(candidates[winner]):
-                    scores[eating, endpoint] = float(candidates[winner])
-                    previous_endpoint[eating, endpoint] = int(starts[winner])
-                    previous_state[eating, endpoint] = background
-            commit = endpoint - 1 - lag_steps
-            if commit >= 0:
-                terminal_state = int(np.argmax(scores[:, endpoint]))
-                finalized[commit] = self._state_at(
-                    endpoint,
-                    commit,
-                    terminal_state,
-                    previous_endpoint,
-                    previous_state,
-                )
-        terminal_state = int(np.argmax(scores[:, steps]))
-        for target in range(max(0, steps - lag_steps), steps):
-            finalized[target] = self._state_at(
-                steps,
-                target,
-                terminal_state,
-                previous_endpoint,
-                previous_state,
-            )
-        return finalized
+        window: list[float] = []
+        expanded_states: list[int] = []
+        for value in probability:
+            window.append(float(value))
+            if len(window) > lag_steps + maximum_steps:
+                path = self._decode_window(np.asarray(window), finalize=False)
+                eligible = len(window) - lag_steps
+                commit_count = eligible
+                if commit_count and path[commit_count - 1] > 0:
+                    run_start = commit_count - 1
+                    while run_start > 0 and path[run_start - 1] > 0:
+                        run_start -= 1
+                    commit_count = run_start
+                if commit_count:
+                    if path[commit_count - 1] != 0:
+                        raise RuntimeError("Fixed-lag decoder attempted to split an eating segment")
+                    expanded_states.extend(int(state) for state in path[:commit_count])
+                    del window[:commit_count]
+        if window:
+            path = self._decode_window(np.asarray(window), finalize=True)
+            expanded_states.extend(int(value) for value in path)
+        finalized = np.asarray(expanded_states, dtype=np.int32) > 0
+        if len(finalized) != len(probability):
+            raise RuntimeError("Fixed-lag decoder did not emit one state per grid point")
+        return self._drop_incomplete_runs(finalized, minimum_steps, maximum_steps)
 
     def decode_events(
         self, timestamps_ms: np.ndarray, probabilities: np.ndarray
@@ -189,5 +237,8 @@ class FixedLagSemiMarkovDecoder:
             start_ms, end_ms = right_endpoint_run_to_interval(
                 timestamps, int(start), int(end), self.grid_seconds * 1000
             )
+            duration_seconds = (end_ms - start_ms) / 1000.0
+            if not self.prior.minimum_seconds <= duration_seconds <= self.prior.maximum_seconds:
+                raise RuntimeError("Semi-Markov event violated its duration prior bounds")
             output.append((start_ms, end_ms, float(probability[start:end].mean())))
         return output

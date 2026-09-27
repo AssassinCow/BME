@@ -35,12 +35,14 @@ class StatsFusionStateLoss(nn.Module):
         self,
         *,
         smooth_weight: float,
-        smooth_tau: float,
+        smooth_beta: float,
         boundary_weight: float = 0.1,
     ) -> None:
         super().__init__()
         self.smooth_weight = float(smooth_weight)
-        self.smooth_tau = float(smooth_tau)
+        self.smooth_beta = float(smooth_beta)
+        if self.smooth_beta <= 0:
+            raise ValueError("Smooth Huber beta must be positive")
         self.boundary_weight = float(boundary_weight)
 
     @staticmethod
@@ -56,9 +58,10 @@ class StatsFusionStateLoss(nn.Module):
         importance = batch.get("importance_weight", torch.ones_like(supervision))
         if importance.ndim == 1:
             importance = importance.unsqueeze(-1)
-        state_weights = (
-            supervision * importance * batch.get("state_loss_mask", torch.ones_like(supervision))
+        global_mask = batch.get("state_loss_mask", torch.ones_like(supervision)).to(
+            supervision.dtype
         )
+        state_weights = supervision * importance * global_mask
         state_element = F.binary_cross_entropy_with_logits(
             output["state_logit"], batch["state_target"], reduction="none"
         )
@@ -72,23 +75,54 @@ class StatsFusionStateLoss(nn.Module):
         )
         onset = self._weighted_mean(
             onset_element,
-            supervision * importance * batch.get("onset_loss_mask", torch.ones_like(supervision)),
+            supervision
+            * importance
+            * global_mask
+            * batch.get("onset_loss_mask", torch.ones_like(supervision)),
         )
         offset = self._weighted_mean(
             offset_element,
-            supervision * importance * batch.get("offset_loss_mask", torch.ones_like(supervision)),
+            supervision
+            * importance
+            * global_mask
+            * batch.get("offset_loss_mask", torch.ones_like(supervision)),
         )
 
         difference = torch.diff(output["state_logit"], dim=1)
-        smooth_element = difference.square().clamp_max(self.smooth_tau)
+        smooth_element = F.smooth_l1_loss(
+            difference,
+            torch.zeros_like(difference),
+            beta=self.smooth_beta,
+            reduction="none",
+        )
         smooth_mask = supervision[:, 1:] * supervision[:, :-1]
-        smooth_mask = smooth_mask * batch.get("smooth_mask", torch.ones_like(supervision))[:, 1:]
+        boundary_smooth_mask = batch.get("smooth_mask", torch.ones_like(supervision)).to(
+            supervision.dtype
+        )
+        smooth_mask = smooth_mask * torch.minimum(
+            boundary_smooth_mask[:, 1:], boundary_smooth_mask[:, :-1]
+        )
+        smooth_loss_mask = batch.get(
+            "smooth_loss_mask", torch.ones_like(supervision)
+        ).to(supervision.dtype)
+        smooth_mask = smooth_mask * torch.minimum(
+            smooth_loss_mask[:, 1:], smooth_loss_mask[:, :-1]
+        )
+        smooth_mask = smooth_mask * torch.minimum(global_mask[:, 1:], global_mask[:, :-1])
         smooth_mask = smooth_mask * torch.minimum(importance[:, 1:], importance[:, :-1])
         smooth = self._weighted_mean(smooth_element, smooth_mask)
+        smooth_active = smooth_mask.sum()
+        smooth_large_jump = self._weighted_mean(
+            (difference.abs() > self.smooth_beta).to(difference.dtype), smooth_mask
+        )
         total = state + self.smooth_weight * smooth + self.boundary_weight * (onset + offset)
+        if not torch.isfinite(total):
+            raise FloatingPointError("StatsFusion state loss became non-finite")
         return total, {
             "state": state,
             "smooth": smooth,
             "onset": onset,
             "offset": offset,
+            "smooth_active_count": smooth_active,
+            "smooth_large_jump_fraction": smooth_large_jump,
         }

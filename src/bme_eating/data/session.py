@@ -67,7 +67,14 @@ class SessionWindowReader:
         keep = np.concatenate(([True], np.diff(timestamps) > 0))
         return timestamps[keep], values[keep], masks[keep]
 
-    def read(self, session_id: str, start_ms: int, end_ms: int) -> dict[str, np.ndarray]:
+    def read(
+        self,
+        session_id: str,
+        start_ms: int,
+        end_ms: int,
+        *,
+        subject_key: str | None = None,
+    ) -> dict[str, np.ndarray]:
         if end_ms < start_ms:
             raise ValueError("Session window end must not precede start")
         selected = self.segments[
@@ -75,6 +82,10 @@ class SessionWindowReader:
             & (self.segments["end_ms"] >= start_ms)
             & (self.segments["start_ms"] <= end_ms)
         ]
+        if subject_key is not None:
+            if "subject_key" not in self.segments:
+                raise ValueError("Subject-scoped session reads require subject_key in segments")
+            selected = selected[selected["subject_key"].astype(str).eq(str(subject_key))]
         payloads = [self._load(str(row.segment_path)) for row in selected.itertuples(index=False)]
         motion_time, motion_values, motion_mask = self._combine(
             payloads, "motion", start_ms, end_ms

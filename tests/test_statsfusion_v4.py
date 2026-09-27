@@ -13,13 +13,15 @@ import pytest
 import torch
 
 from bme_eating.calibration_v4 import (
+    LogisticScoreCombiner,
     PlattCalibration,
+    ProposalCalibrationV4,
     binary_state_targets,
     state_calibration_metrics,
     subject_crossfit_platt,
 )
 from bme_eating.data.deep_dataset import Normalization
-from bme_eating.data.labels import build_statsfusion_session_anchor_index
+from bme_eating.data.labels import assign_event_sessions, build_statsfusion_session_anchor_index
 from bme_eating.data.stats_fusion_preprocess import (
     RawSessionInput,
     StatsFusionRawSessionPreprocessor,
@@ -80,7 +82,9 @@ from bme_eating.training.hierarchical_v4_trainer import (
     _add_robust_epoch_metrics,
     _assert_nested_lineage,
     _assert_proposal_feature_alignment,
+    _attach_truth_boundaries,
     _build_seeded_state_model,
+    _candidate_domain_metrics,
     _candidate_recall,
     _evaluable_state_calibration_rows,
     _gap_aware_nms,
@@ -147,11 +151,11 @@ def test_stats_scaler_handles_missing_extreme_and_zero_iqr() -> None:
         scaler.assert_unseen({"a"})
 
 
-def test_soft_state_targets_are_binarized_for_selection_and_calibration() -> None:
+def test_soft_state_targets_are_preserved_for_calibration_and_binarized_only_for_diagnostics() -> None:
     targets = np.array([0.0, 0.005, 0.75, 1.0], dtype=np.float64)
     logits = np.array([-3.0, -1.0, 1.0, 3.0], dtype=np.float64)
     binary = binary_state_targets(targets)
-    assert binary.tolist() == [0, 1, 1, 1]
+    assert binary.tolist() == [0, 0, 1, 1]
 
     calibrator = PlattCalibration.fit(logits, targets)
     calibrated = calibrator.transform(logits)
@@ -162,11 +166,29 @@ def test_soft_state_targets_are_binarized_for_selection_and_calibration() -> Non
         low_threshold=0.15,
     )
     assert np.isfinite(calibrated).all()
-    assert metrics["prevalence"] == pytest.approx(0.75)
+    assert metrics["prevalence"] == pytest.approx(targets.mean())
     assert np.isfinite(metrics["brier"])
 
     with pytest.raises(ValueError, match=r"\[0, 1\]"):
         binary_state_targets(np.array([0.0, 1.1]))
+
+
+def test_proposal_calibration_fails_fast_on_empty_or_single_class_oof() -> None:
+    with pytest.raises(ValueError, match="non-empty 2D"):
+        LogisticScoreCombiner.fit(np.empty((0, 3)), np.empty(0))
+    with pytest.raises(ValueError, match="positive and negative"):
+        LogisticScoreCombiner.fit(np.ones((2, 3)), np.ones(2))
+    frame = pd.DataFrame(
+        {
+            "event_logit": [0.0, 1.0],
+            "iou_logit": [0.0, 1.0],
+            "state_score": [0.2, 0.8],
+            "is_positive": [1, 1],
+            "max_iou": [0.5, 0.8],
+        }
+    )
+    with pytest.raises(ValueError, match="positive and negative"):
+        ProposalCalibrationV4.fit(frame)
 
 
 def test_outer_training_never_loads_outer_anchor_labels(tmp_path, monkeypatch) -> None:
@@ -249,13 +271,13 @@ def test_outer_training_never_loads_outer_anchor_labels(tmp_path, monkeypatch) -
     assert set(evaluation_inputs.events["subject_key"]) == {"outer"}
 
 
-def test_r2_loads_session_statistics_without_segment_id(tmp_path, monkeypatch) -> None:
+def test_r3_loads_session_statistics_without_segment_id(tmp_path, monkeypatch) -> None:
     import bme_eating.training.hierarchical_v4_trainer as trainer
 
     input_root = tmp_path / "v2"
     output_root = tmp_path / "v4"
     (input_root / "indices").mkdir(parents=True)
-    canonical_root = output_root / "canonical_input"
+    canonical_root = output_root / "canonical_input_r3"
     canonical_root.mkdir(parents=True)
     anchors = pd.DataFrame(
         {
@@ -286,14 +308,20 @@ def test_r2_loads_session_statistics_without_segment_id(tmp_path, monkeypatch) -
     pd.DataFrame(
         columns=["session_id", "segment_id", "segment_path", "start_ms", "end_ms"]
     ).to_parquet(input_root / "indices" / "segments.parquet", index=False)
-    pd.DataFrame(
+    canonical_events = pd.DataFrame(
         {
             "subject_key": ["train"],
+            "session_id": ["d0"],
             "event_id": ["e0"],
             "start_ms": [0],
             "end_ms": [3_000],
+            "valid_duration": [True],
+            "evaluable": [True],
         }
-    ).to_parquet(input_root / "indices" / "events.parquet", index=False)
+    )
+    canonical_events.to_parquet(input_root / "indices" / "events.parquet", index=False)
+    canonical_events_path = canonical_root / "events_with_session.parquet"
+    canonical_events.to_parquet(canonical_events_path, index=False)
     (input_root / "indices" / "subject_folds.json").write_text(
         json.dumps({"train": 1, "outer": 0}), encoding="utf-8"
     )
@@ -301,12 +329,16 @@ def test_r2_loads_session_statistics_without_segment_id(tmp_path, monkeypatch) -
     monkeypatch.setattr(
         trainer,
         "canonical_input_paths",
-        lambda _root: {"anchors": anchors_path, "statistics": statistics_path},
+        lambda _root: {
+            "anchors": anchors_path,
+            "statistics": statistics_path,
+            "events": canonical_events_path,
+        },
     )
 
     inputs = load_v4_inputs(
         {
-            "experiment": {"protocol_version": "statsfusion-r2"},
+            "experiment": {"protocol_version": "statsfusion-r3"},
             "project": {"artifact_schema_version": "v4"},
             "features": {"artifact_name": "baseline"},
         },
@@ -321,6 +353,37 @@ def test_r2_loads_session_statistics_without_segment_id(tmp_path, monkeypatch) -
         "session_id",
         "timestamp_ms",
     ]
+
+
+def test_session_assignment_keeps_truth_unique_and_expands_ignore_support() -> None:
+    segments = pd.DataFrame(
+        {
+            "subject_key": ["s", "s"],
+            "session_id": ["a", "b"],
+            "start_ms": [0, 20_000],
+            "end_ms": [10_000, 30_000],
+        }
+    )
+    events = pd.DataFrame(
+        {
+            "event_id": ["truth", "ignore", "unobserved"],
+            "subject_key": ["s", "s", "s"],
+            "start_ms": [1_000, 5_000, 100_000],
+            "end_ms": [5_000, 25_000, 110_000],
+            "valid_duration": [True, True, True],
+            "evaluable": [True, False, False],
+        }
+    )
+    assigned = assign_event_sessions(events, segments)
+    assert assigned.loc[assigned.event_id == "truth", "session_id"].tolist() == ["a"]
+    assert set(assigned.loc[assigned.event_id == "ignore", "session_id"]) == {"a", "b"}
+    unobserved = assigned[assigned.event_id == "unobserved"].iloc[0]
+    assert str(unobserved.session_id).startswith("__unobserved__:")
+    assert evaluation_event_partition_summary(assigned) == {
+        "truth": 1,
+        "ignore": 2,
+        "invalid_duration": 0,
+    }
 
 
 def test_statsfusion_receptive_fields_shapes_and_causality() -> None:
@@ -375,6 +438,25 @@ def test_disabled_modality_cannot_leak_values_or_validity(disabled: str) -> None
     torch.testing.assert_close(original, modified)
 
 
+def test_s2_missing_fraction_excludes_disabled_ppg() -> None:
+    config = _model_config()
+    config["use_ppg"] = False
+    model = StatsFusionStateModel(config).eval()
+    batch = _state_batch()
+    changed = {key: value.clone() for key, value in batch.items()}
+    changed["ppg_valid"].zero_()
+    changed["ppg_quality"].zero_()
+    with torch.no_grad():
+        original = model(batch)
+        modified = model(changed)
+    torch.testing.assert_close(
+        original["active_modality_missing_fraction"],
+        modified["active_modality_missing_fraction"],
+        atol=0,
+        rtol=0,
+    )
+
+
 def test_one_sided_targets_and_final_logit_smoothing() -> None:
     timestamps = torch.tensor([-3000, 0, 3000, 30_000, 60_000, 63_000])
     onset, offset = one_sided_transition_targets(
@@ -397,11 +479,76 @@ def test_one_sided_targets_and_final_logit_smoothing() -> None:
         "smooth_mask": torch.ones_like(logits),
     }
     loss, components = StatsFusionStateLoss(
-        smooth_weight=1.0, smooth_tau=100.0, boundary_weight=0.1
+        smooth_weight=1.0, smooth_beta=0.5, boundary_weight=0.1
     )(output, batch)
     loss.backward()
     assert components["smooth"] > 0
     assert logits.grad is not None and torch.count_nonzero(logits.grad) > 0
+
+
+def test_huber_smoothing_keeps_nonzero_gradient_for_large_jumps() -> None:
+    logits = torch.tensor([[0.0, 10.0]], requires_grad=True)
+    zeros = torch.zeros_like(logits, requires_grad=True)
+    _, components = StatsFusionStateLoss(
+        smooth_weight=1.0, smooth_beta=0.5, boundary_weight=0.1
+    )(
+        {
+            "state_logit": logits,
+            "onset_logit": zeros,
+            "offset_logit": zeros,
+        },
+        {
+            "state_target": torch.zeros_like(logits),
+            "onset_target": torch.zeros_like(logits),
+            "offset_target": torch.zeros_like(logits),
+            "supervision_mask": torch.ones_like(logits),
+            "state_loss_mask": torch.ones_like(logits),
+            "onset_loss_mask": torch.ones_like(logits),
+            "offset_loss_mask": torch.ones_like(logits),
+            "smooth_loss_mask": torch.ones_like(logits),
+            "smooth_mask": torch.ones_like(logits),
+        },
+    )
+    gradient = torch.autograd.grad(components["smooth"], logits)[0]
+    assert torch.isfinite(gradient).all()
+    assert torch.count_nonzero(gradient) == 2
+
+
+def test_ignore_region_changes_do_not_affect_any_loss_or_gradient() -> None:
+    criterion = StatsFusionStateLoss(
+        smooth_weight=0.5, smooth_beta=0.5, boundary_weight=0.1
+    )
+    mask = torch.tensor([[1.0, 1.0, 0.0, 0.0, 1.0, 1.0]])
+    batch = {
+        "state_target": torch.tensor([[0.0, 1.0, 0.3, 0.7, 1.0, 0.0]]),
+        "onset_target": torch.zeros(1, 6),
+        "offset_target": torch.zeros(1, 6),
+        "supervision_mask": torch.ones(1, 6),
+        "state_loss_mask": mask,
+        "onset_loss_mask": mask,
+        "offset_loss_mask": mask,
+        "smooth_loss_mask": mask,
+        "smooth_mask": torch.ones(1, 6),
+    }
+
+    def evaluate(replacement: float) -> tuple[torch.Tensor, dict[str, torch.Tensor], torch.Tensor]:
+        state = torch.tensor([[-2.0, 2.0, replacement, -replacement, 2.0, -2.0]], requires_grad=True)
+        onset = state.detach().clone().requires_grad_(True)
+        offset = state.detach().clone().requires_grad_(True)
+        total, components = criterion(
+            {"state_logit": state, "onset_logit": onset, "offset_logit": offset}, batch
+        )
+        gradients = torch.autograd.grad(total, (state, onset, offset))
+        packed = torch.stack(gradients)
+        return total.detach(), {key: value.detach() for key, value in components.items()}, packed
+
+    first_total, first_components, first_gradient = evaluate(10.0)
+    second_total, second_components, second_gradient = evaluate(100.0)
+    torch.testing.assert_close(first_total, second_total, atol=0, rtol=0)
+    for key in ("state", "onset", "offset", "smooth"):
+        torch.testing.assert_close(first_components[key], second_components[key], atol=0, rtol=0)
+    torch.testing.assert_close(first_gradient, second_gradient, atol=0, rtol=0)
+    assert torch.count_nonzero(first_gradient[:, :, 2:4]) == 0
 
 
 def test_clip_sampler_has_importance_weights() -> None:
@@ -563,6 +710,59 @@ def test_candidate_recall_counts_each_recalled_truth_event() -> None:
     assert metrics["different_candidate_recall"] == 1.0
 
 
+def test_candidate_recall_uses_session_scoped_event_identity() -> None:
+    events = pd.DataFrame(
+        {
+            "subject_key": ["subject", "subject"],
+            "session_id": ["morning", "evening"],
+            "event_id": ["meal", "meal"],
+            "start_ms": [0, 100_000],
+            "end_ms": [10_000, 110_000],
+            "evaluable": [True, True],
+            "hand_relation": ["same", "different"],
+        }
+    )
+    proposals = pd.DataFrame(
+        {
+            "subject_key": ["subject", "subject"],
+            "session_id": ["morning", "evening"],
+            "coarse_start_ms": [0, 100_000],
+            "coarse_end_ms": [10_000, 110_000],
+        }
+    )
+    metrics = _candidate_recall(proposals, events)
+    assert metrics["candidate_recall"] == 1.0
+    assert metrics["same_candidate_recall"] == 1.0
+    assert metrics["different_candidate_recall"] == 1.0
+
+
+def test_duration_theoretical_matchability_uses_best_legal_candidate_duration() -> None:
+    truth = pd.DataFrame(
+        {
+            "subject_key": ["subject"] * 3,
+            "session_id": ["session"] * 3,
+            "event_id": ["short", "ordinary", "over"],
+            "start_ms": [0, 10_000, 200_000],
+            "end_ms": [2_000, 110_000, 20_200_000],
+        }
+    )
+    windows = pd.DataFrame(
+        {
+            "subject_key": ["subject"],
+            "session_id": ["session"],
+            "timestamp_ms": [3_000],
+            "gyro_valid_fraction": [1.0],
+        }
+    )
+    empty_proposals = pd.DataFrame(
+        columns=["subject_key", "session_id", "coarse_start_ms", "coarse_end_ms"]
+    )
+    metrics = _candidate_domain_metrics(empty_proposals, truth, windows)
+    assert metrics["duration_strata"]["under_15s"]["theoretical_matchable_fraction"] == 1.0
+    assert metrics["duration_strata"]["ordinary"]["theoretical_matchable_fraction"] == 1.0
+    assert metrics["duration_strata"]["over_4h"]["theoretical_matchable_fraction"] == 1.0
+
+
 def test_hand_recall_does_not_reuse_one_prediction_for_two_truth_events() -> None:
     truth = pd.DataFrame(
         {
@@ -628,6 +828,48 @@ def test_proposal_pooling_uses_all_rows_and_masks_empty_bins() -> None:
     assert features.sequence_mask[0, 4]
 
 
+def test_proposal_pooling_handles_empty_candidate_frame_without_nan_weights() -> None:
+    proposals = pd.DataFrame(
+        columns=[
+            "proposal_id",
+            "subject_key",
+            "session_id",
+            "coarse_start_ms",
+            "coarse_end_ms",
+            "source_mask",
+            "generator_score",
+            "max_iou",
+        ]
+    )
+    windows = pd.DataFrame(
+        columns=[
+            "subject_key",
+            "session_id",
+            "timestamp_ms",
+            "state_probability",
+            "onset_probability",
+            "offset_probability",
+            "ppg_gate",
+            "missing_fraction",
+        ]
+    )
+    features = build_proposal_features_v4(
+        proposals,
+        windows,
+        [],
+        {
+            "left_context_seconds": 60,
+            "right_context_seconds": 60,
+            "left_bins": 4,
+            "event_bins": 16,
+            "right_bins": 4,
+        },
+    )
+    assert features.sequence.shape[0] == 0
+    assert features.sample_weight is not None
+    assert features.sample_weight.size == 0
+
+
 def test_verifier_sampling_and_group_weights() -> None:
     categories = np.asarray(["positive", "near_miss", "hard_false_positive", "random_background"])
     sampler = HardNegativeBatchSampler(
@@ -662,6 +904,21 @@ def test_verifier_sampling_and_group_weights() -> None:
     weights = normalized_proposal_weights(frame)
     family_totals = frame.assign(weight=weights).groupby("proposal_family_id")["weight"].sum()
     assert np.isclose(family_totals["f"], family_totals["g"])
+
+
+def test_positive_verifier_weights_keep_same_event_id_separate_across_sessions() -> None:
+    frame = pd.DataFrame(
+        {
+            "subject_key": ["subject"] * 4,
+            "session_id": ["morning", "evening", "evening", "evening"],
+            "proposal_id": ["m", "e1", "e2", "e3"],
+            "matched_event_id": ["meal"] * 4,
+            "max_iou": [0.9] * 4,
+        }
+    )
+    weights = normalized_proposal_weights(frame)
+    assert weights[0] == pytest.approx(0.5)
+    assert weights[1:].sum() == pytest.approx(0.5)
 
 
 def test_verifier_missing_category_redistributes_in_declared_order() -> None:
@@ -769,7 +1026,12 @@ def test_right_endpoint_state_run_semantics() -> None:
         def decode_states(self, probabilities):
             return np.asarray([True, False], dtype=bool)
 
-    prior = TruncatedLogNormalDurationPrior.fit(np.asarray([15.0, 30.0, 45.0]))
+    prior = TruncatedLogNormalDurationPrior(
+        log_mean=float(np.log(30.0)),
+        log_standard_deviation=0.5,
+        minimum_seconds=15.0,
+        maximum_seconds=45.0,
+    )
     decoder = ForcedDecoder(prior, grid_seconds=15, fixed_lag_seconds=60)
     assert decoder.decode_events(
         np.asarray([15_000, 30_000]), np.asarray([0.9, 0.1])
@@ -912,7 +1174,7 @@ def test_nested_single_seed_epoch_cache_dependency_replay(tmp_path) -> None:
         )
     lineage_path = root / "lineage.json"
     lineage = {
-        "protocol_version": "statsfusion-r2",
+        "protocol_version": "statsfusion-r3",
         "meta_crossfit_protocol": "fully_nested_v1",
         "cache_key": cache_key,
         "training_subjects": sorted(training_subjects),
@@ -1001,6 +1263,27 @@ def test_nested_single_seed_epoch_pipeline_replay(tmp_path, monkeypatch) -> None
             "maximum_duration_ceiling_seconds": 60,
             "grid_seconds": 15,
             "fixed_lag_seconds": 60,
+            "use_semi_markov": False,
+            "ema_half_life_seconds": 12,
+            "high_threshold": 0.20,
+            "low_threshold": 0.10,
+            "gap_merge_seconds": 30,
+            "transition_threshold": 0.30,
+            "semi_markov_duration_weight": 1.0,
+            "candidate_minimum_seconds": 3,
+            "candidate_maximum_seconds": 14_400,
+            "jitter_seconds": [0],
+            "maximum_variants_per_event": 1,
+            "maximum_candidates_per_hour": 20,
+            "deduplication_iou": 0.9,
+        },
+        "decoder_search": {
+            "high_threshold": [0.20],
+            "low_threshold": [0.10],
+            "ema_half_life_seconds": [12],
+            "gap_merge_seconds": [30],
+            "transition_threshold": [0.30],
+            "semi_markov_duration_weight": [1.0],
         },
         "hierarchical": {"verifier_crossfit_partitions": 3},
         "final_training": {"state_seeds": [2026]},
@@ -1224,6 +1507,36 @@ def test_boundary_jitter_is_limited_and_normalized_per_true_event() -> None:
     assert len(augmented) == 5
     assert set(augmented["proposal_id"]) == {"best"}
     assert np.isclose(augmented["sample_weight"].sum(), 1.0)
+
+
+def test_boundary_event_identity_is_scoped_by_subject_and_session() -> None:
+    proposals = pd.DataFrame(
+        {
+            "proposal_id": ["morning", "evening"],
+            "subject_key": ["subject", "subject"],
+            "session_id": ["morning", "evening"],
+            "coarse_start_ms": [0, 100_000],
+            "coarse_end_ms": [10_000, 110_000],
+            "matched_event_id": ["meal", "meal"],
+            "max_iou": [0.9, 0.9],
+        }
+    )
+    events = pd.DataFrame(
+        {
+            "subject_key": ["subject", "subject"],
+            "session_id": ["morning", "evening"],
+            "event_id": ["meal", "meal"],
+            "start_ms": [1_000, 102_000],
+            "end_ms": [9_000, 108_000],
+        }
+    )
+    attached = _attach_truth_boundaries(proposals, events)
+    assert attached["truth_start_ms"].tolist() == [1_000, 102_000]
+    augmented = augment_boundary_training_proposals(attached)
+    assert set(augmented["proposal_id"]) == {"morning", "evening"}
+    assert augmented.groupby(["subject_key", "session_id", "matched_event_id"])[
+        "sample_weight"
+    ].sum().eq(1.0).all()
 
 
 def test_boundary_refinement_enforces_neighbor_safety_gap() -> None:
@@ -1593,14 +1906,14 @@ def test_dataset_and_raw_preprocessor_share_completed_block_phase(tmp_path) -> N
         geometry=geometry,
     )
     raw_session = RawSessionInput(
-        "s",
-        "d",
-        motion_time,
-        motion_values,
-        np.ones_like(motion_values, dtype=bool),
-        ppg_time,
-        ppg_values,
-        np.ones(len(ppg_values), dtype=bool),
+        subject_key="s",
+        session_id="d",
+        motion_timestamp_ms=motion_time,
+        motion_values=motion_values,
+        motion_mask=np.ones_like(motion_values, dtype=bool),
+        ppg_timestamp_ms=ppg_time,
+        ppg_values=ppg_values,
+        ppg_mask=np.ones(len(ppg_values), dtype=bool),
     )
     raw_batch = list(preprocessor.iter_state_batches(raw_session))[-1]
     torch.testing.assert_close(
@@ -1640,14 +1953,66 @@ def test_motion_validity_is_a_true_sampling_ratio() -> None:
 def test_raw_session_validation_rejects_nonfinite_valid_values() -> None:
     with pytest.raises(ValueError, match="finite"):
         RawSessionInput(
-            "s",
-            "d",
-            np.asarray([0]),
-            np.asarray([[np.nan] * 6], dtype=np.float32),
-            np.ones((1, 6), dtype=bool),
-            np.asarray([], dtype=np.int64),
-            np.asarray([], dtype=np.float32),
-            np.asarray([], dtype=bool),
+            subject_key="s",
+            session_id="d",
+            motion_timestamp_ms=np.asarray([0]),
+            motion_values=np.asarray([[np.nan] * 6], dtype=np.float32),
+            motion_mask=np.ones((1, 6), dtype=bool),
+            ppg_timestamp_ms=np.asarray([], dtype=np.int64),
+            ppg_values=np.asarray([], dtype=np.float32),
+            ppg_mask=np.asarray([], dtype=bool),
+        ).validated()
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"schema_version": "statsfusion-raw-v1"}, "schema_version"),
+        ({"timestamp_unit": "s"}, "milliseconds"),
+        (
+            {
+                "motion_channel_order": (
+                    "gyro_x",
+                    "gyro_y",
+                    "gyro_z",
+                    "acc_x",
+                    "acc_y",
+                    "acc_z",
+                )
+            },
+            "channel order",
+        ),
+        ({"unit_contract_id": "unknown"}, "sensor units"),
+        ({"resampling_state": "resampled"}, "native, unresampled"),
+    ],
+)
+def test_raw_session_v2_contract_rejects_unknown_semantics(override, message) -> None:
+    arguments = {
+        "subject_key": "s",
+        "session_id": "d",
+        "motion_timestamp_ms": np.arange(4, dtype=np.int64) * 10,
+        "motion_values": np.zeros((4, 6), dtype=np.float32),
+        "motion_mask": np.ones((4, 6), dtype=bool),
+        "ppg_timestamp_ms": np.arange(4, dtype=np.int64) * 20,
+        "ppg_values": np.zeros(4, dtype=np.float32),
+        "ppg_mask": np.ones(4, dtype=bool),
+        **override,
+    }
+    with pytest.raises(ValueError, match=message):
+        RawSessionInput(**arguments).validated()
+
+
+def test_raw_session_v2_contract_rejects_out_of_distribution_sampling_rate() -> None:
+    with pytest.raises(ValueError, match="sampling rate"):
+        RawSessionInput(
+            subject_key="s",
+            session_id="d",
+            motion_timestamp_ms=np.arange(4, dtype=np.int64) * 100,
+            motion_values=np.zeros((4, 6), dtype=np.float32),
+            motion_mask=np.ones((4, 6), dtype=bool),
+            ppg_timestamp_ms=np.asarray([], dtype=np.int64),
+            ppg_values=np.asarray([], dtype=np.float32),
+            ppg_mask=np.asarray([], dtype=bool),
         ).validated()
 
 
@@ -1656,14 +2021,14 @@ def test_raw_session_anchors_preserve_training_session_phase() -> None:
     last_ms = 12_780
     timestamps = np.arange(first_ms, last_ms + 1, 10, dtype=np.int64)
     session = RawSessionInput(
-        "s",
-        "d",
-        timestamps,
-        np.zeros((len(timestamps), 6), dtype=np.float32),
-        np.ones((len(timestamps), 6), dtype=bool),
-        np.asarray([], dtype=np.int64),
-        np.asarray([], dtype=np.float32),
-        np.asarray([], dtype=bool),
+        subject_key="s",
+        session_id="d",
+        motion_timestamp_ms=timestamps,
+        motion_values=np.zeros((len(timestamps), 6), dtype=np.float32),
+        motion_mask=np.ones((len(timestamps), 6), dtype=bool),
+        ppg_timestamp_ms=np.asarray([], dtype=np.int64),
+        ppg_values=np.asarray([], dtype=np.float32),
+        ppg_mask=np.asarray([], dtype=bool),
     ).validated()
     scaler = FoldRobustScaler(
         STATS_FEATURE_COLUMNS,
@@ -1726,14 +2091,14 @@ def test_canonical_session_grid_does_not_restart_at_fragment_boundaries(tmp_path
     ppg_time = np.concatenate([part[0] for part in ppg_parts])
     ppg_values = np.concatenate([part[1] for part in ppg_parts])
     session = RawSessionInput(
-        "s",
-        "d",
-        motion_time,
-        motion_values,
-        np.ones_like(motion_values, dtype=bool),
-        ppg_time,
-        ppg_values,
-        np.ones(len(ppg_values), dtype=bool),
+        subject_key="s",
+        session_id="d",
+        motion_timestamp_ms=motion_time,
+        motion_values=motion_values,
+        motion_mask=np.ones_like(motion_values, dtype=bool),
+        ppg_timestamp_ms=ppg_time,
+        ppg_values=ppg_values,
+        ppg_mask=np.ones(len(ppg_values), dtype=bool),
     )
     scaler = FoldRobustScaler(
         STATS_FEATURE_COLUMNS, np.zeros(12), np.ones(12), ("train",)
@@ -1744,6 +2109,33 @@ def test_canonical_session_grid_does_not_restart_at_fragment_boundaries(tmp_path
         geometry=SequenceGeometry(),
     )
     assert preprocessor.anchors(session).tolist() == expected.tolist()
+
+
+def test_canonical_targets_do_not_cross_sessions_for_same_subject(tmp_path) -> None:
+    segments = pd.DataFrame(
+        {
+            "segment_id": ["g0", "g1"],
+            "session_id": ["d0", "d1"],
+            "segment_path": [str(tmp_path / "missing0.npz"), str(tmp_path / "missing1.npz")],
+            "subject_key": ["s", "s"],
+            "start_ms": [0, 0],
+            "end_ms": [12_000, 12_000],
+        }
+    )
+    events = pd.DataFrame(
+        {
+            "event_id": ["e0"],
+            "subject_key": ["s"],
+            "session_id": ["d0"],
+            "start_ms": [0],
+            "end_ms": [6_000],
+            "valid_duration": [True],
+            "evaluable": [True],
+        }
+    )
+    anchors = build_statsfusion_session_anchor_index(segments, events)
+    assert anchors.loc[anchors["session_id"].eq("d0"), "state_target"].max() == 1.0
+    assert anchors.loc[anchors["session_id"].eq("d1"), "state_target"].max() == 0.0
 
 
 def test_historical_statistics_padding_marks_all_features_missing() -> None:
@@ -1830,7 +2222,9 @@ def test_selector_epoch_metrics_use_trailing_robust_window() -> None:
             "event_f1": 0.1,
             "state_fragment_count": 20.0,
             "ece": 0.04,
-            "window_auprc": 0.2,
+            "subject_macro_soft_bce": 0.4,
+            "soft_bce_standard_error": 0.02,
+            "center_window_auprc": 0.2,
         },
         {
             "candidate_recall": 0.9,
@@ -1838,7 +2232,9 @@ def test_selector_epoch_metrics_use_trailing_robust_window() -> None:
             "event_f1": 0.8,
             "state_fragment_count": 80.0,
             "ece": 0.2,
-            "window_auprc": 0.9,
+            "subject_macro_soft_bce": 0.3,
+            "soft_bce_standard_error": 0.02,
+            "center_window_auprc": 0.9,
         },
         {
             "candidate_recall": 0.3,
@@ -1846,7 +2242,9 @@ def test_selector_epoch_metrics_use_trailing_robust_window() -> None:
             "event_f1": 0.2,
             "state_fragment_count": 25.0,
             "ece": 0.05,
-            "window_auprc": 0.3,
+            "subject_macro_soft_bce": 0.35,
+            "soft_bce_standard_error": 0.02,
+            "center_window_auprc": 0.3,
         },
     ]
 
@@ -1897,6 +2295,84 @@ def test_semi_markov_cannot_chain_eating_segments_past_maximum_duration() -> Non
         assert all(end - start <= 30_000 for start, end, _ in events)
 
 
+@pytest.mark.parametrize("lag_seconds", [0, 15, 30, 60])
+def test_semi_markov_random_sequences_always_respect_duration_bounds(
+    lag_seconds: int,
+) -> None:
+    prior = TruncatedLogNormalDurationPrior(
+        log_mean=float(np.log(45.0)),
+        log_standard_deviation=0.5,
+        minimum_seconds=15.0,
+        maximum_seconds=75.0,
+    )
+    decoder = FixedLagSemiMarkovDecoder(
+        prior, grid_seconds=15, fixed_lag_seconds=lag_seconds
+    )
+    rng = np.random.default_rng(2026 + lag_seconds)
+    cases = [
+        np.full(40, 0.99),
+        np.tile(np.asarray([0.99, 0.01]), 20),
+        np.full(40, 0.01),
+        *[rng.uniform(0.0, 1.0, size=length) for length in range(1, 50)],
+    ]
+    for probability in cases:
+        timestamps = np.arange(1, len(probability) + 1, dtype=np.int64) * 15_000
+        for start, end, _ in decoder.decode_events(timestamps, probability):
+            assert 15_000 <= end - start <= 75_000
+
+
+def test_three_second_candidate_can_match_two_second_truth_strictly_above_iou_threshold() -> None:
+    windows = pd.DataFrame(
+        {
+            "subject_key": ["s", "s"],
+            "session_id": ["d", "d"],
+            "timestamp_ms": [3_000, 6_000],
+            "state_probability": [0.9, 0.0],
+            "onset_probability": [0.0, 0.0],
+            "offset_probability": [0.0, 0.0],
+        }
+    )
+    prior = TruncatedLogNormalDurationPrior(
+        log_mean=float(np.log(30.0)),
+        log_standard_deviation=0.5,
+        minimum_seconds=15.0,
+        maximum_seconds=60.0,
+    )
+    proposals = generate_event_candidates_v4(
+        windows,
+        FixedLagSemiMarkovDecoder(prior, grid_seconds=15, fixed_lag_seconds=60),
+        {
+            "use_semi_markov": False,
+            "ema_half_life_seconds": 0,
+            "high_threshold": 0.5,
+            "low_threshold": 0.2,
+            "gap_merge_seconds": 0,
+            "transition_threshold": 0.9,
+            "candidate_minimum_seconds": 3,
+            "candidate_maximum_seconds": 14_400,
+            "grid_seconds": 15,
+            "jitter_seconds": [0],
+            "maximum_variants_per_event": 1,
+            "maximum_candidates_per_hour": 20,
+            "deduplication_iou": 0.9,
+        },
+        split_role="test",
+    )
+    truth = pd.DataFrame(
+        {
+            "subject_key": ["s"],
+            "session_id": ["d"],
+            "start_ms": [500],
+            "end_ms": [2_500],
+        }
+    )
+    metrics, _ = evaluate_events(truth, proposals.rename(columns={
+        "coarse_start_ms": "start_ms",
+        "coarse_end_ms": "end_ms",
+    }))
+    assert metrics["true_positive"] == 1
+
+
 def test_sequence_dataset_accepts_empty_unlabeled_event_frame() -> None:
     anchors = pd.DataFrame(
         {
@@ -1945,6 +2421,7 @@ def test_sequence_dataset_masks_ignore_events_from_state_and_boundary_training()
     events = pd.DataFrame(
         {
             "subject_key": ["s", "s"],
+            "session_id": ["d", "d"],
             "start_ms": [0, 30_000],
             "end_ms": [9_000, 40_000],
             "valid_duration": [True, True],
@@ -1965,9 +2442,12 @@ def test_sequence_dataset_masks_ignore_events_from_state_and_boundary_training()
     )
     assert len(dataset.events) == 1
     assert len(dataset.ignore_events) == 1
-    assert dataset.anchors["state_loss_mask"].tolist() == [0.0, 0.0, 0.0, 1.0]
+    assert dataset.anchors["state_loss_mask"].tolist() == [0.0, 0.0, 0.0, 0.0]
     assert dataset.anchors["start_loss_mask"].tolist() == [0.0, 0.0, 0.0, 0.0]
-    assert dataset.anchors["end_loss_mask"].tolist() == [1.0, 1.0, 0.0, 0.0]
+    assert dataset.anchors["end_loss_mask"].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert dataset.anchors["smooth_loss_mask"].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert dataset.anchors["start_target"].tolist() == [0.0, 0.0, 0.0, 0.0]
+    assert dataset.anchors["end_target"].tolist() == [0.0, 0.0, 0.0, 0.0]
 
 
 def test_duration_prior_uses_only_evaluable_truth() -> None:

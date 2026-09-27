@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import warnings
+from pathlib import Path
 
 import _bootstrap  # noqa: F401
 import numpy as np
@@ -21,6 +23,7 @@ from bme_eating.data.stats_fusion_preprocess import (
     StatsFusionRawSessionPreprocessor,
 )
 from bme_eating.data.stats_fusion_sequence import SequenceGeometry, StatsFusionSequenceDataset
+from bme_eating.hierarchical_artifacts import write_json_atomic
 from bme_eating.models.factory import build_state_model
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
 
@@ -29,9 +32,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Replay one real multi-fragment session through canonical v4 preprocessing"
     )
-    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion.yaml")
+    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion_r3.yaml")
     parser.add_argument("--segment-id")
     parser.add_argument("--session-id")
+    parser.add_argument("--output")
     args = parser.parse_args()
     config = load_config(args.config)
     _, input_root, output_root = resolve_artifact_roots(config)
@@ -109,14 +113,14 @@ def main() -> None:
         int(selected["end_ms"].max()),
     )
     raw = RawSessionInput(
-        subject,
-        session_id,
-        payload["motion_timestamp_ms"],
-        payload["motion_values"],
-        payload["motion_mask"],
-        payload["ppg_timestamp_ms"],
-        payload["ppg_values"],
-        payload["ppg_mask"],
+        subject_key=subject,
+        session_id=session_id,
+        motion_timestamp_ms=payload["motion_timestamp_ms"],
+        motion_values=payload["motion_values"],
+        motion_mask=payload["motion_mask"],
+        ppg_timestamp_ms=payload["ppg_timestamp_ms"],
+        ppg_values=payload["ppg_values"],
+        ppg_mask=payload["ppg_mask"],
     )
     preprocessor = StatsFusionRawSessionPreprocessor(
         normalization=normalization,
@@ -189,21 +193,24 @@ def main() -> None:
     )
     if repeat_error > 1e-6:
         raise RuntimeError(f"Real-session repeated inference differs by {repeat_error}")
-    print(
-        json.dumps(
-            {
-                "protocol_version": "statsfusion-r2",
-                "session_id": session_id,
-                "fragment_count": len(selected),
-                "subject_key": subject,
-                "endpoint_ms": endpoint_ms,
-                "preprocessing_max_errors": errors,
-                "repeat_logit_max_error": repeat_error,
-                "device": str(device),
-            },
-            indent=2,
-        )
-    )
+    report = {
+        "protocol_version": "statsfusion-r3",
+        "session_id": session_id,
+        "fragment_count": len(selected),
+        "subject_key": subject,
+        "endpoint_ms": endpoint_ms,
+        "sampling_diagnostics": raw.sampling_diagnostics(),
+        "preprocessing_max_errors": errors,
+        "repeat_logit_max_error": repeat_error,
+        "device": str(device),
+    }
+    if args.output:
+        report_path = Path(args.output).expanduser().resolve()
+    else:
+        identity = hashlib.sha256(f"{subject}\0{session_id}".encode()).hexdigest()[:16]
+        report_path = output_root / "diagnostics" / "raw_session_replay" / f"{identity}.json"
+    write_json_atomic(report_path, report)
+    print(json.dumps({**report, "report_path": str(report_path)}, indent=2))
 
 
 if __name__ == "__main__":

@@ -77,6 +77,8 @@ def build_motion_blocks(
     first_timestamp_ms: int,
     steps: int,
     step_seconds: int,
+    rotation_matrix: np.ndarray | None = None,
+    gyro_dropout: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     sampled, sampled_mask = _sample_grid(
         timestamp_ms,
@@ -86,6 +88,18 @@ def build_motion_blocks(
         steps * step_seconds,
         100,
     )
+    if rotation_matrix is not None:
+        rotation = np.asarray(rotation_matrix, dtype=np.float32)
+        if rotation.shape != (3, 3) or not np.allclose(rotation @ rotation.T, np.eye(3)):
+            raise ValueError("Motion augmentation requires an orthogonal 3x3 rotation")
+        sampled[:, :3] = sampled[:, :3] @ rotation.T
+        sampled[:, 3:6] = sampled[:, 3:6] @ rotation.T
+        permutation = np.abs(rotation).astype(bool)
+        sampled_mask[:, :3] = sampled_mask[:, :3] @ permutation.T
+        sampled_mask[:, 3:6] = sampled_mask[:, 3:6] @ permutation.T
+    if gyro_dropout:
+        sampled[:, 3:6] = 0.0
+        sampled_mask[:, 3:6] = False
     sampled = np.clip(
         (sampled - normalization.motion_median) / normalization.motion_iqr,
         -10.0,
@@ -149,7 +163,19 @@ def build_ppg_blocks(
     return blocks, quality, valid, mapping, block_end_indices
 
 
-@dataclass(frozen=True)
+RAW_SESSION_SCHEMA_VERSION = "statsfusion-raw-v2"
+MOTION_CHANNEL_ORDER = (
+    "acc_x",
+    "acc_y",
+    "acc_z",
+    "gyro_x",
+    "gyro_y",
+    "gyro_z",
+)
+NATIVE_UNIT_CONTRACT = "v2-native-source-units-v1"
+
+
+@dataclass(frozen=True, kw_only=True)
 class RawSessionInput:
     subject_key: str
     session_id: str
@@ -159,6 +185,29 @@ class RawSessionInput:
     ppg_timestamp_ms: np.ndarray
     ppg_values: np.ndarray
     ppg_mask: np.ndarray
+    schema_version: str = RAW_SESSION_SCHEMA_VERSION
+    timestamp_unit: str = "ms"
+    motion_channel_order: tuple[str, ...] = MOTION_CHANNEL_ORDER
+    unit_contract_id: str = NATIVE_UNIT_CONTRACT
+    resampling_state: str = "native"
+
+    def sampling_diagnostics(self) -> dict[str, float | int | str | None]:
+        def inferred(timestamps: np.ndarray) -> float | None:
+            values = np.asarray(timestamps, dtype=np.int64).reshape(-1)
+            if len(values) < 3:
+                return None
+            return float(1000.0 / np.median(np.diff(values)))
+
+        return {
+            "schema_version": self.schema_version,
+            "timestamp_unit": self.timestamp_unit,
+            "unit_contract_id": self.unit_contract_id,
+            "resampling_state": self.resampling_state,
+            "motion_samples": len(self.motion_timestamp_ms),
+            "ppg_samples": len(self.ppg_timestamp_ms),
+            "motion_inferred_hz": inferred(self.motion_timestamp_ms),
+            "ppg_inferred_hz": inferred(self.ppg_timestamp_ms),
+        }
 
     def validated(self) -> RawSessionInput:
         motion_time = np.asarray(self.motion_timestamp_ms, dtype=np.int64).reshape(-1)
@@ -167,6 +216,16 @@ class RawSessionInput:
         ppg_time = np.asarray(self.ppg_timestamp_ms, dtype=np.int64).reshape(-1)
         ppg_values = np.asarray(self.ppg_values, dtype=np.float32).reshape(-1)
         ppg_mask = np.asarray(self.ppg_mask, dtype=bool).reshape(-1)
+        if self.schema_version != RAW_SESSION_SCHEMA_VERSION:
+            raise ValueError("Raw session uses an incompatible schema_version")
+        if self.timestamp_unit != "ms":
+            raise ValueError("Raw session timestamps must use milliseconds")
+        if tuple(self.motion_channel_order) != MOTION_CHANNEL_ORDER:
+            raise ValueError("Raw motion channel order is incompatible with the model bundle")
+        if self.unit_contract_id != NATIVE_UNIT_CONTRACT:
+            raise ValueError("Raw session sensor units do not match the training contract")
+        if self.resampling_state != "native":
+            raise ValueError("Raw session input must contain native, unresampled samples")
         if not str(self.subject_key) or not str(self.session_id):
             raise ValueError("Raw session subject_key and session_id must be non-empty")
         if motion_values.ndim != 2 or motion_values.shape[1] != 6:
@@ -178,6 +237,18 @@ class RawSessionInput:
         for name, timestamps in (("motion", motion_time), ("PPG", ppg_time)):
             if len(timestamps) and np.any(np.diff(timestamps) <= 0):
                 raise ValueError(f"Raw {name} timestamps must be strictly increasing")
+        for name, timestamps, lower_hz, upper_hz in (
+            ("motion", motion_time, 80.0, 120.0),
+            ("PPG", ppg_time, 40.0, 60.0),
+        ):
+            if len(timestamps) >= 3:
+                median_step_ms = float(np.median(np.diff(timestamps)))
+                inferred_hz = 1000.0 / median_step_ms
+                if not lower_hz <= inferred_hz <= upper_hz:
+                    raise ValueError(
+                        f"Raw {name} sampling rate {inferred_hz:.3f} Hz is outside "
+                        f"the supported [{lower_hz:.0f}, {upper_hz:.0f}] Hz range"
+                    )
         if not len(motion_time) and not len(ppg_time):
             raise ValueError("Raw session contains no observations")
         if np.any(motion_mask & ~np.isfinite(motion_values)):
@@ -187,14 +258,19 @@ class RawSessionInput:
         motion_values = np.where(motion_mask, motion_values, 0.0).astype(np.float32)
         ppg_values = np.where(ppg_mask, ppg_values, 0.0).astype(np.float32)
         return RawSessionInput(
-            str(self.subject_key),
-            str(self.session_id),
-            motion_time,
-            motion_values,
-            motion_mask,
-            ppg_time,
-            ppg_values,
-            ppg_mask,
+            subject_key=str(self.subject_key),
+            session_id=str(self.session_id),
+            motion_timestamp_ms=motion_time,
+            motion_values=motion_values,
+            motion_mask=motion_mask,
+            ppg_timestamp_ms=ppg_time,
+            ppg_values=ppg_values,
+            ppg_mask=ppg_mask,
+            schema_version=self.schema_version,
+            timestamp_unit=self.timestamp_unit,
+            motion_channel_order=tuple(self.motion_channel_order),
+            unit_contract_id=self.unit_contract_id,
+            resampling_state=self.resampling_state,
         )
 
 

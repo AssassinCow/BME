@@ -95,6 +95,112 @@ def _minimum_event_distance(timestamp_ms: np.ndarray, events: pd.DataFrame) -> n
     return (distance / 1000.0).astype(np.float32)
 
 
+def assign_event_sessions(
+    events: pd.DataFrame,
+    segments: pd.DataFrame,
+    *,
+    causal_support_seconds: int = 60,
+) -> pd.DataFrame:
+    required_events = {"event_id", "subject_key", "start_ms", "end_ms", "valid_duration"}
+    required_segments = {"subject_key", "session_id", "start_ms", "end_ms"}
+    missing_events = required_events - set(events.columns)
+    missing_segments = required_segments - set(segments.columns)
+    if missing_events:
+        raise ValueError(f"Session assignment events are missing columns: {sorted(missing_events)}")
+    if missing_segments:
+        raise ValueError(f"Session assignment segments are missing columns: {sorted(missing_segments)}")
+    if causal_support_seconds < 0:
+        raise ValueError("Causal event support must be non-negative")
+    if events.empty:
+        output = events.copy()
+        output["session_id"] = pd.Series(dtype=str)
+        output["source_event_key"] = pd.Series(dtype=str)
+        output["session_link_kind"] = pd.Series(dtype=str)
+        return output
+    existing = "session_id" in events and events["session_id"].fillna("").astype(str).ne("").all()
+    if existing:
+        output = events.copy()
+        if "source_event_key" not in output:
+            output["source_event_key"] = (
+                output["subject_key"].astype(str)
+                + "|"
+                + output["session_id"].astype(str)
+                + "|"
+                + output["event_id"].astype(str)
+            )
+        if "session_link_kind" not in output:
+            output["session_link_kind"] = "preassigned"
+        return output
+    if events.duplicated(["subject_key", "event_id"]).any():
+        raise RuntimeError("Events without session_id require unique subject/event identities")
+
+    sessions_by_subject: dict[str, list[tuple[str, np.ndarray]]] = {}
+    for (subject_key, session_id), group in segments.groupby(
+        ["subject_key", "session_id"], sort=False
+    ):
+        intervals = group[["start_ms", "end_ms"]].to_numpy(dtype=np.int64)
+        sessions_by_subject.setdefault(str(subject_key), []).append((str(session_id), intervals))
+
+    support_ms = int(causal_support_seconds) * 1000
+    rows: list[dict[str, object]] = []
+    for event in events.itertuples(index=False):
+        payload = event._asdict()
+        subject_key = str(event.subject_key)
+        event_id = str(event.event_id)
+        start_ms = int(event.start_ms)
+        end_ms = int(event.end_ms)
+        valid_duration = bool(event.valid_duration) and end_ms > start_ms
+        evaluable = bool(
+            getattr(event, "evaluable", getattr(event, "coverage", None) == "full")
+        )
+        source_event_key = f"{subject_key}|{event_id}"
+        session_scores: list[tuple[str, int, int]] = []
+        support_end_ms = end_ms + support_ms if valid_duration else max(start_ms, end_ms)
+        support_start_ms = min(start_ms, end_ms)
+        for session_id, intervals in sessions_by_subject.get(subject_key, []):
+            event_overlap = int(
+                np.maximum(
+                    0,
+                    np.minimum(end_ms, intervals[:, 1])
+                    - np.maximum(start_ms, intervals[:, 0]),
+                ).sum()
+            ) if valid_duration else 0
+            support_overlap = int(
+                np.maximum(
+                    0,
+                    np.minimum(support_end_ms, intervals[:, 1])
+                    - np.maximum(support_start_ms, intervals[:, 0]),
+                ).sum()
+            ) if support_end_ms > support_start_ms else 0
+            if support_overlap > 0:
+                session_scores.append((session_id, event_overlap, support_overlap))
+        if valid_duration and evaluable:
+            direct = [score for score in session_scores if score[1] > 0]
+            if len(direct) != 1:
+                raise RuntimeError(
+                    "Evaluable truth must overlap exactly one session; "
+                    f"event {source_event_key} overlaps {len(direct)}"
+                )
+            selected = [(direct[0][0], "truth_unique")]
+        elif session_scores:
+            selected = [
+                (session_id, "ignore_support" if valid_duration else "invalid_support")
+                for session_id, _, _ in sorted(session_scores, key=lambda value: value[0])
+            ]
+        else:
+            selected = [(f"__unobserved__:{event_id}", "unobserved")]
+        for session_id, link_kind in selected:
+            rows.append(
+                {
+                    **payload,
+                    "session_id": session_id,
+                    "source_event_key": source_event_key,
+                    "session_link_kind": link_kind,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
 def build_anchor_index(
     segments: pd.DataFrame,
     events: pd.DataFrame,
@@ -295,10 +401,19 @@ def build_statsfusion_session_anchor_index(
     missing_segments = required_segments - set(segments.columns)
     if missing_segments:
         raise ValueError(f"StatsFusion segments are missing columns: {sorted(missing_segments)}")
-    required_events = {"event_id", "subject_key", "start_ms", "end_ms", "valid_duration"}
+    required_events = {
+        "event_id",
+        "subject_key",
+        "session_id",
+        "start_ms",
+        "end_ms",
+        "valid_duration",
+    }
     missing_events = required_events - set(events.columns)
     if len(events) and missing_events:
         raise ValueError(f"StatsFusion events are missing columns: {sorted(missing_events)}")
+    if not len(events):
+        events = events.reindex(columns=sorted(set(events.columns) | required_events))
     if output_step_seconds <= 0:
         raise ValueError("StatsFusion output step must be positive")
     step_ms = int(output_step_seconds * 1000)
@@ -420,6 +535,7 @@ def build_statsfusion_session_anchor_index(
 
         subject_events = valid_events[
             valid_events["subject_key"].astype(str).eq(str(subject_key))
+            & valid_events["session_id"].astype(str).eq(str(session_id))
             & (valid_events["end_ms"].astype(np.int64) > first_ms)
             & (valid_events["start_ms"].astype(np.int64) < last_ms)
         ]

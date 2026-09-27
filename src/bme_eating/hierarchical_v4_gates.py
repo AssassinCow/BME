@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ import pandas as pd
 import yaml
 
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
+from bme_eating.v4_protocol import PROTOCOL_VERSION
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -38,8 +40,7 @@ def verify_gate_evidence(output_base: Path, report: dict[str, Any]) -> None:
             for item in value:
                 collect(item)
 
-    collect(report.get("evidence_sha256", {}))
-    collect(report.get("folds", []))
+    collect(report)
     if not evidence:
         raise RuntimeError("Gate report contains no hash-locked evidence")
     for item in evidence:
@@ -67,21 +68,35 @@ def _validate_ppg_source_run(
     output_root: Path,
     run_name: str,
     *,
-    expected_ablation: str,
+    expected_ablations: set[str],
     expected_use_ppg: bool,
-) -> Path:
+) -> tuple[Path, dict[str, Any]]:
     config_path = output_root / "experiments" / run_name / "fold_0" / "resolved_config.yaml"
     if not config_path.is_file():
         raise FileNotFoundError(config_path)
     config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     experiment = config.get("experiment", {})
-    if experiment.get("protocol_version") != "statsfusion-r2":
-        raise RuntimeError(f"{expected_ablation} source run must use statsfusion-r2")
-    if str(experiment.get("ablation_id", "")) != expected_ablation:
-        raise RuntimeError(f"{expected_ablation} source run has the wrong ablation_id")
+    if experiment.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(f"PPG source run must use {PROTOCOL_VERSION}")
+    ablation = str(experiment.get("ablation_id", ""))
+    if ablation not in expected_ablations:
+        raise RuntimeError(
+            f"PPG source run has the wrong ablation_id {ablation!r}; "
+            f"expected one of {sorted(expected_ablations)}"
+        )
     if bool(config.get("model", {}).get("use_ppg", True)) != expected_use_ppg:
-        raise RuntimeError(f"{expected_ablation} source run has the wrong model.use_ppg value")
-    return config_path
+        raise RuntimeError("PPG source run has the wrong model.use_ppg value")
+    return config_path, config
+
+
+def _ppg_comparison_identity(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = deepcopy(config)
+    normalized.pop("_config_path", None)
+    experiment = normalized.get("experiment", {})
+    for key in ("name", "ablation_id", "variant", "ppg_promotion", "motion_parent"):
+        experiment.pop(key, None)
+    normalized.setdefault("model", {})["use_ppg"] = False
+    return normalized
 
 
 def evaluate_ppg_promotion(
@@ -92,21 +107,22 @@ def evaluate_ppg_promotion(
     gate: dict[str, Any],
 ) -> dict[str, Any]:
     if s2_run == s3_run:
-        raise RuntimeError("S2 and S3 promotion evidence must come from distinct runs")
-    source_configs = {
-        "S2": _validate_ppg_source_run(
+        raise RuntimeError("Motion and PPG promotion evidence must come from distinct runs")
+    motion_path, motion_config = _validate_ppg_source_run(
             output_root,
             s2_run,
-            expected_ablation="S2",
+            expected_ablations={"R3-S2", "R3-D1", "R3-D2a", "R3-D2b", "R3-D2c"},
             expected_use_ppg=False,
-        ),
-        "S3": _validate_ppg_source_run(
+        )
+    ppg_path, ppg_config = _validate_ppg_source_run(
             output_root,
             s3_run,
-            expected_ablation="S3",
+            expected_ablations={"R3-P1"},
             expected_use_ppg=True,
-        ),
-    }
+        )
+    if _ppg_comparison_identity(motion_config) != _ppg_comparison_identity(ppg_config):
+        raise RuntimeError("Motion and PPG source runs differ in fields other than PPG enablement")
+    source_configs = {"MOTION": motion_path, "PPG": ppg_path}
     s2 = _candidate_metrics(output_root, s2_run)
     s3 = _candidate_metrics(output_root, s3_run)
     evidence = {
@@ -121,7 +137,7 @@ def evaluate_ppg_promotion(
                 output_root.parent,
             ),
         }
-        for name, run in (("S2", s2_run), ("S3", s3_run))
+        for name, run in (("MOTION", s2_run), ("PPG", s3_run))
     }
     f1_delta = float(s3["state_only_f1"]) - float(s2["state_only_f1"])
     recall_delta = float(s3["candidate_recall"]) - float(s2["candidate_recall"])
@@ -143,134 +159,241 @@ def evaluate_ppg_promotion(
     }
     return {
         "schema_version": 1,
-        "protocol_version": "statsfusion-r2",
-        "source_runs": {"S2": s2_run, "S3": s3_run},
+        "protocol_version": PROTOCOL_VERSION,
+        "source_runs": {"MOTION": s2_run, "PPG": s3_run},
         "evidence_sha256": evidence,
-        "f1_delta_vs_S2": f1_delta,
-        "candidate_recall_delta_vs_S2": recall_delta,
-        "different_sensitivity_delta_vs_S2": different_delta,
+        "f1_delta_vs_motion": f1_delta,
+        "candidate_recall_delta_vs_motion": recall_delta,
+        "different_sensitivity_delta_vs_motion": different_delta,
         "checks": checks,
         "passed": all(checks.values()),
         "resolved_use_ppg": all(checks.values()),
     }
 
 
+def _fold0_run_evidence(output_root: Path, run_name: str) -> dict[str, dict[str, str]]:
+    root = output_root / "experiments" / run_name / "fold_0"
+    evidence = {
+        "resolved_config": _evidence_file(root / "resolved_config.yaml", output_root.parent),
+        "run_manifest": _evidence_file(root / "run_manifest.json", output_root.parent),
+        "candidate_metrics": _evidence_file(
+            root / "decoder" / "candidate_metrics.json", output_root.parent
+        ),
+    }
+    for name, relative in (
+        ("domain_metrics", "diagnostics/domain_metrics.json"),
+        ("state_only_per_subject", "decoder/state_only_per_subject_metrics.csv"),
+    ):
+        path = root / relative
+        if path.is_file():
+            evidence[name] = _evidence_file(path, output_root.parent)
+    return evidence
+
+
+def _fold0_run_config(output_root: Path, run_name: str) -> dict[str, Any]:
+    path = output_root / "experiments" / run_name / "fold_0" / "resolved_config.yaml"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if config.get("experiment", {}).get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError(f"Fold-0 promotion evidence must use {PROTOCOL_VERSION}")
+    return config
+
+
+def _metric_delta(candidate: dict[str, Any], baseline: dict[str, Any], name: str) -> float:
+    return float(candidate[name]) - float(baseline[name])
+
+
+def evaluate_state_promotion(
+    output_root: Path,
+    *,
+    baseline_run: str,
+    candidate_run: str,
+    gate_type: str,
+    gate: dict[str, Any],
+) -> dict[str, Any]:
+    if baseline_run == candidate_run:
+        raise ValueError("Promotion baseline and candidate runs must differ")
+    if gate_type == "ppg":
+        return evaluate_ppg_promotion(
+            output_root,
+            s2_run=baseline_run,
+            s3_run=candidate_run,
+            gate=gate,
+        )
+    if gate_type not in {"statistics", "long_context", "domain", "semi_markov"}:
+        raise ValueError(f"Unsupported StatsFusion-r3 promotion gate: {gate_type}")
+    baseline_config = _fold0_run_config(output_root, baseline_run)
+    candidate_config = _fold0_run_config(output_root, candidate_run)
+    baseline = _candidate_metrics(output_root, baseline_run)
+    candidate = _candidate_metrics(output_root, candidate_run)
+    evidence = {
+        "baseline": _fold0_run_evidence(output_root, baseline_run),
+        "candidate": _fold0_run_evidence(output_root, candidate_run),
+    }
+    f1_delta = _metric_delta(candidate, baseline, "state_only_f1")
+    recall_delta = _metric_delta(candidate, baseline, "candidate_recall")
+    different_delta = _metric_delta(candidate, baseline, "different_sensitivity")
+    same_delta = _metric_delta(candidate, baseline, "same_sensitivity")
+    fragment_reduction = 1.0 - float(candidate["state_fragment_count"]) / max(
+        float(baseline["state_fragment_count"]), 1.0
+    )
+    common_checks = {
+        "fp_per_hour": float(candidate["state_only_fp_per_hour"])
+        <= float(baseline["state_only_fp_per_hour"])
+        * float(gate.get("maximum_fp_per_hour_ratio", 1.05))
+    }
+    diagnostics: dict[str, Any] = {
+        "f1_delta": f1_delta,
+        "candidate_recall_delta": recall_delta,
+        "different_sensitivity_delta": different_delta,
+        "same_sensitivity_delta": same_delta,
+        "fragment_reduction": fragment_reduction,
+    }
+    if gate_type == "statistics":
+        checks = {
+            **common_checks,
+            "f1_gain": f1_delta >= float(gate["minimum_statistics_f1_improvement"]),
+            "different_sensitivity": different_delta
+            >= -float(gate.get("maximum_statistics_different_sensitivity_drop", 0.02)),
+        }
+    elif gate_type == "long_context":
+        checks = {
+            "recall_or_f1_fragment": bool(
+                recall_delta >= float(gate["minimum_long_context_recall_improvement"])
+                or (
+                    f1_delta >= float(gate["minimum_long_context_f1_improvement"])
+                    and fragment_reduction >= float(gate["minimum_fragment_reduction"])
+                )
+            )
+        }
+    elif gate_type == "semi_markov":
+        checks = {
+            **common_checks,
+            "recall_or_fragment": bool(
+                recall_delta >= float(gate["minimum_semi_markov_recall_improvement"])
+                or fragment_reduction >= float(gate["minimum_fragment_reduction"])
+            ),
+            "f1_non_degradation": f1_delta
+            >= -float(gate.get("maximum_ppg_f1_drop", 0.005)),
+        }
+        if bool(baseline_config.get("decoder", {}).get("use_semi_markov", False)):
+            raise RuntimeError("Semi-Markov baseline must have decoder.use_semi_markov=false")
+        if not bool(candidate_config.get("decoder", {}).get("use_semi_markov", False)):
+            raise RuntimeError("Semi-Markov candidate must have decoder.use_semi_markov=true")
+    else:
+        baseline_domain_path = (
+            output_root / "experiments" / baseline_run / "fold_0" / "diagnostics" / "domain_metrics.json"
+        )
+        candidate_domain_path = (
+            output_root / "experiments" / candidate_run / "fold_0" / "diagnostics" / "domain_metrics.json"
+        )
+        baseline_subject_path = (
+            output_root
+            / "experiments"
+            / baseline_run
+            / "fold_0"
+            / "decoder"
+            / "state_only_per_subject_metrics.csv"
+        )
+        candidate_subject_path = (
+            output_root
+            / "experiments"
+            / candidate_run
+            / "fold_0"
+            / "decoder"
+            / "state_only_per_subject_metrics.csv"
+        )
+        baseline_domain = _read_json(baseline_domain_path)
+        candidate_domain = _read_json(candidate_domain_path)
+        probability = _bootstrap_probability(
+            pd.read_csv(candidate_subject_path),
+            pd.read_csv(baseline_subject_path),
+            replicates=1000,
+            seed=2026,
+        )
+        gyro_checks: dict[str, bool] = {}
+        for stratum in ("missing", "complete"):
+            baseline_stratum = baseline_domain["gyro_strata"][stratum]
+            candidate_stratum = candidate_domain["gyro_strata"][stratum]
+            truth_count = min(
+                int(baseline_stratum["truth_count"]), int(candidate_stratum["truth_count"])
+            )
+            if truth_count >= 5:
+                gyro_checks[stratum] = float(candidate_stratum["state_only_recall"]) >= float(
+                    baseline_stratum["state_only_recall"]
+                ) - float(gate["maximum_gyro_stratum_recall_drop"])
+        diagnostics["paired_bootstrap_probability_delta_f1_positive"] = probability
+        diagnostics["gyro_checks"] = gyro_checks
+        checks = {
+            **common_checks,
+            "overall_or_different_hand_gain": bool(
+                f1_delta >= float(gate["minimum_domain_f1_improvement"])
+                or different_delta >= float(gate["minimum_different_hand_recall_improvement"])
+            ),
+            "same_hand": same_delta >= -float(gate["maximum_same_hand_recall_drop"]),
+            "gyro_strata": all(gyro_checks.values()),
+            "paired_bootstrap": probability
+            >= float(gate["minimum_positive_bootstrap_probability"]),
+        }
+    return {
+        "schema_version": 2,
+        "protocol_version": PROTOCOL_VERSION,
+        "gate_type": gate_type,
+        "source_runs": {"baseline": baseline_run, "candidate": candidate_run},
+        "source_ablations": {
+            "baseline": baseline_config.get("experiment", {}).get("ablation_id"),
+            "candidate": candidate_config.get("experiment", {}).get("ablation_id"),
+        },
+        "evidence_sha256": evidence,
+        "diagnostics": diagnostics,
+        "checks": checks,
+        "passed": all(checks.values()),
+    }
+
+
 def evaluate_fold0_ablations(
     output_root: Path,
     *,
-    s0_run: str,
-    s1_run: str,
-    s2_run: str,
-    s3_run: str,
-    s4_run: str,
-    ppg_only_run: str,
+    selected_run: str,
+    comparisons: list[tuple[str, str, str]],
     gate: dict[str, Any],
+    sensor_only_run: str,
 ) -> dict[str, Any]:
-    runs = {
-        "S0": s0_run,
-        "S1": s1_run,
-        "S2": s2_run,
-        "S3": s3_run,
-        "S4": s4_run,
-        "PPG_ONLY": ppg_only_run,
-    }
-    metrics = {name: _candidate_metrics(output_root, run) for name, run in runs.items()}
-    evidence_sha256 = {}
-    for name, run in runs.items():
-        fold_root = output_root / "experiments" / run / "fold_0"
-        evidence_sha256[name] = {
-            "run_manifest": _evidence_file(fold_root / "run_manifest.json", output_root.parent),
-            "candidate_metrics": _evidence_file(
-                fold_root / "decoder" / "candidate_metrics.json", output_root.parent
-            ),
-        }
-
-    def delta(left: str, right: str, metric: str) -> float:
-        return float(metrics[left][metric]) - float(metrics[right][metric])
-
-    statistics_checks = {
-        "f1_gain": delta("S1", "S0", "state_only_f1")
-        >= float(gate["minimum_statistics_f1_improvement"]),
-        "fp_per_hour": float(metrics["S1"]["state_only_fp_per_hour"])
-        <= float(metrics["S0"]["state_only_fp_per_hour"])
-        * float(gate["maximum_fp_per_hour_ratio"]),
-        "different_sensitivity": float(metrics["S1"]["different_sensitivity"])
-        >= float(metrics["S0"]["different_sensitivity"])
-        - float(gate.get("maximum_statistics_different_sensitivity_drop", 0.02)),
-    }
-    recall_gain = delta("S2", "S1", "candidate_recall")
-    f1_gain = delta("S2", "S1", "state_only_f1")
-    fragment_reduction = 1.0 - float(metrics["S2"]["state_fragment_count"]) / max(
-        float(metrics["S1"]["state_fragment_count"]), 1.0
-    )
-    long_context_checks = {
-        "recall_route": recall_gain >= float(gate["minimum_long_context_recall_improvement"]),
-        "f1_fragment_route": f1_gain >= float(gate["minimum_long_context_f1_improvement"])
-        and fragment_reduction >= float(gate["minimum_fragment_reduction"]),
-    }
-    ppg_evidence = {
-        "f1_delta_vs_S2": delta("S3", "S2", "state_only_f1"),
-        "candidate_recall_delta_vs_S2": delta("S3", "S2", "candidate_recall"),
-        "different_sensitivity_delta_vs_S2": delta("S3", "S2", "different_sensitivity"),
-        "motion_only_f1": float(metrics["S0"]["state_only_f1"]),
-        "ppg_only_f1": float(metrics["PPG_ONLY"]["state_only_f1"]),
-        "motion_ppg_f1": float(metrics["S3"]["state_only_f1"]),
-    }
-    ppg_checks = {
-        "quality_route": (
-            ppg_evidence["f1_delta_vs_S2"] >= float(gate.get("minimum_ppg_f1_improvement", 0.005))
-            or (
-                ppg_evidence["candidate_recall_delta_vs_S2"]
-                >= float(gate.get("minimum_ppg_candidate_recall_improvement", 0.010))
-                and ppg_evidence["f1_delta_vs_S2"] >= -float(gate.get("maximum_ppg_f1_drop", 0.005))
-            )
-        ),
-        "fp_per_hour": float(metrics["S3"]["state_only_fp_per_hour"])
-        <= float(metrics["S2"]["state_only_fp_per_hour"])
-        * float(gate["maximum_fp_per_hour_ratio"]),
-        "different_sensitivity": ppg_evidence["different_sensitivity_delta_vs_S2"]
-        >= -float(gate.get("maximum_ppg_different_sensitivity_drop", 0.02)),
-    }
-    ppg_passed = all(ppg_checks.values())
-    s4_config = yaml.safe_load(
-        (output_root / "experiments" / s4_run / "fold_0" / "resolved_config.yaml").read_text(
-            encoding="utf-8"
+    selected = _candidate_metrics(output_root, selected_run)
+    sensor = _candidate_metrics(output_root, sensor_only_run)
+    module_reports: dict[str, dict[str, Any]] = {}
+    for gate_type, baseline, candidate in comparisons:
+        key = f"{gate_type}:{candidate}"
+        if key in module_reports:
+            raise ValueError(f"Duplicate fold-0 comparison: {key}")
+        module_reports[key] = evaluate_state_promotion(
+            output_root,
+            baseline_run=baseline,
+            candidate_run=candidate,
+            gate_type=gate_type,
+            gate=gate,
         )
-    )
-    if bool(s4_config["model"].get("use_ppg", True)) != ppg_passed:
-        expected = "enabled" if ppg_passed else "disabled"
-        raise RuntimeError(f"S4 must be rebuilt from the promoted state path with PPG {expected}")
     candidate_checks = {
-        "state_calibration": bool(metrics["S4"]["state_calibration_gate_passed"]),
-        "minimum_recall": float(metrics["S4"]["candidate_recall"])
+        "state_calibration": bool(selected["state_calibration_gate_passed"]),
+        "minimum_recall": float(selected["candidate_recall"])
         >= float(gate["minimum_candidate_recall"]),
-        "same_side_not_worse_than_sensor_only": float(metrics["S4"]["same_candidate_recall"])
-        >= float(metrics["S0"]["same_candidate_recall"]) - 0.03,
+        "same_side_not_worse_than_sensor_only": float(selected["same_candidate_recall"])
+        >= float(sensor["same_candidate_recall"]) - 0.03,
         "different_side_not_worse_than_sensor_only": float(
-            metrics["S4"]["different_candidate_recall"]
+            selected["different_candidate_recall"]
         )
-        >= float(metrics["S0"]["different_candidate_recall"]) - 0.03,
+        >= float(sensor["different_candidate_recall"]) - 0.03,
     }
     report = {
-        "runs": runs,
-        "evidence_sha256": evidence_sha256,
-        "metrics": metrics,
-        "statistics_branch": {
-            "checks": statistics_checks,
-            "passed": all(statistics_checks.values()),
-        },
-        "long_context": {
-            "recall_gain": recall_gain,
-            "f1_gain": f1_gain,
-            "fragment_reduction": fragment_reduction,
-            "checks": long_context_checks,
-            "passed": any(long_context_checks.values()),
-        },
-        "ppg_ablation": {
-            **ppg_evidence,
-            "checks": ppg_checks,
-            "passed": ppg_passed,
-            "s4_use_ppg": bool(s4_config["model"].get("use_ppg", True)),
+        "schema_version": 2,
+        "protocol_version": PROTOCOL_VERSION,
+        "selected_run": selected_run,
+        "sensor_only_run": sensor_only_run,
+        "comparisons": module_reports,
+        "evidence_sha256": {
+            "selected": _fold0_run_evidence(output_root, selected_run),
+            "sensor_only": _fold0_run_evidence(output_root, sensor_only_run),
         },
         "candidate_gate": {
             "checks": candidate_checks,
@@ -278,11 +401,10 @@ def evaluate_fold0_ablations(
         },
     }
     report["passed"] = bool(
-        report["statistics_branch"]["passed"]
-        and report["long_context"]["passed"]
+        all(value["passed"] for value in module_reports.values())
         and report["candidate_gate"]["passed"]
     )
-    path = output_root / "experiments" / s4_run / "ablation" / "fold_0_report.json"
+    path = output_root / "experiments" / selected_run / "ablation" / "fold_0_report.json"
     write_json_atomic(path, report)
     return report
 

@@ -194,8 +194,9 @@ def augment_boundary_training_proposals(
     missing = required - set(positive_proposals.columns)
     if missing:
         raise ValueError(f"Boundary proposals are missing columns: {sorted(missing)}")
-    ordering = ["matched_event_id"]
-    ascending = [True]
+    event_identity = ["subject_key", "session_id", "matched_event_id"]
+    ordering = list(event_identity)
+    ascending = [True] * len(event_identity)
     for column in ("final_score", "generator_score", "max_iou"):
         if column in positive_proposals:
             ordering.append(column)
@@ -204,7 +205,7 @@ def augment_boundary_training_proposals(
     ascending.append(True)
     representatives = (
         positive_proposals.sort_values(ordering, ascending=ascending, kind="stable")
-        .drop_duplicates("matched_event_id", keep="first")
+        .drop_duplicates(event_identity, keep="first")
         .reset_index(drop=True)
     )
     rows: list[dict[str, Any]] = []

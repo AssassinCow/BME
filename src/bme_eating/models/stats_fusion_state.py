@@ -179,6 +179,16 @@ class StatsFusionStateModel(nn.Module):
         self.use_ppg = bool(config.get("use_ppg", True))
         self.use_statistics = bool(config.get("use_statistics", True))
         self.use_long_context = bool(config.get("use_long_context", True))
+        self.separate_motion_branches = bool(config.get("separate_motion_branches", False))
+        self.use_invariant_motion_branch = bool(
+            config.get("use_invariant_motion_branch", False)
+        )
+        stable_features = tuple(str(value) for value in config.get("stable_feature_columns", ()))
+        self.ppg_statistics_index = (
+            stable_features.index("local_ppg_valid_fraction")
+            if "local_ppg_valid_fraction" in stable_features
+            else None
+        )
         if not self.use_motion and not self.use_ppg:
             raise ValueError("At least one raw sensor branch must be enabled")
 
@@ -193,18 +203,48 @@ class StatsFusionStateModel(nn.Module):
         statistics_dilations = config.get("statistics_dilations", (1, 2, 4, 8))
         long_dilations = config.get("long_dilations", (1, 2, 4, 8, 16, 32))
 
-        self.motion_encoder = LocalEncoder(
-            input_channels=12,
-            stem_channels=48,
-            stem_kernel=9,
-            stem_stride=2,
-            block_channels=(64, 96, 128),
-            block_kernels=(7, 5, 3),
-            block_strides=(2, 2, 2),
-            block_dilations=(1, 2, 4),
-            embedding_dim=motion_dim,
-            dropout=dropout,
-        )
+        def motion_encoder(input_channels: int) -> LocalEncoder:
+            return LocalEncoder(
+                input_channels=input_channels,
+                stem_channels=48,
+                stem_kernel=9,
+                stem_stride=2,
+                block_channels=(64, 96, 128),
+                block_kernels=(7, 5, 3),
+                block_strides=(2, 2, 2),
+                block_dilations=(1, 2, 4),
+                embedding_dim=motion_dim,
+                dropout=dropout,
+            )
+
+        if self.separate_motion_branches:
+            self.acc_encoder = motion_encoder(6)
+            self.gyro_encoder = motion_encoder(6)
+            self.acc_tcn = CausalTCN(motion_dim, hidden_dim, motion_dilations, dropout)
+            self.gyro_tcn = CausalTCN(motion_dim, hidden_dim, motion_dilations, dropout)
+            self.acc_missing = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            self.gyro_missing = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            self.gyro_gate_network = nn.Sequential(
+                nn.Linear(2 * hidden_dim + 2, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.motion_merge_norm = nn.LayerNorm(hidden_dim)
+            nn.init.constant_(self.gyro_gate_network[-1].bias, gate_bias)
+        else:
+            self.motion_encoder = motion_encoder(12)
+            self.motion_tcn = CausalTCN(motion_dim, hidden_dim, motion_dilations, dropout)
+        if self.use_invariant_motion_branch:
+            self.invariant_motion_encoder = motion_encoder(6)
+            self.invariant_motion_tcn = CausalTCN(
+                motion_dim, hidden_dim, motion_dilations, dropout
+            )
+            self.invariant_gate_network = nn.Sequential(
+                nn.Linear(2 * hidden_dim, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            nn.init.constant_(self.invariant_gate_network[-1].bias, gate_bias)
         self.ppg_encoder = LocalEncoder(
             input_channels=2,
             stem_channels=48,
@@ -217,7 +257,6 @@ class StatsFusionStateModel(nn.Module):
             embedding_dim=ppg_dim,
             dropout=dropout,
         )
-        self.motion_tcn = CausalTCN(motion_dim, hidden_dim, motion_dilations, dropout)
         self.ppg_tcn = CausalTCN(ppg_dim, hidden_dim, ppg_dilations, dropout)
         self.ppg_missing = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         self.ppg_gate_network = nn.Sequential(
@@ -287,7 +326,8 @@ class StatsFusionStateModel(nn.Module):
 
     @property
     def short_receptive_field_seconds(self) -> int:
-        return self.motion_tcn.receptive_field_steps * self.motion_block_seconds
+        tcn = self.acc_tcn if self.separate_motion_branches else self.motion_tcn
+        return tcn.receptive_field_steps * self.motion_block_seconds
 
     @property
     def long_receptive_field_seconds(self) -> int:
@@ -297,9 +337,70 @@ class StatsFusionStateModel(nn.Module):
         motion_blocks = batch["motion_blocks"]
         motion_valid = batch["motion_valid"].to(motion_blocks.dtype)
         steps = motion_blocks.shape[1]
-        motion = self._encode_blocks(self.motion_encoder, motion_blocks)
-        motion = self.motion_tcn(motion * motion_valid.unsqueeze(-1))
-        motion_fusion_valid = motion_valid
+        acc_valid = motion_blocks[:, :, 6:9].mean(dim=(2, 3)).to(motion_blocks.dtype)
+        gyro_valid = motion_blocks[:, :, 9:12].mean(dim=(2, 3)).to(motion_blocks.dtype)
+        if self.separate_motion_branches:
+            acc_blocks = torch.cat((motion_blocks[:, :, :3], motion_blocks[:, :, 6:9]), dim=2)
+            gyro_blocks = torch.cat((motion_blocks[:, :, 3:6], motion_blocks[:, :, 9:12]), dim=2)
+            acc = self.acc_tcn(
+                self._encode_blocks(self.acc_encoder, acc_blocks) * acc_valid.unsqueeze(-1)
+            )
+            gyro = self.gyro_tcn(
+                self._encode_blocks(self.gyro_encoder, gyro_blocks) * gyro_valid.unsqueeze(-1)
+            )
+            acc = acc_valid.unsqueeze(-1) * acc + (1.0 - acc_valid).unsqueeze(
+                -1
+            ) * self.acc_missing
+            gyro = gyro_valid.unsqueeze(-1) * gyro + (1.0 - gyro_valid).unsqueeze(
+                -1
+            ) * self.gyro_missing
+            gyro_gate = gyro_valid.unsqueeze(-1) * torch.sigmoid(
+                self.gyro_gate_network(
+                    torch.cat(
+                        (acc, gyro, acc_valid.unsqueeze(-1), gyro_valid.unsqueeze(-1)), dim=-1
+                    )
+                )
+            )
+            motion = self.motion_merge_norm(acc + gyro_gate * gyro)
+            motion_fusion_valid = torch.maximum(acc_valid, gyro_valid)
+        else:
+            motion = self._encode_blocks(self.motion_encoder, motion_blocks)
+            motion = self.motion_tcn(motion * motion_valid.unsqueeze(-1))
+            motion_fusion_valid = motion_valid
+            gyro_gate = torch.zeros_like(motion)
+        invariant_gate = torch.zeros_like(motion)
+        if self.use_invariant_motion_branch:
+            values = motion_blocks[:, :, :6]
+            masks = motion_blocks[:, :, 6:12]
+            acc_values = values[:, :, :3] * masks[:, :, :3]
+            gyro_values = values[:, :, 3:6] * masks[:, :, 3:6]
+            acc_magnitude = torch.linalg.vector_norm(acc_values, dim=2)
+            gyro_magnitude = torch.linalg.vector_norm(gyro_values, dim=2)
+            acc_jerk = torch.linalg.vector_norm(
+                torch.diff(acc_values, dim=-1, prepend=acc_values[..., :1]), dim=2
+            )
+            gyro_jerk = torch.linalg.vector_norm(
+                torch.diff(gyro_values, dim=-1, prepend=gyro_values[..., :1]), dim=2
+            )
+            invariant_blocks = torch.stack(
+                (
+                    acc_magnitude,
+                    gyro_magnitude,
+                    acc_jerk,
+                    gyro_jerk,
+                    masks[:, :, :3].mean(dim=2),
+                    masks[:, :, 3:6].mean(dim=2),
+                ),
+                dim=2,
+            )
+            invariant = self.invariant_motion_tcn(
+                self._encode_blocks(self.invariant_motion_encoder, invariant_blocks)
+                * motion_fusion_valid.unsqueeze(-1)
+            )
+            invariant_gate = torch.sigmoid(
+                self.invariant_gate_network(torch.cat((motion, invariant), dim=-1))
+            )
+            motion = motion + invariant_gate * invariant
         if not self.use_motion:
             motion = torch.zeros_like(motion)
             motion_fusion_valid = torch.zeros_like(motion_valid)
@@ -374,10 +475,22 @@ class StatsFusionStateModel(nn.Module):
             + long_gate * self.long_to_hidden(long)
             + statistics_gate * self.statistics_to_hidden(statistics)
         )
-        statistics_missing_fraction = batch["statistics"][..., 12:].to(short.dtype).mean(dim=-1)
-        missing_fraction = (
-            1.0 - (motion_valid + ppg_valid_aligned + (1.0 - statistics_missing_fraction)) / 3.0
-        )
+        statistics_missing = batch["statistics"][..., 12:].to(short.dtype)
+        if not self.use_ppg and self.ppg_statistics_index is not None:
+            active_statistics = torch.ones(
+                statistics_missing.shape[-1], dtype=torch.bool, device=statistics_missing.device
+            )
+            active_statistics[self.ppg_statistics_index] = False
+            statistics_missing = statistics_missing[..., active_statistics]
+        statistics_missing_fraction = statistics_missing.mean(dim=-1)
+        active_validity: list[torch.Tensor] = []
+        if self.use_motion:
+            active_validity.append(motion_fusion_valid)
+        if self.use_ppg:
+            active_validity.append(ppg_valid_aligned)
+        if self.use_statistics:
+            active_validity.append(1.0 - statistics_missing_fraction)
+        missing_fraction = 1.0 - torch.stack(active_validity, dim=0).mean(dim=0)
         return {
             "state_logit": self.state_head(final).squeeze(-1),
             "onset_logit": self.onset_head(final).squeeze(-1),
@@ -386,8 +499,13 @@ class StatsFusionStateModel(nn.Module):
             "statistics_gate": statistics_gate.mean(dim=-1),
             "long_gate": long_gate.mean(dim=-1),
             "missing_fraction": missing_fraction,
+            "active_modality_missing_fraction": missing_fraction,
             "motion_valid_fraction": motion_valid,
             "motion_present": (motion_valid > 0).to(motion_valid.dtype),
+            "acc_valid_fraction": acc_valid,
+            "gyro_valid_fraction": gyro_valid,
+            "gyro_gate": gyro_gate.mean(dim=-1),
+            "invariant_gate": invariant_gate.mean(dim=-1),
             "ppg_valid_fraction": ppg_valid_aligned,
             "statistics_missing_fraction": statistics_missing_fraction,
         }

@@ -38,8 +38,10 @@ def causal_ema(
     probabilities: np.ndarray, half_life_seconds: float, step_seconds: float
 ) -> np.ndarray:
     values = np.asarray(probabilities, dtype=np.float64)
-    if half_life_seconds <= 0 or step_seconds <= 0:
-        raise ValueError("EMA time constants must be positive")
+    if half_life_seconds < 0 or step_seconds <= 0:
+        raise ValueError("EMA half-life must be non-negative and step size positive")
+    if half_life_seconds == 0:
+        return values.copy()
     alpha = 1.0 - np.exp(-np.log(2.0) * step_seconds / half_life_seconds)
     output = np.empty_like(values)
     if not len(values):
@@ -286,8 +288,10 @@ def generate_event_candidates_v4(
             float(config["ema_half_life_seconds"]),
             step_ms / 1000.0,
         )
-        minimum_ms = round(decoder.prior.minimum_seconds * 1000)
-        maximum_ms = round(decoder.prior.maximum_seconds * 1000)
+        minimum_ms = round(float(config.get("candidate_minimum_seconds", 3)) * 1000)
+        maximum_ms = round(float(config.get("candidate_maximum_seconds", 14_400)) * 1000)
+        if minimum_ms <= 0 or maximum_ms < minimum_ms:
+            raise ValueError("Candidate duration limits are invalid")
         seeds = _hysteresis(
             timestamps,
             smoothed,

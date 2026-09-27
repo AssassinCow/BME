@@ -183,6 +183,8 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         geometry: SequenceGeometry | None = None,
         training: bool = False,
         ppg_modality_dropout: float = 0.0,
+        gyro_modality_dropout: float = 0.0,
+        rotation_augmentation_probability: float = 0.0,
         seed: int = 2026,
     ) -> None:
         required = {
@@ -205,10 +207,17 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             ("end_target", 0.0),
             ("start_loss_mask", 1.0),
             ("end_loss_mask", 1.0),
+            ("smooth_loss_mask", 1.0),
         ):
             if name not in self.anchors:
                 self.anchors[name] = default
-        required_event_columns = {"subject_key", "start_ms", "end_ms", "valid_duration"}
+        required_event_columns = {
+            "subject_key",
+            "session_id",
+            "start_ms",
+            "end_ms",
+            "valid_duration",
+        }
         missing_event_columns = required_event_columns - set(events.columns)
         if len(events) and missing_event_columns:
             raise ValueError(
@@ -224,27 +233,20 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         self.events, self.ignore_events = partition_evaluation_events(events, subjects)
         step_ms = self.geometry.step_seconds * 1000
         for event in self.ignore_events.itertuples(index=False):
-            subject = self.anchors["subject_key"].astype(str).eq(str(event.subject_key))
+            same_session = self.anchors["subject_key"].astype(str).eq(
+                str(event.subject_key)
+            ) & self.anchors["session_id"].astype(str).eq(str(event.session_id))
             timestamps = self.anchors["timestamp_ms"].to_numpy(dtype=np.int64)
-            state_ignore = subject & (timestamps > int(event.start_ms)) & (
-                timestamps - step_ms < int(event.end_ms)
+            ignore_support = same_session & (timestamps > int(event.start_ms)) & (
+                timestamps - step_ms < int(event.end_ms) + 60_000
             )
-            onset_ignore = subject & (timestamps >= int(event.start_ms)) & (
-                timestamps <= int(event.start_ms) + 30_000
-            )
-            offset_ignore = subject & (timestamps >= int(event.end_ms)) & (
-                timestamps <= int(event.end_ms) + 60_000
-            )
-            self.anchors.loc[state_ignore, "state_loss_mask"] = 0.0
-            for target, mask, selected in (
-                ("start_target", "start_loss_mask", onset_ignore),
-                ("end_target", "end_loss_mask", offset_ignore),
-            ):
+            self.anchors.loc[
+                ignore_support,
+                ["state_loss_mask", "start_loss_mask", "end_loss_mask", "smooth_loss_mask"],
+            ] = 0.0
+            for target in ("start_target", "end_target"):
                 if target in self.anchors:
-                    self.anchors.loc[selected, target] = 0.0
-                if mask not in self.anchors:
-                    self.anchors[mask] = 1.0
-                self.anchors.loc[selected, mask] = 0.0
+                    self.anchors.loc[ignore_support, target] = 0.0
         self.normalization = normalization
         self.statistics_columns = tuple(str(value) for value in statistics_columns)
         if len(self.statistics_columns) != 24:
@@ -253,6 +255,12 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         self.ppg_modality_dropout = float(ppg_modality_dropout)
         if not 0.0 <= self.ppg_modality_dropout <= 1.0:
             raise ValueError("PPG modality dropout must be in [0, 1]")
+        self.gyro_modality_dropout = float(gyro_modality_dropout)
+        self.rotation_augmentation_probability = float(rotation_augmentation_probability)
+        if not 0.0 <= self.gyro_modality_dropout <= 1.0:
+            raise ValueError("GYRO modality dropout must be in [0, 1]")
+        if not 0.0 <= self.rotation_augmentation_probability <= 1.0:
+            raise ValueError("Rotation augmentation probability must be in [0, 1]")
         self.seed = int(seed)
         self.reader = SessionWindowReader(segments, cache_size=8)
         self.session_groups = {
@@ -298,6 +306,7 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             "state_loss_mask",
             "start_loss_mask",
             "end_loss_mask",
+            "smooth_loss_mask",
         )
         for field in fields:
             default = 1.0 if field.endswith("loss_mask") else 0.0
@@ -314,9 +323,30 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         arrays["statistics"] = statistics
         return valid, arrays
 
+    @staticmethod
+    def _proper_signed_permutations() -> tuple[np.ndarray, ...]:
+        import itertools
+
+        matrices: list[np.ndarray] = []
+        for permutation in itertools.permutations(range(3)):
+            base = np.eye(3, dtype=np.float32)[list(permutation)]
+            for signs in itertools.product((-1.0, 1.0), repeat=3):
+                matrix = np.diag(np.asarray(signs, dtype=np.float32)) @ base
+                if round(float(np.linalg.det(matrix))) == 1:
+                    matrices.append(matrix)
+        return tuple(matrices)
+
     def _motion_blocks(
-        self, payload: dict[str, np.ndarray], first_timestamp_ms: int, steps: int
+        self,
+        payload: dict[str, np.ndarray],
+        first_timestamp_ms: int,
+        steps: int,
+        rng: np.random.Generator,
     ) -> tuple[np.ndarray, np.ndarray]:
+        rotation = None
+        if self.training and rng.random() < self.rotation_augmentation_probability:
+            rotations = self._proper_signed_permutations()
+            rotation = rotations[int(rng.integers(0, len(rotations)))]
         return build_motion_blocks(
             timestamp_ms=payload["motion_timestamp_ms"],
             values=payload["motion_values"],
@@ -325,6 +355,8 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             first_timestamp_ms=first_timestamp_ms,
             steps=steps,
             step_seconds=self.geometry.step_seconds,
+            rotation_matrix=rotation,
+            gyro_dropout=(self.training and rng.random() < self.gyro_modality_dropout),
         )
 
     def _ppg_blocks(
@@ -347,9 +379,12 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         )
 
     def _transition_targets(
-        self, subject_key: str, timestamps: np.ndarray
+        self, subject_key: str, session_id: str, timestamps: np.ndarray
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        selected = self.events[self.events["subject_key"].astype(str) == subject_key]
+        selected = self.events[
+            (self.events["subject_key"].astype(str) == subject_key)
+            & (self.events["session_id"].astype(str) == session_id)
+        ]
         if len(timestamps):
             selected = selected[
                 selected["start_ms"].between(
@@ -383,11 +418,6 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             )
             near_boundary = (np.abs(start_delta) <= 30.0) | (np.abs(end_delta) <= 30.0)
             smooth[near_boundary] = 0.0
-        ignored = self.ignore_events[self.ignore_events["subject_key"].astype(str) == subject_key]
-        for event in ignored.itertuples(index=False):
-            start_delta = (timestamps - int(event.start_ms)) / 1000.0
-            end_delta = (timestamps - int(event.end_ms)) / 1000.0
-            smooth[(np.abs(start_delta) <= 30.0) | (np.abs(end_delta) <= 30.0)] = 0.0
         return onset.astype(np.float32), offset.astype(np.float32), smooth
 
     def __getitem__(
@@ -416,9 +446,12 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
                 - 2 * self.geometry.long_pool_factor * self.geometry.step_seconds * 1000
             ),
             int(timestamps[-1]),
+            subject_key=subject_key,
         )
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, row_index, int(epoch)]))
-        motion, motion_valid = self._motion_blocks(payload, int(timestamps[0]), len(timestamps))
+        motion, motion_valid = self._motion_blocks(
+            payload, int(timestamps[0]), len(timestamps), rng
+        )
         ppg, ppg_quality, ppg_valid, ppg_mapping, block_end_indices = self._ppg_blocks(
             payload,
             timestamps,
@@ -426,7 +459,7 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             rng,
         )
         aligned_valid, arrays = self._aligned_anchor_arrays(group, timestamps)
-        onset, offset, smooth = self._transition_targets(subject_key, timestamps)
+        onset, offset, smooth = self._transition_targets(subject_key, session_id, timestamps)
         supervision = np.zeros(len(timestamps), dtype=np.float32)
         supervision[-self.geometry.supervised_steps :] = 1.0
         supervision *= aligned_valid.astype(np.float32)
@@ -450,6 +483,7 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
             "onset_loss_mask": torch.from_numpy(arrays["start_loss_mask"]),
             "offset_loss_mask": torch.from_numpy(arrays["end_loss_mask"]),
             "smooth_mask": torch.from_numpy(smooth),
+            "smooth_loss_mask": torch.from_numpy(arrays["smooth_loss_mask"]),
             "supervision_mask": torch.from_numpy(supervision),
             "importance_weight": torch.from_numpy(importance),
             "motion_present": torch.from_numpy((motion_valid > 0).astype(np.float32)),

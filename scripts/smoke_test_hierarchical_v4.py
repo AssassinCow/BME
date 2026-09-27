@@ -16,7 +16,7 @@ from bme_eating.models.stats_fusion_loss import StatsFusionStateLoss
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the StatsFusion v4 bf16 smoke test")
-    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion.yaml")
+    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion_r3.yaml")
     parser.add_argument("--batch-size", type=int)
     args = parser.parse_args()
     config = load_config(args.config)
@@ -66,7 +66,7 @@ def main() -> None:
     model = build_state_model(config["model"]).to(device).train()
     criterion = StatsFusionStateLoss(
         smooth_weight=float(config["loss"]["smooth_weight"]),
-        smooth_tau=float(config["loss"]["smooth_tau"]),
+        smooth_beta=float(config["loss"]["smooth_beta"]),
         boundary_weight=float(config["loss"]["boundary_weight"]),
     )
     if device.type == "cuda":

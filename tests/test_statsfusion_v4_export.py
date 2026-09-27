@@ -66,6 +66,8 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path) -> 
             "maximum_variants_per_event": 1,
             "maximum_candidates_per_hour": 20,
             "deduplication_iou": 0.9,
+            "candidate_minimum_seconds": 3,
+            "candidate_maximum_seconds": 14_400,
         },
         "verifier": {
             "left_context_seconds": 60,
@@ -139,12 +141,31 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path) -> 
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "protocol_version": "statsfusion-r2",
+                "code_version": "v4.3",
+                "protocol_version": "statsfusion-r3",
+                "blocked_predecessors": [
+                    "statsfusion-r0-blocked",
+                    "statsfusion-r1-blocked",
+                    "statsfusion-r2-blocked",
+                ],
+                "raw_input_schema": "statsfusion-raw-v2",
                 "selection_source": "pooled_outer_oof",
+                "candidate_minimum_seconds": 3,
+                "candidate_maximum_seconds": 14_400,
+                "promotion_evidence_sha256": {
+                    name: "0" * 64
+                    for name in (
+                        "fold0_ablation",
+                        "development_gate",
+                        "freeze_manifest",
+                        "stress_gate",
+                    )
+                },
                 "state_seeds": [2026, 2027, 2028],
                 "verifier_seeds": [2026, 2027, 2028],
                 "verifier_kind": "logistic",
                 "boundary_enabled": False,
+                "decoder_config": config["decoder"],
             }
         ),
         encoding="utf-8",
@@ -164,7 +185,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path) -> 
         json.dumps(
             {
                 "stage": "COMPLETE",
-                "protocol_version": "statsfusion-r2",
+                "protocol_version": "statsfusion-r3",
                 "artifact_hashes": {},
             }
         ),
@@ -201,7 +222,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path) -> 
         f"detector=load_hierarchical_v4_bundle({str(bundle)!r},device='cpu')\n"
         "motion_t=np.arange(12000,dtype=np.int64)*10\n"
         "ppg_t=np.arange(6000,dtype=np.int64)*20\n"
-        "session=RawSessionInput('s','d',motion_t,np.zeros((len(motion_t),6),np.float32),np.ones((len(motion_t),6),bool),ppg_t,np.zeros(len(ppg_t),np.float32),np.ones(len(ppg_t),bool))\n"
+        "session=RawSessionInput(subject_key='s',session_id='d',motion_timestamp_ms=motion_t,motion_values=np.zeros((len(motion_t),6),np.float32),motion_mask=np.ones((len(motion_t),6),bool),ppg_timestamp_ms=ppg_t,ppg_values=np.zeros(len(ppg_t),np.float32),ppg_mask=np.ones(len(ppg_t),bool))\n"
         "events=detector.predict_session(session)\n"
         "assert isinstance(events,list)\n"
     )
@@ -234,12 +255,31 @@ def test_v4_export_rejects_incomplete_deep_verifier_seed_mirror(tmp_path) -> Non
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "protocol_version": "statsfusion-r2",
+                "code_version": "v4.3",
+                "protocol_version": "statsfusion-r3",
+                "blocked_predecessors": [
+                    "statsfusion-r0-blocked",
+                    "statsfusion-r1-blocked",
+                    "statsfusion-r2-blocked",
+                ],
+                "raw_input_schema": "statsfusion-raw-v2",
                 "selection_source": "pooled_outer_oof",
+                "candidate_minimum_seconds": 3,
+                "candidate_maximum_seconds": 14_400,
+                "promotion_evidence_sha256": {
+                    name: "0" * 64
+                    for name in (
+                        "fold0_ablation",
+                        "development_gate",
+                        "freeze_manifest",
+                        "stress_gate",
+                    )
+                },
                 "state_seeds": [2026, 2027, 2028],
                 "verifier_seeds": [2026, 2027, 2028],
                 "verifier_kind": "deep",
                 "boundary_enabled": False,
+                "decoder_config": {},
             }
         ),
         encoding="utf-8",
@@ -250,7 +290,7 @@ def test_v4_export_rejects_incomplete_deep_verifier_seed_mirror(tmp_path) -> Non
         json.dumps(
             {
                 "stage": "COMPLETE",
-                "protocol_version": "statsfusion-r2",
+                "protocol_version": "statsfusion-r3",
                 "artifact_hashes": {},
             }
         ),
