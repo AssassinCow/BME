@@ -29,6 +29,25 @@ class ProposalFeatureBatchV4:
     sample_weight: np.ndarray | None = None
 
 
+def pooled_logistic_features(features: ProposalFeatureBatchV4) -> np.ndarray:
+    sequence = np.asarray(features.sequence)
+    mask = np.asarray(features.sequence_mask, dtype=bool)
+    scalar = np.asarray(features.scalar)
+    if sequence.ndim != 3 or mask.shape != sequence.shape[:2]:
+        raise ValueError("Pooled Logistic sequence and mask shapes are incompatible")
+    if scalar.ndim != 2 or scalar.shape[0] != sequence.shape[0]:
+        raise ValueError("Pooled Logistic scalar features are not aligned")
+    expanded_mask = mask[..., None]
+    count = expanded_mask.sum(axis=1).clip(min=1)
+    mean = np.where(expanded_mask, sequence, 0.0).sum(axis=1) / count
+    maximum = np.where(expanded_mask, sequence, -np.inf).max(axis=1)
+    maximum[~np.isfinite(maximum)] = 0.0
+    matrix = np.concatenate((mean, maximum, scalar), axis=1)
+    if not np.isfinite(matrix).all():
+        raise ValueError("Pooled Logistic features must be finite on valid bins and scalars")
+    return matrix
+
+
 class ProposalDatasetV4(Dataset[dict[str, torch.Tensor | str]]):
     def __init__(self, features: ProposalFeatureBatchV4) -> None:
         self.features = features
@@ -326,7 +345,15 @@ def build_proposal_features_v4(
         "onset_probability",
         "offset_probability",
         "ppg_gate",
+        "statistics_gate",
+        "long_gate",
+        "gyro_gate",
+        "invariant_gate",
         "missing_fraction",
+        "acc_valid_fraction",
+        "gyro_valid_fraction",
+        "ppg_valid_fraction",
+        "statistics_missing_fraction",
         *statistics_columns,
     ]
     required = {"subject_key", "session_id", "timestamp_ms", *base_columns}

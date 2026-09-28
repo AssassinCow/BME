@@ -37,10 +37,10 @@ def _changed_paths(first: dict[str, Any], second: dict[str, Any]) -> set[str]:
 
 def test_r3_config_is_strict_and_has_fixed_features() -> None:
     root = Path(__file__).resolve().parents[1]
-    config = load_config(root / "configs" / "hierarchical_v4_statsfusion_r31.yaml")
+    config = load_config(root / "configs" / "hierarchical_v4_statsfusion_r3.yaml")
     validate_r3_config(config)
-    assert config["experiment"]["code_version"] == "v4.3.1"
-    assert config["experiment"]["protocol_version"] == "statsfusion-r3.1"
+    assert config["experiment"]["code_version"] == "v4.4.2"
+    assert config["experiment"]["protocol_version"] == "statsfusion-r3.2"
     assert config["project"]["artifact_schema_version"] == "v4"
     assert config["project"]["strict_resume_identity"] is True
     assert tuple(config["model"]["stable_feature_columns"]) == STATS_FEATURE_COLUMNS
@@ -53,9 +53,16 @@ def test_r3_config_is_strict_and_has_fixed_features() -> None:
 
 def test_r3_config_rejects_blocked_s4_ablation_name() -> None:
     root = Path(__file__).resolve().parents[1]
-    config = load_config(root / "configs" / "hierarchical_v4_statsfusion_r31.yaml")
+    config = load_config(root / "configs" / "hierarchical_v4_statsfusion_r3.yaml")
     config["experiment"]["ablation_id"] = "S4"
     with pytest.raises(ValueError, match="unsupported ablation_id"):
+        validate_r3_config(config)
+
+
+def test_r32_rejects_r31_configuration() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r31_direct_best.yaml")
+    with pytest.raises(ValueError, match="statsfusion-r3.2"):
         validate_r3_config(config)
 
 
@@ -86,34 +93,27 @@ def test_r3_architecture_configs_change_registered_components() -> None:
         assert config["decoder"]["use_semi_markov"] is (ablation == "R3-M1")
 
 
-def test_r3_time_constrained_direct_config_enables_robust_full_state_path() -> None:
+def test_r32_time_constrained_config_uses_single_holdout_and_pooled_logistic() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
-    config = load_config(root / "hierarchical_v4_r31_direct_best.yaml")
+    config = load_config(root / "hierarchical_v4_r32_fast_logistic.yaml")
     validate_r3_config(config)
     assert config["experiment"]["ablation_id"] == "R3-DIRECT"
-    assert config["experiment"]["variant"] == "time_constrained_direct_d2c_ppg_semimarkov"
+    assert config["experiment"]["variant"] == "time_constrained_outer_single_holdout_logistic"
     assert config["experiment"]["time_constrained_direct"] is True
+    assert config["experiment"]["time_constrained_single_holdout"] is True
     assert config["model"]["use_statistics"] is True
     assert config["model"]["use_long_context"] is True
     assert config["model"]["separate_motion_branches"] is True
     assert config["model"]["use_invariant_motion_branch"] is True
     assert config["model"]["use_ppg"] is True
-    assert config["training"]["gyro_modality_dropout"] == 0.20
-    assert config["training"]["ppg_modality_dropout"] == 0.20
-    assert config["training"]["rotation_augmentation_probability"] == 0.50
+    assert config["training"]["gyro_modality_dropout"] == 0.0
+    assert config["training"]["ppg_modality_dropout"] == 0.0
+    assert config["training"]["rotation_augmentation_probability"] == 0.0
     assert config["training"]["batch_size"] == 8
     assert config["training"]["gradient_accumulation"] == 4
-    assert config["training"]["steps_per_epoch"] == 2500
-    assert (
-        config["training"]["batch_size"]
-        * config["training"]["steps_per_epoch"]
-        == 20_000
-    )
-    assert (
-        config["training"]["steps_per_epoch"]
-        // config["training"]["gradient_accumulation"]
-        == 625
-    )
+    assert config["training"]["clips_per_subject_per_epoch"] == 1000
+    assert config["training"]["subject_balanced_sampling"] is True
+    assert config["training"]["fixed_state_epochs"] == 5
     assert config["training"]["inference_batch_size"] == 8
     assert config["training"]["validation_every_epochs"] == 1
     assert config["training"]["selector_decoder_search"] == "fixed"
@@ -122,9 +122,13 @@ def test_r3_time_constrained_direct_config_enables_robust_full_state_path() -> N
     assert config["training"]["gradient_clip_norm"] == 5.0
     assert _enforce_gradient_clipping_gate(config) is False
     assert _gradient_clipping_gate_passed(config, 0.90) is True
-    assert config["decoder"]["use_semi_markov"] is True
+    assert config["decoder"]["use_semi_markov"] is False
+    assert config["decoder"]["use_transition_candidates"] is False
+    assert config["hierarchical"]["state_crossfit_mode"] == "single_holdout"
+    assert config["hierarchical"]["downstream_mode"] == "pooled_logistic"
     assert config["final_training"]["state_seeds"] == [2026]
-    assert len(_decoder_configurations(config)) == 48
+    assert config["verifier"]["seeds"] == [2026]
+    assert len(_decoder_configurations(config)) == 1
     assert len(_decoder_configurations(_selector_decoder_search_config(config))) == 1
     geometry = sequence_geometry_from_config(config)
     assert geometry.fused_short_receptive_field_steps == 155
@@ -132,9 +136,69 @@ def test_r3_time_constrained_direct_config_enables_robust_full_state_path() -> N
     assert geometry.total_steps == 1049
 
 
+def test_r32_fast_config_uses_one_fixed_subject_holdout() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r32_fast_logistic.yaml")
+    validate_r3_config(config)
+    assert config["experiment"]["variant"] == "time_constrained_outer_single_holdout_logistic"
+    assert config["experiment"]["time_constrained_direct"] is True
+    assert config["experiment"]["time_constrained_single_holdout"] is True
+    assert config["training"]["fixed_state_epochs"] == 5
+    assert config["training"]["single_holdout_fraction"] == 0.35
+    assert config["training"]["learning_rate"] == 0.00015
+    assert config["training"]["warmup_fraction"] == 0.10
+    assert config["hierarchical"]["state_crossfit_mode"] == "single_holdout"
+    assert config["hierarchical"]["downstream_mode"] == "pooled_logistic"
+    assert config["final_training"]["state_seeds"] == [2026]
+    assert len(_decoder_configurations(config)) == 1
+    assert _decoder_configurations(config)[0] == {
+        **config["decoder"],
+        "high_threshold": 0.10,
+        "low_threshold": 0.05,
+        "ema_half_life_seconds": 12,
+        "gap_merge_seconds": 60,
+        "transition_threshold": 0.20,
+        "semi_markov_duration_weight": 1.0,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("fixed_state_epochs", 0, "fixed_state_epochs"),
+        ("single_holdout_fraction", 0.1, "Single-holdout fraction"),
+        ("single_holdout_fraction", 0.5, "Single-holdout fraction"),
+    ],
+)
+def test_r32_fast_config_rejects_invalid_training_scope(
+    field: str, value: float, message: str
+) -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r32_fast_logistic.yaml")
+    config["training"][field] = value
+    with pytest.raises(ValueError, match=message):
+        validate_r3_config(config)
+
+
+def test_r32_fast_config_requires_pooled_logistic_downstream() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r32_fast_logistic.yaml")
+    config["hierarchical"]["downstream_mode"] = "full"
+    with pytest.raises(ValueError, match="pooled-logistic downstream"):
+        validate_r3_config(config)
+
+
+def test_r32_fast_variant_requires_explicit_protocol_flag() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r32_fast_logistic.yaml")
+    config["experiment"].pop("time_constrained_single_holdout")
+    with pytest.raises(ValueError, match="variant and protocol flag"):
+        validate_r3_config(config)
+
+
 def test_r3_direct_config_cannot_silently_masquerade_as_a_registered_ablation() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
-    config = load_config(root / "hierarchical_v4_r31_direct_best.yaml")
+    config = load_config(root / "hierarchical_v4_r32_fast_logistic.yaml")
     config["experiment"].pop("time_constrained_direct")
     with pytest.raises(ValueError, match="time_constrained_direct"):
         validate_r3_config(config)
@@ -142,7 +206,7 @@ def test_r3_direct_config_cannot_silently_masquerade_as_a_registered_ablation() 
 
 def test_r3_direct_config_requires_fixed_selector_decoder_search() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
-    config = load_config(root / "hierarchical_v4_r31_direct_best.yaml")
+    config = load_config(root / "hierarchical_v4_r32_fast_logistic.yaml")
     config["training"]["selector_decoder_search"] = "full"
     with pytest.raises(ValueError, match="fixed decoder search"):
         validate_r3_config(config)

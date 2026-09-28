@@ -29,6 +29,7 @@ from bme_eating.data.stats_fusion_sequence import (
 from bme_eating.hierarchical_artifacts import write_json_atomic
 from bme_eating.models.factory import build_state_model
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
+from bme_eating.v4_protocol import PROTOCOL_VERSION
 
 
 def main() -> None:
@@ -82,9 +83,7 @@ def main() -> None:
     )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
-        scaler = FoldRobustScaler.fit(
-            merged, STATS_FEATURE_COLUMNS, training_subjects={subject}
-        )
+        scaler = FoldRobustScaler.fit(merged, STATS_FEATURE_COLUMNS, training_subjects={subject})
     transformed = scaler.transform_frame(merged)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -182,10 +181,13 @@ def main() -> None:
         key: value.to(device) if isinstance(value, torch.Tensor) else value
         for key, value in raw_batch.items()
     }
-    with torch.no_grad(), torch.autocast(
-        device_type=device.type,
-        dtype=torch.bfloat16,
-        enabled=device.type == "cuda",
+    with (
+        torch.no_grad(),
+        torch.autocast(
+            device_type=device.type,
+            dtype=torch.bfloat16,
+            enabled=device.type == "cuda",
+        ),
     ):
         first = model(model_batch)
         second = model(model_batch)
@@ -195,7 +197,7 @@ def main() -> None:
     if repeat_error > 1e-6:
         raise RuntimeError(f"Real-session repeated inference differs by {repeat_error}")
     report = {
-        "protocol_version": "statsfusion-r3.1",
+        "protocol_version": PROTOCOL_VERSION,
         "session_id": session_id,
         "fragment_count": len(selected),
         "subject_key": subject,

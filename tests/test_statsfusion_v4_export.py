@@ -14,6 +14,7 @@ import bme_eating.hierarchical_v4_export as export_module
 from bme_eating.hierarchical_artifacts import sha256_file
 from bme_eating.hierarchical_v4_export import (
     REQUIRED_MODEL_FILES,
+    _selected_optional_model_files,
     export_hierarchical_v4_bundle,
 )
 from bme_eating.hierarchical_v4_pipeline import load_hierarchical_v4_bundle
@@ -26,15 +27,21 @@ from bme_eating.v4_protocol import runtime_source_identity
 def _resume_identity(project_root: Path) -> dict[str, object]:
     return {
         "git": git_worktree_identity(project_root),
-        "runtime_source_identity": runtime_source_identity(
-            project_root / "src" / "bme_eating"
-        ),
+        "runtime_source_identity": runtime_source_identity(project_root / "src" / "bme_eating"),
     }
 
 
-def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
-    tmp_path, monkeypatch
-) -> None:
+def test_state_only_bundle_selects_no_verifier_artifact() -> None:
+    selection = {"verifier_kind": "state_only", "boundary_enabled": False}
+    selected = _selected_optional_model_files(
+        selection, "time_constrained_single_holdout_v1"
+    )
+    assert selected == ("time_constrained_protocol.json",)
+    assert "logistic_verifier.json" not in selected
+    assert "proposal_calibration.json" not in selected
+
+
+def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path, monkeypatch) -> None:
     final_root = tmp_path / "final"
     final_root.mkdir()
     model_config = {
@@ -158,13 +165,14 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "code_version": "v4.3.1",
-                "protocol_version": "statsfusion-r3.1",
+                "code_version": "v4.4.2",
+                "protocol_version": "statsfusion-r3.2",
                 "blocked_predecessors": [
                     "statsfusion-r0-blocked",
                     "statsfusion-r1-blocked",
                     "statsfusion-r2-blocked",
                     "statsfusion-r3-blocked",
+                    "statsfusion-r3.1-blocked",
                 ],
                 "raw_input_schema": "statsfusion-raw-v2",
                 "selection_source": "pooled_outer_oof",
@@ -194,9 +202,9 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
     (final_root / "logistic_verifier.json").write_text(
         json.dumps(
             {
-                "mean": [0.0] * 190,
-                "scale": [1.0] * 190,
-                "coefficients": [0.0] * 190,
+                "mean": [0.0] * 270,
+                "scale": [1.0] * 270,
+                "coefficients": [0.0] * 270,
                 "intercept": -10.0,
             }
         ),
@@ -207,7 +215,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
         json.dumps(
             {
                 "stage": "COMPLETE",
-                "protocol_version": "statsfusion-r3.1",
+                "protocol_version": "statsfusion-r3.2",
                 "artifact_hashes": {},
                 "resume_identity": _resume_identity(project_root),
             }
@@ -265,9 +273,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(
     repaired_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert repaired_manifest["artifact_hashes"]["model_bundle.zip"] == sha256_file(zip_path)
     zip_path.unlink()
-    resumed = export_hierarchical_v4_bundle(
-        project_root, final_root, fresh=False, resume=True
-    )
+    resumed = export_hierarchical_v4_bundle(project_root, final_root, fresh=False, resume=True)
     assert resumed == bundle
     assert zip_path.is_file()
     monkeypatch.setattr(
@@ -298,13 +304,14 @@ def test_v4_export_rejects_incomplete_deep_verifier_seed_mirror(tmp_path) -> Non
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "code_version": "v4.3.1",
-                "protocol_version": "statsfusion-r3.1",
+                "code_version": "v4.4.2",
+                "protocol_version": "statsfusion-r3.2",
                 "blocked_predecessors": [
                     "statsfusion-r0-blocked",
                     "statsfusion-r1-blocked",
                     "statsfusion-r2-blocked",
                     "statsfusion-r3-blocked",
+                    "statsfusion-r3.1-blocked",
                 ],
                 "raw_input_schema": "statsfusion-raw-v2",
                 "selection_source": "pooled_outer_oof",
@@ -340,7 +347,7 @@ def test_v4_export_rejects_incomplete_deep_verifier_seed_mirror(tmp_path) -> Non
         json.dumps(
             {
                 "stage": "COMPLETE",
-                "protocol_version": "statsfusion-r3.1",
+                "protocol_version": "statsfusion-r3.2",
                 "artifact_hashes": {},
                 "resume_identity": _resume_identity(project_root),
             }

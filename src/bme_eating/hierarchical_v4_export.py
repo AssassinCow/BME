@@ -38,9 +38,26 @@ OPTIONAL_MODEL_FILES = (
     "proposal_calibration.json",
     "boundary.pt",
     "boundary_range.json",
+    "time_constrained_protocol.json",
 )
 
 RUNTIME_FILES = RUNTIME_SOURCE_FILES
+
+
+def _selected_optional_model_files(
+    selection: dict[str, object], promotion_protocol: str
+) -> tuple[str, ...]:
+    selected: list[str] = []
+    verifier_kind = str(selection.get("verifier_kind", ""))
+    if verifier_kind == "logistic":
+        selected.append("logistic_verifier.json")
+    elif verifier_kind == "deep":
+        selected.append("proposal_calibration.json")
+    if bool(selection.get("boundary_enabled", False)):
+        selected.extend(("boundary.pt", "boundary_range.json"))
+    if promotion_protocol == "time_constrained_single_holdout_v1":
+        selected.append("time_constrained_protocol.json")
+    return tuple(selected)
 
 
 def _copy_sanitized_checkpoint(source: Path, target: Path, allowed: set[str]) -> None:
@@ -156,12 +173,35 @@ def export_hierarchical_v4_bundle(
         raise RuntimeError("V4 selection has invalid candidate duration bounds")
     config = yaml.safe_load((final_root / "resolved_config.yaml").read_text(encoding="utf-8"))
     promotion_hashes = selection.get("promotion_evidence_sha256", {})
-    required_promotion = {"fold0_ablation", "development_gate", "freeze_manifest", "stress_gate"}
+    promotion_protocol = str(
+        selection.get("promotion_protocol", "registered_ablation_gates_v1")
+    )
+    if str(manifest.get("promotion_protocol", "registered_ablation_gates_v1")) != (
+        promotion_protocol
+    ):
+        raise RuntimeError("V4 final manifest and selection promotion protocols differ")
+    required_promotion = (
+        {"time_constrained_protocol"}
+        if promotion_protocol == "time_constrained_single_holdout_v1"
+        else {"fold0_ablation", "development_gate", "freeze_manifest", "stress_gate"}
+    )
+    if promotion_protocol not in {
+        "registered_ablation_gates_v1",
+        "time_constrained_single_holdout_v1",
+    }:
+        raise RuntimeError("V4 selection has an unsupported promotion protocol")
     if set(promotion_hashes) != required_promotion or any(
         not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value)
         for value in promotion_hashes.values()
     ):
         raise RuntimeError("V4 selection has incomplete promotion evidence hashes")
+    if promotion_protocol == "time_constrained_single_holdout_v1":
+        evidence_path = final_root / "time_constrained_protocol.json"
+        if (
+            not evidence_path.is_file()
+            or sha256_file(evidence_path) != promotion_hashes["time_constrained_protocol"]
+        ):
+            raise RuntimeError("V4 time-constrained protocol evidence is missing or changed")
     state_seeds = validate_serialized_state_seeds(selection.get("state_seeds", []))
     configured_state = config.get("final_training", {}).get("state_seeds")
     if configured_state is not None and [int(value) for value in configured_state] != state_seeds:
@@ -194,6 +234,9 @@ def export_hierarchical_v4_bundle(
     elif verifier_kind == "logistic":
         if not (final_root / "logistic_verifier.json").is_file():
             raise FileNotFoundError("Logistic v4 verifier artifact is missing")
+    elif verifier_kind == "state_only":
+        if selection.get("score_column") not in {"generator_score", "final_score"}:
+            raise RuntimeError("State-only v4 selection has an invalid score column")
     else:
         raise RuntimeError(f"Unsupported v4 verifier kind: {verifier_kind}")
     if bool(selection.get("boundary_enabled", False)):
@@ -235,7 +278,9 @@ def export_hierarchical_v4_bundle(
     if temporary.exists():
         raise RuntimeError("Stale V4 model_bundle.tmp exists")
     temporary.mkdir(parents=True)
-    for name in (*REQUIRED_MODEL_FILES, *selected_state_files, *OPTIONAL_MODEL_FILES):
+    selected_optional_files = _selected_optional_model_files(selection, promotion_protocol)
+    unexpected_optional_files = set(OPTIONAL_MODEL_FILES) - set(selected_optional_files)
+    for name in (*REQUIRED_MODEL_FILES, *selected_state_files, *selected_optional_files):
         source = final_root / name
         if not source.is_file():
             continue
@@ -254,6 +299,11 @@ def export_hierarchical_v4_bundle(
             _copy_sanitized_scaler(source, target)
         else:
             shutil.copy2(source, temporary / name)
+    copied_optional_files = {
+        path.name for path in temporary.iterdir() if path.name in OPTIONAL_MODEL_FILES
+    }
+    if copied_optional_files & unexpected_optional_files:
+        raise RuntimeError("V4 bundle retained an unselected optional model artifact")
     for name in selected_verifier_files:
         _copy_sanitized_checkpoint(
             final_root / name,

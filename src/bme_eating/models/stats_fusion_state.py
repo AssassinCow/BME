@@ -144,16 +144,15 @@ class CausalCompletedBlockPool(nn.Module):
         last = torch.where(valid_bool.any(dim=2, keepdim=True), last, torch.zeros_like(last))
         valid_fraction = pooled_valid.to(values.dtype).mean(dim=2, keepdim=True)
         pooled = self.projection(torch.cat((mean, maximum, last, valid_fraction), dim=-1))
-        pooled = pooled * endpoint_valid.unsqueeze(-1).to(pooled.dtype)
+        block_has_valid = endpoint_valid & valid_bool.any(dim=2)
+        pooled = pooled * block_has_valid.unsqueeze(-1).to(pooled.dtype)
         return pooled, valid_fraction.squeeze(-1)
 
     def hold_completed(self, low_rate: torch.Tensor, indices: torch.Tensor) -> torch.Tensor:
         if indices.ndim != 2 or indices.shape[0] != low_rate.shape[0]:
             raise ValueError("Completed-block hold indices have an incompatible shape")
         if low_rate.shape[1] == 0:
-            return low_rate.new_zeros(
-                (low_rate.shape[0], indices.shape[1], low_rate.shape[-1])
-            )
+            return low_rate.new_zeros((low_rate.shape[0], indices.shape[1], low_rate.shape[-1]))
         if torch.any(indices >= low_rate.shape[1]):
             raise ValueError("Completed-block hold refers to a missing low-rate token")
         valid = indices >= 0
@@ -180,9 +179,7 @@ class StatsFusionStateModel(nn.Module):
         self.use_statistics = bool(config.get("use_statistics", True))
         self.use_long_context = bool(config.get("use_long_context", True))
         self.separate_motion_branches = bool(config.get("separate_motion_branches", False))
-        self.use_invariant_motion_branch = bool(
-            config.get("use_invariant_motion_branch", False)
-        )
+        self.use_invariant_motion_branch = bool(config.get("use_invariant_motion_branch", False))
         stable_features = tuple(str(value) for value in config.get("stable_feature_columns", ()))
         self.ppg_statistics_index = (
             stable_features.index("local_ppg_valid_fraction")
@@ -234,11 +231,10 @@ class StatsFusionStateModel(nn.Module):
         else:
             self.motion_encoder = motion_encoder(12)
             self.motion_tcn = CausalTCN(motion_dim, hidden_dim, motion_dilations, dropout)
+            self.motion_missing = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         if self.use_invariant_motion_branch:
             self.invariant_motion_encoder = motion_encoder(6)
-            self.invariant_motion_tcn = CausalTCN(
-                motion_dim, hidden_dim, motion_dilations, dropout
-            )
+            self.invariant_motion_tcn = CausalTCN(motion_dim, hidden_dim, motion_dilations, dropout)
             self.invariant_gate_network = nn.Sequential(
                 nn.Linear(2 * hidden_dim, hidden_dim),
                 nn.SiLU(),
@@ -278,7 +274,7 @@ class StatsFusionStateModel(nn.Module):
         self.statistics_to_hidden = nn.Linear(statistics_dim, hidden_dim, bias=False)
 
         self.short_fusion = nn.Sequential(
-            nn.Linear(2 * hidden_dim + 2, hidden_dim),
+            nn.Linear(2 * hidden_dim + 3, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.SiLU(),
             nn.Dropout(dropout),
@@ -295,7 +291,7 @@ class StatsFusionStateModel(nn.Module):
         self.long_to_hidden = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.long_gate_network = nn.Linear(2 * hidden_dim, hidden_dim)
         self.statistics_gate_network = nn.Sequential(
-            nn.Linear(hidden_dim + statistics_dim + 2, hidden_dim),
+            nn.Linear(hidden_dim + statistics_dim + 4, hidden_dim),
             nn.SiLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
@@ -339,22 +335,16 @@ class StatsFusionStateModel(nn.Module):
         steps = motion_blocks.shape[1]
         acc_valid = motion_blocks[:, :, 6:9].mean(dim=(2, 3)).to(motion_blocks.dtype)
         gyro_valid = motion_blocks[:, :, 9:12].mean(dim=(2, 3)).to(motion_blocks.dtype)
+        acc_present = acc_valid > 0
+        gyro_present = gyro_valid > 0
         if self.separate_motion_branches:
             acc_blocks = torch.cat((motion_blocks[:, :, :3], motion_blocks[:, :, 6:9]), dim=2)
             gyro_blocks = torch.cat((motion_blocks[:, :, 3:6], motion_blocks[:, :, 9:12]), dim=2)
-            acc = self.acc_tcn(
-                self._encode_blocks(self.acc_encoder, acc_blocks) * acc_valid.unsqueeze(-1)
-            )
-            gyro = self.gyro_tcn(
-                self._encode_blocks(self.gyro_encoder, gyro_blocks) * gyro_valid.unsqueeze(-1)
-            )
-            acc = acc_valid.unsqueeze(-1) * acc + (1.0 - acc_valid).unsqueeze(
-                -1
-            ) * self.acc_missing
-            gyro = gyro_valid.unsqueeze(-1) * gyro + (1.0 - gyro_valid).unsqueeze(
-                -1
-            ) * self.gyro_missing
-            gyro_gate = gyro_valid.unsqueeze(-1) * torch.sigmoid(
+            acc = self.acc_tcn(self._encode_blocks(self.acc_encoder, acc_blocks))
+            gyro = self.gyro_tcn(self._encode_blocks(self.gyro_encoder, gyro_blocks))
+            acc = torch.where(acc_present.unsqueeze(-1), acc, self.acc_missing)
+            gyro = torch.where(gyro_present.unsqueeze(-1), gyro, self.gyro_missing)
+            gyro_gate = gyro_present.unsqueeze(-1).to(gyro.dtype) * torch.sigmoid(
                 self.gyro_gate_network(
                     torch.cat(
                         (acc, gyro, acc_valid.unsqueeze(-1), gyro_valid.unsqueeze(-1)), dim=-1
@@ -365,7 +355,8 @@ class StatsFusionStateModel(nn.Module):
             motion_fusion_valid = torch.maximum(acc_valid, gyro_valid)
         else:
             motion = self._encode_blocks(self.motion_encoder, motion_blocks)
-            motion = self.motion_tcn(motion * motion_valid.unsqueeze(-1))
+            motion = self.motion_tcn(motion)
+            motion = torch.where((motion_valid > 0).unsqueeze(-1), motion, self.motion_missing)
             motion_fusion_valid = motion_valid
             gyro_gate = torch.zeros_like(motion)
         invariant_gate = torch.zeros_like(motion)
@@ -378,15 +369,16 @@ class StatsFusionStateModel(nn.Module):
             invariant_blocks = invariant_blocks.to(motion_blocks.dtype)
             invariant = self.invariant_motion_tcn(
                 self._encode_blocks(self.invariant_motion_encoder, invariant_blocks)
-                * motion_fusion_valid.unsqueeze(-1)
             )
-            invariant_gate = torch.sigmoid(
-                self.invariant_gate_network(torch.cat((motion, invariant), dim=-1))
-            )
+            invariant_gate = (motion_fusion_valid > 0).unsqueeze(-1).to(
+                motion.dtype
+            ) * torch.sigmoid(self.invariant_gate_network(torch.cat((motion, invariant), dim=-1)))
             motion = motion + invariant_gate * invariant
         if not self.use_motion:
             motion = torch.zeros_like(motion)
             motion_fusion_valid = torch.zeros_like(motion_valid)
+            acc_valid = torch.zeros_like(acc_valid)
+            gyro_valid = torch.zeros_like(gyro_valid)
 
         ppg_blocks = batch["ppg_blocks"]
         ppg_quality = batch["ppg_quality"].to(ppg_blocks.dtype)
@@ -423,23 +415,43 @@ class StatsFusionStateModel(nn.Module):
                 (
                     motion,
                     ppg_aligned,
-                    motion_fusion_valid.unsqueeze(-1),
+                    acc_valid.unsqueeze(-1),
+                    gyro_valid.unsqueeze(-1),
                     ppg_fusion_valid.unsqueeze(-1),
                 ),
                 dim=-1,
             )
         )
-        statistics = self.statistics_projection(batch["statistics"].to(short.dtype))
+        statistics_input = batch["statistics"].to(short.dtype)
+        statistics_missing = statistics_input[..., 12:]
+        if not self.use_ppg and self.ppg_statistics_index is not None:
+            active_statistics = torch.ones(
+                statistics_missing.shape[-1], dtype=torch.bool, device=statistics_missing.device
+            )
+            active_statistics[self.ppg_statistics_index] = False
+            statistics_missing = statistics_missing[..., active_statistics]
+        statistics_missing_fraction = statistics_missing.mean(dim=-1)
+        statistics_reliability = 1.0 - statistics_missing_fraction
+        statistics = self.statistics_projection(statistics_input)
         statistics = self.statistics_tcn(statistics)
         if not self.use_statistics:
             statistics = torch.zeros_like(statistics)
-        quality = torch.stack((motion_fusion_valid, ppg_fusion_valid), dim=-1)
+            statistics_reliability = torch.zeros_like(statistics_reliability)
+        quality = torch.stack(
+            (acc_valid, gyro_valid, ppg_fusion_valid, statistics_reliability), dim=-1
+        )
         statistics_gate = torch.sigmoid(
             self.statistics_gate_network(torch.cat((short, statistics, quality), dim=-1))
         )
 
-        combined = torch.cat((short, statistics), dim=-1)
-        combined_valid = torch.maximum(motion_fusion_valid, ppg_fusion_valid)
+        statistics_gate_scalar = statistics_gate.mean(dim=-1, keepdim=True)
+        gated_statistics = (
+            statistics * statistics_gate_scalar * statistics_reliability.unsqueeze(-1)
+        )
+        combined = torch.cat((short, gated_statistics), dim=-1)
+        combined_valid = torch.maximum(
+            torch.maximum(motion_fusion_valid, ppg_fusion_valid), statistics_reliability
+        )
         block_end_indices = batch.get("long_block_end_indices")
         if block_end_indices is None:
             raise ValueError("StatsFusion requires session-phased long_block_end_indices")
@@ -456,19 +468,13 @@ class StatsFusionStateModel(nn.Module):
         final = self.final_norm(
             short
             + long_gate * self.long_to_hidden(long)
-            + statistics_gate * self.statistics_to_hidden(statistics)
+            + statistics_gate
+            * statistics_reliability.unsqueeze(-1)
+            * self.statistics_to_hidden(statistics)
         )
-        statistics_missing = batch["statistics"][..., 12:].to(short.dtype)
-        if not self.use_ppg and self.ppg_statistics_index is not None:
-            active_statistics = torch.ones(
-                statistics_missing.shape[-1], dtype=torch.bool, device=statistics_missing.device
-            )
-            active_statistics[self.ppg_statistics_index] = False
-            statistics_missing = statistics_missing[..., active_statistics]
-        statistics_missing_fraction = statistics_missing.mean(dim=-1)
         active_validity: list[torch.Tensor] = []
         if self.use_motion:
-            active_validity.append(motion_fusion_valid)
+            active_validity.extend((acc_valid, gyro_valid))
         if self.use_ppg:
             active_validity.append(ppg_valid_aligned)
         if self.use_statistics:

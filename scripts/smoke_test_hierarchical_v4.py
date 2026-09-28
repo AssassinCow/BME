@@ -34,13 +34,19 @@ def main() -> None:
         factor=geometry.long_pool_factor,
     )
     ppg_steps = len(block_end_indices)
+    motion_blocks = torch.randn(batch_size, steps, 12, 300, device=device)
+    motion_blocks[:, :, 6:] = 1.0
+    invariant_blocks = torch.randn(batch_size, steps, 6, 300, device=device)
+    invariant_blocks[:, :, 3:] = 1.0
+    ppg_blocks = torch.randn(batch_size, ppg_steps, 2, 750, device=device)
+    ppg_blocks[:, :, 1] = 1.0
+    statistics = torch.randn(batch_size, steps, 24, device=device)
+    statistics[:, :, 12:] = 0.0
     batch = {
-        "motion_blocks": torch.randn(batch_size, steps, 12, 300, device=device),
+        "motion_blocks": motion_blocks,
         "motion_valid": torch.ones(batch_size, steps, device=device),
-        "motion_invariant_blocks": torch.randn(
-            batch_size, steps, 6, 300, device=device
-        ),
-        "ppg_blocks": torch.randn(batch_size, ppg_steps, 2, 750, device=device),
+        "motion_invariant_blocks": invariant_blocks,
+        "ppg_blocks": ppg_blocks,
         "ppg_quality": torch.randn(batch_size, ppg_steps, 8, device=device),
         "ppg_valid": torch.ones(batch_size, ppg_steps, device=device),
         "ppg_to_motion_index": torch.from_numpy(mapping)
@@ -51,7 +57,7 @@ def main() -> None:
         .unsqueeze(0)
         .expand(batch_size, -1)
         .to(device),
-        "statistics": torch.randn(batch_size, steps, 24, device=device),
+        "statistics": statistics,
         "state_target": torch.randint(0, 2, (batch_size, steps), device=device).float(),
         "onset_target": torch.zeros(batch_size, steps, device=device),
         "offset_target": torch.zeros(batch_size, steps, device=device),

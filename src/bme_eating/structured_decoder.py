@@ -97,6 +97,10 @@ class FixedLagSemiMarkovDecoder:
             raise ValueError("Duration prior contains no legal structured-grid duration")
         durations = np.arange(maximum_steps + 1, dtype=np.float64) * self.grid_seconds
         log_probability = self.prior.log_probability(durations)
+        legal = np.isfinite(log_probability)
+        if not legal.any():
+            raise ValueError("Duration prior contains no finite structured-grid mass")
+        log_probability[legal] -= float(log_probability[legal].max())
         return minimum_steps, maximum_steps, log_probability
 
     def _decode_window(
@@ -178,9 +182,7 @@ class FixedLagSemiMarkovDecoder:
         output = np.asarray(states, dtype=bool).copy()
         padded = np.concatenate(([False], output, [False])).astype(np.int8)
         transitions = np.diff(padded)
-        for start, end in zip(
-            np.flatnonzero(transitions == 1), np.flatnonzero(transitions == -1)
-        ):
+        for start, end in zip(np.flatnonzero(transitions == 1), np.flatnonzero(transitions == -1)):
             duration = int(end - start)
             if duration < minimum_steps:
                 output[start:end] = False

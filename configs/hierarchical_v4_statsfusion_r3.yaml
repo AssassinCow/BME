@@ -11,13 +11,14 @@ data:
 
 experiment:
   name: hierarchical_v4_statsfusion_r3
-  code_version: v4.3.1
-  protocol_version: statsfusion-r3.1
+  code_version: v4.4.2
+  protocol_version: statsfusion-r3.2
   blocked_protocols:
     - statsfusion-r0-blocked
     - statsfusion-r1-blocked
     - statsfusion-r2-blocked
     - statsfusion-r3-blocked
+    - statsfusion-r3.1-blocked
   ablation_id: R3-S2
 
 features:
@@ -117,6 +118,7 @@ calibration:
 
 decoder:
   use_semi_markov: false
+  use_transition_candidates: true
   ema_half_life_seconds: 12
   high_threshold: 0.20
   low_threshold: 0.10

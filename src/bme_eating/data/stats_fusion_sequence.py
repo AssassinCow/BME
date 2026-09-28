@@ -29,10 +29,13 @@ class SequenceGeometry:
 
     @property
     def history_steps(self) -> int:
-        short_history = max(
-            self.short_receptive_field_steps,
-            self.fused_short_receptive_field_steps,
-        ) - 1
+        short_history = (
+            max(
+                self.short_receptive_field_steps,
+                self.fused_short_receptive_field_steps,
+            )
+            - 1
+        )
         if not self.use_long_context:
             return short_history
         nested_long_history = (
@@ -109,6 +112,7 @@ class ClipMixtureSampler(Sampler[tuple[int, int, np.ndarray]]):
         mixture: dict[str, float],
         seed: int,
         supervised_steps: int = 256,
+        balance_subjects: bool = False,
     ) -> None:
         required = {
             "state_target",
@@ -144,14 +148,8 @@ class ClipMixtureSampler(Sampler[tuple[int, int, np.ndarray]]):
             "boundary": indices[
                 eligible
                 & (
-                    (
-                        (anchors["start_target"].to_numpy(dtype=float) > 0)
-                        & start_eligible
-                    )
-                    | (
-                        (anchors["end_target"].to_numpy(dtype=float) > 0)
-                        & end_eligible
-                    )
+                    ((anchors["start_target"].to_numpy(dtype=float) > 0) & start_eligible)
+                    | ((anchors["end_target"].to_numpy(dtype=float) > 0) & end_eligible)
                 )
             ],
         }
@@ -160,10 +158,43 @@ class ClipMixtureSampler(Sampler[tuple[int, int, np.ndarray]]):
         for name in ("event", "boundary"):
             if not len(pools[name]):
                 pools[name] = pools["uniform"]
+        subject_values = (
+            anchors["subject_key"].astype(str).to_numpy()
+            if "subject_key" in anchors
+            else np.full(len(anchors), "all", dtype=object)
+        )
+        subjects = sorted(set(subject_values[eligible]))
+        if not subjects:
+            raise ValueError("Clip sampler received no subjects with eligible anchors")
+        subject_pools: dict[str, dict[str, np.ndarray]] = {}
         probabilities = np.zeros(len(anchors), dtype=np.float64)
-        for weight, name in zip(weights, ("uniform", "event", "boundary")):
-            probabilities[pools[name]] += float(weight) / len(pools[name])
-        natural = 1.0 / len(pools["uniform"])
+        natural_endpoint_probability = np.zeros(len(anchors), dtype=np.float64)
+        if balance_subjects:
+            subject_probability = 1.0 / len(subjects)
+            for subject in subjects:
+                subject_mask = subject_values == subject
+                uniform_pool = indices[eligible & subject_mask]
+                category_pools: dict[str, np.ndarray] = {"uniform": uniform_pool}
+                for name in ("event", "boundary"):
+                    candidate_pool = pools[name][subject_values[pools[name]] == subject]
+                    category_pools[name] = candidate_pool if len(candidate_pool) else uniform_pool
+                subject_pools[subject] = category_pools
+                natural_endpoint_probability[uniform_pool] = subject_probability / len(uniform_pool)
+                for weight, name in zip(weights, ("uniform", "event", "boundary")):
+                    probabilities[category_pools[name]] += (
+                        subject_probability * float(weight) / len(category_pools[name])
+                    )
+        else:
+            for weight, name in zip(weights, ("uniform", "event", "boundary")):
+                probabilities[pools[name]] += float(weight) / len(pools[name])
+            natural_endpoint_probability[eligible] = 1.0 / len(pools["uniform"])
+            subject_pools = {
+                subject: {
+                    name: pool[subject_values[pool] == subject] for name, pool in pools.items()
+                }
+                for subject in subjects
+            }
+        natural = natural_endpoint_probability
         self.importance = np.divide(
             natural,
             probabilities,
@@ -182,7 +213,6 @@ class ClipMixtureSampler(Sampler[tuple[int, int, np.ndarray]]):
                 grouping[key] = group.index.to_numpy(dtype=np.int64)
         else:
             grouping = {("all", "all"): np.arange(len(anchors), dtype=np.int64)}
-        natural_endpoint_probability = np.where(eligible, natural, 0.0)
         for group_indices in grouping.values():
             ordered = np.asarray(group_indices, dtype=np.int64)
             sampled = probabilities[ordered]
@@ -206,6 +236,9 @@ class ClipMixtureSampler(Sampler[tuple[int, int, np.ndarray]]):
             for position, row_index in enumerate(ordered):
                 self._session_positions[int(row_index)] = (ordered, position)
         self.pools = pools
+        self.subject_pools = subject_pools
+        self.subjects = np.asarray(subjects, dtype=object)
+        self.balance_subjects = bool(balance_subjects)
         self.weights = weights
         self.samples_per_epoch = int(samples_per_epoch)
         self.seed = int(seed)
@@ -222,7 +255,11 @@ class ClipMixtureSampler(Sampler[tuple[int, int, np.ndarray]]):
         names = np.asarray(("uniform", "event", "boundary"), dtype=object)
         for _ in range(self.samples_per_epoch):
             category = str(rng.choice(names, p=self.weights))
-            index = int(rng.choice(self.pools[category]))
+            if self.balance_subjects:
+                subject = str(rng.choice(self.subjects))
+                index = int(rng.choice(self.subject_pools[subject][category]))
+            else:
+                index = int(rng.choice(self.pools[category]))
             ordered, position = self._session_positions[index]
             first = max(0, position - self.supervised_steps + 1)
             weights = np.zeros(self.supervised_steps, dtype=np.float32)
@@ -297,8 +334,10 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
                 str(event.subject_key)
             ) & self.anchors["session_id"].astype(str).eq(str(event.session_id))
             timestamps = self.anchors["timestamp_ms"].to_numpy(dtype=np.int64)
-            ignore_support = same_session & (timestamps > int(event.start_ms)) & (
-                timestamps - step_ms < int(event.end_ms) + 60_000
+            ignore_support = (
+                same_session
+                & (timestamps > int(event.start_ms))
+                & (timestamps - step_ms < int(event.end_ms) + 60_000)
             )
             self.anchors.loc[
                 ignore_support,

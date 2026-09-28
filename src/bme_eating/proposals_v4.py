@@ -70,9 +70,7 @@ def _hysteresis(
             active = True
             start = index
         elif active and probability < low:
-            start_ms, end_ms = right_endpoint_run_to_interval(
-                timestamps, start, index, step_ms
-            )
+            start_ms, end_ms = right_endpoint_run_to_interval(timestamps, start, index, step_ms)
             events.append(
                 (
                     start_ms,
@@ -226,9 +224,7 @@ def decoder_valid_mask(windows: pd.DataFrame) -> np.ndarray:
         if column in windows
     ]
     if validity_columns:
-        validity = np.nan_to_num(
-            windows[validity_columns].to_numpy(dtype=np.float64), nan=0.0
-        )
+        validity = np.nan_to_num(windows[validity_columns].to_numpy(dtype=np.float64), nan=0.0)
         return validity.max(axis=1) > 0.0
     if "active_modality_missing_fraction" in windows:
         missing = windows["active_modality_missing_fraction"].to_numpy(dtype=np.float64)
@@ -245,19 +241,13 @@ def configured_decoder_valid_mask(
     masks: list[np.ndarray] = []
     if use_motion:
         motion_columns = [
-            column
-            for column in ("acc_valid_fraction", "gyro_valid_fraction")
-            if column in windows
+            column for column in ("acc_valid_fraction", "gyro_valid_fraction") if column in windows
         ]
         if motion_columns:
-            motion = np.nan_to_num(
-                windows[motion_columns].to_numpy(dtype=np.float64), nan=0.0
-            )
+            motion = np.nan_to_num(windows[motion_columns].to_numpy(dtype=np.float64), nan=0.0)
             masks.append(motion.max(axis=1) > 0.0)
         elif "motion_valid_fraction" in windows:
-            masks.append(
-                windows["motion_valid_fraction"].fillna(0.0).to_numpy(dtype=float) > 0.0
-            )
+            masks.append(windows["motion_valid_fraction"].fillna(0.0).to_numpy(dtype=float) > 0.0)
     if use_ppg and "ppg_valid_fraction" in windows:
         masks.append(windows["ppg_valid_fraction"].fillna(0.0).to_numpy(dtype=float) > 0.0)
     if not masks:
@@ -277,10 +267,9 @@ def _valid_timeline_runs(windows: pd.DataFrame) -> tuple[list[pd.DataFrame], int
     positions = np.flatnonzero(valid)
     if not len(positions):
         return [], step_ms
-    split = np.flatnonzero(
-        (np.diff(positions) != 1)
-        | (np.diff(timestamps[positions]) != step_ms)
-    ) + 1
+    split = (
+        np.flatnonzero((np.diff(positions) != 1) | (np.diff(timestamps[positions]) != step_ms)) + 1
+    )
     runs = [
         ordered.iloc[indices].reset_index(drop=True)
         for indices in np.split(positions, split)
@@ -397,19 +386,18 @@ def generate_event_candidates_v4(
                     )
                     for start, end, score in decoder.decode_events(grid, sampled)
                 )
-            seeds.extend(
-                _transition_candidates(
-                    timestamps,
-                    onset,
-                    offset,
-                    threshold=float(config["transition_threshold"]),
-                    minimum_ms=minimum_ms,
-                    maximum_ms=maximum_ms,
+            if bool(config.get("use_transition_candidates", True)):
+                seeds.extend(
+                    _transition_candidates(
+                        timestamps,
+                        onset,
+                        offset,
+                        threshold=float(config["transition_threshold"]),
+                        minimum_ms=minimum_ms,
+                        maximum_ms=maximum_ms,
+                    )
                 )
-            )
-            seeds = [
-                event for event in seeds if minimum_ms <= event[1] - event[0] <= maximum_ms
-            ]
+            seeds = [event for event in seeds if minimum_ms <= event[1] - event[0] <= maximum_ms]
             family_seeds = [
                 (
                     *event,
@@ -437,18 +425,18 @@ def generate_event_candidates_v4(
                 if source & ~ALLOWED_SOURCE_MASK:
                     raise RuntimeError("A non-deep proposal source entered the v4 pipeline")
                 rows.append(
-                {
-                    "proposal_id": _proposal_id(str(subject), str(session), start, end, source),
-                    "proposal_family_id": family_id,
-                    "subject_key": str(subject),
-                    "session_id": str(session),
-                    "coarse_start_ms": int(start),
-                    "coarse_end_ms": int(end),
-                    "source_mask": int(source),
-                    "generator_score": float(score),
-                    "rank_within_session": 0,
-                    "split_role": split_role,
-                }
+                    {
+                        "proposal_id": _proposal_id(str(subject), str(session), start, end, source),
+                        "proposal_family_id": family_id,
+                        "subject_key": str(subject),
+                        "session_id": str(session),
+                        "coarse_start_ms": int(start),
+                        "coarse_end_ms": int(end),
+                        "source_mask": int(source),
+                        "generator_score": float(score),
+                        "rank_within_session": 0,
+                        "split_role": split_role,
+                    }
                 )
     columns = [
         "proposal_id",
@@ -467,49 +455,33 @@ def generate_event_candidates_v4(
         return unbudgeted
     selected_frames: list[pd.DataFrame] = []
     maximum_per_hour = int(config["maximum_candidates_per_hour"])
-    for (subject, session), group in unbudgeted.groupby(
-        ["subject_key", "session_id"], sort=False
-    ):
+    for (subject, session), group in unbudgeted.groupby(["subject_key", "session_id"], sort=False):
         session_key = (str(subject), str(session))
         budget = max(1, int(np.ceil(observed_hours[session_key] * maximum_per_hour)))
+        ordering = ["generator_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"]
+        ascending = [False, True, True, True]
+        ranked_group = group.sort_values(ordering, ascending=ascending, kind="stable")
+        family_representatives = ranked_group.drop_duplicates("proposal_family_id", keep="first")
         preferred: list[int] = []
         for source in (
             ProposalSource.HYSTERESIS,
             ProposalSource.SEMI_MARKOV,
             ProposalSource.TRANSITION,
         ):
-            eligible = group[(group["source_mask"].astype(int) & int(source)) > 0]
+            eligible = family_representatives[
+                (family_representatives["source_mask"].astype(int) & int(source)) > 0
+            ]
             if len(eligible):
-                preferred.append(
-                    int(
-                        eligible.sort_values(
-                            [
-                                "generator_score",
-                                "coarse_start_ms",
-                                "coarse_end_ms",
-                                "proposal_id",
-                            ],
-                            ascending=[False, True, True, True],
-                            kind="stable",
-                        ).index[0]
-                    )
-                )
+                preferred.append(int(eligible.index[0]))
         preferred = (
             unbudgeted.loc[list(dict.fromkeys(preferred))]
-            .sort_values(
-                ["generator_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"],
-                ascending=[False, True, True, True],
-                kind="stable",
-            )
+            .sort_values(ordering, ascending=ascending, kind="stable")
             .index.tolist()
         )
-        ranked = group.sort_values(
-            ["generator_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"],
-            ascending=[False, True, True, True],
-            kind="stable",
-        ).index.tolist()
+        family_ranked = family_representatives.index.tolist()
+        variant_ranked = ranked_group.index.tolist()
         selected: list[int] = []
-        for index in [*preferred, *ranked]:
+        for index in [*preferred, *family_ranked, *variant_ranked]:
             if index not in selected:
                 selected.append(index)
             if len(selected) >= budget:

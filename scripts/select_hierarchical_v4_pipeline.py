@@ -20,7 +20,7 @@ def main() -> None:
     mode.add_argument("--resume", action="store_true")
     args = parser.parse_args()
     if args.fresh:
-        raise SystemExit("Selection continues a boundary run; use --resume")
+        raise SystemExit("Selection continues a proposal or boundary run; use --resume")
     require_git_worktree()
     config = load_config(args.config)
     _, input_root, output_root = resolve_artifact_roots(config)

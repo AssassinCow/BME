@@ -33,6 +33,7 @@ from bme_eating.models.event_verifier_v4 import (
     EventVerifierV4,
     ProposalFeatureBatchV4,
     build_proposal_features_v4,
+    pooled_logistic_features,
 )
 from bme_eating.models.factory import build_state_model
 from bme_eating.proposals_v4 import (
@@ -158,6 +159,8 @@ class HierarchicalEatingDetectorV4:
             raise ValueError("Deep verifier selection requires model and calibration")
         if verifier_kind == "logistic" and logistic_verifier is None:
             raise ValueError("Logistic verifier selection requires its fitted model")
+        if verifier_kind not in {"deep", "logistic", "state_only"}:
+            raise ValueError(f"Unsupported v4 verifier kind: {verifier_kind}")
         self.device = torch.device(device)
         self.state_models = list(state_models)
         self.state_calibration = state_calibration
@@ -269,15 +272,17 @@ class HierarchicalEatingDetectorV4:
         return frame.loc[selected].reset_index(drop=True)
 
     def _logistic_features(self, features: ProposalFeatureBatchV4) -> np.ndarray:
-        mask = features.sequence_mask[..., None]
-        count = mask.sum(axis=1).clip(min=1)
-        mean = (features.sequence * mask).sum(axis=1) / count
-        maximum = np.where(mask, features.sequence, -np.inf).max(axis=1)
-        maximum[~np.isfinite(maximum)] = 0.0
-        return np.concatenate((mean, maximum, features.scalar), axis=1)
+        return pooled_logistic_features(features)
 
     @torch.no_grad()
     def _score_proposals(self, proposals: pd.DataFrame, windows: pd.DataFrame) -> pd.DataFrame:
+        if self.selection.get("verifier_kind") == "state_only":
+            output = proposals.copy().reset_index(drop=True)
+            output["state_score"] = output["generator_score"]
+            output["final_score"] = output["generator_score"]
+            output["event_logit"] = np.nan
+            output["predicted_iou"] = np.nan
+            return output
         features = build_proposal_features_v4(
             proposals,
             windows,
@@ -464,6 +469,17 @@ def load_hierarchical_v4_bundle(
     config = {**config, "decoder": dict(selected_decoder)}
     if selection.get("selection_source") != "pooled_outer_oof":
         raise RuntimeError("V4 bundle selection must come from pooled outer OOF")
+    if selection.get("promotion_protocol") == "time_constrained_single_holdout_v1":
+        evidence_path = root / "time_constrained_protocol.json"
+        expected = selection.get("promotion_evidence_sha256", {}).get(
+            "time_constrained_protocol"
+        )
+        if (
+            not evidence_path.is_file()
+            or not isinstance(expected, str)
+            or _sha256_file(evidence_path) != expected
+        ):
+            raise RuntimeError("V4 time-constrained protocol evidence is missing or changed")
     required_protocols = {
         "ignore_protocol_version": IGNORE_PROTOCOL,
         "observation_gap_protocol": OBSERVATION_GAP_PROTOCOL,
@@ -506,7 +522,7 @@ def load_hierarchical_v4_bundle(
         missing = [path.name for path in verifier_paths if not path.is_file()]
         if missing:
             raise FileNotFoundError(f"Deep v4 verifier checkpoints are missing: {missing}")
-    elif verifier_kind != "logistic":
+    elif verifier_kind not in {"logistic", "state_only"}:
         raise RuntimeError(f"Unsupported v4 verifier kind: {verifier_kind}")
     for verifier_path in verifier_paths:
         checkpoint = torch.load(verifier_path, map_location=device, weights_only=False)

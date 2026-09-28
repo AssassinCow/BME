@@ -163,8 +163,7 @@ def _validate_p1_parent(config: dict[str, Any], output_root: Path) -> None:
     parent = experiment.get("motion_parent")
     if not isinstance(parent, dict):
         raise TypeError(
-            "R3-P1 must be built from the passing motion winner with "
-            "prepare_hierarchical_v4_p1.py"
+            "R3-P1 must be built from the passing motion winner with prepare_hierarchical_v4_p1.py"
         )
     run_name = str(parent.get("run_name", ""))
     source_root = output_root / "experiments" / run_name
@@ -299,17 +298,18 @@ def initialize_v4_run(
     project_root = Path(__file__).resolve().parents[2]
     git_identity = git_worktree_identity(project_root)
     experiment_root = output_root / "experiments" / run_name
+    time_constrained_single_holdout = bool(
+        config.get("experiment", {}).get("time_constrained_single_holdout", False)
+    )
     fold_zero_manifest = experiment_root / "fold_0" / "run_manifest.json"
     reference = None
     if fold > 0 and fold_zero_manifest.is_file():
         reference = json.loads(fold_zero_manifest.read_text(encoding="utf-8"))
-        reference_hash = _saved_resume_config_hash(
-            fold_zero_manifest.parent, reference
-        )
+        reference_hash = _saved_resume_config_hash(fold_zero_manifest.parent, reference)
         if reference_hash != config_hash:
             raise RuntimeError("V4 fold configuration differs from fold 0")
     freeze_path = experiment_root / "freeze_manifest.json"
-    if fold >= 2:
+    if fold >= 2 and not time_constrained_single_holdout:
         validate_v4_freeze_manifest(
             freeze_path,
             output_root,
@@ -327,13 +327,17 @@ def initialize_v4_run(
             raise FileExistsError(f"V4 run already exists: {run_root}")
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if payload.get("protocol_version") != PROTOCOL_VERSION:
-            raise RuntimeError("Blocked predecessor runs cannot be resumed as statsfusion-r3.1")
+            raise RuntimeError(f"Blocked predecessor runs cannot be resumed as {PROTOCOL_VERSION}")
         saved_config_hash = _saved_resume_config_hash(run_root, payload)
         if saved_config_hash != config_hash:
             raise RuntimeError("Active v4 configuration differs from the run manifest")
         if payload.get("input_hashes") != input_hashes:
             raise RuntimeError("V2 inputs changed after the v4 run was initialized")
-        if fold >= 2 and payload.get("freeze_manifest_sha256") != sha256_file(freeze_path):
+        if (
+            fold >= 2
+            and not time_constrained_single_holdout
+            and payload.get("freeze_manifest_sha256") != sha256_file(freeze_path)
+        ):
             raise RuntimeError("V4 freeze manifest changed after run initialization")
         run = HierarchicalRun(run_root, manifest_path, payload)
         run.verify_artifacts()
@@ -407,9 +411,7 @@ def initialize_v4_run(
 
     state_model = build_state_model(config["model"])
     parameter_count = sum(parameter.numel() for parameter in state_model.parameters())
-    canonical_manifest = json.loads(
-        tracked["canonical_manifest"].read_text(encoding="utf-8")
-    )
+    canonical_manifest = json.loads(tracked["canonical_manifest"].read_text(encoding="utf-8"))
     if not snapshot_path.is_file():
         write_json_atomic(snapshot_path, snapshot)
     if not provenance_path.is_file():
@@ -425,6 +427,11 @@ def initialize_v4_run(
         "calibration_protocol": CALIBRATION_PROTOCOL,
         "decoder_protocol": DECODER_PROTOCOL,
         "raw_input_schema": RAW_INPUT_SCHEMA,
+        "promotion_protocol": (
+            "time_constrained_single_holdout_v1"
+            if time_constrained_single_holdout
+            else "registered_ablation_gates_v1"
+        ),
         "candidate_minimum_seconds": int(config["decoder"]["candidate_minimum_seconds"]),
         "feature_code_sha256": canonical_manifest["feature_code_sha256"],
         "run_name": run_name,
@@ -444,8 +451,18 @@ def initialize_v4_run(
                     "state_seeds", [config["training"]["random_seed"]]
                 )
             ],
-            "verifier": [int(value) for value in config["verifier"]["seeds"]],
-            "boundary": [int(value) for value in config["boundary"]["seeds"]],
+            "verifier": (
+                []
+                if config.get("hierarchical", {}).get("downstream_mode")
+                in {"state_only", "pooled_logistic"}
+                else [int(value) for value in config["verifier"]["seeds"]]
+            ),
+            "boundary": (
+                []
+                if config.get("hierarchical", {}).get("downstream_mode")
+                in {"state_only", "pooled_logistic"}
+                else [int(value) for value in config["boundary"]["seeds"]]
+            ),
         },
         "state_model_parameter_count": parameter_count,
         "artifact_hashes": {"resolved_config.yaml": sha256_file(run_root / "resolved_config.yaml")},
@@ -473,7 +490,7 @@ def initialize_v4_run(
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         },
     }
-    if fold >= 2:
+    if fold >= 2 and not time_constrained_single_holdout:
         payload["freeze_manifest_sha256"] = sha256_file(freeze_path)
     write_json_atomic(manifest_path, payload)
     return HierarchicalRun(run_root, manifest_path, payload)

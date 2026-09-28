@@ -1,0 +1,69 @@
+extends: hierarchical_v4_r3_d2a.yaml
+
+experiment:
+  name: hierarchical_v4_r32_fast_logistic
+  code_version: v4.4.2
+  protocol_version: statsfusion-r3.2
+  blocked_protocols:
+    - statsfusion-r0-blocked
+    - statsfusion-r1-blocked
+    - statsfusion-r2-blocked
+    - statsfusion-r3-blocked
+    - statsfusion-r3.1-blocked
+  ablation_id: R3-DIRECT
+  variant: time_constrained_outer_single_holdout_logistic
+  time_constrained_direct: true
+  time_constrained_single_holdout: true
+
+model:
+  use_ppg: true
+  use_statistics: true
+  use_long_context: true
+  separate_motion_branches: true
+  use_invariant_motion_branch: true
+
+training:
+  batch_size: 8
+  gradient_accumulation: 4
+  clips_per_subject_per_epoch: 1000
+  subject_balanced_sampling: true
+  fixed_state_epochs: 5
+  single_holdout_fraction: 0.35
+  inference_batch_size: 8
+  validation_every_epochs: 1
+  selector_decoder_search: fixed
+  learning_rate: 0.00015
+  warmup_fraction: 0.10
+  gradient_clip_norm: 5.0
+  ppg_modality_dropout: 0.0
+  gyro_modality_dropout: 0.0
+  rotation_augmentation_probability: 0.0
+
+decoder:
+  use_semi_markov: false
+  use_transition_candidates: false
+  high_threshold: 0.10
+  low_threshold: 0.05
+  ema_half_life_seconds: 12
+  gap_merge_seconds: 60
+  transition_threshold: 0.20
+  semi_markov_duration_weight: 1.0
+
+decoder_search:
+  high_threshold: [0.10]
+  low_threshold: [0.05]
+  ema_half_life_seconds: [12]
+  gap_merge_seconds: [60]
+  transition_threshold: [0.20]
+  semi_markov_duration_weight: [1.0]
+
+verifier:
+  seeds: [2026]
+  logistic_c_values: [0.01, 0.1, 1.0]
+
+hierarchical:
+  state_crossfit_mode: single_holdout
+  downstream_mode: pooled_logistic
+
+final_training:
+  state_seeds: [2026]

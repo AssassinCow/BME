@@ -5,14 +5,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-CODE_VERSION = "v4.3.1"
-PROTOCOL_VERSION = "statsfusion-r3.1"
-INPUT_SNAPSHOT_FILENAME = "input_snapshot_r3_1.json"
+CODE_VERSION = "v4.4.2"
+PROTOCOL_VERSION = "statsfusion-r3.2"
+INPUT_SNAPSHOT_FILENAME = "input_snapshot_r3_2.json"
 BLOCKED_PREDECESSORS = (
     "statsfusion-r0-blocked",
     "statsfusion-r1-blocked",
     "statsfusion-r2-blocked",
     "statsfusion-r3-blocked",
+    "statsfusion-r3.1-blocked",
 )
 TARGET_SEMANTICS = "soft_interval_occupancy"
 CALIBRATION_PROTOCOL = "soft_platt_v1"
@@ -138,7 +139,8 @@ def validate_r3_config(config: dict[str, Any]) -> None:
     if ablation_id not in R3_ABLATION_IDS:
         raise ValueError(f"StatsFusion-r3 uses an unsupported ablation_id: {ablation_id!r}")
     if ablation_id == "R3-DIRECT":
-        if experiment.get("variant") != "time_constrained_direct_d2c_ppg_semimarkov":
+        direct_variants = {"time_constrained_outer_single_holdout_logistic"}
+        if experiment.get("variant") not in direct_variants:
             raise ValueError("R3-DIRECT requires the registered time-constrained variant")
         if not bool(experiment.get("time_constrained_direct", False)):
             raise ValueError("R3-DIRECT must explicitly declare time_constrained_direct: true")
@@ -152,10 +154,48 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         )
         if not all(bool(model.get(key, False)) for key in required_model_flags):
             raise ValueError("R3-DIRECT requires the registered D2c+PPG state architecture")
-        if not bool(config.get("decoder", {}).get("use_semi_markov", False)):
-            raise ValueError("R3-DIRECT requires the coherent Semi-Markov decoder")
+        decoder = config.get("decoder", {})
+        if bool(decoder.get("use_semi_markov", False)):
+            raise ValueError("R3-DIRECT disables Semi-Markov for the time-constrained route")
+        if bool(decoder.get("use_transition_candidates", True)):
+            raise ValueError("R3-DIRECT disables transition candidates")
         if config.get("training", {}).get("selector_decoder_search") != "fixed":
             raise ValueError("R3-DIRECT requires fixed decoder search during state selection")
+        single_holdout = bool(experiment.get("time_constrained_single_holdout", False))
+        variant_is_single_holdout = (
+            experiment.get("variant") == "time_constrained_outer_single_holdout_logistic"
+        )
+        if single_holdout != variant_is_single_holdout:
+            raise ValueError("Single-holdout variant and protocol flag must agree")
+        state_crossfit_mode = str(config.get("hierarchical", {}).get("state_crossfit_mode", "full"))
+        downstream_mode = str(config.get("hierarchical", {}).get("downstream_mode", "full"))
+        if single_holdout:
+            if state_crossfit_mode != "single_holdout":
+                raise ValueError("Single-holdout direct training requires state_crossfit_mode")
+            if downstream_mode != "pooled_logistic":
+                raise ValueError(
+                    "Single-holdout direct training must use pooled-logistic downstream"
+                )
+            fixed_epochs = int(config.get("training", {}).get("fixed_state_epochs", 0))
+            holdout_fraction = float(config.get("training", {}).get("single_holdout_fraction", 0.0))
+            if not 1 <= fixed_epochs <= 12:
+                raise ValueError("Single-holdout fixed_state_epochs must be in [1, 12]")
+            if not 0.2 <= holdout_fraction < 0.5:
+                raise ValueError("Single-holdout fraction must be in [0.2, 0.5)")
+            training = config.get("training", {})
+            if not bool(training.get("subject_balanced_sampling", False)):
+                raise ValueError("R3-DIRECT requires subject-balanced sampling")
+            if int(training.get("clips_per_subject_per_epoch", 0)) <= 0:
+                raise ValueError("R3-DIRECT requires positive clips_per_subject_per_epoch")
+            for key in (
+                "ppg_modality_dropout",
+                "gyro_modality_dropout",
+                "rotation_augmentation_probability",
+            ):
+                if float(training.get(key, 0.0)) != 0.0:
+                    raise ValueError(f"R3-DIRECT requires {key}: 0")
+        elif state_crossfit_mode != "full" or downstream_mode != "full":
+            raise ValueError("Registered full direct training requires full crossfit/downstream")
     if tuple(experiment.get("blocked_protocols", ())) != BLOCKED_PREDECESSORS:
         raise ValueError("StatsFusion-r3 must declare all blocked predecessor protocols")
     public_keys = {key for key in config if not key.startswith("_")}
@@ -180,12 +220,13 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         raise ValueError("StatsFusion-r3 uses smooth_beta, not the blocked smooth_tau loss")
     if float(config.get("loss", {}).get("smooth_beta", 0)) != 0.5:
         raise ValueError("StatsFusion-r3 Huber smooth_beta must be 0.5")
-    selector_decoder_search = str(
-        config.get("training", {}).get("selector_decoder_search", "full")
-    )
+    selector_decoder_search = str(config.get("training", {}).get("selector_decoder_search", "full"))
     if selector_decoder_search not in {"full", "fixed"}:
         raise ValueError("training.selector_decoder_search must be 'full' or 'fixed'")
     configured_state_seeds(config)
     verifier_seeds = [int(value) for value in config.get("verifier", {}).get("seeds", [])]
-    if verifier_seeds != [2026, 2027, 2028]:
-        raise ValueError("StatsFusion-r3 requires verifier seeds 2026/2027/2028")
+    expected_verifier_seeds = [2026] if ablation_id == "R3-DIRECT" else [2026, 2027, 2028]
+    if verifier_seeds != expected_verifier_seeds:
+        raise ValueError(
+            f"{ablation_id or 'StatsFusion-r3'} requires verifier seeds {expected_verifier_seeds}"
+        )

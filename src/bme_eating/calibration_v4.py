@@ -113,9 +113,7 @@ class SoftPlattCalibration:
             loss = np.logaddexp(0.0, linear) - targets * linear
             probability = sigmoid(linear)
             residual = normalized_weight * (probability - targets)
-            gradient = np.asarray(
-                [np.sum(residual * logits), np.sum(residual)], dtype=np.float64
-            )
+            gradient = np.asarray([np.sum(residual * logits), np.sum(residual)], dtype=np.float64)
             return float(np.sum(normalized_weight * loss)), gradient
 
         initial = np.asarray(
@@ -251,10 +249,16 @@ class LogisticScoreCombiner:
     scale: tuple[float, ...]
     coefficients: tuple[float, ...]
     intercept: float
+    regularization_c: float = 1.0
 
     @classmethod
     def fit(
-        cls, features: np.ndarray, targets: np.ndarray, sample_weight: np.ndarray | None = None
+        cls,
+        features: np.ndarray,
+        targets: np.ndarray,
+        sample_weight: np.ndarray | None = None,
+        *,
+        regularization_c: float = 1.0,
     ) -> LogisticScoreCombiner:
         values = np.asarray(features, dtype=np.float64)
         targets = np.asarray(targets, dtype=np.int64).reshape(-1)
@@ -266,7 +270,9 @@ class LogisticScoreCombiner:
             raise ValueError("Logistic score calibration features must be finite")
         classes = np.unique(targets)
         if not np.array_equal(classes, np.asarray([0, 1])):
-            raise ValueError("Logistic score calibration requires both positive and negative proposals")
+            raise ValueError(
+                "Logistic score calibration requires both positive and negative proposals"
+            )
         if sample_weight is not None:
             weights = np.asarray(sample_weight, dtype=np.float64).reshape(-1)
             if (
@@ -283,13 +289,16 @@ class LogisticScoreCombiner:
         scale = values.std(axis=0)
         scale = np.where(scale > 1e-6, scale, 1.0)
         standardized = (values - mean) / scale
-        model = LogisticRegression(C=1.0, solver="lbfgs", random_state=2026)
+        if not np.isfinite(regularization_c) or regularization_c <= 0:
+            raise ValueError("Logistic regularization C must be finite and positive")
+        model = LogisticRegression(C=float(regularization_c), solver="lbfgs", random_state=2026)
         model.fit(standardized, targets, sample_weight=sample_weight)
         return cls(
             tuple(float(value) for value in mean),
             tuple(float(value) for value in scale),
             tuple(float(value) for value in model.coef_[0]),
             float(model.intercept_[0]),
+            float(regularization_c),
         )
 
     def predict(self, features: np.ndarray) -> np.ndarray:
@@ -303,6 +312,7 @@ class LogisticScoreCombiner:
             "scale": list(self.scale),
             "coefficients": list(self.coefficients),
             "intercept": self.intercept,
+            "regularization_c": self.regularization_c,
         }
 
     @classmethod
@@ -312,6 +322,7 @@ class LogisticScoreCombiner:
             tuple(float(value) for value in payload["scale"]),
             tuple(float(value) for value in payload["coefficients"]),
             float(payload["intercept"]),
+            float(payload.get("regularization_c", 1.0)),
         )
 
 

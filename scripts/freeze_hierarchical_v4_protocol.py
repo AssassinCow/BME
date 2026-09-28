@@ -52,8 +52,11 @@ def main() -> None:
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         if payload.get("stage") != "EVALUATED":
             raise RuntimeError(f"Fold {fold} must be EVALUATED before protocol freeze")
-        if payload.get("code_version") != CODE_VERSION or payload.get("protocol_version") != PROTOCOL_VERSION:
-            raise RuntimeError(f"Fold {fold} is not a StatsFusion-r3.1/v4.3.1 artifact")
+        if (
+            payload.get("code_version") != CODE_VERSION
+            or payload.get("protocol_version") != PROTOCOL_VERSION
+        ):
+            raise RuntimeError(f"Fold {fold} is not a {PROTOCOL_VERSION}/{CODE_VERSION} artifact")
         if payload.get("resume_config_sha256") != resume_config_hash(config):
             raise RuntimeError(f"Fold {fold} configuration differs from the freeze configuration")
         for name, relative in (
@@ -74,8 +77,13 @@ def main() -> None:
         if not bool(report.get("passed", False)):
             raise RuntimeError(f"V4 {name} did not pass; folds 2-4 remain blocked")
         if name == "fold0_ablation":
-            if report.get("protocol_version") != PROTOCOL_VERSION or report.get("selected_run") != args.run_name:
-                raise RuntimeError("Fold-0 promotion report does not select this StatsFusion-r3 run")
+            if (
+                report.get("protocol_version") != PROTOCOL_VERSION
+                or report.get("selected_run") != args.run_name
+            ):
+                raise RuntimeError(
+                    "Fold-0 promotion report does not select this StatsFusion-r3 run"
+                )
         elif report.get("mode") != "development" or report.get("candidate_run") != args.run_name:
             raise RuntimeError("Development gate does not select this StatsFusion-r3 run")
         verify_gate_evidence(output_root.parent, report)

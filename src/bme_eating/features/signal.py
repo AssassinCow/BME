@@ -97,9 +97,7 @@ def ppg_quality_features(
     valid_fraction = float(mask.mean())
     valid_values = values[mask]
     if len(valid_values) < max(16, int(sampling_hz)):
-        features = np.asarray(
-            [valid_fraction, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32
-        )
+        features = np.asarray([valid_fraction, 1.0, 1.0, 1.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
         return features, 0.0
 
     gap_ratio = longest_false_run(mask) / max(len(mask), 1)
@@ -178,7 +176,7 @@ def robust_statistics(values: np.ndarray) -> dict[str, float]:
     values = values[np.isfinite(values)]
     if len(values) == 0:
         return {
-            name: 0.0
+            name: float("nan")
             for name in (
                 "mean",
                 "std",

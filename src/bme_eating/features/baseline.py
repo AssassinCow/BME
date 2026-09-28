@@ -68,24 +68,18 @@ def _motion_window_features(
         magnitude_all = np.linalg.norm(values[:, start : start + 3], axis=1)
         magnitude = magnitude_all[valid_rows]
         _add_statistics(output, f"{prefix}_{sensor_name}", magnitude)
-        for name, value in masked_spectral_summary(
-            magnitude_all, valid_rows, sampling_hz
-        ).items():
+        for name, value in masked_spectral_summary(magnitude_all, valid_rows, sampling_hz).items():
             output[f"{prefix}_{sensor_name}_{name}"] = value
         adjacent_valid = valid_rows[:-1] & valid_rows[1:]
         if adjacent_valid.any():
             jerk = np.diff(magnitude_all)[adjacent_valid] * sampling_hz
             output[f"{prefix}_{sensor_name}_jerk_std"] = float(np.std(jerk))
-            output[f"{prefix}_{sensor_name}_jerk_rms"] = float(
-                np.sqrt(np.mean(np.square(jerk)))
-            )
-            output[f"{prefix}_{sensor_name}_jerk_p95"] = float(
-                np.percentile(np.abs(jerk), 95)
-            )
+            output[f"{prefix}_{sensor_name}_jerk_rms"] = float(np.sqrt(np.mean(np.square(jerk))))
+            output[f"{prefix}_{sensor_name}_jerk_p95"] = float(np.percentile(np.abs(jerk), 95))
         else:
-            output[f"{prefix}_{sensor_name}_jerk_std"] = 0.0
-            output[f"{prefix}_{sensor_name}_jerk_rms"] = 0.0
-            output[f"{prefix}_{sensor_name}_jerk_p95"] = 0.0
+            output[f"{prefix}_{sensor_name}_jerk_std"] = float("nan")
+            output[f"{prefix}_{sensor_name}_jerk_rms"] = float("nan")
+            output[f"{prefix}_{sensor_name}_jerk_p95"] = float("nan")
     for start, sensor_name in ((0, "acc"), (3, "gyro")):
         block = cleaned[:, start : start + 3]
         for left, right, suffix in ((0, 1, "xy"), (0, 2, "xz"), (1, 2, "yz")):
@@ -141,8 +135,7 @@ def _compact_motion_bucket_features(
     statistics: list[str] | tuple[str, ...] | None = None,
 ) -> dict[str, float]:
     selected = tuple(
-        statistics
-        or ("mean", "std", "rms", "maximum", "slope", "last", "valid_fraction")
+        statistics or ("mean", "std", "rms", "maximum", "slope", "last", "valid_fraction")
     )
     supported = {"mean", "std", "rms", "maximum", "slope", "last", "valid_fraction"}
     unknown = sorted(set(selected) - supported)
@@ -157,9 +150,7 @@ def _compact_motion_bucket_features(
             if statistic == "slope":
                 value = _masked_slope(magnitude, valid)
             elif statistic == "last":
-                value = (
-                    float(magnitude[np.flatnonzero(valid)[-1]]) if valid.any() else 0.0
-                )
+                value = float(magnitude[np.flatnonzero(valid)[-1]]) if valid.any() else 0.0
             elif statistic == "valid_fraction":
                 value = float(valid.mean()) if len(valid) else 0.0
             else:
@@ -182,13 +173,9 @@ def _compact_ppg_bucket_features(
     output[f"{prefix}_ppg_last"] = (
         float(ppg_values[np.flatnonzero(ppg_mask)[-1]]) if ppg_mask.any() else 0.0
     )
-    output[f"{prefix}_ppg_valid_fraction"] = (
-        float(ppg_mask.mean()) if len(ppg_mask) else 0.0
-    )
+    output[f"{prefix}_ppg_valid_fraction"] = float(ppg_mask.mean()) if len(ppg_mask) else 0.0
     zero_mask = ppg_mask & (ppg_values == 0)
-    output[f"{prefix}_ppg_zero_fraction"] = float(
-        zero_mask.sum() / max(ppg_mask.sum(), 1)
-    )
+    output[f"{prefix}_ppg_zero_fraction"] = float(zero_mask.sum() / max(ppg_mask.sum(), 1))
     output[f"{prefix}_ppg_longest_zero_run_ratio"] = float(
         longest_false_run(~zero_mask) / max(len(zero_mask), 1)
     )
@@ -249,16 +236,12 @@ def build_segment_features(
         features = _motion_window_features(
             motion_values[motion_slice], motion_mask[motion_slice], 100.0
         )
-        features.update(
-            _ppg_window_features(ppg_values[ppg_slice], ppg_mask[ppg_slice], 50.0)
-        )
+        features.update(_ppg_window_features(ppg_values[ppg_slice], ppg_mask[ppg_slice], 50.0))
         if include_dyadic:
             motion_cursor_ms = end_ms
             for bucket_index, width_seconds in enumerate(motion_bucket_seconds):
                 bucket_start_ms = motion_cursor_ms - int(width_seconds * 1000)
-                motion_bucket = _history_slice(
-                    motion_time, bucket_start_ms, motion_cursor_ms
-                )
+                motion_bucket = _history_slice(motion_time, bucket_start_ms, motion_cursor_ms)
                 features.update(
                     _compact_motion_bucket_features(
                         motion_values[motion_bucket],

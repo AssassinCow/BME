@@ -1,10 +1,38 @@
-# StatsFusion-r2 运行手册
+# StatsFusion v4 运行手册
+
+## 当前时间受限路线（v4.4.2 / statsfusion-r3.2）
+
+当前正式配置为 `configs/hierarchical_v4_r32_fast_logistic.yaml`。每个 outer fold 只训练
+一个 subject-disjoint state holdout、一个 state seed，并固定训练 5 epochs；fold 内只运行
+state、候选、state-only 选择和 outer evaluation。五折结束后，最终训练入口才使用完整
+outer OOF 交叉拟合 pooled Logistic，并在未通过晋级门禁时自动回退 state-only。
+
+```powershell
+$config = "configs/hierarchical_v4_r32_fast_logistic.yaml"
+$run = "hierarchical_v4_r32_fast_logistic_20260928a"
+
+python scripts/prepare_statsfusion_v4_inputs.py --config $config --workers 8 --resume
+
+foreach ($fold in 0..4) {
+  python scripts/train_hierarchical_v4_state.py --config $config --run-name $run --fold $fold --fresh
+  python scripts/build_event_candidates_v4.py --config $config --run-name $run --fold $fold --resume
+  python scripts/select_hierarchical_v4_pipeline.py --config $config --run-name $run --fold $fold --resume
+  python scripts/evaluate_hierarchical_v4.py --config $config --run-name $run --fold $fold --resume
+}
+
+python scripts/train_hierarchical_v4_final.py --config $config --run-name $run --fresh
+python scripts/export_hierarchical_v4_bundle.py --config $config --run-name $run --fresh
+```
+
+若某一步中断，只对该既有 run 使用 `--resume`，不要把 `--fresh` 和 `--resume` 同时传入。
+旧 r0/r1/r2/r3/r3.1 run 和 canonical 输入均禁止 resume。下面的分级消融、deep verifier
+和 boundary 命令保留为完整研究协议参考，不属于当前时间受限路线。
 
 ## 边界
 
 - 输入只读复用 `outputs/v2/`，输出只写 `outputs/v4/`。
-- 旧实现统一标记为 `statsfusion-r0-blocked` / `statsfusion-r1-blocked`；r2 必须使用
-  全新 run name，禁止 resume 任何旧 v4 产物。
+- `statsfusion-r0/r1/r2/r3/r3.1` 均为 blocked predecessor；r3.2 必须使用全新 run name，
+  禁止 resume 旧 v4 产物。
 - v4 不加载 XGBoost 模型，不读取 XGBoost 概率、事件或候选，也不使用蒸馏目标。
 - 唯一保留的是配置中固定顺序的 12 项 trailing 15 秒统计特征。
 - `strict_resume_identity` 固定为 `true`；数据、模型结构、采样、优化参数及标签/评估规则变化时拒绝恢复。
@@ -20,23 +48,23 @@
 
 ```powershell
 python scripts/prepare_statsfusion_v4_inputs.py `
-  --config configs/hierarchical_v4_statsfusion.yaml `
+  --config configs/hierarchical_v4_r32_fast_logistic.yaml `
   --workers 8 `
   --fresh
 
 python scripts/audit_statsfusion_feature_provenance.py `
-  --config configs/hierarchical_v4_statsfusion.yaml `
+  --config configs/hierarchical_v4_r32_fast_logistic.yaml `
   --fresh
 ```
 
 第一条命令会重新生成 session-wide 3 秒右端点网格和同相位 trailing 15 秒统计特征，写入
-`outputs/v4/canonical_input/`。正式 r2 训练会校验 events/segments、每个 segment archive
+`outputs/v4/canonical_input_r3_2/`。正式 r3.2 训练会校验 events/segments、每个 segment archive
 完整 SHA-256、确定性聚合 SHA、preparation identity、anchor sidecar 与全部输出 SHA-256；
 缺少该阶段或仍使用逐 segment 重启相位的旧输入时直接拒绝启动。中断后使用 `--resume`
 复用按 archive 内容寻址的逐 session 缓存；源身份或 anchor sidecar 不一致时拒绝复用，
 不得回退到 `outputs/v2/` 的旧相位 anchors。
-当前数据的只读 v2 快照仍有 1,117 个 masked anchors；按真实原始首末时间重建后的 canonical
-快照为 1,581,724 个 anchors，其中 1,125 个 masked。两者差异来自相位与尾端网格修正，
+当前数据的只读 v2 快照仍有 1,117 个 masked anchors；按真实原始首末时间重建后的 r3.2 canonical
+快照为 1,581,724 个 anchors，其中 794 个 masked。两者差异来自相位、真实观测边界与尾端网格修正，
 manifest 会记录实际计数，训练和 outer calibration 统一使用 canonical 计数，不硬编码任一数字。
 
 当前配置按保守规则把 12 项特征视为查看过五折 gain 后固定，因此 folds 0–4 只能作为

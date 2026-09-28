@@ -16,7 +16,7 @@ from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS
 from bme_eating.v4_protocol import PROTOCOL_VERSION
 
-CANONICAL_INPUT_DIRECTORY = "canonical_input_r3_1"
+CANONICAL_INPUT_DIRECTORY = "canonical_input_r3_2"
 CANONICAL_ANCHORS_FILE = "anchors.parquet"
 CANONICAL_STATISTICS_FILE = "statistics.parquet"
 CANONICAL_EVENTS_FILE = "events_with_session.parquet"
@@ -115,7 +115,7 @@ def _session_cache_path(
     subject_key: str | None = None,
 ) -> Path:
     digest = hashlib.sha256()
-    digest.update(b"statsfusion-r3.1-canonical-statistics-v3")
+    digest.update(b"statsfusion-r3.2-canonical-statistics-v4")
     digest.update((feature_code_sha256 or feature_implementation_identity()["sha256"]).encode())
     digest.update(str(subject_key or "").encode("utf-8"))
     digest.update(str(session_id).encode("utf-8"))
@@ -170,7 +170,7 @@ def _require_matching_preparation_identity(
     if not path.is_file():
         raise RuntimeError(
             "Partial StatsFusion canonical inputs lack preparation_identity.json; "
-            "refuse resume and rebuild with --fresh in a clean canonical_input_r3_1 directory"
+            "refuse resume and rebuild with --fresh in a clean canonical_input_r3_2 directory"
         )
     stored = json.loads(path.read_text(encoding="utf-8"))
     if stored != current:
