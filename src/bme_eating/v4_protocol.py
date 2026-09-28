@@ -176,13 +176,21 @@ def validate_r3_config(config: dict[str, Any]) -> None:
                 raise ValueError(
                     "Single-holdout direct training must use pooled-logistic downstream"
                 )
-            fixed_epochs = int(config.get("training", {}).get("fixed_state_epochs", 0))
+            training = config.get("training", {})
+            if "fixed_state_epochs" in training:
+                raise ValueError("Single-holdout training must select epochs with early stopping")
+            maximum_epochs = int(training.get("max_epochs", 0))
+            minimum_epochs = int(training.get("early_stopping_min_epochs", 0))
+            patience_checks = int(training.get("early_stopping_patience_checks", 0))
             holdout_fraction = float(config.get("training", {}).get("single_holdout_fraction", 0.0))
-            if not 1 <= fixed_epochs <= 12:
-                raise ValueError("Single-holdout fixed_state_epochs must be in [1, 12]")
+            if maximum_epochs != 32:
+                raise ValueError("Single-holdout max_epochs must be 32")
+            if not 1 <= minimum_epochs < maximum_epochs:
+                raise ValueError("Single-holdout early-stopping minimum must be in [1, 31]")
+            if not 1 <= patience_checks <= 8:
+                raise ValueError("Single-holdout early-stopping patience must be in [1, 8]")
             if not 0.2 <= holdout_fraction < 0.5:
                 raise ValueError("Single-holdout fraction must be in [0.2, 0.5)")
-            training = config.get("training", {})
             if not bool(training.get("subject_balanced_sampling", False)):
                 raise ValueError("R3-DIRECT requires subject-balanced sampling")
             if int(training.get("clips_per_subject_per_epoch", 0)) <= 0:

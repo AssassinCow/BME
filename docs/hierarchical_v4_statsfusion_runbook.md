@@ -2,9 +2,12 @@
 
 ## 当前时间受限路线（v4.4.2 / statsfusion-r3.2）
 
-当前正式配置为 `configs/hierarchical_v4_r32_fast_logistic.yaml`。每个 outer fold 只训练
-一个 subject-disjoint state holdout、一个 state seed，并固定训练 5 epochs；fold 内只运行
-state、候选、state-only 选择和 outer evaluation。五折结束后，最终训练入口才使用完整
+当前正式配置为 `configs/hierarchical_v4_r32_fast_logistic.yaml`。每个 outer fold 只使用
+一个 subject-disjoint state OOF holdout 和一个 state seed；其训练受试者内部再划分独立
+selector，最多训练 32 epochs，最早第 5 轮早停、patience 为 3。当前时间受限路线使用
+`0.70` 的跑通门槛和 `0.75` 的候选召回目标；它们是开发期门槛，不替代最终性能要求。选中 epoch 后在完整训练块
+重训，再预测从未参与 epoch 选择的 OOF holdout。fold 内只运行 state、候选、state-only
+选择和 outer evaluation。五折结束后，最终训练入口才使用完整
 outer OOF 交叉拟合 pooled Logistic，并在未通过晋级门禁时自动回退 state-only。
 
 ```powershell

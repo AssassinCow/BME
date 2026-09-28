@@ -113,7 +113,10 @@ def test_r32_time_constrained_config_uses_single_holdout_and_pooled_logistic() -
     assert config["training"]["gradient_accumulation"] == 4
     assert config["training"]["clips_per_subject_per_epoch"] == 1000
     assert config["training"]["subject_balanced_sampling"] is True
-    assert config["training"]["fixed_state_epochs"] == 5
+    assert "fixed_state_epochs" not in config["training"]
+    assert config["training"]["max_epochs"] == 32
+    assert config["training"]["early_stopping_min_epochs"] == 5
+    assert config["training"]["early_stopping_patience_checks"] == 3
     assert config["training"]["inference_batch_size"] == 8
     assert config["training"]["validation_every_epochs"] == 1
     assert config["training"]["selector_decoder_search"] == "fixed"
@@ -128,6 +131,8 @@ def test_r32_time_constrained_config_uses_single_holdout_and_pooled_logistic() -
     assert config["hierarchical"]["downstream_mode"] == "pooled_logistic"
     assert config["final_training"]["state_seeds"] == [2026]
     assert config["verifier"]["seeds"] == [2026]
+    assert config["promotion_gate"]["minimum_candidate_recall"] == 0.70
+    assert config["promotion_gate"]["target_candidate_recall"] == 0.75
     assert len(_decoder_configurations(config)) == 1
     assert len(_decoder_configurations(_selector_decoder_search_config(config))) == 1
     geometry = sequence_geometry_from_config(config)
@@ -136,20 +141,25 @@ def test_r32_time_constrained_config_uses_single_holdout_and_pooled_logistic() -
     assert geometry.total_steps == 1049
 
 
-def test_r32_fast_config_uses_one_fixed_subject_holdout() -> None:
+def test_r32_fast_config_uses_one_nested_selector_holdout() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
     config = load_config(root / "hierarchical_v4_r32_fast_logistic.yaml")
     validate_r3_config(config)
     assert config["experiment"]["variant"] == "time_constrained_outer_single_holdout_logistic"
     assert config["experiment"]["time_constrained_direct"] is True
     assert config["experiment"]["time_constrained_single_holdout"] is True
-    assert config["training"]["fixed_state_epochs"] == 5
+    assert "fixed_state_epochs" not in config["training"]
+    assert config["training"]["max_epochs"] == 32
+    assert config["training"]["early_stopping_min_epochs"] == 5
+    assert config["training"]["early_stopping_patience_checks"] == 3
     assert config["training"]["single_holdout_fraction"] == 0.35
     assert config["training"]["learning_rate"] == 0.00015
     assert config["training"]["warmup_fraction"] == 0.10
     assert config["hierarchical"]["state_crossfit_mode"] == "single_holdout"
     assert config["hierarchical"]["downstream_mode"] == "pooled_logistic"
     assert config["final_training"]["state_seeds"] == [2026]
+    assert config["promotion_gate"]["minimum_candidate_recall"] == 0.70
+    assert config["promotion_gate"]["target_candidate_recall"] == 0.75
     assert len(_decoder_configurations(config)) == 1
     assert _decoder_configurations(config)[0] == {
         **config["decoder"],
@@ -165,7 +175,9 @@ def test_r32_fast_config_uses_one_fixed_subject_holdout() -> None:
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("fixed_state_epochs", 0, "fixed_state_epochs"),
+        ("max_epochs", 31, "max_epochs"),
+        ("early_stopping_min_epochs", 0, "early-stopping minimum"),
+        ("early_stopping_patience_checks", 0, "early-stopping patience"),
         ("single_holdout_fraction", 0.1, "Single-holdout fraction"),
         ("single_holdout_fraction", 0.5, "Single-holdout fraction"),
     ],

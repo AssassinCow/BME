@@ -1235,6 +1235,54 @@ def _selector_early_stopping_improved(
     )
 
 
+def _choose_conservative_state_epoch(
+    epoch_metrics: list[dict[str, Any]],
+    qualified: list[dict[str, Any]],
+    *,
+    minimum_delta: float,
+    minimum_epoch: int = 1,
+) -> tuple[dict[str, Any], bool]:
+    eligible_metrics = [
+        value for value in epoch_metrics if int(value["epoch"]) >= int(minimum_epoch)
+    ]
+    if not eligible_metrics:
+        raise ValueError("State epoch selection has no metrics at or after the minimum epoch")
+    qualified = [
+        value for value in qualified if int(value["epoch"]) >= int(minimum_epoch)
+    ]
+    if qualified:
+        eligible = qualified
+        promotion_eligible = True
+    else:
+        best_recall = max(
+            float(value["robust_candidate_recall"]) for value in eligible_metrics
+        )
+        eligible = [
+            value
+            for value in eligible_metrics
+            if float(value["robust_candidate_recall"]) >= best_recall - minimum_delta
+        ]
+        promotion_eligible = False
+    minimum_bce = min(eligible, key=lambda value: value["robust_subject_macro_soft_bce"])
+    one_standard_error = float(minimum_bce["robust_soft_bce_standard_error"])
+    within_one_standard_error = [
+        value
+        for value in eligible
+        if float(value["robust_subject_macro_soft_bce"])
+        <= float(minimum_bce["robust_subject_macro_soft_bce"]) + one_standard_error
+    ]
+    best = min(
+        within_one_standard_error,
+        key=lambda value: (
+            int(value["epoch"]),
+            -float(value["robust_candidate_recall"]),
+            float(value["robust_state_fragment_count"]),
+            float(value["robust_ece"]),
+        ),
+    )
+    return best, promotion_eligible
+
+
 def _select_epoch(
     fit_anchors: pd.DataFrame,
     selector_anchors: pd.DataFrame,
@@ -1389,38 +1437,12 @@ def _select_epoch(
         and bool(value["robust_calibration_passed"])
         and clipping_by_epoch.get(int(value["epoch"]), False)
     ]
-    if qualified:
-        minimum_bce = min(qualified, key=lambda value: value["robust_subject_macro_soft_bce"])
-        one_standard_error = float(minimum_bce["robust_soft_bce_standard_error"])
-        within_one_standard_error = [
-            value
-            for value in qualified
-            if float(value["robust_subject_macro_soft_bce"])
-            <= float(minimum_bce["robust_subject_macro_soft_bce"]) + one_standard_error
-        ]
-        best = min(
-            within_one_standard_error,
-            key=lambda value: (
-                int(value["epoch"]),
-                -float(value["robust_candidate_recall"]),
-                float(value["robust_state_fragment_count"]),
-                float(value["robust_ece"]),
-            ),
-        )
-        promotion_eligible = True
-    else:
-        best = max(
-            epoch_metrics,
-            key=lambda value: (
-                value["robust_candidate_recall"],
-                -value["robust_subject_macro_soft_bce"],
-                -value["robust_state_fragment_count"],
-                -value["robust_ece"],
-                value["robust_center_window_auprc"],
-                value["candidate_recall"],
-            ),
-        )
-        promotion_eligible = False
+    best, promotion_eligible = _choose_conservative_state_epoch(
+        epoch_metrics,
+        qualified,
+        minimum_delta=minimum_delta,
+        minimum_epoch=minimum_training_epochs,
+    )
     return int(best["epoch"]), {
         "selected_epoch": int(best["epoch"]),
         "promotion_eligible": promotion_eligible,
@@ -1432,7 +1454,7 @@ def _select_epoch(
         ),
         "selected_epoch_clipping_gate_passed": clipping_by_epoch.get(int(best["epoch"]), False),
         "selector_calibration_protocol": "subject_crossfit_soft_platt_v1",
-        "selection_rule": "earliest_epoch_within_one_standard_error_soft_bce",
+        "selection_rule": "best_recall_then_earliest_epoch_within_one_standard_error_soft_bce",
         "selector_rolling_epochs": rolling_epochs,
         "validation_every_epochs": validation_interval,
         "early_stopping_min_epochs": minimum_training_epochs,
@@ -1775,12 +1797,24 @@ def train_state_crossfit_v4(
                 outer=outer_test,
             )
         else:
-            fit_subjects = training_subjects
-            selector_subjects = set()
+            fit_subjects, selector_subjects, selector_split_report = _selector_split(
+                training_subjects,
+                float(config["training"]["selector_fraction"]),
+                int(config["training"]["random_seed"]) + partition + 20_000,
+                events=inputs.events,
+                anchors=inputs.anchors,
+            )
             selector_split_report = {
-                **(single_holdout_report or {}),
-                "role": "state_oof_holdout",
+                **selector_split_report,
+                "outer_single_holdout": single_holdout_report,
+                "role": "nested_epoch_selector",
             }
+            assert_disjoint_subjects(
+                fit=fit_subjects,
+                selector=selector_subjects,
+                holdout=holdout,
+                outer=outer_test,
+            )
         partition_root = run.root / "crossfit" / f"partition_{partition}" / "state"
         scaler_path = partition_root / "statistics_scaler.json"
         normalization_path = partition_root / "sensor_normalization.json"
@@ -1832,42 +1866,28 @@ def train_state_crossfit_v4(
                         raise RuntimeError("Saved state selector subjects differ from this run")
                     epochs = int(selector_report["selected_epoch"])
                 else:
-                    if crossfit_mode == "single_holdout":
-                        epochs = int(config["training"]["fixed_state_epochs"])
-                        selector_report = {
-                            "selected_epoch": epochs,
-                            "promotion_eligible": False,
-                            "selection_rule": "fixed_from_fold0_partition0_diagnostic",
-                            "state_oof_protocol": "single_holdout_fixed_epoch_v1",
-                            "training_metrics": [],
-                            "epochs": [],
-                            "fit_subjects": sorted(fit_subjects),
-                            "selector_subjects": [],
-                            "selector_split": selector_split_report,
-                        }
-                        write_json_atomic(selector_report_path, selector_report)
-                    else:
-                        epochs, selector_report = _select_epoch(
-                            inputs.anchors[
-                                inputs.anchors["subject_key"].astype(str).isin(fit_subjects)
-                            ],
-                            inputs.anchors[
-                                inputs.anchors["subject_key"].astype(str).isin(selector_subjects)
-                            ],
-                            fit_subjects,
-                            inputs,
-                            config,
-                            seed + partition * 10_000,
-                            checkpoint_path=partition_root / f"selector_seed_{seed}_last.pt",
-                            resume=resume,
-                        )
-                        selector_report = {
-                            **selector_report,
-                            "fit_subjects": sorted(fit_subjects),
-                            "selector_subjects": sorted(selector_subjects),
-                            "selector_split": selector_split_report,
-                        }
-                        write_json_atomic(selector_report_path, selector_report)
+                    epochs, selector_report = _select_epoch(
+                        inputs.anchors[
+                            inputs.anchors["subject_key"].astype(str).isin(fit_subjects)
+                        ],
+                        inputs.anchors[
+                            inputs.anchors["subject_key"].astype(str).isin(selector_subjects)
+                        ],
+                        fit_subjects,
+                        inputs,
+                        config,
+                        seed + partition * 10_000,
+                        checkpoint_path=partition_root / f"selector_seed_{seed}_last.pt",
+                        resume=resume,
+                    )
+                    selector_report = {
+                        **selector_report,
+                        "fit_subjects": sorted(fit_subjects),
+                        "selector_subjects": sorted(selector_subjects),
+                        "selector_split": selector_split_report,
+                        "retrain_epoch_policy": "selected_earliest_one_standard_error_epoch",
+                    }
+                    write_json_atomic(selector_report_path, selector_report)
                 train_rows = transformed[
                     transformed["subject_key"].astype(str).isin(training_subjects)
                 ].reset_index(drop=True)
@@ -2119,7 +2139,9 @@ def train_state_crossfit_v4(
             "outer_test_subjects": sorted(outer_test),
             "stacking_partitions": partitions,
             "state_oof_protocol": (
-                "fully_nested_v1" if crossfit_mode == "full" else "single_holdout_fixed_epoch_v1"
+                "fully_nested_v1"
+                if crossfit_mode == "full"
+                else "single_holdout_nested_selector_v1"
             ),
             "state_training_subjects": sorted(outer_train - prediction_subjects),
             "state_oof_prediction_subjects": sorted(prediction_subjects),
@@ -2420,7 +2442,7 @@ def build_candidates_v4(
     prediction_subjects = set(logits["subject_key"].astype(str))
     prior_subjects = (
         set(run.payload.get("state_training_subjects", []))
-        if run.payload.get("state_oof_protocol") == "single_holdout_fixed_epoch_v1"
+        if run.payload.get("state_oof_protocol") == "single_holdout_nested_selector_v1"
         else prediction_subjects
     )
     if not prior_subjects:
@@ -5147,7 +5169,7 @@ def select_v4_pipeline(
             "decoder_config": decoder_selection["decoder"],
             "masking_protocol": "zero_mask_layernorm_v1",
             "candidate_budget_scope": "session",
-            "meta_crossfit_protocol": "single_holdout_fixed_epoch_v1",
+            "meta_crossfit_protocol": "single_holdout_nested_selector_v1",
             "selection_source": "single_holdout_state_only",
             "formal_full_oof": False,
             "ignore_protocol_version": IGNORE_PROTOCOL,
@@ -5930,8 +5952,8 @@ def train_hierarchical_final_v4(
             {
                 "schema_version": 1,
                 "protocol": "time_constrained_single_holdout_v1",
-                "state_oof_protocol": "single_holdout_fixed_epoch_v1",
-                "fixed_state_epoch_by_seed": {
+                "state_oof_protocol": "single_holdout_nested_selector_v1",
+                "selected_state_epoch_by_seed": {
                     str(seed): epoch for seed, epoch in fixed_epochs.items()
                 },
                 "fold_selection_sha256": {
@@ -5939,7 +5961,10 @@ def train_hierarchical_final_v4(
                     for fold, root in enumerate(fold_roots)
                 },
                 "limitations": [
-                    "Each fold uses one subject-disjoint development holdout instead of full inner OOF.",
+                    (
+                        "Each fold uses one subject-disjoint OOF holdout; epoch selection occurs "
+                        "inside its training subjects with a separate selector split."
+                    ),
                     (
                         "Fold-local verifier and boundary stages are disabled; a pooled "
                         "subject-crossfit Logistic verifier is evaluated after all outer folds."

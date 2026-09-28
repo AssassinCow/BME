@@ -27,8 +27,11 @@ training:
   gradient_accumulation: 4
   clips_per_subject_per_epoch: 1000
   subject_balanced_sampling: true
-  fixed_state_epochs: 5
   single_holdout_fraction: 0.35
+  max_epochs: 32
+  early_stopping_min_epochs: 5
+  early_stopping_patience_checks: 3
+  early_stopping_min_delta: 0.003
   inference_batch_size: 8
   validation_every_epochs: 1
   selector_decoder_search: fixed
@@ -67,3 +70,7 @@ hierarchical:
 
 final_training:
   state_seeds: [2026]
+
+promotion_gate:
+  minimum_candidate_recall: 0.70
+  target_candidate_recall: 0.75

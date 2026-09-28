@@ -91,6 +91,7 @@ from bme_eating.training.hierarchical_v4_trainer import (
     _build_seeded_state_model,
     _candidate_domain_metrics,
     _candidate_recall,
+    _choose_conservative_state_epoch,
     _evaluable_state_calibration_rows,
     _fit_pooled_logistic_crossfit,
     _gap_aware_nms,
@@ -3011,6 +3012,57 @@ def test_selector_early_stopping_uses_v3_minimum_delta_semantics() -> None:
     assert _selector_early_stopping_improved(
         improved, best, minimum_recall=0.83, minimum_delta=0.003
     )
+
+
+def test_unqualified_state_epoch_selection_prefers_earliest_stable_epoch() -> None:
+    metrics = [
+        {
+            "epoch": epoch,
+            "robust_candidate_recall": recall,
+            "robust_subject_macro_soft_bce": bce,
+            "robust_soft_bce_standard_error": 0.01,
+            "robust_state_fragment_count": fragments,
+            "robust_ece": 0.01,
+        }
+        for epoch, recall, bce, fragments in (
+            (4, 0.790, 0.120, 20),
+            (5, 0.792, 0.115, 18),
+            (6, 0.792, 0.110, 16),
+        )
+    ]
+    selected, promotion_eligible = _choose_conservative_state_epoch(
+        metrics,
+        [],
+        minimum_delta=0.003,
+    )
+    assert promotion_eligible is False
+    assert selected["epoch"] == 4
+
+
+def test_state_epoch_selection_respects_minimum_training_epoch() -> None:
+    metrics = [
+        {
+            "epoch": epoch,
+            "robust_candidate_recall": recall,
+            "robust_subject_macro_soft_bce": bce,
+            "robust_soft_bce_standard_error": 0.01,
+            "robust_state_fragment_count": 20 - epoch,
+            "robust_ece": 0.01,
+        }
+        for epoch, recall, bce in (
+            (4, 0.792, 0.120),
+            (5, 0.791, 0.115),
+            (6, 0.790, 0.110),
+        )
+    ]
+    selected, promotion_eligible = _choose_conservative_state_epoch(
+        metrics,
+        [],
+        minimum_delta=0.003,
+        minimum_epoch=5,
+    )
+    assert promotion_eligible is False
+    assert selected["epoch"] == 5
 
 
 def test_semi_markov_cannot_chain_eating_segments_past_maximum_duration() -> None:
