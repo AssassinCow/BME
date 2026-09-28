@@ -22,6 +22,7 @@ from bme_eating.v4_protocol import (
     RUNTIME_SOURCE_FILES,
     runtime_source_identity,
     validate_serialized_state_seeds,
+    validate_serialized_verifier_seeds,
 )
 
 REQUIRED_MODEL_FILES = (
@@ -216,9 +217,9 @@ def export_hierarchical_v4_bundle(
     verifier_kind = str(selection.get("verifier_kind", ""))
     selected_verifier_files: list[str] = []
     if verifier_kind == "deep":
-        verifier_seeds = [int(value) for value in selection.get("verifier_seeds", [])]
-        if verifier_seeds != [2026, 2027, 2028]:
-            raise RuntimeError("Deep v4 export requires verifier seeds 2026/2027/2028")
+        verifier_seeds = validate_serialized_verifier_seeds(
+            selection.get("verifier_seeds", [])
+        )
         configured_verifier = config.get("verifier", {}).get("seeds")
         if configured_verifier is not None and [
             int(value) for value in configured_verifier

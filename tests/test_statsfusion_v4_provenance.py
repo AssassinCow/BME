@@ -21,7 +21,11 @@ from bme_eating.data.stats_fusion_inputs import (
     verify_canonical_statsfusion_inputs,
 )
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
-from bme_eating.hierarchical_v4_artifacts import initialize_v4_run, resume_config_hash
+from bme_eating.hierarchical_v4_artifacts import (
+    _input_snapshot_matches,
+    initialize_v4_run,
+    resume_config_hash,
+)
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, audit_feature_provenance
 from bme_eating.v4_protocol import INPUT_SNAPSHOT_FILENAME
 
@@ -29,6 +33,24 @@ from bme_eating.v4_protocol import INPUT_SNAPSHOT_FILENAME
 def _r3_config() -> dict:
     root = Path(__file__).resolve().parents[1]
     return load_config(root / "configs" / "hierarchical_v4_statsfusion_r3.yaml")
+
+
+def test_input_snapshot_identity_ignores_code_version_but_not_input_hashes() -> None:
+    current = {
+        "version": 6,
+        "protocol_version": "statsfusion-r3.2",
+        "input_artifact_schema_version": "v2",
+        "hashes": {"anchors": "a" * 64},
+    }
+    legacy = {
+        **current,
+        "version": 5,
+        "code_version": "v4.4.2",
+    }
+    assert _input_snapshot_matches(legacy, current)
+    assert not _input_snapshot_matches(
+        {**legacy, "hashes": {"anchors": "b" * 64}}, current
+    )
 
 
 def test_canonical_identity_includes_archive_reader_and_session_dependencies(
@@ -288,7 +310,7 @@ def test_r3_freeze_manifest_hash_locks_promotion_and_selection_evidence(tmp_path
     config = {"decoder": {"candidate_minimum_seconds": 3, "candidate_maximum_seconds": 14_400}}
     freeze_path = experiment_root / "freeze_manifest.json"
     payload = {
-        "code_version": "v4.4.2",
+        "code_version": "v4.5.1",
         "protocol_version": "statsfusion-r3.2",
         "blocked_predecessors": [
             "statsfusion-r0-blocked",

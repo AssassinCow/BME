@@ -5,8 +5,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-CODE_VERSION = "v4.4.2"
+CODE_VERSION = "v4.5.1"
 PROTOCOL_VERSION = "statsfusion-r3.2"
+POOLED_HEAD_PROTOCOL = "outer_fold_crossfit_joint_tuning_v1"
 INPUT_SNAPSHOT_FILENAME = "input_snapshot_r3_2.json"
 BLOCKED_PREDECESSORS = (
     "statsfusion-r0-blocked",
@@ -113,6 +114,15 @@ def validate_serialized_state_seeds(values: Any) -> list[int]:
     return seeds
 
 
+def validate_serialized_verifier_seeds(values: Any) -> list[int]:
+    seeds = [int(value) for value in values]
+    if tuple(seeds) not in {DIRECT_STATE_SEEDS, FULL_STATE_SEEDS}:
+        raise RuntimeError(
+            "V4 verifier seeds must match a registered single-seed or three-seed profile"
+        )
+    return seeds
+
+
 def runtime_source_identity(package_root: Path) -> dict[str, Any]:
     files: dict[str, str] = {}
     for relative in RUNTIME_SOURCE_FILES:
@@ -139,7 +149,10 @@ def validate_r3_config(config: dict[str, Any]) -> None:
     if ablation_id not in R3_ABLATION_IDS:
         raise ValueError(f"StatsFusion-r3 uses an unsupported ablation_id: {ablation_id!r}")
     if ablation_id == "R3-DIRECT":
-        direct_variants = {"time_constrained_outer_single_holdout_logistic"}
+        direct_variants = {
+            "time_constrained_outer_single_holdout_logistic",
+            "time_constrained_outer_single_holdout_pooled_heads",
+        }
         if experiment.get("variant") not in direct_variants:
             raise ValueError("R3-DIRECT requires the registered time-constrained variant")
         if not bool(experiment.get("time_constrained_direct", False)):
@@ -162,9 +175,7 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         if config.get("training", {}).get("selector_decoder_search") != "fixed":
             raise ValueError("R3-DIRECT requires fixed decoder search during state selection")
         single_holdout = bool(experiment.get("time_constrained_single_holdout", False))
-        variant_is_single_holdout = (
-            experiment.get("variant") == "time_constrained_outer_single_holdout_logistic"
-        )
+        variant_is_single_holdout = experiment.get("variant") in direct_variants
         if single_holdout != variant_is_single_holdout:
             raise ValueError("Single-holdout variant and protocol flag must agree")
         state_crossfit_mode = str(config.get("hierarchical", {}).get("state_crossfit_mode", "full"))
@@ -172,9 +183,15 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         if single_holdout:
             if state_crossfit_mode != "single_holdout":
                 raise ValueError("Single-holdout direct training requires state_crossfit_mode")
-            if downstream_mode != "pooled_logistic":
+            expected_downstream = (
+                "pooled_heads"
+                if experiment.get("variant")
+                == "time_constrained_outer_single_holdout_pooled_heads"
+                else "pooled_logistic"
+            )
+            if downstream_mode != expected_downstream:
                 raise ValueError(
-                    "Single-holdout direct training must use pooled-logistic downstream"
+                    "Single-holdout direct training downstream mode does not match its variant"
                 )
             training = config.get("training", {})
             if "fixed_state_epochs" in training:
@@ -195,13 +212,20 @@ def validate_r3_config(config: dict[str, Any]) -> None:
                 raise ValueError("R3-DIRECT requires subject-balanced sampling")
             if int(training.get("clips_per_subject_per_epoch", 0)) <= 0:
                 raise ValueError("R3-DIRECT requires positive clips_per_subject_per_epoch")
-            for key in (
-                "ppg_modality_dropout",
-                "gyro_modality_dropout",
-                "rotation_augmentation_probability",
-            ):
-                if float(training.get(key, 0.0)) != 0.0:
-                    raise ValueError(f"R3-DIRECT requires {key}: 0")
+            if float(training.get("gyro_modality_dropout", 0.0)) != 0.20:
+                raise ValueError("R3-DIRECT requires gyro_modality_dropout: 0.20")
+            if float(training.get("ppg_modality_dropout", 0.0)) != 0.20:
+                raise ValueError("R3-DIRECT requires ppg_modality_dropout: 0.20")
+            if float(training.get("rotation_augmentation_probability", 0.0)) != 0.50:
+                raise ValueError("R3-DIRECT requires rotation_augmentation_probability: 0.50")
+            promotion_fraction = float(
+                training.get("gradient_clipping_promotion_fraction", 0.20)
+            )
+            abort_fraction = float(training.get("gradient_clipping_abort_fraction", 0.50))
+            if promotion_fraction != 0.20:
+                raise ValueError("R3-DIRECT clipping promotion fraction must be 0.20")
+            if not 0.50 <= abort_fraction <= 1.0:
+                raise ValueError("R3-DIRECT clipping abort fraction must be in [0.50, 1.0]")
         elif state_crossfit_mode != "full" or downstream_mode != "full":
             raise ValueError("Registered full direct training requires full crossfit/downstream")
     if tuple(experiment.get("blocked_protocols", ())) != BLOCKED_PREDECESSORS:
@@ -238,3 +262,16 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         raise ValueError(
             f"{ablation_id or 'StatsFusion-r3'} requires verifier seeds {expected_verifier_seeds}"
         )
+    if str(config.get("hierarchical", {}).get("downstream_mode", "full")) == "pooled_heads":
+        if config.get("hierarchical", {}).get("pooled_head_protocol") != POOLED_HEAD_PROTOCOL:
+            raise ValueError(
+                f"Pooled heads require pooled_head_protocol: {POOLED_HEAD_PROTOCOL}"
+            )
+        for section in ("verifier", "boundary"):
+            minimum_epochs = int(config.get(section, {}).get("minimum_epochs", 0))
+            maximum_epochs = int(config.get(section, {}).get("max_epochs", 0))
+            patience = int(config.get(section, {}).get("patience", 0))
+            if not 1 <= minimum_epochs <= maximum_epochs:
+                raise ValueError(f"{section} minimum_epochs must lie within its epoch budget")
+            if patience != 8:
+                raise ValueError(f"Pooled {section} patience must be 8")

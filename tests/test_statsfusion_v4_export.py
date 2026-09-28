@@ -165,7 +165,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path, mon
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "code_version": "v4.4.2",
+                "code_version": "v4.5.1",
                 "protocol_version": "statsfusion-r3.2",
                 "blocked_predecessors": [
                     "statsfusion-r0-blocked",
@@ -304,7 +304,7 @@ def test_v4_export_rejects_incomplete_deep_verifier_seed_mirror(tmp_path) -> Non
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "code_version": "v4.4.2",
+                "code_version": "v4.5.1",
                 "protocol_version": "statsfusion-r3.2",
                 "blocked_predecessors": [
                     "statsfusion-r0-blocked",

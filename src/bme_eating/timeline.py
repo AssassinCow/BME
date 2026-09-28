@@ -9,6 +9,20 @@ import pandas as pd
 TIMELINE_KEYS = ("subject_key", "session_id", "timestamp_ms")
 
 
+def tail_aligned_chunk_endpoints(total_rows: int, chunk_size: int) -> list[int]:
+    total = int(total_rows)
+    size = int(chunk_size)
+    if total < 0:
+        raise ValueError("Timeline row count must be non-negative")
+    if size <= 0:
+        raise ValueError("Timeline chunk size must be positive")
+    if total == 0:
+        return []
+    last = total - 1
+    first = last % size
+    return list(range(first, total, size))
+
+
 def claim_new_timeline_rows(
     frame: pd.DataFrame,
     previous_chunks: MutableMapping[tuple[str, str], pd.DataFrame],

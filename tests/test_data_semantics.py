@@ -201,6 +201,13 @@ def test_dtp_evaluation_partitions_non_evaluable_events_as_ignore():
     assert ignore["event_id"].tolist() == ["partial"]
 
 
+def test_partition_evaluation_events_accepts_empty_legacy_schema():
+    events = pd.DataFrame(columns=["subject_key", "valid_duration"])
+    truth, ignore = partition_evaluation_events(events, {"validation"})
+    assert truth.empty
+    assert ignore.empty
+
+
 def test_quality_report_detects_overlaps_across_different_sessions(tmp_path):
     index_dir = tmp_path / "indices"
     index_dir.mkdir()

@@ -233,6 +233,88 @@ def test_selector_resume_preserves_epoch_metrics(tmp_path, monkeypatch):
         assert torch.equal(value, _weights(interrupted_path)[1][name])
 
 
+def test_selector_resume_finishes_pending_validation_without_retraining(tmp_path, monkeypatch):
+    _patch_toy_training(monkeypatch)
+    config = _config()
+    config["training"].update(
+        {
+            "max_epochs": 2,
+            "validation_every_epochs": 1,
+            "early_stopping_min_epochs": 2,
+        }
+    )
+    anchors = pd.DataFrame({"subject_key": ["fit"] * 6 + ["selector"] * 6})
+    events = pd.DataFrame({"subject_key": ["fit", "selector"]})
+    inputs = trainer.V4Inputs(anchors, pd.DataFrame(), events, pd.DataFrame(), {})
+    monkeypatch.setattr(trainer, "_fit_scaler_and_transform", lambda *_args: (None, anchors))
+    monkeypatch.setattr(trainer, "compute_normalization", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(trainer, "_make_dataset", lambda *_args, **_kwargs: ToyDataset())
+
+    def seeded(_config, seed):
+        torch.manual_seed(seed)
+        return ToyModel()
+
+    monkeypatch.setattr(trainer, "_build_seeded_state_model", seeded)
+    validation_calls = 0
+
+    def score(*_args, **_kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        if validation_calls == 1:
+            raise RuntimeError("simulated validation interruption")
+        return {
+            "candidate_recall": 0.8,
+            "event_f1": 0.4,
+            "state_fragment_count": 1,
+            "ece": 0.02,
+            "subject_macro_soft_bce": 0.3,
+            "soft_bce_standard_error": 0.01,
+            "center_window_auprc": 0.4,
+            "calibration_passed": True,
+        }
+
+    monkeypatch.setattr(trainer, "_selector_score", score)
+    fit = anchors[anchors["subject_key"] == "fit"]
+    selector = anchors[anchors["subject_key"] == "selector"]
+    checkpoint_path = tmp_path / "selector_pending_validation.pt"
+    with pytest.raises(RuntimeError, match="validation interruption"):
+        trainer._select_epoch(
+            fit,
+            selector,
+            {"fit"},
+            inputs,
+            config,
+            46,
+            checkpoint_path=checkpoint_path,
+        )
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["epoch"] == 1
+    assert checkpoint["validation_pending"] is True
+
+    original = trainer._train_state_epochs
+    resumed_epoch_offsets: list[int] = []
+
+    def record_training(*args, **kwargs):
+        resumed_epoch_offsets.append(int(kwargs["epoch_offset"]))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(trainer, "_train_state_epochs", record_training)
+    selected, report = trainer._select_epoch(
+        fit,
+        selector,
+        {"fit"},
+        inputs,
+        config,
+        46,
+        checkpoint_path=checkpoint_path,
+        resume=True,
+    )
+    assert selected in {1, 2}
+    assert report["completed_training_epochs"] == 2
+    assert resumed_epoch_offsets == [1]
+    assert [row["epoch"] for row in report["epochs"]] == [1, 2]
+
+
 def _interrupt_after_second_head_epoch(monkeypatch):
     original_save = trainer._save_head_epoch
 

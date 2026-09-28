@@ -18,23 +18,14 @@ def temporal_receptive_field(dilations: Sequence[int], kernel_size: int = 3) -> 
     return 1 + (kernel_size - 1) * sum(int(value) for value in dilations)
 
 
-def _group_count(channels: int) -> int:
-    for groups in (16, 8, 4, 2, 1):
-        if channels % groups == 0:
-            return groups
-    return 1
-
-
-class TimewiseGroupNorm(nn.Module):
+class TimewiseLayerNorm(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
-        self.normalization = nn.GroupNorm(_group_count(channels), channels)
+        self.normalization = nn.LayerNorm(channels)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
-        batch, channels, steps = values.shape
-        values = values.transpose(1, 2).reshape(batch * steps, channels, 1)
-        values = self.normalization(values)
-        return values.reshape(batch, steps, channels).transpose(1, 2)
+        normalized = self.normalization(values.transpose(1, 2).contiguous())
+        return normalized.transpose(1, 2)
 
 
 class CausalDepthwiseBlock(nn.Module):
@@ -50,7 +41,7 @@ class CausalDepthwiseBlock(nn.Module):
             bias=False,
         )
         self.pointwise = nn.Conv1d(channels, channels, kernel_size=1, bias=False)
-        self.normalization = TimewiseGroupNorm(channels)
+        self.normalization = TimewiseLayerNorm(channels)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
@@ -74,7 +65,7 @@ class CausalTCN(nn.Module):
         self.blocks = nn.ModuleList(
             CausalDepthwiseBlock(channels, dilation, dropout) for dilation in self.dilations
         )
-        self.output_norm = TimewiseGroupNorm(channels)
+        self.output_norm = TimewiseLayerNorm(channels)
 
     @property
     def receptive_field_steps(self) -> int:

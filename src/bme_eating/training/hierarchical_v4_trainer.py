@@ -95,7 +95,11 @@ from bme_eating.structured_decoder import (
     FixedLagSemiMarkovDecoder,
     TruncatedLogNormalDurationPrior,
 )
-from bme_eating.timeline import claim_new_timeline_rows, deduplicate_consistent_timeline
+from bme_eating.timeline import (
+    claim_new_timeline_rows,
+    deduplicate_consistent_timeline,
+    tail_aligned_chunk_endpoints,
+)
 from bme_eating.v4_protocol import (
     BLOCKED_PREDECESSORS,
     CALIBRATION_PROTOCOL,
@@ -103,6 +107,7 @@ from bme_eating.v4_protocol import (
     DECODER_PROTOCOL,
     IGNORE_PROTOCOL,
     OBSERVATION_GAP_PROTOCOL,
+    POOLED_HEAD_PROTOCOL,
     PROTOCOL_VERSION,
     RAW_INPUT_SCHEMA,
     RUNTIME_SOURCE_BINDING,
@@ -139,6 +144,77 @@ def _dataframe_sha256(frame: pd.DataFrame, columns: list[str]) -> str:
     digest.update("\n".join(columns).encode("utf-8"))
     digest.update(hashed.tobytes())
     return digest.hexdigest()
+
+
+def _write_outer_event_snapshot(
+    root: Path,
+    truth: pd.DataFrame,
+    ignore: pd.DataFrame,
+    *,
+    expected_subjects: set[str] | None = None,
+) -> tuple[Path, Path, Path]:
+    identity_columns = ["subject_key", "session_id", "event_id", "start_ms", "end_ms"]
+    truth_path = root / "evaluation" / "truth_events.parquet"
+    ignore_path = root / "evaluation" / "ignore_events.parquet"
+    manifest_path = root / "evaluation" / "truth_ignore_snapshot.json"
+    ordered_truth = truth.sort_values(identity_columns, kind="stable").reset_index(drop=True)
+    ordered_ignore = ignore.sort_values(identity_columns, kind="stable").reset_index(drop=True)
+    write_parquet_atomic(truth_path, ordered_truth)
+    write_parquet_atomic(ignore_path, ordered_ignore)
+    event_subjects = set(ordered_truth["subject_key"].astype(str)) | set(
+        ordered_ignore["subject_key"].astype(str)
+    )
+    snapshot_subjects = event_subjects if expected_subjects is None else set(expected_subjects)
+    if not event_subjects.issubset(snapshot_subjects):
+        raise ValueError("Truth/ignore events contain subjects outside the expected outer fold")
+    write_json_atomic(
+        manifest_path,
+        {
+            "schema_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
+            "snapshot_protocol": "outer_evaluation_truth_ignore_sha256_v1",
+            "truth_rows": len(ordered_truth),
+            "ignore_rows": len(ordered_ignore),
+            "subjects": sorted(snapshot_subjects),
+            "subjects_with_events": sorted(event_subjects),
+            "truth_semantic_sha256": _dataframe_sha256(ordered_truth, identity_columns),
+            "ignore_semantic_sha256": _dataframe_sha256(ordered_ignore, identity_columns),
+            "files": {
+                truth_path.name: sha256_file(truth_path),
+                ignore_path.name: sha256_file(ignore_path),
+            },
+        },
+    )
+    return truth_path, ignore_path, manifest_path
+
+
+def _load_outer_event_snapshot(root: Path) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    snapshot_root = root / "evaluation"
+    manifest_path = snapshot_root / "truth_ignore_snapshot.json"
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Fold truth/ignore snapshot is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("protocol_version") != PROTOCOL_VERSION:
+        raise RuntimeError("Fold truth/ignore snapshot protocol changed")
+    files = manifest.get("files", {})
+    if set(files) != {"truth_events.parquet", "ignore_events.parquet"}:
+        raise RuntimeError("Fold truth/ignore snapshot file set is invalid")
+    for name, expected in files.items():
+        path = snapshot_root / name
+        if not path.is_file() or sha256_file(path) != expected:
+            raise RuntimeError(f"Fold truth/ignore snapshot changed: {name}")
+    truth = pd.read_parquet(snapshot_root / "truth_events.parquet")
+    ignore = pd.read_parquet(snapshot_root / "ignore_events.parquet")
+    identity_columns = ["subject_key", "session_id", "event_id", "start_ms", "end_ms"]
+    if _dataframe_sha256(truth, identity_columns) != manifest.get("truth_semantic_sha256"):
+        raise RuntimeError("Fold truth snapshot semantic identity changed")
+    if _dataframe_sha256(ignore, identity_columns) != manifest.get("ignore_semantic_sha256"):
+        raise RuntimeError("Fold ignore snapshot semantic identity changed")
+    if int(manifest.get("truth_rows", -1)) != len(truth) or int(
+        manifest.get("ignore_rows", -1)
+    ) != len(ignore):
+        raise RuntimeError("Fold truth/ignore snapshot row count changed")
+    return truth, ignore, manifest
 
 
 def _truth_event_durations(events: pd.DataFrame, subjects: set[str]) -> np.ndarray:
@@ -216,6 +292,19 @@ class V4Inputs:
     events: pd.DataFrame
     statistics: pd.DataFrame
     subject_folds: dict[str, int]
+
+
+@dataclass(frozen=True)
+class PooledFoldProposalData:
+    prediction_fold: int
+    proposals: pd.DataFrame
+    features: ProposalFeatureBatchV4
+    windows: pd.DataFrame
+    training_indices: np.ndarray
+    prediction_indices: np.ndarray
+    training_subjects: frozenset[str]
+    prediction_subjects: frozenset[str]
+    upstream_lineage: dict[str, Any]
 
 
 def load_v4_inputs(
@@ -328,6 +417,7 @@ def _fold_uses_state_only_downstream(config: dict[str, Any]) -> bool:
     return str(config.get("hierarchical", {}).get("downstream_mode", "full")) in {
         "state_only",
         "pooled_logistic",
+        "pooled_heads",
     }
 
 
@@ -631,11 +721,21 @@ def _state_loss(config: dict[str, Any]) -> StatsFusionStateLoss:
 
 
 def _enforce_gradient_clipping_gate(config: dict[str, Any]) -> bool:
-    return not bool(config.get("experiment", {}).get("time_constrained_direct", False))
+    return True
 
 
 def _gradient_clipping_gate_passed(config: dict[str, Any], clipping_fraction: float) -> bool:
-    return not _enforce_gradient_clipping_gate(config) or float(clipping_fraction) <= 0.20
+    threshold = float(config.get("training", {}).get("gradient_clipping_promotion_fraction", 0.20))
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("gradient_clipping_promotion_fraction must be in [0, 1]")
+    return float(clipping_fraction) <= threshold
+
+
+def _gradient_clipping_abort_fraction(config: dict[str, Any]) -> float:
+    threshold = float(config.get("training", {}).get("gradient_clipping_abort_fraction", 0.50))
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("gradient_clipping_abort_fraction must be in [0, 1]")
+    return threshold
 
 
 def _state_samples_per_epoch(dataset: StatsFusionSequenceDataset, config: dict[str, Any]) -> int:
@@ -890,17 +990,19 @@ def _train_state_epochs(
         warmup_epoch = max(
             1, math.ceil(schedule_total * float(config["training"]["warmup_fraction"]))
         )
-        enforce_clipping_gate = _enforce_gradient_clipping_gate(config)
-        if enforce_clipping_gate and epoch + 1 > warmup_epoch and clipping_fraction > 0.50:
+        abort_fraction = _gradient_clipping_abort_fraction(config)
+        if epoch + 1 > warmup_epoch and clipping_fraction > abort_fraction:
             raise RuntimeError(
-                "State gradient clipping exceeded 50% after warmup; inspect importance weights, "
+                "State gradient clipping exceeded the configured hard abort threshold after "
+                "warmup; inspect importance weights, "
                 "auxiliary losses, and batch composition before changing learning rate"
             )
-        if not enforce_clipping_gate and clipping_fraction > 0.50:
+        if clipping_fraction > float(
+            config.get("training", {}).get("gradient_clipping_promotion_fraction", 0.20)
+        ):
             tqdm.write(
                 f"[{progress_label}] clipping diagnostic: {clipping_fraction:.1%} of optimizer "
-                "updates were clipped; direct-mode training continues because loss and "
-                "gradients remain finite"
+                "updates were clipped; this epoch is not promotion-eligible"
             )
         tqdm.write(
             f"[{progress_label}] epoch {epoch + 1}/{display_total} "
@@ -922,9 +1024,12 @@ def _save_state_epoch(
     seed: int,
     subjects: dict[str, set[str]],
     extra: dict[str, Any] | None = None,
+    scheduler_state: dict[str, Any] | None = None,
 ) -> None:
     scheduler = getattr(optimizer, "_bme_scheduler", None)
-    if scheduler is None:
+    if scheduler is not None:
+        scheduler_state = scheduler.state_dict()
+    if scheduler_state is None:
         raise RuntimeError("Cannot save a state epoch without its LR scheduler")
     _save_torch_atomic(
         path,
@@ -936,7 +1041,7 @@ def _save_state_epoch(
             "resume_config_sha256": resume_config_hash(config),
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict(),
+            "scheduler": scheduler_state,
             "torch_rng_state": torch.get_rng_state(),
             "cuda_rng_states": torch.cuda.get_rng_state_all()
             if torch.cuda.is_available()
@@ -1340,6 +1445,7 @@ def _select_epoch(
     completed_training_epochs = 0
     scheduler_state = None
     training_metrics: list[dict[str, Any]] = []
+    validation_pending = False
     if resume and checkpoint_path is not None and checkpoint_path.is_file():
         completed_training_epochs, optimizer, scheduler_state, checkpoint = _load_state_epoch(
             checkpoint_path,
@@ -1355,6 +1461,70 @@ def _select_epoch(
         checks_without_improvement = int(checkpoint["checks_without_improvement"])
         stopped_early = bool(checkpoint["stopped_early"])
         training_metrics = list(checkpoint.get("training_metrics", []))
+        validation_pending = bool(checkpoint.get("validation_pending", False))
+
+    def validate_epoch(epoch: int) -> None:
+        nonlocal best_progress, checks_without_improvement, stopped_early, validation_pending
+        score = _selector_score(
+            model,
+            selector_dataset,
+            config,
+            fit_events,
+            selector_events,
+            progress_label=f"state validate {epoch}/{maximum_epochs}",
+        )
+        epoch_metrics.append({"epoch": epoch, **score})
+        _add_robust_epoch_metrics(epoch_metrics, rolling_epochs)
+        current = epoch_metrics[-1]
+        if _selector_early_stopping_improved(
+            current,
+            best_progress,
+            minimum_recall=minimum_recall,
+            minimum_delta=minimum_delta,
+        ):
+            best_progress = dict(current)
+            checks_without_improvement = 0
+        else:
+            checks_without_improvement += 1
+        tqdm.write(
+            f"[state selector seed={seed}] epoch {epoch}/{maximum_epochs} "
+            f"recall={score['candidate_recall']:.4f} F1={score['event_f1']:.4f} "
+            f"ECE={score['ece']:.4f}"
+        )
+        if epoch >= minimum_training_epochs and checks_without_improvement >= patience_checks:
+            stopped_early = True
+            tqdm.write(
+                f"[state selector seed={seed}] early stop after epoch {epoch}; "
+                f"no robust improvement for {checks_without_improvement} checks"
+            )
+        validation_pending = False
+
+    def save_selector_checkpoint(epoch: int) -> None:
+        if checkpoint_path is None or optimizer is None:
+            return
+        _save_state_epoch(
+            checkpoint_path,
+            model,
+            optimizer,
+            config,
+            kind="selector",
+            epoch=epoch,
+            seed=seed,
+            subjects={"fit": fit_subjects, "selector": selector_subjects},
+            scheduler_state=scheduler_state,
+            extra={
+                "epoch_metrics": epoch_metrics,
+                "best_progress": best_progress,
+                "checks_without_improvement": checks_without_improvement,
+                "stopped_early": stopped_early,
+                "training_metrics": training_metrics,
+                "validation_pending": validation_pending,
+            },
+        )
+
+    if validation_pending:
+        validate_epoch(completed_training_epochs)
+        save_selector_checkpoint(completed_training_epochs)
     for epoch in range(completed_training_epochs + 1, maximum_epochs + 1):
         if stopped_early:
             break
@@ -1373,57 +1543,11 @@ def _select_epoch(
         )
         scheduler_state = None
         completed_training_epochs = epoch
-        if epoch % validation_interval == 0 or epoch == maximum_epochs:
-            score = _selector_score(
-                model,
-                selector_dataset,
-                config,
-                fit_events,
-                selector_events,
-                progress_label=f"state validate {epoch}/{maximum_epochs}",
-            )
-            epoch_metrics.append({"epoch": epoch, **score})
-            _add_robust_epoch_metrics(epoch_metrics, rolling_epochs)
-            current = epoch_metrics[-1]
-            if _selector_early_stopping_improved(
-                current,
-                best_progress,
-                minimum_recall=minimum_recall,
-                minimum_delta=minimum_delta,
-            ):
-                best_progress = dict(current)
-                checks_without_improvement = 0
-            else:
-                checks_without_improvement += 1
-            tqdm.write(
-                f"[state selector seed={seed}] epoch {epoch}/{maximum_epochs} "
-                f"recall={score['candidate_recall']:.4f} F1={score['event_f1']:.4f} "
-                f"ECE={score['ece']:.4f}"
-            )
-            if epoch >= minimum_training_epochs and checks_without_improvement >= patience_checks:
-                stopped_early = True
-                tqdm.write(
-                    f"[state selector seed={seed}] early stop after epoch {epoch}; "
-                    f"no robust improvement for {checks_without_improvement} checks"
-                )
-        if checkpoint_path is not None:
-            _save_state_epoch(
-                checkpoint_path,
-                model,
-                optimizer,
-                config,
-                kind="selector",
-                epoch=epoch,
-                seed=seed,
-                subjects={"fit": fit_subjects, "selector": selector_subjects},
-                extra={
-                    "epoch_metrics": epoch_metrics,
-                    "best_progress": best_progress,
-                    "checks_without_improvement": checks_without_improvement,
-                    "stopped_early": stopped_early,
-                    "training_metrics": training_metrics,
-                },
-            )
+        validation_pending = epoch % validation_interval == 0 or epoch == maximum_epochs
+        save_selector_checkpoint(epoch)
+        if validation_pending:
+            validate_epoch(epoch)
+            save_selector_checkpoint(epoch)
         if stopped_early:
             break
     clipping_by_epoch = {
@@ -1447,11 +1571,7 @@ def _select_epoch(
         "selected_epoch": int(best["epoch"]),
         "promotion_eligible": promotion_eligible,
         "minimum_candidate_recall": minimum_recall,
-        "gradient_clipping_gate": (
-            "selected_epoch_clipping_fraction_lte_0.20"
-            if _enforce_gradient_clipping_gate(config)
-            else "diagnostic_only_for_time_constrained_direct"
-        ),
+        "gradient_clipping_gate": "selected_epoch_clipping_fraction_lte_configured_threshold",
         "selected_epoch_clipping_gate_passed": clipping_by_epoch.get(int(best["epoch"]), False),
         "selector_calibration_protocol": "subject_crossfit_soft_platt_v1",
         "selection_rule": "best_recall_then_earliest_epoch_within_one_standard_error_soft_bce",
@@ -1474,9 +1594,7 @@ def _inference_endpoints(dataset: StatsFusionSequenceDataset) -> list[int]:
     step = dataset.geometry.supervised_steps
     for group in dataset.session_groups.values():
         rows = group["_row_id"].to_numpy(dtype=np.int64)
-        local = list(range(min(step - 1, len(rows) - 1), len(rows), step))
-        if not local or local[-1] != len(rows) - 1:
-            local.append(len(rows) - 1)
+        local = tail_aligned_chunk_endpoints(len(rows), step)
         endpoints.extend(int(rows[index]) for index in local)
     return endpoints
 
@@ -3279,10 +3397,11 @@ def _select_verifier_epoch(
         weight_decay=float(config["verifier"]["weight_decay"]),
     )
     best_epoch = 1
-    best_key = (-math.inf, -math.inf)
+    best_key = (-math.inf, -math.inf, -math.inf, -math.inf)
     patience = 0
     history: list[dict[str, float]] = []
     maximum_epochs = int(config["verifier"]["max_epochs"])
+    minimum_epochs = int(config["verifier"].get("minimum_epochs", 1))
     completed_epochs = 0
     if checkpoint_path is not None and identity is None:
         raise ValueError("Verifier selector checkpoint requires an identity")
@@ -3303,7 +3422,7 @@ def _select_verifier_epoch(
         patience = int(saved["patience"])
         history = saved["history"]
     for epoch in range(completed_epochs + 1, maximum_epochs + 1):
-        if patience >= int(config["verifier"]["patience"]):
+        if epoch > minimum_epochs and patience >= int(config["verifier"]["patience"]):
             break
         sampler.set_epoch(epoch - 1)
         model.train()
@@ -3332,12 +3451,63 @@ def _select_verifier_epoch(
             config,
             selector_ignore,
         )
-        key = (float(point["f1"]), -float(point["fp_per_hour"]))
+        diagnostic_columns = {
+            "subject_key",
+            "session_id",
+            "coarse_start_ms",
+            "coarse_end_ms",
+        }
+        if diagnostic_columns.issubset(scored) and {
+            "acceptance_threshold",
+            "nms_iou_threshold",
+        }.issubset(point):
+            accepted = _accepted_from_point(scored, point, "final_score")
+            subject_metrics = _per_subject_metrics_v4(
+                selector_truth,
+                _prediction_events(accepted),
+                selector_windows,
+                selector_ignore,
+            )
+            subject_f1 = subject_metrics["f1"].to_numpy(dtype=np.float64)
+            subject_f1 = subject_f1[np.isfinite(subject_f1)]
+        else:
+            subject_f1 = np.asarray([float(point["f1"])], dtype=np.float64)
+        subject_macro_f1 = float(subject_f1.mean()) if len(subject_f1) else 0.0
+        subject_f1_se = (
+            float(subject_f1.std(ddof=1) / math.sqrt(len(subject_f1)))
+            if len(subject_f1) >= 2
+            else 0.0
+        )
+        iou_target = np.asarray(selector_features.iou_target, dtype=np.float64)
+        predicted_iou = 1.0 / (1.0 + np.exp(-np.asarray(iou_logit, dtype=np.float64)))
+        iou_errors = np.abs(predicted_iou - iou_target)
+        proposal_subjects = (
+            selector_proposals["subject_key"].astype(str).to_numpy()
+            if "subject_key" in selector_proposals
+            else np.full(len(selector_proposals), "all", dtype=object)
+        )
+        subject_iou_errors = [
+            float(iou_errors[proposal_subjects == subject].mean())
+            for subject in sorted(set(proposal_subjects))
+            if np.any(proposal_subjects == subject)
+        ]
+        subject_macro_iou_mae = (
+            float(np.mean(subject_iou_errors)) if subject_iou_errors else float("inf")
+        )
+        key = (
+            subject_macro_f1,
+            float(point["f1"]),
+            -float(point["fp_per_hour"]),
+            -subject_macro_iou_mae,
+        )
         history.append(
             {
                 "epoch": float(epoch),
                 "event_f1": float(point["f1"]),
                 "fp_per_hour": float(point["fp_per_hour"]),
+                "subject_macro_f1": subject_macro_f1,
+                "subject_f1_standard_error": subject_f1_se,
+                "subject_macro_iou_mae": subject_macro_iou_mae,
             }
         )
         if key > best_key:
@@ -3364,9 +3534,36 @@ def _select_verifier_epoch(
                     "history": history,
                 },
             )
-        if patience >= int(config["verifier"]["patience"]):
+        if epoch >= minimum_epochs and patience >= int(config["verifier"]["patience"]):
             break
-    return best_epoch, history
+    eligible = [row for row in history if int(row["epoch"]) >= minimum_epochs]
+    if not eligible:
+        raise RuntimeError("Verifier selector did not reach its minimum epoch")
+    best = max(
+        eligible,
+        key=lambda row: (
+            float(row["subject_macro_f1"]),
+            float(row["event_f1"]),
+            -float(row["fp_per_hour"]),
+            -float(row["subject_macro_iou_mae"]),
+        ),
+    )
+    lower_bound = float(best["subject_macro_f1"]) - float(
+        best["subject_f1_standard_error"]
+    )
+    stable = [
+        row for row in eligible if float(row["subject_macro_f1"]) >= lower_bound - 1e-12
+    ]
+    selected = min(
+        stable,
+        key=lambda row: (
+            int(row["epoch"]),
+            -float(row["subject_macro_f1"]),
+            float(row["fp_per_hour"]),
+            float(row["subject_macro_iou_mae"]),
+        ),
+    )
+    return int(selected["epoch"]), history
 
 
 @torch.no_grad()
@@ -3705,7 +3902,7 @@ def train_verifier_crossfit_v4(
     inputs: V4Inputs,
 ) -> None:
     run.require_stage("PROPOSALS_COMPLETE")
-    if run.payload.get("downstream_mode") in {"state_only", "pooled_logistic"}:
+    if run.payload.get("downstream_mode") in {"state_only", "pooled_logistic", "pooled_heads"}:
         raise RuntimeError(
             "Fold-local verifier training is disabled for the time-constrained route; "
             "pooled Logistic is fitted only from cross-fitted outer OOF predictions"
@@ -4054,7 +4251,9 @@ def train_verifier_crossfit_v4(
         matching_sensitivity["deep"]["max_cardinality_f1"]
         - matching_sensitivity["logistic"]["max_cardinality_f1"],
         matching_sensitivity["deep"]["greedy_f1"] - matching_sensitivity["logistic"]["greedy_f1"],
-        tolerance=float(config["calibration"].get("matching_reversal_tolerance", 0.005)),
+        tolerance=float(
+            config.get("calibration", {}).get("matching_reversal_tolerance", 0.005)
+        ),
     ):
         raise RuntimeError("Verifier ranking reverses between matching methods")
     deep_passed = deep_point["f1"] >= logistic_point["f1"] + float(
@@ -4470,6 +4669,7 @@ def _select_boundary_epoch(
     config: dict[str, Any],
     *,
     seed: int,
+    selector_subject_keys: np.ndarray | None = None,
     checkpoint_path: Path | None = None,
     resume: bool = False,
     identity: dict[str, Any] | None = None,
@@ -4487,6 +4687,7 @@ def _select_boundary_epoch(
     rng = np.random.default_rng(seed)
     batch_size = int(config["boundary"]["batch_size"])
     patience_limit = int(config["boundary"]["patience"])
+    minimum_epochs = int(config["boundary"].get("minimum_epochs", 1))
     best_epoch = 1
     best_mae = math.inf
     patience = 0
@@ -4513,7 +4714,7 @@ def _select_boundary_epoch(
         patience = int(saved["patience"])
         history = saved["history"]
     for epoch in range(completed_epochs + 1, maximum_epochs + 1):
-        if patience >= patience_limit:
+        if epoch > minimum_epochs and patience >= patience_limit:
             break
         order = rng.permutation(len(fit_features.sample_ids))
         model.train()
@@ -4536,7 +4737,7 @@ def _select_boundary_epoch(
             loss.backward()
             optimizer.step()
         predicted = _infer_endpoint_model(model, selector_features, config)
-        errors: list[np.ndarray] = []
+        endpoint_errors: list[np.ndarray] = []
         for predicted_offset, target, endpoint_weight, grid in (
             (
                 predicted[0],
@@ -4553,12 +4754,49 @@ def _select_boundary_epoch(
         ):
             valid = endpoint_weight > 0
             target_offset = (target * grid[None, :]).sum(axis=1)
-            errors.append(np.abs(predicted_offset[valid] - target_offset[valid]))
-        finite_errors = np.concatenate([value[np.isfinite(value)] for value in errors])
+            values = np.full(len(target_offset), np.nan, dtype=np.float64)
+            values[valid] = np.abs(predicted_offset[valid] - target_offset[valid])
+            endpoint_errors.append(values)
+        stacked_errors = np.stack(endpoint_errors, axis=1)
+        valid_counts = np.isfinite(stacked_errors).sum(axis=1)
+        per_sample = np.divide(
+            np.nansum(stacked_errors, axis=1),
+            valid_counts,
+            out=np.full(len(stacked_errors), np.nan, dtype=np.float64),
+            where=valid_counts > 0,
+        )
+        finite_errors = per_sample[np.isfinite(per_sample)]
         mae = float(finite_errors.mean()) if len(finite_errors) else math.inf
-        history.append({"epoch": float(epoch), "endpoint_mae_seconds": mae})
-        if np.isfinite(mae) and mae < best_mae - 1e-9:
-            best_mae = mae
+        if selector_subject_keys is not None:
+            subjects = np.asarray(selector_subject_keys, dtype=str)
+            if len(subjects) != len(per_sample):
+                raise ValueError("Boundary selector subject keys are not aligned")
+            subject_values = np.asarray(
+                [
+                    float(np.nanmean(per_sample[subjects == subject]))
+                    for subject in np.unique(subjects)
+                    if np.isfinite(per_sample[subjects == subject]).any()
+                ],
+                dtype=np.float64,
+            )
+        else:
+            subject_values = finite_errors
+        macro_mae = float(subject_values.mean()) if len(subject_values) else math.inf
+        standard_error = (
+            float(subject_values.std(ddof=1) / math.sqrt(len(subject_values)))
+            if len(subject_values) >= 2
+            else 0.0
+        )
+        history.append(
+            {
+                "epoch": float(epoch),
+                "endpoint_mae_seconds": mae,
+                "subject_macro_endpoint_mae_seconds": macro_mae,
+                "subject_macro_standard_error": standard_error,
+            }
+        )
+        if np.isfinite(macro_mae) and macro_mae < best_mae - 1e-9:
+            best_mae = macro_mae
             best_epoch = epoch
             patience = 0
         else:
@@ -4582,11 +4820,35 @@ def _select_boundary_epoch(
                     "history": history,
                 },
             )
-        if patience >= patience_limit:
+        if epoch >= minimum_epochs and patience >= patience_limit:
             break
     if not np.isfinite(best_mae):
         raise RuntimeError("Boundary selector never produced a finite endpoint MAE")
-    return best_epoch, history
+    eligible = [
+        row
+        for row in history
+        if int(row["epoch"]) >= minimum_epochs
+        and np.isfinite(float(row["subject_macro_endpoint_mae_seconds"]))
+    ]
+    if not eligible:
+        raise RuntimeError("Boundary selector did not reach its minimum epoch")
+    best = min(
+        eligible,
+        key=lambda row: (
+            float(row["subject_macro_endpoint_mae_seconds"]),
+            int(row["epoch"]),
+        ),
+    )
+    upper_bound = float(best["subject_macro_endpoint_mae_seconds"]) + float(
+        best["subject_macro_standard_error"]
+    )
+    stable = [
+        row
+        for row in eligible
+        if float(row["subject_macro_endpoint_mae_seconds"]) <= upper_bound + 1e-12
+    ]
+    selected = min(stable, key=lambda row: int(row["epoch"]))
+    return int(selected["epoch"]), history
 
 
 @torch.no_grad()
@@ -5133,6 +5395,7 @@ def select_v4_pipeline(
     if run.stage == "PROPOSALS_COMPLETE" and run.payload.get("downstream_mode") in {
         "state_only",
         "pooled_logistic",
+        "pooled_heads",
     }:
         windows = pd.read_parquet(run.root / "oof" / "window_predictions.parquet")
         proposals = pd.read_parquet(run.root / "oof" / "proposals_labeled.parquet")
@@ -5454,6 +5717,12 @@ def evaluate_v4_outer(
         outer_inputs.events["subject_key"].astype(str)
     )
     truth, ignore = partition_evaluation_events(outer_inputs.events, outer_subjects)
+    truth_snapshot_path, ignore_snapshot_path, snapshot_manifest_path = _write_outer_event_snapshot(
+        run.root,
+        truth,
+        ignore,
+        expected_subjects=outer_subjects,
+    )
     max_metrics, matches = evaluate_events(
         truth, predictions, method="max_cardinality_iou", ignore=ignore
     )
@@ -5579,6 +5848,9 @@ def evaluate_v4_outer(
             per_subject_path,
             state_only_subject_path,
             ignored_prediction_path,
+            truth_snapshot_path,
+            ignore_snapshot_path,
+            snapshot_manifest_path,
         ],
     )
 
@@ -5600,6 +5872,304 @@ def _concatenate_proposal_features(parts: list[ProposalFeatureBatchV4]) -> Propo
         iou_target=optional("iou_target"),
         sample_weight=optional("sample_weight"),
     )
+
+
+def _fit_duration_prior_from_truth(
+    truth: pd.DataFrame, config: dict[str, Any]
+) -> TruncatedLogNormalDurationPrior:
+    if truth.empty:
+        raise ValueError("Duration prior requires non-empty training truth")
+    durations = (
+        truth["end_ms"].to_numpy(dtype=np.float64)
+        - truth["start_ms"].to_numpy(dtype=np.float64)
+    ) / 1000.0
+    return TruncatedLogNormalDurationPrior.fit(
+        durations,
+        lower_quantile=float(config["decoder"]["duration_lower_quantile"]),
+        upper_quantile=float(config["decoder"]["duration_upper_quantile"]),
+        minimum_floor_seconds=float(config["decoder"]["minimum_duration_floor_seconds"]),
+        maximum_ceiling_seconds=float(config["decoder"]["maximum_duration_ceiling_seconds"]),
+    )
+
+
+def _build_isolated_pooled_fold_data(
+    outer_logits: list[pd.DataFrame],
+    outer_windows: list[pd.DataFrame],
+    outer_truth: list[pd.DataFrame],
+    outer_ignore: list[pd.DataFrame],
+    config: dict[str, Any],
+) -> list[PooledFoldProposalData]:
+    fold_count = len(outer_windows)
+    if not (
+        fold_count >= 2
+        and len(outer_logits) == fold_count
+        and len(outer_truth) == fold_count
+        and len(outer_ignore) == fold_count
+    ):
+        raise ValueError("Pooled fold inputs must contain aligned data for at least two folds")
+    from bme_eating.calibration_v4 import PlattCalibration
+
+    results: list[PooledFoldProposalData] = []
+    statistic_columns = [f"stat_{name}" for name in STATS_FEATURE_COLUMNS]
+    for prediction_fold in range(fold_count):
+        training_folds = [fold for fold in range(fold_count) if fold != prediction_fold]
+        training_logits = pd.concat(
+            [outer_logits[fold] for fold in training_folds], ignore_index=True
+        )
+        calibration_rows = training_logits[
+            training_logits["state_loss_mask"].to_numpy(dtype=float) > 0
+        ]
+        if calibration_rows.empty:
+            raise RuntimeError(
+                f"Pooled fold {prediction_fold} has no evaluable state calibration rows"
+            )
+        calibrator = PlattCalibration.fit(
+            calibration_rows["state_logit"].to_numpy(),
+            calibration_rows["state_target"].to_numpy(),
+        )
+        training_truth = pd.concat(
+            [outer_truth[fold] for fold in training_folds], ignore_index=True
+        )
+        training_ignore = pd.concat(
+            [outer_ignore[fold] for fold in training_folds], ignore_index=True
+        )
+        prior = _fit_duration_prior_from_truth(training_truth, config)
+        calibrated_windows = [
+            _apply_state_calibration_to_windows(frame, calibrator) for frame in outer_windows
+        ]
+        training_windows = pd.concat(
+            [calibrated_windows[fold] for fold in training_folds], ignore_index=True
+        )
+        decoder_config, decoder_search = _select_decoder_configuration(
+            training_windows,
+            training_truth,
+            training_ignore,
+            prior,
+            config,
+            split_role=f"pooled_head_train_without_outer_{prediction_fold}",
+        )
+        decoder = FixedLagSemiMarkovDecoder(
+            prior,
+            grid_seconds=int(decoder_config["grid_seconds"]),
+            fixed_lag_seconds=int(decoder_config["fixed_lag_seconds"]),
+            duration_weight=float(decoder_config.get("semi_markov_duration_weight", 1.0)),
+        )
+        proposal_parts: list[pd.DataFrame] = []
+        feature_parts: list[ProposalFeatureBatchV4] = []
+        for source_fold in range(fold_count):
+            proposals = generate_event_candidates_v4(
+                calibrated_windows[source_fold],
+                decoder,
+                decoder_config,
+                split_role=(
+                    f"pooled_head_model_{prediction_fold}_source_outer_{source_fold}"
+                ),
+            ).copy()
+            proposals["proposal_id"] = (
+                f"head{prediction_fold}:outer{source_fold}:"
+                + proposals["proposal_id"].astype(str)
+            )
+            labeled = exclude_ignored_candidates(
+                label_event_candidates(proposals, outer_truth[source_fold], 0.25),
+                outer_ignore[source_fold],
+            )
+            labeled = labeled.sort_values("proposal_id", kind="stable").reset_index(drop=True)
+            labeled["outer_fold"] = int(source_fold)
+            labeled["prediction_fold"] = int(prediction_fold)
+            if labeled.empty:
+                raise RuntimeError(
+                    f"Pooled head fold {prediction_fold} produced no candidates for fold "
+                    f"{source_fold}"
+                )
+            proposal_parts.append(labeled)
+            feature_parts.append(
+                build_proposal_features_v4(
+                    labeled,
+                    calibrated_windows[source_fold],
+                    statistic_columns,
+                    config["verifier"],
+                )
+            )
+        proposals = pd.concat(proposal_parts, ignore_index=True)
+        features = _concatenate_proposal_features(feature_parts)
+        _assert_proposal_feature_alignment(
+            features,
+            proposals,
+            context=f"Pooled isolated fold {prediction_fold}",
+        )
+        source_folds = proposals["outer_fold"].to_numpy(dtype=int)
+        training_indices = np.flatnonzero(source_folds != prediction_fold)
+        prediction_indices = np.flatnonzero(source_folds == prediction_fold)
+        training_subjects = frozenset(
+            proposals.iloc[training_indices]["subject_key"].astype(str)
+        )
+        prediction_subjects = frozenset(
+            proposals.iloc[prediction_indices]["subject_key"].astype(str)
+        )
+        assert_disjoint_subjects(
+            training_subjects=set(training_subjects),
+            prediction_subjects=set(prediction_subjects),
+        )
+        results.append(
+            PooledFoldProposalData(
+                prediction_fold=prediction_fold,
+                proposals=proposals,
+                features=features,
+                windows=pd.concat(calibrated_windows, ignore_index=True),
+                training_indices=training_indices,
+                prediction_indices=prediction_indices,
+                training_subjects=training_subjects,
+                prediction_subjects=prediction_subjects,
+                upstream_lineage={
+                    "prediction_fold": prediction_fold,
+                    "training_folds": training_folds,
+                    "training_subjects": sorted(training_subjects),
+                    "prediction_subjects": sorted(prediction_subjects),
+                    "globally_excluded_subjects": sorted(prediction_subjects),
+                    "state_calibration": calibrator.to_json(),
+                    "state_calibration_source": "other_outer_folds_only",
+                    "duration_prior": prior.to_json(),
+                    "duration_prior_source": "other_outer_fold_truth_only",
+                    "decoder": decoder_config,
+                    "decoder_source": "other_outer_fold_oof_only",
+                    "decoder_search_sha256": _dataframe_sha256(
+                        decoder_search,
+                        sorted(decoder_search.columns),
+                    ),
+                },
+            )
+        )
+    return results
+
+
+def _pooled_prediction_frame_and_features(
+    fold_data: list[PooledFoldProposalData],
+) -> tuple[pd.DataFrame, ProposalFeatureBatchV4]:
+    proposal_parts: list[pd.DataFrame] = []
+    feature_parts: list[ProposalFeatureBatchV4] = []
+    for data in fold_data:
+        proposal_parts.append(data.proposals.iloc[data.prediction_indices].reset_index(drop=True))
+        feature_parts.append(_slice_proposal_features(data.features, data.prediction_indices))
+    proposals = pd.concat(proposal_parts, ignore_index=True)
+    features = _concatenate_proposal_features(feature_parts)
+    _assert_proposal_feature_alignment(features, proposals, context="Pooled isolated predictions")
+    if proposals["proposal_id"].astype(str).duplicated().any():
+        raise RuntimeError("Pooled isolated prediction proposal IDs are not globally unique")
+    return proposals, features
+
+
+def _pooled_head_diagnostics(
+    scores: pd.DataFrame,
+    score_column: str,
+    truth: pd.DataFrame,
+    windows: pd.DataFrame,
+    ignore: pd.DataFrame,
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    point = _best_verifier_operating_point(
+        scores, truth, windows, score_column, config, ignore
+    )
+    required = {
+        "subject_key",
+        "session_id",
+        "coarse_start_ms",
+        "coarse_end_ms",
+        "proposal_id",
+    }
+    if not required.issubset(scores) or truth.empty:
+        return (
+            {
+                "point": point,
+                "hand": {
+                    "same_sensitivity": float("nan"),
+                    "different_sensitivity": float("nan"),
+                },
+                "greedy_f1": float(point["f1"]),
+                "accepted_proposal_ids": [],
+            },
+            scores.iloc[0:0].copy(),
+        )
+    accepted = _accepted_from_point(scores, point, score_column)
+    predictions = _prediction_events(accepted)
+    greedy, _ = evaluate_events(truth, predictions, method="greedy", ignore=ignore)
+    return (
+        {
+            "point": point,
+            "hand": _hand_metrics(truth, predictions, ignore),
+            "greedy_f1": float(greedy["f1"]),
+            "accepted_proposal_ids": accepted["proposal_id"].astype(str).tolist(),
+        },
+        accepted,
+    )
+
+
+def _pooled_head_promotion(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    minimum_f1_gain: float,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    baseline_point = baseline["point"]
+    candidate_point = candidate["point"]
+    maximum_f1_drop = float(config["promotion_gate"]["maximum_verifier_f1_drop"])
+    minimum_fp_reduction = float(config["promotion_gate"]["minimum_verifier_fp_reduction"])
+    maximum_hand_drop = float(
+        config["promotion_gate"].get("maximum_different_sensitivity_drop", 0.03)
+    )
+    performance_passed = bool(
+        float(candidate_point["f1"]) >= float(baseline_point["f1"]) + minimum_f1_gain
+        or (
+            float(candidate_point["f1"])
+            >= float(baseline_point["f1"]) - maximum_f1_drop
+            and float(candidate_point["fp_per_hour"])
+            <= float(baseline_point["fp_per_hour"]) * (1.0 - minimum_fp_reduction)
+        )
+    )
+    hand_checks: dict[str, bool] = {}
+    for relation in ("same", "different"):
+        baseline_value = float(baseline["hand"].get(f"{relation}_sensitivity", float("nan")))
+        candidate_value = float(
+            candidate["hand"].get(f"{relation}_sensitivity", float("nan"))
+        )
+        hand_checks[relation] = bool(
+            (not np.isfinite(baseline_value) and not np.isfinite(candidate_value))
+            or (
+                np.isfinite(baseline_value)
+                and np.isfinite(candidate_value)
+                and candidate_value >= baseline_value - maximum_hand_drop
+            )
+        )
+    maximum_delta = float(candidate_point["f1"]) - float(baseline_point["f1"])
+    greedy_delta = float(candidate["greedy_f1"]) - float(baseline["greedy_f1"])
+    reversal = _matching_ranking_reversal(
+        maximum_delta,
+        greedy_delta,
+        tolerance=float(
+            config.get("calibration", {}).get("matching_reversal_tolerance", 0.005)
+        ),
+    )
+    finite = all(
+        np.isfinite(float(value))
+        for value in (
+            candidate_point["f1"],
+            candidate_point["fp_per_hour"],
+            candidate_point["acceptance_threshold"],
+            candidate_point["nms_iou_threshold"],
+            candidate["greedy_f1"],
+        )
+    )
+    return {
+        "passed": bool(performance_passed and all(hand_checks.values()) and not reversal and finite),
+        "performance_passed": performance_passed,
+        "hand_checks": hand_checks,
+        "matching_ranking_reversal": reversal,
+        "finite_outputs": finite,
+        "minimum_f1_gain": float(minimum_f1_gain),
+        "maximum_f1_drop": maximum_f1_drop,
+        "minimum_fp_reduction": minimum_fp_reduction,
+        "maximum_hand_recall_drop": maximum_hand_drop,
+    }
 
 
 def _fit_pooled_logistic_crossfit(
@@ -5686,25 +6256,24 @@ def _fit_pooled_logistic_crossfit(
     logistic_frame = proposals.copy()
     logistic_frame["logistic_score"] = logistic_scores
     logistic_frame["final_score"] = logistic_scores
-    logistic_point = _best_verifier_operating_point(
-        logistic_frame, truth, windows, "final_score", config, ignore
+    logistic_diagnostics, _ = _pooled_head_diagnostics(
+        logistic_frame, "final_score", truth, windows, ignore, config
     )
+    logistic_point = logistic_diagnostics["point"]
     baseline_frame = proposals.copy()
     baseline_frame["final_score"] = baseline_frame["generator_score"]
-    baseline_point = _best_verifier_operating_point(
-        baseline_frame, truth, windows, "final_score", config, ignore
+    baseline_diagnostics, _ = _pooled_head_diagnostics(
+        baseline_frame, "final_score", truth, windows, ignore, config
     )
+    baseline_point = baseline_diagnostics["point"]
     minimum_f1_gain = 0.005
-    maximum_f1_drop = float(config["promotion_gate"]["maximum_verifier_f1_drop"])
-    minimum_fp_reduction = float(config["promotion_gate"]["minimum_verifier_fp_reduction"])
-    fp_target = float(baseline_point["fp_per_hour"]) * (1.0 - minimum_fp_reduction)
-    promoted = bool(
-        float(logistic_point["f1"]) >= float(baseline_point["f1"]) + minimum_f1_gain
-        or (
-            float(logistic_point["f1"]) >= float(baseline_point["f1"]) - maximum_f1_drop
-            and float(logistic_point["fp_per_hour"]) <= fp_target
-        )
+    promotion = _pooled_head_promotion(
+        baseline_diagnostics,
+        logistic_diagnostics,
+        minimum_f1_gain=minimum_f1_gain,
+        config=config,
     )
+    promoted = bool(promotion["passed"])
     final_model = LogisticScoreCombiner.fit(
         matrix,
         targets,
@@ -5719,22 +6288,804 @@ def _fit_pooled_logistic_crossfit(
         "state_only": {
             "f1": float(baseline_point["f1"]),
             "fp_per_hour": float(baseline_point["fp_per_hour"]),
+            "hand": baseline_diagnostics["hand"],
+            "greedy_f1": baseline_diagnostics["greedy_f1"],
         },
         "logistic": {
             "f1": float(logistic_point["f1"]),
             "fp_per_hour": float(logistic_point["fp_per_hour"]),
+            "hand": logistic_diagnostics["hand"],
+            "greedy_f1": logistic_diagnostics["greedy_f1"],
         },
-        "promotion": {
-            "passed": promoted,
-            "minimum_f1_gain": minimum_f1_gain,
-            "maximum_f1_drop": maximum_f1_drop,
-            "minimum_fp_reduction": minimum_fp_reduction,
-        },
+        "promotion": promotion,
     }
     if promoted:
         return logistic_frame, final_model, report, logistic_point
     baseline_frame["logistic_score"] = logistic_scores
     return baseline_frame, final_model, report, baseline_point
+
+
+def _fit_isolated_pooled_logistic_crossfit(
+    fold_data: list[PooledFoldProposalData],
+    prediction_proposals: pd.DataFrame,
+    truth: pd.DataFrame,
+    windows: pd.DataFrame,
+    ignore: pd.DataFrame,
+    config: dict[str, Any],
+) -> tuple[pd.DataFrame, float, dict[str, Any], dict[str, Any]]:
+    candidates = [float(value) for value in config["verifier"].get("logistic_c_values", [1.0])]
+    if not candidates or any(not np.isfinite(value) or value <= 0 for value in candidates):
+        raise ValueError("verifier.logistic_c_values must contain positive finite values")
+    score_parts: list[pd.DataFrame] = []
+    lineage: list[dict[str, Any]] = []
+    selected_values: list[float] = []
+    for data in fold_data:
+        train_features = _slice_proposal_features(data.features, data.training_indices)
+        prediction_features = _slice_proposal_features(data.features, data.prediction_indices)
+        train_proposals = data.proposals.iloc[data.training_indices].reset_index(drop=True)
+        holdout_proposals = data.proposals.iloc[data.prediction_indices].reset_index(drop=True)
+        matrix = _verifier_matrix(train_features)
+        targets = np.asarray(train_features.event_target, dtype=np.int64)
+        weights = (
+            None
+            if train_features.sample_weight is None
+            else np.asarray(train_features.sample_weight, dtype=np.float64)
+        )
+        source_folds = train_proposals["outer_fold"].to_numpy(dtype=int)
+        inner_reports: list[dict[str, Any]] = []
+        training_truth = truth[
+            ~truth["subject_key"].astype(str).isin(data.prediction_subjects)
+        ]
+        training_ignore = ignore[
+            ~ignore["subject_key"].astype(str).isin(data.prediction_subjects)
+        ]
+        training_windows = data.windows[
+            ~data.windows["subject_key"].astype(str).isin(data.prediction_subjects)
+        ]
+        for regularization_c in candidates:
+            inner_scores = np.full(len(train_proposals), np.nan, dtype=np.float64)
+            for validation_fold in sorted(np.unique(source_folds)):
+                inner_prediction = np.flatnonzero(source_folds == validation_fold)
+                inner_training = np.flatnonzero(source_folds != validation_fold)
+                model = LogisticScoreCombiner.fit(
+                    matrix[inner_training],
+                    targets[inner_training],
+                    sample_weight=None if weights is None else weights[inner_training],
+                    regularization_c=regularization_c,
+                )
+                inner_scores[inner_prediction] = model.predict(matrix[inner_prediction])
+            if not np.isfinite(inner_scores).all():
+                raise RuntimeError("Nested pooled Logistic left unscored training candidates")
+            inner_frame = train_proposals.copy()
+            inner_frame["final_score"] = inner_scores
+            point = _best_verifier_operating_point(
+                inner_frame,
+                training_truth,
+                training_windows,
+                "final_score",
+                config,
+                training_ignore,
+            )
+            inner_reports.append(
+                {
+                    "regularization_c": regularization_c,
+                    "f1": float(point["f1"]),
+                    "fp_per_hour": float(point["fp_per_hour"]),
+                }
+            )
+        selected = max(
+            inner_reports,
+            key=lambda row: (
+                float(row["f1"]),
+                -float(row["fp_per_hour"]),
+                -float(row["regularization_c"]),
+            ),
+        )
+        selected_c = float(selected["regularization_c"])
+        selected_values.append(selected_c)
+        model = LogisticScoreCombiner.fit(
+            matrix,
+            targets,
+            sample_weight=weights,
+            regularization_c=selected_c,
+        )
+        holdout_scores = model.predict(_verifier_matrix(prediction_features))
+        holdout_scored = holdout_proposals.copy()
+        holdout_scored["logistic_score"] = holdout_scores
+        holdout_scored["final_score"] = holdout_scores
+        score_parts.append(holdout_scored)
+        lineage.append(
+            {
+                **data.upstream_lineage,
+                "selected_regularization_c": selected_c,
+                "regularization_search": inner_reports,
+                "verifier_training_subjects": sorted(data.training_subjects),
+                "verifier_prediction_subjects": sorted(data.prediction_subjects),
+            }
+        )
+    logistic_frame = pd.concat(score_parts, ignore_index=True)
+    logistic_frame = prediction_proposals[["proposal_id"]].merge(
+        logistic_frame,
+        on="proposal_id",
+        how="left",
+        validate="one_to_one",
+    )
+    if logistic_frame[["logistic_score", "final_score"]].isna().any().any():
+        raise RuntimeError("Isolated pooled Logistic failed to score every prediction candidate")
+    logistic_diagnostics, _ = _pooled_head_diagnostics(
+        logistic_frame, "final_score", truth, windows, ignore, config
+    )
+    baseline_frame = prediction_proposals.copy()
+    baseline_frame["final_score"] = baseline_frame["generator_score"]
+    baseline_diagnostics, _ = _pooled_head_diagnostics(
+        baseline_frame, "final_score", truth, windows, ignore, config
+    )
+    promotion = _pooled_head_promotion(
+        baseline_diagnostics,
+        logistic_diagnostics,
+        minimum_f1_gain=0.005,
+        config=config,
+    )
+    counts = {value: selected_values.count(value) for value in set(selected_values)}
+    deployment_c = min(counts, key=lambda value: (-counts[value], value))
+    report = {
+        "protocol": "outer_fold_fully_isolated_logistic_crossfit_v2",
+        "joint_threshold_tuning": True,
+        "lineage": lineage,
+        "deployment_regularization_c": deployment_c,
+        "state_only": baseline_diagnostics,
+        "logistic": logistic_diagnostics,
+        "promotion": promotion,
+    }
+    if bool(promotion["passed"]):
+        return logistic_frame, deployment_c, report, logistic_diagnostics["point"]
+    baseline_frame["logistic_score"] = logistic_frame["logistic_score"].to_numpy()
+    return baseline_frame, deployment_c, report, baseline_diagnostics["point"]
+
+
+def _fit_pooled_deep_crossfit(
+    fold_data: list[PooledFoldProposalData],
+    prediction_proposals: pd.DataFrame,
+    truth: pd.DataFrame,
+    ignore: pd.DataFrame,
+    windows: pd.DataFrame,
+    config: dict[str, Any],
+    final_root: Path,
+    *,
+    resume: bool,
+    parent_artifact_sha256: dict[str, str],
+) -> tuple[
+    pd.DataFrame,
+    ProposalCalibrationV4,
+    dict[str, Any],
+    dict[int, int],
+    list[Path],
+]:
+    folds = sorted(data.prediction_fold for data in fold_data)
+    if len(folds) != 5 or folds != list(range(5)):
+        raise RuntimeError("Pooled Deep requires all five outer folds")
+    selected_epochs: dict[int, list[int]] = {
+        int(seed): [] for seed in config["verifier"]["seeds"]
+    }
+    lineages: list[dict[str, Any]] = []
+    calibration_lineage: list[dict[str, Any]] = []
+    artifacts: list[Path] = []
+    calibrated_parts: list[pd.DataFrame] = []
+    raw_prediction_parts: list[pd.DataFrame] = []
+    head_root = final_root / "pooled_heads" / "verifier"
+    for data in fold_data:
+        fold = data.prediction_fold
+        training_subjects = set(data.training_subjects)
+        prediction_subjects = set(data.prediction_subjects)
+        assert_disjoint_subjects(
+            training_subjects=training_subjects,
+            prediction_subjects=prediction_subjects,
+        )
+        fit_subjects, selector_subjects, selector_split = _selector_split(
+            training_subjects,
+            float(config["training"]["selector_fraction"]),
+            int(config["training"]["random_seed"]) + 310_000 + fold,
+            events=truth,
+            anchors=windows,
+        )
+        assert_disjoint_subjects(
+            fit_subjects=fit_subjects,
+            selector_subjects=selector_subjects,
+            prediction_subjects=prediction_subjects,
+        )
+        train_features = _slice_proposal_features(data.features, data.training_indices)
+        prediction_features = _slice_proposal_features(data.features, data.prediction_indices)
+        train_proposals = data.proposals.iloc[data.training_indices].reset_index(drop=True)
+        prediction_proposals_fold = data.proposals.iloc[data.prediction_indices].reset_index(
+            drop=True
+        )
+        train_subject_values = train_proposals["subject_key"].astype(str).to_numpy()
+        fit_indices = np.flatnonzero(np.isin(train_subject_values, sorted(fit_subjects)))
+        selector_indices = np.flatnonzero(
+            np.isin(train_subject_values, sorted(selector_subjects))
+        )
+        fit_features = _slice_proposal_features(train_features, fit_indices)
+        selector_features = _slice_proposal_features(train_features, selector_indices)
+        selector_proposals = train_proposals.iloc[selector_indices].reset_index(drop=True)
+        selector_truth = truth[truth["subject_key"].astype(str).isin(selector_subjects)]
+        selector_ignore = ignore[ignore["subject_key"].astype(str).isin(selector_subjects)]
+        selector_windows = data.windows[
+            data.windows["subject_key"].astype(str).isin(selector_subjects)
+        ]
+        training_semantic_sha256 = _dataframe_sha256(
+            train_proposals,
+            [
+                "subject_key",
+                "session_id",
+                "proposal_id",
+                "coarse_start_ms",
+                "coarse_end_ms",
+                "is_positive",
+                "max_iou",
+            ],
+        )
+        fold_parent_sha256 = {
+            **parent_artifact_sha256,
+            "training_proposals": training_semantic_sha256,
+            "upstream": hashlib.sha256(
+                json.dumps(data.upstream_lineage, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+        }
+        fold_predictions: list[tuple[np.ndarray, np.ndarray]] = []
+        calibration_predictions: list[tuple[np.ndarray, np.ndarray]] = []
+        fold_selected_epochs: dict[str, int] = {}
+        train_categories = classify_proposals(train_proposals)
+        for configured_seed in config["verifier"]["seeds"]:
+            seed = int(configured_seed)
+            checkpoint = head_root / f"fold_{fold}_seed_{seed}.pt"
+            selector_identity = {
+                "fit_subjects": sorted(fit_subjects),
+                "selector_subjects": sorted(selector_subjects),
+                "prediction_subjects": sorted(prediction_subjects),
+                "globally_excluded_subjects": sorted(prediction_subjects),
+                "parent_artifact_sha256": fold_parent_sha256,
+            }
+            selected_epoch, history = _select_verifier_epoch(
+                fit_features,
+                train_categories[fit_indices],
+                selector_features,
+                selector_proposals,
+                selector_truth,
+                selector_ignore,
+                selector_windows,
+                config,
+                seed=seed + fold * 100,
+                checkpoint_path=checkpoint.with_name(checkpoint.stem + "_selector_last.pt"),
+                resume=resume,
+                identity=selector_identity,
+            )
+            retrain_identity = {
+                "training_subjects": sorted(training_subjects),
+                "prediction_subjects": sorted(prediction_subjects),
+                "globally_excluded_subjects": sorted(prediction_subjects),
+                "parent_artifact_sha256": fold_parent_sha256,
+            }
+            model = _train_verifier_model_v4(
+                train_features,
+                train_categories,
+                config,
+                seed=seed + fold * 100,
+                epochs=selected_epoch,
+                checkpoint_path=checkpoint.with_name(checkpoint.stem + "_last.pt"),
+                resume=resume,
+                identity=retrain_identity,
+            )
+            _save_torch_atomic(
+                checkpoint,
+                {
+                    "model": model.state_dict(),
+                    "sequence_dim": train_features.sequence.shape[-1],
+                    "scalar_dim": train_features.scalar.shape[-1],
+                    "config": config["verifier"],
+                    "seed": seed,
+                    "epochs": selected_epoch,
+                    **retrain_identity,
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                    "outer_fold": fold,
+                    "state_calibration_source": "pooled_outer_oof_joint_tuning",
+                    "duration_prior_source": "pooled_outer_oof_joint_tuning",
+                },
+            )
+            selector_path = head_root / f"fold_{fold}_seed_{seed}_selector.json"
+            write_json_atomic(
+                selector_path,
+                {
+                    "selected_epoch": selected_epoch,
+                    "history": history,
+                    "selection_rule": "earliest_within_one_standard_error_subject_macro_f1",
+                    "selector_split": selector_split,
+                    "outer_fold": fold,
+                    "seed": seed,
+                    **selector_identity,
+                },
+            )
+            artifacts.extend((checkpoint, selector_path))
+            selected_epochs[seed].append(selected_epoch)
+            fold_selected_epochs[str(seed)] = selected_epoch
+            fold_predictions.append(_infer_verifier_model(model, prediction_features, config))
+
+            partitions = stacking_partitions(
+                training_subjects,
+                min(3, len(training_subjects)),
+                int(config["training"]["random_seed"]) + 510_000 + fold * 100 + seed,
+            )
+            seed_event_logits = np.full(len(train_proposals), np.nan, dtype=np.float64)
+            seed_iou_logits = np.full(len(train_proposals), np.nan, dtype=np.float64)
+            for partition in sorted(set(partitions.values())):
+                calibration_subjects = {
+                    subject for subject, value in partitions.items() if value == partition
+                }
+                calibration_training_subjects = training_subjects - calibration_subjects
+                assert_disjoint_subjects(
+                    training_subjects=calibration_training_subjects,
+                    prediction_subjects=calibration_subjects,
+                    globally_excluded_subjects=prediction_subjects,
+                )
+                inner_train_indices = np.flatnonzero(
+                    np.isin(train_subject_values, sorted(calibration_training_subjects))
+                )
+                inner_prediction_indices = np.flatnonzero(
+                    np.isin(train_subject_values, sorted(calibration_subjects))
+                )
+                inner_checkpoint = head_root / (
+                    f"fold_{fold}_seed_{seed}_calibration_partition_{partition}_last.pt"
+                )
+                inner_identity = {
+                    "training_subjects": sorted(calibration_training_subjects),
+                    "prediction_subjects": sorted(calibration_subjects),
+                    "globally_excluded_subjects": sorted(prediction_subjects),
+                    "parent_artifact_sha256": fold_parent_sha256,
+                }
+                inner_model = _train_verifier_model_v4(
+                    _slice_proposal_features(train_features, inner_train_indices),
+                    train_categories[inner_train_indices],
+                    config,
+                    seed=seed + fold * 100 + partition + 10_000,
+                    epochs=selected_epoch,
+                    checkpoint_path=inner_checkpoint,
+                    resume=resume,
+                    identity=inner_identity,
+                )
+                inner_event, inner_iou = _infer_verifier_model(
+                    inner_model,
+                    _slice_proposal_features(train_features, inner_prediction_indices),
+                    config,
+                )
+                seed_event_logits[inner_prediction_indices] = inner_event
+                seed_iou_logits[inner_prediction_indices] = inner_iou
+                artifacts.append(inner_checkpoint)
+            if not np.isfinite(seed_event_logits).all() or not np.isfinite(seed_iou_logits).all():
+                raise RuntimeError(
+                    f"Pooled Deep fold {fold} inner calibration crossfit left unscored rows"
+                )
+            calibration_predictions.append((seed_event_logits, seed_iou_logits))
+
+        training_raw = train_proposals.copy()
+        training_raw["event_logit"] = np.mean(
+            [value[0] for value in calibration_predictions], axis=0
+        )
+        training_raw["iou_logit"] = np.mean(
+            [value[1] for value in calibration_predictions], axis=0
+        )
+        training_raw["state_score"] = train_features.scalar[:, 2]
+        calibration = ProposalCalibrationV4.fit(training_raw)
+        prediction_raw = prediction_proposals_fold.copy()
+        prediction_raw["event_logit"] = np.mean(
+            [value[0] for value in fold_predictions], axis=0
+        )
+        prediction_raw["iou_logit"] = np.mean(
+            [value[1] for value in fold_predictions], axis=0
+        )
+        prediction_raw["predicted_iou"] = 1.0 / (
+            1.0 + np.exp(-prediction_raw["iou_logit"].to_numpy(dtype=np.float64))
+        )
+        prediction_raw["state_score"] = prediction_features.scalar[:, 2]
+        prediction_raw["sample_weight"] = (
+            np.ones(len(prediction_raw), dtype=np.float64)
+            if prediction_features.sample_weight is None
+            else np.asarray(prediction_features.sample_weight, dtype=np.float64)
+        )
+        raw_prediction_parts.append(prediction_raw)
+        calibrated_parts.append(calibration.apply(prediction_raw))
+        calibration_lineage.append(
+            {
+                "prediction_fold": fold,
+                "training_subjects": sorted(training_subjects),
+                "prediction_subjects": sorted(prediction_subjects),
+                "globally_excluded_subjects": sorted(prediction_subjects),
+                "source": "inner_subject_crossfit_within_other_outer_folds",
+            }
+        )
+        lineage_path = head_root / f"fold_{fold}_lineage.json"
+        lineage = {
+            "protocol_version": PROTOCOL_VERSION,
+            "pooled_head_protocol": POOLED_HEAD_PROTOCOL,
+            "outer_fold": fold,
+            "training_subjects": sorted(training_subjects),
+            "selector_subjects": sorted(selector_subjects),
+            "prediction_subjects": sorted(prediction_subjects),
+            "globally_excluded_subjects": sorted(prediction_subjects),
+            "seeds": [int(value) for value in config["verifier"]["seeds"]],
+            "selected_epoch_by_seed": fold_selected_epochs,
+            "parent_artifact_sha256": fold_parent_sha256,
+            "upstream_lineage": data.upstream_lineage,
+        }
+        write_json_atomic(lineage_path, lineage)
+        artifacts.append(lineage_path)
+        lineages.append(lineage)
+    scored = pd.concat(calibrated_parts, ignore_index=True).sort_values(
+        "proposal_id", kind="stable"
+    ).reset_index(drop=True)
+    scored = prediction_proposals[["proposal_id"]].merge(
+        scored, on="proposal_id", how="left", validate="one_to_one"
+    )
+    if scored["final_score"].isna().any():
+        raise RuntimeError("Pooled Deep failed to score every held-out proposal")
+    raw = pd.concat(raw_prediction_parts, ignore_index=True)
+    final_calibration = ProposalCalibrationV4.fit(raw)
+    fixed_epochs = {
+        seed: int(np.median(values)) for seed, values in selected_epochs.items()
+    }
+    report = {
+        "protocol": POOLED_HEAD_PROTOCOL,
+        "joint_tuning": True,
+        "evidence_class": "development_stress_only",
+        "lineage": lineages,
+        "calibration_lineage": calibration_lineage,
+        "selected_epochs": {str(key): value for key, value in selected_epochs.items()},
+        "deployment_epoch_by_seed": {str(key): value for key, value in fixed_epochs.items()},
+    }
+    return scored, final_calibration, report, fixed_epochs, artifacts
+
+
+def _train_pooled_deep_deployment(
+    features: ProposalFeatureBatchV4,
+    proposals: pd.DataFrame,
+    config: dict[str, Any],
+    final_root: Path,
+    *,
+    epochs_by_seed: dict[int, int],
+    resume: bool,
+    parent_artifact_sha256: dict[str, str],
+) -> list[Path]:
+    _assert_proposal_feature_alignment(features, proposals, context="Pooled Deep deployment")
+    deployment_subjects = set(proposals["subject_key"].astype(str))
+    deployment_categories = classify_proposals(proposals)
+    artifacts: list[Path] = []
+    for seed, epochs in epochs_by_seed.items():
+        verifier_path = final_root / f"verifier_seed_{seed}.pt"
+        identity = {
+            "training_subjects": sorted(deployment_subjects),
+            "prediction_subjects": [],
+            "globally_excluded_subjects": [],
+            "parent_artifact_sha256": parent_artifact_sha256,
+        }
+        model = _train_verifier_model_v4(
+            features,
+            deployment_categories,
+            config,
+            seed=seed + 120_000,
+            epochs=epochs,
+            checkpoint_path=verifier_path.with_name(verifier_path.stem + "_last.pt"),
+            resume=resume,
+            identity=identity,
+        )
+        _save_torch_atomic(
+            verifier_path,
+            {
+                "model": model.state_dict(),
+                "sequence_dim": features.sequence.shape[-1],
+                "scalar_dim": features.scalar.shape[-1],
+                "config": config["verifier"],
+                "seed": seed,
+                "epochs": epochs,
+                **identity,
+                "state_calibration_source": "pooled_outer_oof_deployment_only",
+                "duration_prior_source": "pooled_outer_truth_deployment_only",
+            },
+        )
+        artifacts.append(verifier_path)
+    return artifacts
+
+
+def _fit_pooled_boundary_crossfit(
+    positive: pd.DataFrame,
+    accepted: pd.DataFrame,
+    windows: pd.DataFrame,
+    truth: pd.DataFrame,
+    config: dict[str, Any],
+    final_root: Path,
+    *,
+    resume: bool,
+    parent_artifact_sha256: dict[str, str],
+    fold_data: list[PooledFoldProposalData] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any], dict[int, int], list[Path]]:
+    if "outer_fold" not in positive or "outer_fold" not in accepted:
+        raise ValueError("Pooled Boundary requires outer_fold lineage")
+    folds = sorted(int(value) for value in accepted["outer_fold"].unique())
+    if len(folds) != 5:
+        raise RuntimeError("Pooled Boundary requires accepted events from all five outer folds")
+    head_root = final_root / "pooled_heads" / "boundary"
+    score_parts: list[pd.DataFrame] = []
+    artifacts: list[Path] = []
+    lineages: list[dict[str, Any]] = []
+    selected_epochs: dict[int, list[int]] = {
+        int(seed): [] for seed in config["boundary"]["seeds"]
+    }
+    for fold in folds:
+        holdout = accepted[accepted["outer_fold"].to_numpy(dtype=int) == fold].copy()
+        isolated = (
+            next((item for item in fold_data if item.prediction_fold == fold), None)
+            if fold_data is not None
+            else None
+        )
+        if fold_data is not None and isolated is None:
+            raise RuntimeError(f"Pooled Boundary is missing isolated fold data for fold {fold}")
+        if isolated is None:
+            train = positive[positive["outer_fold"].to_numpy(dtype=int) != fold].copy()
+            fold_windows = windows
+            upstream_lineage: dict[str, Any] | None = None
+        else:
+            training_candidates = isolated.proposals.iloc[isolated.training_indices]
+            training_truth = truth[
+                ~truth["subject_key"].astype(str).isin(isolated.prediction_subjects)
+            ]
+            train = _attach_truth_boundaries(
+                training_candidates[training_candidates["max_iou"] > 0.25],
+                training_truth,
+            )
+            fold_windows = isolated.windows
+            upstream_lineage = isolated.upstream_lineage
+        training_subjects = set(train["subject_key"].astype(str))
+        prediction_subjects = set(holdout["subject_key"].astype(str))
+        assert_disjoint_subjects(
+            training_subjects=training_subjects,
+            prediction_subjects=prediction_subjects,
+        )
+        independent_events = len(
+            train[["subject_key", "session_id", "matched_event_id"]].drop_duplicates()
+        )
+        if independent_events < 2:
+            raise RuntimeError(f"Pooled Boundary fold {fold} has insufficient training events")
+        start_residual = (
+            train["truth_start_ms"].to_numpy(dtype=float)
+            - train["coarse_start_ms"].to_numpy(dtype=float)
+        ) / 1000.0
+        end_residual = (
+            train["truth_end_ms"].to_numpy(dtype=float)
+            - train["coarse_end_ms"].to_numpy(dtype=float)
+        ) / 1000.0
+        boundary_range = select_boundary_range(
+            start_residual,
+            end_residual,
+            quantile=float(config["boundary"]["residual_quantile"]),
+            minimum_seconds=int(config["boundary"]["minimum_range_seconds"]),
+            maximum_seconds=int(config["boundary"]["maximum_range_seconds"]),
+        )
+        if boundary_range.clipped_fraction > float(
+            config["boundary"]["maximum_clipped_fraction"]
+        ):
+            raise RuntimeError(f"Pooled Boundary fold {fold} residual range clips too much mass")
+        fit_subjects, selector_subjects, selector_split = _selector_split(
+            training_subjects,
+            float(config["training"]["selector_fraction"]),
+            int(config["training"]["random_seed"]) + 410_000 + fold,
+            events=truth,
+            anchors=fold_windows,
+        )
+        assert_disjoint_subjects(
+            fit_subjects=fit_subjects,
+            selector_subjects=selector_subjects,
+            prediction_subjects=prediction_subjects,
+        )
+        fit_positive = train[train["subject_key"].astype(str).isin(fit_subjects)]
+        selector_positive = train[train["subject_key"].astype(str).isin(selector_subjects)]
+        if fit_positive.empty or selector_positive.empty:
+            raise RuntimeError(f"Pooled Boundary fold {fold} selector split has no positives")
+        selection_range = select_boundary_range(
+            (
+                fit_positive["truth_start_ms"].to_numpy(dtype=float)
+                - fit_positive["coarse_start_ms"].to_numpy(dtype=float)
+            )
+            / 1000.0,
+            (
+                fit_positive["truth_end_ms"].to_numpy(dtype=float)
+                - fit_positive["coarse_end_ms"].to_numpy(dtype=float)
+            )
+            / 1000.0,
+            quantile=float(config["boundary"]["residual_quantile"]),
+            minimum_seconds=int(config["boundary"]["minimum_range_seconds"]),
+            maximum_seconds=int(config["boundary"]["maximum_range_seconds"]),
+        )
+        fit_augmented = augment_boundary_training_proposals(
+            fit_positive,
+            maximum_jitters_per_event=int(config["boundary"]["maximum_jitters_per_event"]),
+            jitter_seconds=int(config["boundary"]["jitter_seconds"]),
+        )
+        selector_augmented = augment_boundary_training_proposals(
+            selector_positive,
+            maximum_jitters_per_event=int(config["boundary"]["maximum_jitters_per_event"]),
+            jitter_seconds=int(config["boundary"]["jitter_seconds"]),
+        )
+        train_augmented = augment_boundary_training_proposals(
+            train,
+            maximum_jitters_per_event=int(config["boundary"]["maximum_jitters_per_event"]),
+            jitter_seconds=int(config["boundary"]["jitter_seconds"]),
+        )
+        fit_features = build_endpoint_features(
+            fit_augmented,
+            fold_windows,
+            [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+            selection_range,
+            config["boundary"],
+        )
+        selector_features = build_endpoint_features(
+            selector_augmented,
+            fold_windows,
+            [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+            selection_range,
+            config["boundary"],
+        )
+        train_features = build_endpoint_features(
+            train_augmented,
+            fold_windows,
+            [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+            boundary_range,
+            config["boundary"],
+        )
+        holdout_features = build_endpoint_features(
+            holdout,
+            fold_windows,
+            [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+            boundary_range,
+            config["boundary"],
+        )
+        selector_subject_map = selector_augmented.set_index("boundary_sample_id")[
+            "subject_key"
+        ].astype(str)
+        selector_subject_keys = selector_subject_map.loc[
+            selector_features.sample_ids.astype(str)
+        ].to_numpy(dtype=str)
+        fold_parent_sha256 = {
+            **parent_artifact_sha256,
+            "training_positive_proposals": _dataframe_sha256(
+                train,
+                [
+                    "subject_key",
+                    "session_id",
+                    "proposal_id",
+                    "coarse_start_ms",
+                    "coarse_end_ms",
+                    "matched_event_id",
+                    "truth_start_ms",
+                    "truth_end_ms",
+                ],
+            ),
+        }
+        seed_outputs: dict[int, tuple[np.ndarray, ...]] = {}
+        fold_selected_epochs: dict[str, int] = {}
+        for configured_seed in config["boundary"]["seeds"]:
+            seed = int(configured_seed)
+            checkpoint = head_root / f"fold_{fold}_seed_{seed}.pt"
+            selector_identity = {
+                "fit_subjects": sorted(fit_subjects),
+                "selector_subjects": sorted(selector_subjects),
+                "prediction_subjects": sorted(prediction_subjects),
+                "globally_excluded_subjects": sorted(prediction_subjects),
+                "range": selection_range.__dict__,
+                "parent_artifact_sha256": fold_parent_sha256,
+            }
+            selected_epoch, history = _select_boundary_epoch(
+                fit_features,
+                selector_features,
+                config,
+                seed=seed + fold * 100,
+                selector_subject_keys=selector_subject_keys,
+                checkpoint_path=checkpoint.with_name(checkpoint.stem + "_selector_last.pt"),
+                resume=resume,
+                identity=selector_identity,
+            )
+            retrain_identity = {
+                "training_subjects": sorted(training_subjects),
+                "prediction_subjects": sorted(prediction_subjects),
+                "globally_excluded_subjects": sorted(prediction_subjects),
+                "range": boundary_range.__dict__,
+                "parent_artifact_sha256": fold_parent_sha256,
+            }
+            model = _train_endpoint_model(
+                train_features,
+                config,
+                seed=seed + fold * 100,
+                epochs=selected_epoch,
+                checkpoint_path=checkpoint.with_name(checkpoint.stem + "_last.pt"),
+                resume=resume,
+                identity=retrain_identity,
+            )
+            _save_torch_atomic(
+                checkpoint,
+                {
+                    "model": model.state_dict(),
+                    "input_dim": train_features.start_sequence.shape[-1],
+                    "config": config["boundary"],
+                    "seed": seed,
+                    "epochs": selected_epoch,
+                    "outer_fold": fold,
+                    **retrain_identity,
+                    "fit_subjects": sorted(fit_subjects),
+                    "selector_subjects": sorted(selector_subjects),
+                },
+            )
+            selector_path = head_root / f"fold_{fold}_seed_{seed}_selector.json"
+            write_json_atomic(
+                selector_path,
+                {
+                    "selected_epoch": selected_epoch,
+                    "history": history,
+                    "selection_rule": (
+                        "earliest_within_one_standard_error_subject_macro_endpoint_mae"
+                    ),
+                    "selector_split": selector_split,
+                    "outer_fold": fold,
+                    "seed": seed,
+                    **selector_identity,
+                },
+            )
+            artifacts.extend((checkpoint, selector_path))
+            selected_epochs[seed].append(selected_epoch)
+            fold_selected_epochs[str(seed)] = selected_epoch
+            seed_outputs[seed] = _infer_endpoint_model(model, holdout_features, config)
+        output = holdout[["proposal_id", "outer_fold"]].copy().reset_index(drop=True)
+        for index, name in enumerate(
+            ("start_offset_seconds", "end_offset_seconds", "start_entropy", "end_entropy")
+        ):
+            output[name] = np.mean(
+                [values[index] for values in seed_outputs.values()], axis=0
+            )
+        score_parts.append(output)
+        range_path = head_root / f"fold_{fold}_range.json"
+        write_json_atomic(range_path, boundary_range.__dict__)
+        lineage_path = head_root / f"fold_{fold}_lineage.json"
+        lineage = {
+            "protocol_version": PROTOCOL_VERSION,
+            "pooled_head_protocol": POOLED_HEAD_PROTOCOL,
+            "outer_fold": fold,
+            "training_subjects": sorted(training_subjects),
+            "selector_subjects": sorted(selector_subjects),
+            "prediction_subjects": sorted(prediction_subjects),
+            "globally_excluded_subjects": sorted(prediction_subjects),
+            "selected_epoch_by_seed": fold_selected_epochs,
+            "range_source": "other_outer_folds_only",
+            "parent_artifact_sha256": fold_parent_sha256,
+            "upstream_lineage": upstream_lineage,
+        }
+        write_json_atomic(lineage_path, lineage)
+        artifacts.extend((range_path, lineage_path))
+        lineages.append(lineage)
+    scores = pd.concat(score_parts, ignore_index=True)
+    if scores["proposal_id"].astype(str).duplicated().any():
+        raise RuntimeError("Pooled Boundary produced duplicate proposal IDs")
+    expected_ids = accepted["proposal_id"].astype(str).tolist()
+    scored_ids = scores["proposal_id"].astype(str).tolist()
+    if set(expected_ids) != set(scored_ids):
+        raise RuntimeError("Pooled Boundary does not cover every accepted event exactly once")
+    fixed_epochs = {
+        seed: int(np.median(values)) for seed, values in selected_epochs.items()
+    }
+    report = {
+        "protocol": POOLED_HEAD_PROTOCOL,
+        "joint_tuning": True,
+        "evidence_class": "development_stress_only",
+        "lineage": lineages,
+        "selected_epochs": {str(key): value for key, value in selected_epochs.items()},
+        "deployment_epoch_by_seed": {str(key): value for key, value in fixed_epochs.items()},
+    }
+    return scores, report, fixed_epochs, artifacts
 
 
 def train_hierarchical_final_v4(
@@ -5776,9 +7127,17 @@ def train_hierarchical_final_v4(
     downstream_mode = str(config.get("hierarchical", {}).get("downstream_mode", "full"))
     state_only_downstream = downstream_mode == "state_only"
     pooled_logistic_downstream = downstream_mode == "pooled_logistic"
-    fold_state_only_downstream = state_only_downstream or pooled_logistic_downstream
+    pooled_heads_downstream = downstream_mode == "pooled_heads"
+    fold_state_only_downstream = (
+        state_only_downstream or pooled_logistic_downstream or pooled_heads_downstream
+    )
     expected_verifier_seeds = (
         [] if fold_state_only_downstream else [int(value) for value in config["verifier"]["seeds"]]
+    )
+    deployment_verifier_seeds = (
+        [int(value) for value in config["verifier"]["seeds"]]
+        if pooled_heads_downstream or not fold_state_only_downstream
+        else []
     )
     for fold, root in enumerate(fold_roots):
         path = root / "run_manifest.json"
@@ -5809,6 +7168,9 @@ def train_hierarchical_final_v4(
             root / "outer" / "window_logits.parquet",
             root / "outer" / "window_predictions.parquet",
             root / "outer" / "proposals.parquet",
+            root / "evaluation" / "truth_events.parquet",
+            root / "evaluation" / "ignore_events.parquet",
+            root / "evaluation" / "truth_ignore_snapshot.json",
             *(root / "outer" / f"state_seed_{seed}.pt" for seed in expected_state_seeds),
         ]
         if not fold_state_only_downstream:
@@ -5875,7 +7237,8 @@ def train_hierarchical_final_v4(
     resume_identity = {
         **identity,
         "state_seeds": expected_state_seeds,
-        "verifier_seeds": expected_verifier_seeds,
+        "fold_verifier_seeds": expected_verifier_seeds,
+        "deployment_verifier_seeds": deployment_verifier_seeds,
         "runtime_source_identity": runtime_source_identity(Path(__file__).resolve().parents[1]),
         "parent_artifact_hashes": parent_artifact_hashes,
     }
@@ -5966,10 +7329,15 @@ def train_hierarchical_final_v4(
                         "inside its training subjects with a separate selector split."
                     ),
                     (
-                        "Fold-local verifier and boundary stages are disabled; a pooled "
-                        "subject-crossfit Logistic verifier is evaluated after all outer folds."
-                        if pooled_logistic_downstream
-                        else "Learned verifier and boundary stages are disabled."
+                        "Fold-local verifier and boundary stages are disabled; pooled Logistic, "
+                        "Deep verifier, and Boundary heads are cross-fitted after all outer folds."
+                        if pooled_heads_downstream
+                        else (
+                            "Fold-local verifier and boundary stages are disabled; a pooled "
+                            "subject-crossfit Logistic verifier is evaluated after all outer folds."
+                            if pooled_logistic_downstream
+                            else "Learned verifier and boundary stages are disabled."
+                        )
                     ),
                     "Registered ablation, development, freeze, and stress promotion gates were not run.",
                     "Five outer-fold predictions remain subject-disjoint and are pooled only after evaluation.",
@@ -6054,7 +7422,12 @@ def train_hierarchical_final_v4(
             for subject, subject_fold in inputs.subject_folds.items()
             if subject_fold == fold
         }
-        evaluable, ignored = partition_evaluation_events(inputs.events, outer_subjects)
+        evaluable, ignored, snapshot_manifest = _load_outer_event_snapshot(root)
+        snapshot_subjects = set(snapshot_manifest.get("subjects", []))
+        if snapshot_subjects != outer_subjects:
+            raise RuntimeError(
+                f"Fold {fold} truth/ignore snapshot subjects differ from its outer fold"
+            )
         anchors = inputs.anchors[inputs.anchors["subject_key"].astype(str).isin(outer_subjects)][
             ["subject_key", "session_id", "timestamp_ms", "state_target", "state_loss_mask"]
         ]
@@ -6120,6 +7493,9 @@ def train_hierarchical_final_v4(
                     else sha256_file(root / "outer" / "proposal_scores.parquet")
                 ),
                 "selection_sha256": sha256_file(root / "selection" / "selected_pipeline.json"),
+                "truth_ignore_snapshot_sha256": sha256_file(
+                    root / "evaluation" / "truth_ignore_snapshot.json"
+                ),
                 "truth_labels_sha256": _dataframe_sha256(
                     evaluable,
                     ["subject_key", "session_id", "event_id", "start_ms", "end_ms"],
@@ -6151,21 +7527,13 @@ def train_hierarchical_final_v4(
     state_calibration_path = final_root / "state_calibration.json"
     write_json_atomic(state_calibration_path, state_calibration.to_json())
     artifacts.append(state_calibration_path)
-    all_subjects = set(inputs.events["subject_key"].astype(str))
-    durations = _truth_event_durations(inputs.events, all_subjects)
-    prior = TruncatedLogNormalDurationPrior.fit(
-        durations,
-        lower_quantile=float(config["decoder"]["duration_lower_quantile"]),
-        upper_quantile=float(config["decoder"]["duration_upper_quantile"]),
-        minimum_floor_seconds=float(config["decoder"]["minimum_duration_floor_seconds"]),
-        maximum_ceiling_seconds=float(config["decoder"]["maximum_duration_ceiling_seconds"]),
-    )
+    pooled_truth = pd.concat(truth_parts, ignore_index=True)
+    pooled_ignore = pd.concat(ignore_parts, ignore_index=True)
+    prior = _fit_duration_prior_from_truth(pooled_truth, config)
     prior_path = final_root / "duration_prior.json"
     write_json_atomic(prior_path, prior.to_json())
     artifacts.append(prior_path)
 
-    pooled_truth = pd.concat(truth_parts, ignore_index=True)
-    pooled_ignore = pd.concat(ignore_parts, ignore_index=True)
     globally_calibrated_windows = _apply_state_calibration_to_windows(
         pd.concat(window_parts, ignore_index=True), state_calibration
     )
@@ -6199,38 +7567,85 @@ def train_hierarchical_final_v4(
     proposal_feature_parts = []
     scored_parts = []
     boundary_positive_parts = []
-    for fold, (root, windows, evaluable, ignored) in enumerate(
-        zip(fold_roots, window_parts, truth_parts, ignore_parts)
-    ):
-        fold_subjects = set(windows["subject_key"].astype(str))
-        windows = pooled_windows[
-            pooled_windows["subject_key"].astype(str).isin(fold_subjects)
-        ].reset_index(drop=True)
-        proposals = generate_event_candidates_v4(
-            windows,
-            pooled_decoder,
-            selected_decoder,
-            split_role=f"pooled_outer_oof_fold_{fold}",
-        )
-        labeled = (
-            exclude_ignored_candidates(label_event_candidates(proposals, evaluable, 0.25), ignored)
-            .sort_values("proposal_id")
-            .reset_index(drop=True)
-        )
-        if fold_state_only_downstream:
-            scored = labeled.copy()
-            scored["state_score"] = scored["generator_score"]
-            scored["final_score"] = scored["generator_score"]
-            if pooled_logistic_downstream:
-                proposal_feature_parts.append(
-                    build_proposal_features_v4(
-                        labeled,
-                        windows,
-                        [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
-                        config["verifier"],
-                    )
+    deployment_parts: list[pd.DataFrame] = []
+    deployment_feature_parts: list[ProposalFeatureBatchV4] = []
+    if pooled_logistic_downstream or pooled_heads_downstream:
+        for fold, (windows, evaluable, ignored) in enumerate(
+            zip(window_parts, truth_parts, ignore_parts)
+        ):
+            fold_subjects = set(windows["subject_key"].astype(str))
+            deployment_windows = pooled_windows[
+                pooled_windows["subject_key"].astype(str).isin(fold_subjects)
+            ].reset_index(drop=True)
+            deployment_proposals = generate_event_candidates_v4(
+                deployment_windows,
+                pooled_decoder,
+                selected_decoder,
+                split_role=f"pooled_deployment_outer_{fold}",
+            ).copy()
+            deployment_proposals["proposal_id"] = (
+                f"deployment:outer{fold}:" + deployment_proposals["proposal_id"].astype(str)
+            )
+            deployment_labeled = exclude_ignored_candidates(
+                label_event_candidates(deployment_proposals, evaluable, 0.25), ignored
+            ).sort_values("proposal_id", kind="stable").reset_index(drop=True)
+            deployment_labeled["outer_fold"] = int(fold)
+            deployment_parts.append(deployment_labeled)
+            deployment_feature_parts.append(
+                build_proposal_features_v4(
+                    deployment_labeled,
+                    deployment_windows,
+                    [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+                    config["verifier"],
                 )
-        else:
+            )
+    deployment_frame = (
+        pd.concat(deployment_parts, ignore_index=True) if deployment_parts else pd.DataFrame()
+    )
+    deployment_features = (
+        _concatenate_proposal_features(deployment_feature_parts)
+        if deployment_feature_parts
+        else None
+    )
+    pooled_fold_data: list[PooledFoldProposalData] = []
+    if fold_state_only_downstream:
+        pooled_fold_data = _build_isolated_pooled_fold_data(
+            outer_logits_parts,
+            window_parts,
+            truth_parts,
+            ignore_parts,
+            config,
+        )
+        calibration_frame, prediction_features = _pooled_prediction_frame_and_features(
+            pooled_fold_data
+        )
+        calibration_frame["state_score"] = calibration_frame["generator_score"]
+        calibration_frame["final_score"] = calibration_frame["generator_score"]
+        proposal_feature_parts.append(prediction_features)
+        scored_parts.append(calibration_frame)
+        boundary_positive_parts.append(
+            _attach_truth_boundaries(
+                calibration_frame[calibration_frame["max_iou"] > 0.25], pooled_truth
+            )
+        )
+    else:
+        for fold, (root, windows, evaluable, ignored) in enumerate(
+            zip(fold_roots, window_parts, truth_parts, ignore_parts)
+        ):
+            fold_subjects = set(windows["subject_key"].astype(str))
+            windows = pooled_windows[
+                pooled_windows["subject_key"].astype(str).isin(fold_subjects)
+            ].reset_index(drop=True)
+            proposals = generate_event_candidates_v4(
+                windows,
+                pooled_decoder,
+                selected_decoder,
+                split_role=f"pooled_outer_oof_fold_{fold}",
+            ).copy()
+            proposals["proposal_id"] = f"outer{fold}:" + proposals["proposal_id"].astype(str)
+            labeled = exclude_ignored_candidates(
+                label_event_candidates(proposals, evaluable, 0.25), ignored
+            ).sort_values("proposal_id", kind="stable").reset_index(drop=True)
             scored, features = _score_with_fold_verifier(
                 root,
                 labeled,
@@ -6238,18 +7653,21 @@ def train_hierarchical_final_v4(
                 config,
                 verifier_kind,
             )
+            scored["outer_fold"] = int(fold)
+            scored_parts.append(scored)
             proposal_feature_parts.append(features)
-        scored["outer_fold"] = int(fold)
-        scored_parts.append(scored)
-        boundary_positive_parts.append(
-            _attach_truth_boundaries(scored[scored["max_iou"] > 0.25], evaluable)
-        )
+            boundary_positive_parts.append(
+                _attach_truth_boundaries(scored[scored["max_iou"] > 0.25], evaluable)
+            )
 
     calibration_frame = pd.concat(scored_parts, ignore_index=True)
     if calibration_frame.empty:
         raise RuntimeError("Pooled outer OOF produced no proposals")
+    if calibration_frame["proposal_id"].astype(str).duplicated().any():
+        raise RuntimeError("Pooled outer OOF proposal IDs are not globally unique")
     verifier_epoch_by_seed: dict[int, int] = {}
     pooled_logistic_report: dict[str, Any] | None = None
+    pooled_deep_report: dict[str, Any] | None = None
     if state_only_downstream:
         pooled_scores = calibration_frame
         point = _best_verifier_operating_point(
@@ -6263,14 +7681,15 @@ def train_hierarchical_final_v4(
     elif pooled_logistic_downstream:
         if set(calibration_frame["is_positive"].astype(int).unique()) != {0, 1}:
             raise RuntimeError("Pooled Logistic requires positive and negative outer OOF proposals")
-        verifier_features = _concatenate_proposal_features(proposal_feature_parts)
-        pooled_scores, logistic, pooled_logistic_report, point = _fit_pooled_logistic_crossfit(
-            verifier_features,
-            calibration_frame,
-            pooled_truth,
-            pooled_windows,
-            pooled_ignore,
-            config,
+        pooled_scores, deployment_c, pooled_logistic_report, point = (
+            _fit_isolated_pooled_logistic_crossfit(
+                pooled_fold_data,
+                calibration_frame,
+                pooled_truth,
+                pooled_windows,
+                pooled_ignore,
+                config,
+            )
         )
         logistic_report_path = final_root / "logistic_crossfit.json"
         logistic_scores_path = final_root / "logistic_crossfit_scores.parquet"
@@ -6278,12 +7697,149 @@ def train_hierarchical_final_v4(
         write_parquet_atomic(logistic_scores_path, pooled_scores)
         artifacts.extend((logistic_report_path, logistic_scores_path))
         if bool(pooled_logistic_report["promotion"]["passed"]):
+            if deployment_features is None or deployment_frame.empty:
+                raise RuntimeError("Pooled Logistic deployment features are missing")
             verifier_kind = "logistic"
+            logistic = LogisticScoreCombiner.fit(
+                _verifier_matrix(deployment_features),
+                np.asarray(deployment_features.event_target, dtype=np.int64),
+                sample_weight=deployment_features.sample_weight,
+                regularization_c=deployment_c,
+            )
             logistic_path = final_root / "logistic_verifier.json"
             write_json_atomic(logistic_path, logistic.to_json())
             artifacts.append(logistic_path)
         else:
             verifier_kind = "state_only"
+    elif pooled_heads_downstream:
+        if set(calibration_frame["is_positive"].astype(int).unique()) != {0, 1}:
+            raise RuntimeError("Pooled heads require positive and negative outer OOF proposals")
+        verifier_features = _concatenate_proposal_features(proposal_feature_parts)
+        _assert_proposal_feature_alignment(
+            verifier_features,
+            calibration_frame,
+            context="Pooled heads outer OOF",
+        )
+        pooled_scores, deployment_c, pooled_logistic_report, point = (
+            _fit_isolated_pooled_logistic_crossfit(
+                pooled_fold_data,
+                calibration_frame,
+                pooled_truth,
+                pooled_windows,
+                pooled_ignore,
+                config,
+            )
+        )
+        logistic_report_path = final_root / "logistic_crossfit.json"
+        logistic_scores_path = final_root / "logistic_crossfit_scores.parquet"
+        write_json_atomic(logistic_report_path, pooled_logistic_report)
+        write_parquet_atomic(logistic_scores_path, pooled_scores)
+        artifacts.extend((logistic_report_path, logistic_scores_path))
+        verifier_kind = (
+            "logistic" if bool(pooled_logistic_report["promotion"]["passed"]) else "state_only"
+        )
+        current_diagnostics, _ = _pooled_head_diagnostics(
+            pooled_scores,
+            "final_score",
+            pooled_truth,
+            pooled_windows,
+            pooled_ignore,
+            config,
+        )
+        pooled_verifier_parent_sha256 = {
+            "state_calibration": sha256_file(state_calibration_path),
+            "duration_prior": sha256_file(prior_path),
+            "decoder_search": sha256_file(decoder_search_path),
+            "selected_decoder": sha256_file(selected_decoder_path),
+            "truth_snapshots": hashlib.sha256(
+                json.dumps(
+                    [value["truth_ignore_snapshot_sha256"] for value in pooled_evidence],
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        deep_scores, deployment_calibration, pooled_deep_report, fixed_deep_epochs, deep_artifacts = (
+            _fit_pooled_deep_crossfit(
+                pooled_fold_data,
+                calibration_frame,
+                pooled_truth,
+                pooled_ignore,
+                pooled_windows,
+                config,
+                final_root,
+                resume=resume,
+                parent_artifact_sha256=pooled_verifier_parent_sha256,
+            )
+        )
+        artifacts.extend(deep_artifacts)
+        verifier_epoch_by_seed.update(fixed_deep_epochs)
+        deep_scores = deep_scores.merge(
+            pooled_scores[["proposal_id", "logistic_score"]],
+            on="proposal_id",
+            how="left",
+            validate="one_to_one",
+        )
+        if deep_scores[["final_score", "logistic_score"]].isna().any().any():
+            raise RuntimeError("Pooled head scores failed to align on proposal_id")
+        deep_diagnostics, _ = _pooled_head_diagnostics(
+            deep_scores,
+            "final_score",
+            pooled_truth,
+            pooled_windows,
+            pooled_ignore,
+            config,
+        )
+        deep_promotion = _pooled_head_promotion(
+            current_diagnostics,
+            deep_diagnostics,
+            minimum_f1_gain=float(config["promotion_gate"]["minimum_verifier_f1_improvement"]),
+            config=config,
+        )
+        pooled_deep_report.update(
+            {
+                "baseline_kind": verifier_kind,
+                "baseline": current_diagnostics,
+                "deep": deep_diagnostics,
+                "promotion": deep_promotion,
+            }
+        )
+        deep_report_path = final_root / "deep_crossfit.json"
+        deep_scores_path = final_root / "deep_crossfit_scores.parquet"
+        write_json_atomic(deep_report_path, pooled_deep_report)
+        write_parquet_atomic(deep_scores_path, deep_scores)
+        artifacts.extend((deep_report_path, deep_scores_path))
+        if bool(deep_promotion["passed"]):
+            if deployment_features is None or deployment_frame.empty:
+                raise RuntimeError("Pooled Deep deployment features are missing")
+            verifier_kind = "deep"
+            pooled_scores = deep_scores
+            point = deep_diagnostics["point"]
+            proposal_calibration_path = final_root / "proposal_calibration.json"
+            write_json_atomic(proposal_calibration_path, deployment_calibration.to_json())
+            artifacts.append(proposal_calibration_path)
+            artifacts.extend(
+                _train_pooled_deep_deployment(
+                    deployment_features,
+                    deployment_frame,
+                    config,
+                    final_root,
+                    epochs_by_seed=fixed_deep_epochs,
+                    resume=resume,
+                    parent_artifact_sha256=pooled_verifier_parent_sha256,
+                )
+            )
+        elif verifier_kind == "logistic":
+            if deployment_features is None or deployment_frame.empty:
+                raise RuntimeError("Pooled Logistic deployment features are missing")
+            logistic = LogisticScoreCombiner.fit(
+                _verifier_matrix(deployment_features),
+                np.asarray(deployment_features.event_target, dtype=np.int64),
+                sample_weight=deployment_features.sample_weight,
+                regularization_c=deployment_c,
+            )
+            logistic_path = final_root / "logistic_verifier.json"
+            write_json_atomic(logistic_path, logistic.to_json())
+            artifacts.append(logistic_path)
     else:
         if set(calibration_frame["is_positive"].astype(int).unique()) != {0, 1}:
             raise RuntimeError(
@@ -6393,8 +7949,12 @@ def train_hierarchical_final_v4(
         "decoder_config": selected_decoder,
         "masking_protocol": "zero_mask_layernorm_v1",
         "candidate_budget_scope": "session",
+        "pooled_head_protocol": POOLED_HEAD_PROTOCOL if pooled_heads_downstream else None,
+        "evidence_class": "development_stress_only",
         "meta_crossfit_protocol": (
-            "outer_fold_subject_disjoint_logistic_crossfit_v1"
+            POOLED_HEAD_PROTOCOL
+            if pooled_heads_downstream
+            else "outer_fold_subject_disjoint_logistic_crossfit_v1"
             if pooled_logistic_downstream
             else "outer_subject_oof_single_holdout_tuning_v1"
             if state_only_downstream
@@ -6413,10 +7973,13 @@ def train_hierarchical_final_v4(
         "boundary_seed": None,
         "boundary_entropy_threshold": None,
         "state_seeds": [int(value) for value in config["final_training"]["state_seeds"]],
-        "verifier_seeds": expected_verifier_seeds,
+        "verifier_seeds": deployment_verifier_seeds if verifier_kind == "deep" else [],
         "pooled_logistic_promotion": pooled_logistic_report,
+        "pooled_deep_promotion": pooled_deep_report,
         "verifier_feature_calibration_source": (
-            "outer_fold_oof_calibration"
+            "outer_fold_crossfit_logits_only"
+            if pooled_heads_downstream and verifier_kind == "deep"
+            else "outer_fold_oof_calibration"
             if pooled_logistic_downstream
             else "pooled_outer_oof_calibration"
         ),
@@ -6445,20 +8008,236 @@ def train_hierarchical_final_v4(
         },
     }
 
+    pooled_boundary_fixed_epochs: dict[int, int] = {}
+    pooled_boundary_positive: pd.DataFrame | None = None
+    if pooled_heads_downstream:
+        accepted = _accepted_from_point(pooled_scores, point, "final_score")
+        pooled_boundary_positive = _attach_truth_boundaries(
+            pooled_scores[pooled_scores["max_iou"] > 0.25], pooled_truth
+        )
+        independent_events = len(
+            pooled_boundary_positive[
+                ["subject_key", "session_id", "matched_event_id"]
+            ].drop_duplicates()
+        )
+        boundary_report: dict[str, Any] = {
+            "protocol": POOLED_HEAD_PROTOCOL,
+            "evidence_class": "development_stress_only",
+            "independent_matched_events": independent_events,
+            "minimum_independent_events": int(config["boundary"]["minimum_independent_events"]),
+            "enabled": False,
+        }
+        if independent_events >= int(config["boundary"]["minimum_independent_events"]):
+            boundary_parent_sha256 = {
+                "selected_head_scores": _dataframe_sha256(
+                    pooled_scores,
+                    [
+                        "subject_key",
+                        "session_id",
+                        "proposal_id",
+                        "coarse_start_ms",
+                        "coarse_end_ms",
+                        "outer_fold",
+                    ],
+                ),
+                "truth_snapshots": hashlib.sha256(
+                    json.dumps(
+                        [value["truth_ignore_snapshot_sha256"] for value in pooled_evidence],
+                        sort_keys=True,
+                    ).encode("utf-8")
+                ).hexdigest(),
+            }
+            try:
+                boundary_scores, crossfit_report, pooled_boundary_fixed_epochs, boundary_artifacts = (
+                    _fit_pooled_boundary_crossfit(
+                        pooled_boundary_positive,
+                        accepted,
+                        pooled_windows,
+                        pooled_truth,
+                        config,
+                        final_root,
+                        resume=resume,
+                        parent_artifact_sha256=boundary_parent_sha256,
+                        fold_data=pooled_fold_data,
+                    )
+                )
+                artifacts.extend(boundary_artifacts)
+                boundary_scores_path = final_root / "boundary_crossfit_scores.parquet"
+                write_parquet_atomic(boundary_scores_path, boundary_scores)
+                artifacts.append(boundary_scores_path)
+                coarse_predictions = _prediction_events(accepted)
+                coarse_metrics, coarse_matches = evaluate_events(
+                    pooled_truth,
+                    coarse_predictions,
+                    method="max_cardinality_iou",
+                    ignore=pooled_ignore,
+                )
+                winners: list[
+                    tuple[float, float, dict[str, Any], pd.DataFrame, dict[str, Any]]
+                ] = []
+                for threshold in config["boundary"]["entropy_thresholds"]:
+                    refined = _refine_from_scores(
+                        accepted,
+                        boundary_scores,
+                        float(threshold),
+                        int(config["boundary"]["safety_gap_seconds"]),
+                    )
+                    identity_preserved = bool(
+                        len(refined) == len(accepted)
+                        and refined["proposal_id"].astype(str).tolist()
+                        == accepted["proposal_id"].astype(str).tolist()
+                    )
+                    predictions = refined.rename(
+                        columns={
+                            "refined_start_ms": "start_ms",
+                            "refined_end_ms": "end_ms",
+                        }
+                    )[["subject_key", "session_id", "start_ms", "end_ms", "proposal_id"]]
+                    metrics, matches = evaluate_events(
+                        pooled_truth,
+                        predictions,
+                        method="max_cardinality_iou",
+                        ignore=pooled_ignore,
+                    )
+                    start_improved = bool(
+                        np.isfinite(metrics["start_mae_seconds"])
+                        and np.isfinite(coarse_metrics["start_mae_seconds"])
+                        and metrics["start_mae_seconds"]
+                        <= coarse_metrics["start_mae_seconds"]
+                        * (
+                            1.0
+                            - float(
+                                config["promotion_gate"]["minimum_boundary_mae_improvement"]
+                            )
+                        )
+                    )
+                    end_improved = bool(
+                        np.isfinite(metrics["end_mae_seconds"])
+                        and np.isfinite(coarse_metrics["end_mae_seconds"])
+                        and metrics["end_mae_seconds"]
+                        <= coarse_metrics["end_mae_seconds"]
+                        * (
+                            1.0
+                            - float(
+                                config["promotion_gate"]["minimum_boundary_mae_improvement"]
+                            )
+                        )
+                    )
+                    hand_gate: dict[str, Any] = {}
+                    hand_passed = True
+                    for relation in ("same", "different"):
+                        coarse_relation = coarse_matches[
+                            coarse_matches.get("hand_relation", pd.Series(dtype=str)) == relation
+                        ]
+                        refined_relation = matches[
+                            matches.get("hand_relation", pd.Series(dtype=str)) == relation
+                        ]
+                        enough = len(coarse_relation) >= 5 and len(refined_relation) >= 5
+                        endpoint_checks: dict[str, bool] = {}
+                        for endpoint in ("start", "end"):
+                            column = f"{endpoint}_absolute_error_ms"
+                            coarse_value = (
+                                float(coarse_relation[column].mean())
+                                if len(coarse_relation)
+                                else float("nan")
+                            )
+                            refined_value = (
+                                float(refined_relation[column].mean())
+                                if len(refined_relation)
+                                else float("nan")
+                            )
+                            endpoint_checks[endpoint] = bool(
+                                np.isfinite(coarse_value)
+                                and np.isfinite(refined_value)
+                                and refined_value <= coarse_value * 1.05
+                            )
+                        relation_passed = enough and all(endpoint_checks.values())
+                        hand_passed &= relation_passed
+                        hand_gate[relation] = {
+                            "matched_events": len(refined_relation),
+                            "endpoint_checks": endpoint_checks,
+                            "passed": relation_passed,
+                        }
+                    matched_enough = len(matches) >= int(
+                        config["boundary"]["minimum_independent_events"]
+                    )
+                    passed = bool(
+                        identity_preserved
+                        and matched_enough
+                        and start_improved
+                        and end_improved
+                        and metrics["f1"]
+                        >= coarse_metrics["f1"]
+                        - float(config["promotion_gate"]["maximum_boundary_f1_drop"])
+                        and hand_passed
+                    )
+                    diagnostics = {
+                        "threshold": float(threshold),
+                        "passed": passed,
+                        "identity_preserved": identity_preserved,
+                        "matched_events": len(matches),
+                        "start_mae_improved_10pct": start_improved,
+                        "end_mae_improved_10pct": end_improved,
+                        "f1": float(metrics["f1"]),
+                        "start_mae_seconds": float(metrics["start_mae_seconds"]),
+                        "end_mae_seconds": float(metrics["end_mae_seconds"]),
+                        "hand_gate": hand_gate,
+                    }
+                    if passed:
+                        winners.append(
+                            (
+                                float(np.nanmean(
+                                    [metrics["start_mae_seconds"], metrics["end_mae_seconds"]]
+                                )),
+                                float(threshold),
+                                metrics,
+                                refined,
+                                diagnostics,
+                            )
+                        )
+                    boundary_report.setdefault("thresholds", []).append(diagnostics)
+                boundary_report.update(crossfit_report)
+                if winners:
+                    _, entropy_threshold, _, _, selected_diagnostics = min(
+                        winners, key=lambda value: (value[0], value[1])
+                    )
+                    selection.update(
+                        {
+                            "boundary_enabled": True,
+                            "boundary_seed": int(config["boundary"]["seeds"][0]),
+                            "boundary_entropy_threshold": entropy_threshold,
+                        }
+                    )
+                    boundary_report["enabled"] = True
+                    boundary_report["selected"] = selected_diagnostics
+            except (ValueError, RuntimeError) as error:
+                boundary_report["disabled_reason"] = f"{type(error).__name__}: {error}"
+        else:
+            boundary_report["disabled_reason"] = "insufficient_independent_matched_events"
+        boundary_report_path = final_root / "boundary_crossfit.json"
+        write_json_atomic(boundary_report_path, boundary_report)
+        artifacts.append(boundary_report_path)
+        selection["boundary_selection_diagnostics"] = boundary_report
+
     all_fold_boundary_enabled = all(
         bool(value.get("boundary_enabled", False)) for value in fold_selections
     )
     boundary_score_files_complete = all(
         (root / "outer" / "boundary_scores.parquet").is_file() for root in fold_roots
     )
-    selection["boundary_selection_diagnostics"] = {
-        "all_folds_enabled": all_fold_boundary_enabled,
-        "score_files_complete": boundary_score_files_complete,
-        "full_accepted_coverage": False,
-        "accepted_count": 0,
-        "covered_count": 0,
-    }
-    if all_fold_boundary_enabled and boundary_score_files_complete:
+    if not pooled_heads_downstream:
+        selection["boundary_selection_diagnostics"] = {
+            "all_folds_enabled": all_fold_boundary_enabled,
+            "score_files_complete": boundary_score_files_complete,
+            "full_accepted_coverage": False,
+            "accepted_count": 0,
+            "covered_count": 0,
+        }
+    if (
+        not pooled_heads_downstream
+        and all_fold_boundary_enabled
+        and boundary_score_files_complete
+    ):
         accepted = _accepted_from_point(pooled_scores, point, "final_score")
         pooled_boundary = pd.concat(
             [pd.read_parquet(root / "outer" / "boundary_scores.parquet") for root in fold_roots],
@@ -6559,7 +8338,80 @@ def train_hierarchical_final_v4(
                     }
                 )
 
-    if selection["boundary_enabled"]:
+    if selection["boundary_enabled"] and pooled_heads_downstream:
+        if pooled_boundary_positive is None or not pooled_boundary_fixed_epochs:
+            raise RuntimeError("Selected pooled Boundary is missing its crossfit evidence")
+        if deployment_frame.empty:
+            raise RuntimeError("Selected pooled Boundary is missing deployment candidates")
+        positive = _attach_truth_boundaries(
+            deployment_frame[deployment_frame["max_iou"] > 0.25], pooled_truth
+        )
+        final_range = select_boundary_range(
+            (
+                positive["truth_start_ms"].to_numpy(dtype=float)
+                - positive["coarse_start_ms"].to_numpy(dtype=float)
+            )
+            / 1000.0,
+            (
+                positive["truth_end_ms"].to_numpy(dtype=float)
+                - positive["coarse_end_ms"].to_numpy(dtype=float)
+            )
+            / 1000.0,
+            quantile=float(config["boundary"]["residual_quantile"]),
+            minimum_seconds=int(config["boundary"]["minimum_range_seconds"]),
+            maximum_seconds=int(config["boundary"]["maximum_range_seconds"]),
+        )
+        augmented = augment_boundary_training_proposals(
+            positive,
+            maximum_jitters_per_event=int(config["boundary"]["maximum_jitters_per_event"]),
+            jitter_seconds=int(config["boundary"]["jitter_seconds"]),
+        )
+        final_features = build_endpoint_features(
+            augmented,
+            pooled_windows,
+            [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
+            final_range,
+            config["boundary"],
+        )
+        boundary_seed = int(selection["boundary_seed"])
+        boundary_path = final_root / "boundary.pt"
+        model = _train_endpoint_model(
+            final_features,
+            config,
+            seed=boundary_seed + 120_000,
+            epochs=int(pooled_boundary_fixed_epochs[boundary_seed]),
+            checkpoint_path=final_root / "boundary_last.pt",
+            resume=resume,
+            identity={
+                "training_subjects": sorted(set(positive["subject_key"].astype(str))),
+                "prediction_subjects": [],
+                "globally_excluded_subjects": [],
+                "range": final_range.__dict__,
+                "parent_artifact_sha256": {
+                    "boundary_crossfit": sha256_file(boundary_report_path),
+                },
+            },
+        )
+        _save_torch_atomic(
+            boundary_path,
+            {
+                "model": model.state_dict(),
+                "input_dim": final_features.start_sequence.shape[-1],
+                "config": config["boundary"],
+                "seed": boundary_seed,
+                "epochs": int(pooled_boundary_fixed_epochs[boundary_seed]),
+                "training_subjects": sorted(set(positive["subject_key"].astype(str))),
+                "prediction_subjects": [],
+                "globally_excluded_subjects": [],
+                "parent_artifact_sha256": {
+                    "boundary_crossfit": sha256_file(boundary_report_path),
+                },
+            },
+        )
+        range_path = final_root / "boundary_range.json"
+        write_json_atomic(range_path, final_range.__dict__)
+        artifacts.extend((boundary_path, range_path))
+    elif selection["boundary_enabled"]:
         positive = pd.concat(boundary_positive_parts, ignore_index=True)
         independent_events = len(
             positive[["subject_key", "session_id", "matched_event_id"]].drop_duplicates()
@@ -6680,7 +8532,7 @@ def train_hierarchical_final_v4(
         "blocked_predecessors": list(BLOCKED_PREDECESSORS),
         "state_seeds": [int(value) for value in config["final_training"]["state_seeds"]],
         "fixed_state_epoch_by_seed": {str(seed): epoch for seed, epoch in fixed_epochs.items()},
-        "verifier_seeds": expected_verifier_seeds,
+        "verifier_seeds": deployment_verifier_seeds if verifier_kind == "deep" else [],
         "fixed_verifier_epoch_by_seed": {
             str(seed): epoch for seed, epoch in verifier_epoch_by_seed.items()
         },

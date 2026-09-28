@@ -14,7 +14,7 @@ from bme_eating.training.hierarchical_v4_trainer import (
     _gradient_clipping_gate_passed,
     _selector_decoder_search_config,
 )
-from bme_eating.v4_protocol import validate_r3_config
+from bme_eating.v4_protocol import validate_r3_config, validate_serialized_verifier_seeds
 
 
 def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
@@ -39,7 +39,7 @@ def test_r3_config_is_strict_and_has_fixed_features() -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "configs" / "hierarchical_v4_statsfusion_r3.yaml")
     validate_r3_config(config)
-    assert config["experiment"]["code_version"] == "v4.4.2"
+    assert config["experiment"]["code_version"] == "v4.5.1"
     assert config["experiment"]["protocol_version"] == "statsfusion-r3.2"
     assert config["project"]["artifact_schema_version"] == "v4"
     assert config["project"]["strict_resume_identity"] is True
@@ -106,9 +106,9 @@ def test_r32_time_constrained_config_uses_single_holdout_and_pooled_logistic() -
     assert config["model"]["separate_motion_branches"] is True
     assert config["model"]["use_invariant_motion_branch"] is True
     assert config["model"]["use_ppg"] is True
-    assert config["training"]["gyro_modality_dropout"] == 0.0
-    assert config["training"]["ppg_modality_dropout"] == 0.0
-    assert config["training"]["rotation_augmentation_probability"] == 0.0
+    assert config["training"]["gyro_modality_dropout"] == 0.20
+    assert config["training"]["ppg_modality_dropout"] == 0.20
+    assert config["training"]["rotation_augmentation_probability"] == 0.50
     assert config["training"]["batch_size"] == 8
     assert config["training"]["gradient_accumulation"] == 4
     assert config["training"]["clips_per_subject_per_epoch"] == 1000
@@ -123,8 +123,10 @@ def test_r32_time_constrained_config_uses_single_holdout_and_pooled_logistic() -
     assert config["training"]["learning_rate"] == 0.00015
     assert config["training"]["warmup_fraction"] == 0.10
     assert config["training"]["gradient_clip_norm"] == 5.0
-    assert _enforce_gradient_clipping_gate(config) is False
-    assert _gradient_clipping_gate_passed(config, 0.90) is True
+    assert _enforce_gradient_clipping_gate(config) is True
+    assert _gradient_clipping_gate_passed(config, 0.20) is True
+    assert _gradient_clipping_gate_passed(config, 0.21) is False
+    assert config["training"]["gradient_clipping_abort_fraction"] == 1.0
     assert config["decoder"]["use_semi_markov"] is False
     assert config["decoder"]["use_transition_candidates"] is False
     assert config["hierarchical"]["state_crossfit_mode"] == "single_holdout"
@@ -139,6 +141,34 @@ def test_r32_time_constrained_config_uses_single_holdout_and_pooled_logistic() -
     assert geometry.fused_short_receptive_field_steps == 155
     assert geometry.history_steps == 793
     assert geometry.total_steps == 1049
+
+
+def test_r32_pooled_heads_config_keeps_fast_state_and_single_seed_heads() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r32_pooled_heads.yaml")
+    validate_r3_config(config)
+    assert config["experiment"]["variant"] == (
+        "time_constrained_outer_single_holdout_pooled_heads"
+    )
+    assert config["hierarchical"]["state_crossfit_mode"] == "single_holdout"
+    assert config["hierarchical"]["downstream_mode"] == "pooled_heads"
+    assert config["hierarchical"]["pooled_head_protocol"] == (
+        "outer_fold_crossfit_joint_tuning_v1"
+    )
+    assert config["final_training"]["state_seeds"] == [2026]
+    assert config["verifier"]["seeds"] == [2026]
+    assert config["boundary"]["seeds"] == [2026]
+    assert config["verifier"]["minimum_epochs"] == 5
+    assert config["boundary"]["minimum_epochs"] == 5
+    assert config["verifier"]["patience"] == 8
+    assert config["boundary"]["patience"] == 8
+
+
+def test_verifier_seed_profiles_allow_single_or_three_seed_deployment() -> None:
+    assert validate_serialized_verifier_seeds([2026]) == [2026]
+    assert validate_serialized_verifier_seeds([2026, 2027, 2028]) == [2026, 2027, 2028]
+    with pytest.raises(RuntimeError, match="verifier seeds"):
+        validate_serialized_verifier_seeds([2027])
 
 
 def test_r32_fast_config_uses_one_nested_selector_holdout() -> None:
@@ -196,7 +226,7 @@ def test_r32_fast_config_requires_pooled_logistic_downstream() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
     config = load_config(root / "hierarchical_v4_r32_fast_logistic.yaml")
     config["hierarchical"]["downstream_mode"] = "full"
-    with pytest.raises(ValueError, match="pooled-logistic downstream"):
+    with pytest.raises(ValueError, match="downstream mode"):
         validate_r3_config(config)
 
 

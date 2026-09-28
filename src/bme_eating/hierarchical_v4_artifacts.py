@@ -32,6 +32,7 @@ from bme_eating.v4_protocol import (
     CODE_VERSION,
     DECODER_PROTOCOL,
     INPUT_SNAPSHOT_FILENAME,
+    POOLED_HEAD_PROTOCOL,
     PROTOCOL_VERSION,
     RAW_INPUT_SCHEMA,
     TARGET_SEMANTICS,
@@ -138,6 +139,13 @@ def _tracked_inputs(config: dict[str, Any], input_root: Path) -> dict[str, Path]
     }
 
 
+def _input_snapshot_matches(existing: dict[str, Any], current: dict[str, Any]) -> bool:
+    return existing.get("version") in {5, 6} and all(
+        existing.get(key) == current.get(key)
+        for key in ("protocol_version", "input_artifact_schema_version", "hashes")
+    )
+
+
 def _m1_comparison_identity(config: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(_public_config(config))
     experiment = normalized.get("experiment", {})
@@ -239,6 +247,11 @@ def current_v4_identity(config: dict[str, Any], input_root: Path) -> dict[str, A
         raise FileNotFoundError(f"Required StatsFusion inputs are missing: {missing}")
     return {
         "protocol_version": PROTOCOL_VERSION,
+        "pooled_head_protocol": (
+            POOLED_HEAD_PROTOCOL
+            if config.get("hierarchical", {}).get("downstream_mode") == "pooled_heads"
+            else None
+        ),
         "resolved_config_sha256": resume_config_hash(config),
         "git": git_worktree_identity(Path(__file__).resolve().parents[2]),
         "input_hashes": {name: sha256_file(path) for name, path in tracked.items()},
@@ -381,17 +394,16 @@ def initialize_v4_run(
     if run_root.exists() and any(run_root.iterdir()):
         raise RuntimeError("V4 run directory exists without a valid manifest")
     snapshot = {
-        "version": 5,
-        "code_version": CODE_VERSION,
+        "version": 6,
         "protocol_version": PROTOCOL_VERSION,
         "input_artifact_schema_version": "v2",
         "hashes": input_hashes,
     }
     snapshot_path = output_root / INPUT_SNAPSHOT_FILENAME
-    if snapshot_path.is_file() and (
-        json.loads(snapshot_path.read_text(encoding="utf-8")) != snapshot
-    ):
-        raise RuntimeError("V4 input snapshot conflicts with current v2 artifacts")
+    if snapshot_path.is_file():
+        existing_snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        if not _input_snapshot_matches(existing_snapshot, snapshot):
+            raise RuntimeError("V4 input snapshot conflicts with current v2 artifacts")
     provenance_config = config["feature_provenance"]
     provenance = audit_feature_provenance(
         project_root=project_root,
@@ -454,13 +466,13 @@ def initialize_v4_run(
             "verifier": (
                 []
                 if config.get("hierarchical", {}).get("downstream_mode")
-                in {"state_only", "pooled_logistic"}
+                in {"state_only", "pooled_logistic", "pooled_heads"}
                 else [int(value) for value in config["verifier"]["seeds"]]
             ),
             "boundary": (
                 []
                 if config.get("hierarchical", {}).get("downstream_mode")
-                in {"state_only", "pooled_logistic"}
+                in {"state_only", "pooled_logistic", "pooled_heads"}
                 else [int(value) for value in config["boundary"]["seeds"]]
             ),
         },

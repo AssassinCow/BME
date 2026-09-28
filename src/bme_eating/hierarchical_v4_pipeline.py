@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -45,7 +45,10 @@ from bme_eating.structured_decoder import (
     FixedLagSemiMarkovDecoder,
     TruncatedLogNormalDurationPrior,
 )
-from bme_eating.timeline import claim_new_timeline_rows, deduplicate_consistent_timeline
+from bme_eating.timeline import (
+    claim_new_timeline_rows,
+    deduplicate_consistent_timeline,
+)
 from bme_eating.types import Event
 from bme_eating.v4_protocol import (
     IGNORE_PROTOCOL,
@@ -54,6 +57,7 @@ from bme_eating.v4_protocol import (
     RAW_INPUT_SCHEMA,
     RUNTIME_SOURCE_BINDING,
     validate_serialized_state_seeds,
+    validate_serialized_verifier_seeds,
 )
 
 
@@ -63,6 +67,13 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _iter_tail_aligned_raw_state_batches(
+    preprocessor: StatsFusionRawSessionPreprocessor,
+    raw_session: RawSessionInput,
+) -> Iterator[dict[str, Any]]:
+    yield from preprocessor.iter_state_batches(raw_session)
 
 
 def _proposal_nms(
@@ -418,7 +429,7 @@ class HierarchicalEatingDetectorV4:
         )
         frames: list[pd.DataFrame] = []
         previous_chunks: dict[tuple[str, str], pd.DataFrame] = {}
-        for batch in preprocessor.iter_state_batches(session):
+        for batch in _iter_tail_aligned_raw_state_batches(preprocessor, session):
             frame = self.predict_state_sequence(
                 batch,
                 subject_key=session.subject_key,
@@ -510,9 +521,9 @@ def load_hierarchical_v4_bundle(
     verifier_kind = str(selection.get("verifier_kind", ""))
     verifier_paths: list[Path] = []
     if verifier_kind == "deep":
-        verifier_seeds = [int(value) for value in selection.get("verifier_seeds", [])]
-        if verifier_seeds != [2026, 2027, 2028]:
-            raise RuntimeError("Deep v4 bundle requires verifier seeds 2026/2027/2028")
+        verifier_seeds = validate_serialized_verifier_seeds(
+            selection.get("verifier_seeds", [])
+        )
         configured_verifier = config.get("verifier", {}).get("seeds")
         if configured_verifier is not None and [
             int(value) for value in configured_verifier

@@ -11,6 +11,7 @@ from bme_eating.data.deep_dataset import Normalization, _sample_grid
 from bme_eating.features.baseline import _motion_window_features, _ppg_window_features
 from bme_eating.features.signal import ppg_quality_features
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
+from bme_eating.timeline import tail_aligned_chunk_endpoints
 
 
 def session_right_endpoint_grid(
@@ -428,9 +429,7 @@ class StatsFusionRawSessionPreprocessor:
         supervised = self.geometry.supervised_steps
         step_ms = self.geometry.step_seconds * 1000
         session_origin_ms = int(anchors[0]) - step_ms
-        endpoints = list(range(min(supervised - 1, len(anchors) - 1), len(anchors), supervised))
-        if endpoints[-1] != len(anchors) - 1:
-            endpoints.append(len(anchors) - 1)
+        endpoints = tail_aligned_chunk_endpoints(len(anchors), supervised)
         for endpoint in endpoints:
             end_timestamp = int(anchors[endpoint])
             timestamps = (

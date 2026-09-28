@@ -1,0 +1,23 @@
+extends: hierarchical_v4_r32_fast_logistic.yaml
+
+experiment:
+  name: hierarchical_v4_r32_pooled_heads
+  code_version: v4.5.1
+  variant: time_constrained_outer_single_holdout_pooled_heads
+
+verifier:
+  seeds: [2026]
+  max_epochs: 80
+  minimum_epochs: 5
+  patience: 8
+
+boundary:
+  seeds: [2026]
+  max_epochs: 80
+  minimum_epochs: 5
+  patience: 8
+
+hierarchical:
+  state_crossfit_mode: single_holdout
+  downstream_mode: pooled_heads
+  pooled_head_protocol: outer_fold_crossfit_joint_tuning_v1

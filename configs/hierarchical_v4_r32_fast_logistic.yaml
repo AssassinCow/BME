@@ -1,8 +1,8 @@
-extends: hierarchical_v4_r3_d2a.yaml
+extends: hierarchical_v4_r3_d2c.yaml
 
 experiment:
   name: hierarchical_v4_r32_fast_logistic
-  code_version: v4.4.2
+  code_version: v4.5.1
   protocol_version: statsfusion-r3.2
   blocked_protocols:
     - statsfusion-r0-blocked
@@ -38,9 +38,8 @@ training:
   learning_rate: 0.00015
   warmup_fraction: 0.10
   gradient_clip_norm: 5.0
-  ppg_modality_dropout: 0.0
-  gyro_modality_dropout: 0.0
-  rotation_augmentation_probability: 0.0
+  gradient_clipping_promotion_fraction: 0.20
+  gradient_clipping_abort_fraction: 1.0
 
 decoder:
   use_semi_markov: false

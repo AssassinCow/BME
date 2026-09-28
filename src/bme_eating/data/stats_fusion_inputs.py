@@ -13,6 +13,7 @@ from bme_eating.data.labels import assign_event_sessions, build_statsfusion_sess
 from bme_eating.features.baseline import build_segment_features
 from bme_eating.fusion import ALIGNMENT_KEYS
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
+from bme_eating.metrics import partition_evaluation_events
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS
 from bme_eating.v4_protocol import PROTOCOL_VERSION
 
@@ -34,6 +35,14 @@ FEATURE_IMPLEMENTATION_FILES = (
     "features/signal.py",
     "stats_features.py",
 )
+NON_CANONICAL_SOURCE_MIGRATIONS = {
+    "data/stats_fusion_preprocess.py": {
+        (
+            "773e6f413f696295423ad6f2e10746011c98a19fcc9df0473c46b6f95ec5fd8d",
+            "bef22313c1801b35e0b7860a365de9e796b2e2e1f7cde9a2e00f48fa46288579",
+        )
+    }
+}
 
 
 def canonical_input_paths(output_root: Path) -> dict[str, Path]:
@@ -173,7 +182,28 @@ def _require_matching_preparation_identity(
             "refuse resume and rebuild with --fresh in a clean canonical_input_r3_2 directory"
         )
     stored = json.loads(path.read_text(encoding="utf-8"))
-    if stored != current:
+    if stored == current:
+        return stored
+    stored_copy = json.loads(json.dumps(stored))
+    current_copy = json.loads(json.dumps(current))
+    stored_implementation = stored_copy.get("feature_implementation", {})
+    current_implementation = current_copy.get("feature_implementation", {})
+    stored_files = stored_implementation.get("files", {})
+    current_files = current_implementation.get("files", {})
+    changed_files = {
+        name
+        for name in set(stored_files) | set(current_files)
+        if stored_files.get(name) != current_files.get(name)
+    }
+    compatible = bool(changed_files)
+    for name in changed_files:
+        transition = (stored_files.get(name), current_files.get(name))
+        compatible &= transition in NON_CANONICAL_SOURCE_MIGRATIONS.get(name, set())
+        if compatible:
+            current_files[name] = stored_files[name]
+    if compatible:
+        current_implementation["sha256"] = stored_implementation.get("sha256")
+    if not compatible or stored_copy != current_copy:
         raise RuntimeError(
             "StatsFusion canonical source identity changed; refuse resume of stale partial inputs"
         )
@@ -389,6 +419,20 @@ def prepare_canonical_statsfusion_inputs(
     temporary = paths["statistics"].with_name(paths["statistics"].name + ".tmp")
     statistics.to_parquet(temporary, index=False)
     temporary.replace(paths["statistics"])
+    canonical_masked = anchors["state_loss_mask"].fillna(0.0).astype(float) <= 0
+    effective_masked = canonical_masked.copy()
+    _, ignored_events = partition_evaluation_events(
+        session_events, set(anchors["subject_key"].astype(str))
+    )
+    timestamps = anchors["timestamp_ms"].to_numpy(dtype="int64")
+    for event in ignored_events.itertuples(index=False):
+        same_session = anchors["subject_key"].astype(str).eq(str(event.subject_key))
+        same_session &= anchors["session_id"].astype(str).eq(str(event.session_id))
+        effective_masked |= (
+            same_session
+            & (timestamps > int(event.start_ms))
+            & (timestamps - 3_000 < int(event.end_ms) + 60_000)
+        )
     manifest = {
         "version": 3,
         "protocol_version": PROTOCOL_VERSION,
@@ -415,9 +459,8 @@ def prepare_canonical_statsfusion_inputs(
             "subjects": int(anchors["subject_key"].nunique()),
             "sessionized_event_rows": len(session_events),
             "source_events": int(session_events["source_event_key"].nunique()),
-            "state_loss_masked_anchors": int(
-                (anchors["state_loss_mask"].fillna(0.0).astype(float) <= 0).sum()
-            ),
+            "canonical_state_loss_masked_anchors": int(canonical_masked.sum()),
+            "effective_state_loss_masked_anchors": int(effective_masked.sum()),
         },
     }
     write_json_atomic(paths["manifest"], manifest)

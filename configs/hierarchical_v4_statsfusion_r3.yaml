@@ -11,7 +11,7 @@ data:
 
 experiment:
   name: hierarchical_v4_statsfusion_r3
-  code_version: v4.4.2
+  code_version: v4.5.1
   protocol_version: statsfusion-r3.2
   blocked_protocols:
     - statsfusion-r0-blocked

@@ -44,6 +44,8 @@ def partition_evaluation_events(
         evaluable = selected["evaluable"].fillna(False).astype(bool)
     elif "coverage" in selected.columns:
         evaluable = selected["coverage"].eq("full")
+    elif selected.empty:
+        return selected.copy(), selected.copy()
     else:
         raise ValueError("Events must contain evaluable or coverage")
     return selected[evaluable].copy(), selected[~evaluable].copy()
