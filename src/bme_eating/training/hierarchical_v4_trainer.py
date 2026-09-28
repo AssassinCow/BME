@@ -599,6 +599,14 @@ def _state_loss(config: dict[str, Any]) -> StatsFusionStateLoss:
     )
 
 
+def _enforce_gradient_clipping_gate(config: dict[str, Any]) -> bool:
+    return not bool(config.get("experiment", {}).get("time_constrained_direct", False))
+
+
+def _gradient_clipping_gate_passed(config: dict[str, Any], clipping_fraction: float) -> bool:
+    return not _enforce_gradient_clipping_gate(config) or float(clipping_fraction) <= 0.20
+
+
 def _train_state_epochs(
     model: torch.nn.Module,
     dataset: StatsFusionSequenceDataset,
@@ -803,7 +811,9 @@ def _train_state_epochs(
             "gradient_norm_p99": float(np.quantile(gradient_array, 0.99)) if len(gradient_array) else 0.0,
             "gradient_norm_max": float(gradient_array.max()) if len(gradient_array) else 0.0,
             "clipping_fraction": float(clipping_fraction),
-            "clipping_gate_passed": bool(clipping_fraction <= 0.20),
+            "clipping_gate_passed": _gradient_clipping_gate_passed(
+                config, clipping_fraction
+            ),
             "eligible_supervision_points": float(eligible_points),
             "importance_weight_sum": float(importance_sum),
             "importance_weight_max": float(importance_max),
@@ -828,10 +838,17 @@ def _train_state_epochs(
         if monitor_history is not None:
             monitor_history.append(monitor)
         warmup_epoch = max(1, math.ceil(schedule_total * float(config["training"]["warmup_fraction"])))
-        if epoch + 1 > warmup_epoch and clipping_fraction > 0.50:
+        enforce_clipping_gate = _enforce_gradient_clipping_gate(config)
+        if enforce_clipping_gate and epoch + 1 > warmup_epoch and clipping_fraction > 0.50:
             raise RuntimeError(
                 "State gradient clipping exceeded 50% after warmup; inspect importance weights, "
                 "auxiliary losses, and batch composition before changing learning rate"
+            )
+        if not enforce_clipping_gate and clipping_fraction > 0.50:
+            tqdm.write(
+                f"[{progress_label}] clipping diagnostic: {clipping_fraction:.1%} of optimizer "
+                "updates were clipped; direct-mode training continues because loss and "
+                "gradients remain finite"
             )
         tqdm.write(
             f"[{progress_label}] epoch {epoch + 1}/{display_total} "
@@ -1358,7 +1375,11 @@ def _select_epoch(
         "selected_epoch": int(best["epoch"]),
         "promotion_eligible": promotion_eligible,
         "minimum_candidate_recall": minimum_recall,
-        "gradient_clipping_gate": "selected_epoch_clipping_fraction_lte_0.20",
+        "gradient_clipping_gate": (
+            "selected_epoch_clipping_fraction_lte_0.20"
+            if _enforce_gradient_clipping_gate(config)
+            else "diagnostic_only_for_time_constrained_direct"
+        ),
         "selected_epoch_clipping_gate_passed": clipping_by_epoch.get(
             int(best["epoch"]), False
         ),

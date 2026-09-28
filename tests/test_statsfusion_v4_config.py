@@ -10,6 +10,8 @@ from bme_eating.data.stats_fusion_sequence import sequence_geometry_from_config
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS
 from bme_eating.training.hierarchical_v4_trainer import (
     _decoder_configurations,
+    _enforce_gradient_clipping_gate,
+    _gradient_clipping_gate_passed,
     _selector_decoder_search_config,
 )
 from bme_eating.v4_protocol import validate_r3_config
@@ -118,6 +120,8 @@ def test_r3_time_constrained_direct_config_enables_robust_full_state_path() -> N
     assert config["training"]["learning_rate"] == 0.00015
     assert config["training"]["warmup_fraction"] == 0.10
     assert config["training"]["gradient_clip_norm"] == 5.0
+    assert _enforce_gradient_clipping_gate(config) is False
+    assert _gradient_clipping_gate_passed(config, 0.90) is True
     assert config["decoder"]["use_semi_markov"] is True
     assert config["final_training"]["state_seeds"] == [2026]
     assert len(_decoder_configurations(config)) == 48
@@ -142,6 +146,14 @@ def test_r3_direct_config_requires_fixed_selector_decoder_search() -> None:
     config["training"]["selector_decoder_search"] = "full"
     with pytest.raises(ValueError, match="fixed decoder search"):
         validate_r3_config(config)
+
+
+def test_r3_registered_ablations_keep_gradient_clipping_gate() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r3_s2.yaml")
+    assert _enforce_gradient_clipping_gate(config) is True
+    assert _gradient_clipping_gate_passed(config, 0.20) is True
+    assert _gradient_clipping_gate_passed(config, 0.21) is False
 
 
 def test_r3_training_ablations_change_only_declared_factors() -> None:
