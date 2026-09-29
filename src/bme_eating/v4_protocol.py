@@ -198,12 +198,20 @@ def validate_r3_config(config: dict[str, Any]) -> None:
                 raise ValueError("Single-holdout training must select epochs with early stopping")
             maximum_epochs = int(training.get("max_epochs", 0))
             minimum_epochs = int(training.get("early_stopping_min_epochs", 0))
+            checkpoint_selection_minimum_epoch = int(
+                training.get("checkpoint_selection_min_epoch", minimum_epochs)
+            )
             patience_checks = int(training.get("early_stopping_patience_checks", 0))
             holdout_fraction = float(config.get("training", {}).get("single_holdout_fraction", 0.0))
             if maximum_epochs != 32:
                 raise ValueError("Single-holdout max_epochs must be 32")
             if not 1 <= minimum_epochs < maximum_epochs:
                 raise ValueError("Single-holdout early-stopping minimum must be in [1, 31]")
+            if not 1 <= checkpoint_selection_minimum_epoch <= minimum_epochs:
+                raise ValueError(
+                    "Single-holdout checkpoint-selection minimum must be between 1 and the "
+                    "early-stopping minimum"
+                )
             if not 1 <= patience_checks <= 8:
                 raise ValueError("Single-holdout early-stopping patience must be in [1, 8]")
             if not 0.2 <= holdout_fraction < 0.5:

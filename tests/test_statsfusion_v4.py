@@ -1114,6 +1114,40 @@ def test_duration_theoretical_matchability_uses_best_legal_candidate_duration() 
     assert metrics["duration_strata"]["over_4h"]["theoretical_matchable_fraction"] == 1.0
 
 
+def test_candidate_domain_metrics_use_event_sensitivity_for_gyro_recall() -> None:
+    truth = pd.DataFrame(
+        {
+            "subject_key": ["subject", "subject"],
+            "session_id": ["session", "session"],
+            "event_id": ["gyro-missing", "gyro-complete"],
+            "start_ms": [0, 20_000],
+            "end_ms": [10_000, 30_000],
+        }
+    )
+    windows = pd.DataFrame(
+        {
+            "subject_key": ["subject", "subject"],
+            "session_id": ["session", "session"],
+            "timestamp_ms": [3_000, 23_000],
+            "gyro_valid_fraction": [0.0, 1.0],
+        }
+    )
+    proposals = pd.DataFrame(
+        {
+            "subject_key": ["subject", "subject"],
+            "session_id": ["session", "session"],
+            "coarse_start_ms": [0, 20_000],
+            "coarse_end_ms": [10_000, 30_000],
+        }
+    )
+    state_predictions = proposals.rename(
+        columns={"coarse_start_ms": "start_ms", "coarse_end_ms": "end_ms"}
+    )
+    metrics = _candidate_domain_metrics(proposals, truth, windows, state_predictions)
+    assert metrics["gyro_strata"]["missing"]["state_only_recall"] == 1.0
+    assert metrics["gyro_strata"]["complete"]["state_only_recall"] == 1.0
+
+
 def test_hand_recall_does_not_reuse_one_prediction_for_two_truth_events() -> None:
     truth = pd.DataFrame(
         {
@@ -3306,6 +3340,32 @@ def test_state_epoch_selection_respects_minimum_training_epoch() -> None:
     )
     assert promotion_eligible is False
     assert selected["epoch"] == 5
+
+
+def test_state_epoch_selection_can_include_epochs_before_early_stopping_floor() -> None:
+    metrics = [
+        {
+            "epoch": epoch,
+            "robust_candidate_recall": recall,
+            "robust_subject_macro_soft_bce": bce,
+            "robust_soft_bce_standard_error": 0.01,
+            "robust_state_fragment_count": 20 - epoch,
+            "robust_ece": 0.01,
+        }
+        for epoch, recall, bce in (
+            (1, 0.710, 0.130),
+            (2, 0.790, 0.115),
+            (3, 0.700, 0.110),
+        )
+    ]
+    selected, promotion_eligible = _choose_conservative_state_epoch(
+        metrics,
+        [],
+        minimum_delta=0.003,
+        minimum_epoch=1,
+    )
+    assert promotion_eligible is False
+    assert selected["epoch"] == 2
 
 
 def test_semi_markov_cannot_chain_eating_segments_past_maximum_duration() -> None:

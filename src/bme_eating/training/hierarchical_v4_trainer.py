@@ -1434,6 +1434,11 @@ def _select_epoch(
     minimum_training_epochs = int(
         config["training"].get("early_stopping_min_epochs", maximum_epochs)
     )
+    checkpoint_selection_minimum_epoch = int(
+        config["training"].get(
+            "checkpoint_selection_min_epoch", minimum_training_epochs
+        )
+    )
     patience_checks = int(config["training"].get("early_stopping_patience_checks", maximum_epochs))
     minimum_delta = float(config["training"].get("early_stopping_min_delta", 0.0))
     minimum_recall = float(config["promotion_gate"]["minimum_candidate_recall"])
@@ -1565,7 +1570,7 @@ def _select_epoch(
         epoch_metrics,
         qualified,
         minimum_delta=minimum_delta,
-        minimum_epoch=minimum_training_epochs,
+        minimum_epoch=checkpoint_selection_minimum_epoch,
     )
     return int(best["epoch"]), {
         "selected_epoch": int(best["epoch"]),
@@ -1578,6 +1583,7 @@ def _select_epoch(
         "selector_rolling_epochs": rolling_epochs,
         "validation_every_epochs": validation_interval,
         "early_stopping_min_epochs": minimum_training_epochs,
+        "checkpoint_selection_min_epoch": checkpoint_selection_minimum_epoch,
         "early_stopping_patience_checks": patience_checks,
         "early_stopping_min_delta": minimum_delta,
         "stopped_early": stopped_early,
@@ -2515,7 +2521,7 @@ def _candidate_domain_metrics(
                 state_predictions,
                 method="max_cardinality_iou",
             )
-            output["gyro_strata"][name]["state_only_recall"] = float(state_metrics["recall"])
+            output["gyro_strata"][name]["state_only_recall"] = float(state_metrics["sensitivity"])
         else:
             output["gyro_strata"][name]["state_only_recall"] = float("nan")
     return output

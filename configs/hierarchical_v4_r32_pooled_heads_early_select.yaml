@@ -1,0 +1,8 @@
+extends: hierarchical_v4_r32_pooled_heads.yaml
+
+experiment:
+  name: hierarchical_v4_r32_pooled_heads_early_select
+
+training:
+  early_stopping_min_epochs: 3
+  checkpoint_selection_min_epoch: 1

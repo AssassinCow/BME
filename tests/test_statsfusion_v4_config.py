@@ -164,6 +164,17 @@ def test_r32_pooled_heads_config_keeps_fast_state_and_single_seed_heads() -> Non
     assert config["boundary"]["patience"] == 8
 
 
+def test_r32_early_select_decouples_early_stop_and_checkpoint_selection() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r32_pooled_heads_early_select.yaml")
+    validate_r3_config(config)
+    assert config["training"]["max_epochs"] == 32
+    assert config["training"]["early_stopping_min_epochs"] == 3
+    assert config["training"]["early_stopping_patience_checks"] == 3
+    assert config["training"]["checkpoint_selection_min_epoch"] == 1
+    assert config["hierarchical"]["downstream_mode"] == "pooled_heads"
+
+
 def test_verifier_seed_profiles_allow_single_or_three_seed_deployment() -> None:
     assert validate_serialized_verifier_seeds([2026]) == [2026]
     assert validate_serialized_verifier_seeds([2026, 2027, 2028]) == [2026, 2027, 2028]
