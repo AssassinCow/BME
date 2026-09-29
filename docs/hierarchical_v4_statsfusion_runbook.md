@@ -1,20 +1,27 @@
-# StatsFusion v4 运行手册
+# StatsFusion v4.7.1 运行手册
 
-## 当前时间受限路线（v4.4.2 / statsfusion-r3.2）
+## 唯一正式路线
 
-当前正式配置为 `configs/hierarchical_v4_r32_fast_logistic.yaml`。每个 outer fold 只使用
-一个 subject-disjoint state OOF holdout 和一个 state seed；其训练受试者内部再划分独立
-selector，最多训练 32 epochs，最早第 5 轮早停、patience 为 3。当前时间受限路线使用
-`0.70` 的跑通门槛和 `0.75` 的候选召回目标；它们是开发期门槛，不替代最终性能要求。选中 epoch 后在完整训练块
-重训，再预测从未参与 epoch 选择的 OOF holdout。fold 内只运行 state、候选、state-only
-选择和 outer evaluation。五折结束后，最终训练入口才使用完整
-outer OOF 交叉拟合 pooled Logistic，并在未通过晋级门禁时自动回退 state-only。
+- 协议：`statsfusion-r3.2`
+- 配置：`configs/hierarchical_v4_r32_pooled_heads_early_select.yaml`
+- state、Deep verifier、Boundary seed：`2026`
+- state：每 fold 一个 subject-disjoint holdout，最多 32 epochs
+- early stopping：至少 3 epochs，连续 3 次无稳健改进停止
+- checkpoint：从 epoch 3 起参与选择，确保三轮稳健窗口完整
+- 后端：五折 outer OOF 汇总后依次比较 state-only、pooled Logistic、pooled Deep verifier
+- Boundary：只在 verifier 锁定后训练；门禁失败自动保留 coarse boundary
+
+旧 r0/r1/r2/r3/r3.1、v4.5.1 和旧 checkpoint 选择配置均为 blocked predecessor，不能
+resume。`canonical_input_r3_2` 只有在完整身份验证通过时才允许只读复用。
+
+## 完整命令
 
 ```powershell
-$config = "configs/hierarchical_v4_r32_fast_logistic.yaml"
-$run = "hierarchical_v4_r32_fast_logistic_20260928a"
+$config = "configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+$run = "hierarchical_v4_r32_pooled_heads_early_select_20260928a"
 
 python scripts/prepare_statsfusion_v4_inputs.py --config $config --workers 8 --resume
+python scripts/audit_statsfusion_feature_provenance.py --config $config --fresh
 
 foreach ($fold in 0..4) {
   python scripts/train_hierarchical_v4_state.py --config $config --run-name $run --fold $fold --fresh
@@ -27,223 +34,83 @@ python scripts/train_hierarchical_v4_final.py --config $config --run-name $run -
 python scripts/export_hierarchical_v4_bundle.py --config $config --run-name $run --fresh
 ```
 
-若某一步中断，只对该既有 run 使用 `--resume`，不要把 `--fresh` 和 `--resume` 同时传入。
-旧 r0/r1/r2/r3/r3.1 run 和 canonical 输入均禁止 resume。下面的分级消融、deep verifier
-和 boundary 命令保留为完整研究协议参考，不属于当前时间受限路线。
+同一阶段中断时，把该命令的 `--fresh` 改为 `--resume`。Git commit、dirty worktree 和运行时代码
+SHA 变化只写入 `source_identity_history`，不会要求提交 Git、重建 scaler 或重启 run。结果相关
+配置、数据/canonical identity、subject folds、truth/ignore、训练/预测受试者集合及模型/OOF 父
+artifact 哈希仍严格锁定；模型张量结构不兼容时 checkpoint 加载会立即失败。经过代码变化续跑的
+结果应标记为混合源码证据，manifest 保留每次身份迁移供复核。
 
-## 边界
+## 单折诊断头
 
-- 输入只读复用 `outputs/v2/`，输出只写 `outputs/v4/`。
-- `statsfusion-r0/r1/r2/r3/r3.1` 均为 blocked predecessor；r3.2 必须使用全新 run name，
-  禁止 resume 旧 v4 产物。
-- v4 不加载 XGBoost 模型，不读取 XGBoost 概率、事件或候选，也不使用蒸馏目标。
-- 唯一保留的是配置中固定顺序的 12 项 trailing 15 秒统计特征。
-- `strict_resume_identity` 固定为 `true`；数据、模型结构、采样、优化参数及标签/评估规则变化时拒绝恢复。
-  仅 `training.num_workers`、`training.inference_num_workers`、
-  `training.inference_batch_size`、`training.inference_resume_chunk_rows` 可在同一 run 中调整。
-  旧版 run 首次恢复时通过保存的 `resolved_config.yaml` 核对结果相关配置，并把运行参数变化记录在
-  `run_manifest.json`；模型 checkpoint 一旦存在，代码指纹变化仍会拒绝恢复。
-- folds 2–4 需要先写入 `freeze_manifest.json`。
-- 训练阶段对 outer-test anchors 只读取时间轴与文件定位列，并注入零值占位；真实窗口/事件标签
-  只由 `evaluate_hierarchical_v4.py` 在 `SELECTED` 阶段读取。
-
-## 首次审计
+时间不足时，可在某一 fold 完成 state 后训练 Logistic、Deep verifier 和 Boundary 诊断头：
 
 ```powershell
-python scripts/prepare_statsfusion_v4_inputs.py `
-  --config configs/hierarchical_v4_r32_fast_logistic.yaml `
-  --workers 8 `
-  --fresh
-
-python scripts/audit_statsfusion_feature_provenance.py `
-  --config configs/hierarchical_v4_r32_fast_logistic.yaml `
-  --fresh
+python scripts/train_hierarchical_v4_single_fold_heads.py `
+  --config $config --run-name $run --fold 0 --fresh
 ```
 
-第一条命令会重新生成 session-wide 3 秒右端点网格和同相位 trailing 15 秒统计特征，写入
-`outputs/v4/canonical_input_r3_2/`。正式 r3.2 训练会校验 events/segments、每个 segment archive
-完整 SHA-256、确定性聚合 SHA、preparation identity、anchor sidecar 与全部输出 SHA-256；
-缺少该阶段或仍使用逐 segment 重启相位的旧输入时直接拒绝启动。中断后使用 `--resume`
-复用按 archive 内容寻址的逐 session 缓存；源身份或 anchor sidecar 不一致时拒绝复用，
-不得回退到 `outputs/v2/` 的旧相位 anchors。
-当前数据的只读 v2 快照仍有 1,117 个 masked anchors；按真实原始首末时间重建后的 r3.2 canonical
-快照为 1,581,724 个 anchors，其中 794 个 masked。两者差异来自相位、真实观测边界与尾端网格修正，
-manifest 会记录实际计数，训练和 outer calibration 统一使用 canonical 计数，不硬编码任一数字。
+该结果只覆盖一个 outer fold，不是五折 pooled 证据，不得作为最终 bundle 的晋级依据。
 
-当前配置按保守规则把 12 项特征视为查看过五折 gain 后固定，因此 folds 0–4 只能作为
-development/stress evidence；真正独立证据来自官方隐藏测试或新增受试者。
+## 数据与标签契约
 
-## 单折顺序
+- 训练与 raw-session 推理均使用 session-wide 3 秒右端点网格。
+- 3 秒 anchor `t` 表示 `(t-3s,t]`；15 秒 grid `g` 表示 `(g-15s,g]`。
+- truth/ignore 按 `subject_key + session_id` 划分。
+- ignore 及最长 60 秒因果提示区间不产生 state、onset、offset 或 smooth 梯度。
+- state target 是软 occupancy；校准使用 Soft-Platt、soft Brier 和 soft ECE。
+- 候选匹配仍使用严格 `IoU > 0.25`；官方一对一匹配细节仍为 `UNKNOWN`。
+- 最大未来数据为 60 秒；当前正式 decoder 禁用 Semi-Markov 和 transition candidates。
 
-```powershell
-$run = "hierarchical_v4_statsfusion_r2_20260925a"
-$fold = 0
-$config = "configs/hierarchical_v4_statsfusion.yaml"
+## 训练参数
 
-python scripts/train_hierarchical_v4_state.py --config $config --run-name $run --fold $fold --fresh
-python scripts/build_event_candidates_v4.py --config $config --run-name $run --fold $fold --resume
-python scripts/train_event_verifier_v4.py --config $config --run-name $run --fold $fold --resume
-python scripts/train_boundary_refiner_v4.py --config $config --run-name $run --fold $fold --resume
-python scripts/select_hierarchical_v4_pipeline.py --config $config --run-name $run --fold $fold --resume
-python scripts/evaluate_hierarchical_v4.py --config $config --run-name $run --fold $fold --resume
+- `batch_size=8`
+- `gradient_accumulation=4`
+- 有效 batch 为 32
+- 每位训练受试者每 epoch 采样 1000 clips
+- `learning_rate=0.00015`
+- `warmup_fraction=0.10`
+- `gradient_clip_norm=5.0`
+- `validation_every_epochs=1`
+- promotion recall 跑通门槛 `0.70`，开发目标 `0.75`
+
+selector 在训练受试者内部再按 subject 隔离；固定 seed、完整 selector session 时间轴和三轮滚动
+稳健指标用于选择 epoch。重训使用所选 epoch，但保持同一 32-epoch cosine schedule horizon，避免
+因缩短 horizon 改变前期学习率轨迹。
+
+## Pooled heads
+
+五折 state 全部完成后，final 阶段才训练 pooled heads。每个预测 fold 的 Logistic、Deep verifier、
+校准器和 Boundary 只使用其余四折候选；训练、selector、calibration 与 prediction subjects
+存在交集时立即失败。模型门禁失败时按 `Deep -> Logistic -> state-only` 自动回退，Boundary
+失败时保留 coarse endpoint。
+
+完整 pooled OOF 允许联合选择 decoder、模型类型和部署阈值，这是时间受限开发取舍，报告必须
+标记为 development/stress evidence。verifier 无法找回 state 阶段未生成的事件，候选召回必须
+单独报告。
+
+## 推理与 bundle
+
+公共入口保持：
+
+```python
+HierarchicalEatingDetectorV4.predict_session(session: RawSessionInput) -> list[Event]
 ```
 
-Windows 推理阶段默认 `inference_num_workers=0`，训练继续使用 `num_workers=8`。
-只调整上述执行参数后，保留原 run name，把 state 命令末尾改为 `--resume` 即可。
-v4 state 每完成一轮，即以原子替换保存 `crossfit/partition_*/state/selector_seed_*_last.pt`
-或 `retrain_seed_*_last.pt`；outer 全训练也保存 `outer/state/retrain_seed_*_last.pt`。
-checkpoint 包含模型、优化器、学习率调度器、随机状态、已完成轮次、受试者集合及配置身份；
-selector 还记录历史指标与早停状态。`--resume` 从最近完整的一轮继续。轮内中断时重做当前轮。
-嵌套 meta-crossfit 的状态 selector / retrain 同样逐轮保存到
-`nested/meta_*/state/inner_*/`；最终全数据状态训练保存到
-`final/<run-name>/retrain_seed_*_last.pt`。最终训练会先写 `IN_PROGRESS` manifest，
-完成后改为 `COMPLETE`，因此中途中断后可用同一 run name 和 `--resume` 继续训练。
-verifier 与 boundary 的 selector 和重训也每轮保存 `*_selector_last.pt` / `*_last.pt`，
-覆盖各 outer partition、嵌套 verifier OOF、outer 全训练及最终全数据训练。
-boundary checkpoint 额外保存 NumPy 采样器状态；恢复时核对训练受试者、父产物哈希、
-边界搜索范围和结果相关配置。各阶段中断后沿用原脚本与 run name、传入 `--resume`。
-旧代码运行期间未曾写出这些文件的轮次无法追溯恢复。对于只有 scaler 的旧 run，恢复时会重新拟合
-scaler，并记录代码指纹迁移；已有训练产物的 run 仍须匹配原 Git 指纹。
-
-阶段固定为：
-
-```text
-CREATED -> STATE_COMPLETE -> PROPOSALS_COMPLETE -> VERIFIER_COMPLETE
-        -> BOUNDARY_COMPLETE -> SELECTED -> EVALUATED
-```
-
-候选阶段会在 ECE、Brier、预测正例率或纯深度候选召回未过门禁时主动停止。duration
-prior 只使用 `evaluable=True` 的 truth，valid ignore 不进入持续时间拟合。boundary 每个
-训练分区不足 60 个独立事件时自动禁用，保留 coarse boundary，不会用少样本强行训练。
-
-状态阶段同时保存 `oof/gate_diagnostics.parquet` 和 JSON 汇总，逐受试者记录 PPG、统计与
-长上下文 gate 的均值、标准差和分位数。若统计 gate 的受试者均值落到 `<=0.01` 或
-`>=0.99`，审计文件会标出塌缩风险，但不会擅自放宽门禁。
-
-verifier/boundary 使用 `fully_nested_v1` meta-crossfit：每个 meta holdout 都会在其余受试者
-内重新执行三折、三 seed state crossfit，meta holdout 不得出现在 scaler、state、Platt、
-duration prior、verifier、calibrator、boundary 或阈值选择的训练集合中。该协议的 state
-训练成本约为普通 outer crossfit 的 3 倍；nested cache 只在 subject 集合、配置、seed、epoch、
-父 artifact 哈希和全部 inner lineage 均一致时复用，任何不一致都要求更换全新 run name。
-
-## fold 0 消融
-
-每个消融使用独立 run name，依次运行“状态训练 + 候选生成”；配置关系为：
-
-| 代号 | 配置 | 变化 |
-|---|---|---|
-| S0 | `configs/hierarchical_v4_s0.yaml` | motion-only 短上下文 |
-| S1 | `configs/hierarchical_v4_s1.yaml` | S0 + 统计门控 |
-| S2 | `configs/hierarchical_v4_s2.yaml` | S1 + 1905 秒长上下文 |
-| S3 | `configs/hierarchical_v4_s3.yaml` | S2 + PPG |
-| S4 | `configs/hierarchical_v4_statsfusion.yaml` | S3 + semi-Markov |
-| PPG-only | `configs/hierarchical_v4_ppg_only.yaml` | 独立模态诊断 |
-
-先完成 S0、S1、S2、S3 与 PPG-only。S3 相对 S2 只有满足以下任一路径才允许 S4 使用
-PPG：F1 至少提高 0.005；或候选召回至少提高 0.010 且 F1 下降不超过 0.005；同时
-FP/h 不超过 1.05 倍、异侧召回下降不超过 0.02。若未通过，S4 必须将 `model.use_ppg`
-设为 `false`，即从 S2 状态路径加 semi-Markov。不要手工改配置，使用：
-
-```powershell
-$config = (& python scripts/prepare_hierarchical_v4_s4.py `
-  --config configs/hierarchical_v4_statsfusion.yaml `
-  --run-name $run --s2-run $s2Run --s3-run $s3Run --fresh | Select-Object -Last 1)
-```
-
-该命令会哈希锁定 S2/S3 指标，自动写入 `model.use_ppg` 和晋级证据。后续 S4 的所有 fold、
-freeze、stress、final 与 export 命令都必须使用这份 `$config`；门禁代码仍会拒绝与决定不一致
-的 S4。
-
-所有 run 完成 `PROPOSALS_COMPLETE` 后执行：
-
-```powershell
-python scripts/check_hierarchical_v4_gates.py `
-  --config configs/hierarchical_v4_statsfusion.yaml `
-  --mode ablation `
-  --run-name $run `
-  --s0-run $s0Run --s1-run $s1Run --s2-run $s2Run --s3-run $s3Run `
-  --ppg-only-run $ppgOnlyRun
-```
-
-该命令锁定统计分支、长上下文、纯深度候选和两类佩戴手门禁，并写入
-`ablation/fold_0_report.json`。PPG 部分同时报告 motion-only、PPG-only、motion+PPG，
-没有正向证据时不得在报告中声称 PPG 带来增益。
-
-## 冻结与最终模型
-
-S4 与 S0 完成 folds 0–1 的一次性 outer 评价后，先运行开发门禁；若存在可用 v3 基线，
-同时传入 `--v3-run`，每折自动选择 S0/v3 中更强者：
-
-```powershell
-python scripts/check_hierarchical_v4_gates.py `
-  --config $config --mode development --run-name $run --s0-run $s0Run
-```
-
-folds 0–1 通过开发门禁后：
-
-```powershell
-python scripts/freeze_hierarchical_v4_protocol.py --config $config --run-name $run --fresh
-```
-
-冻结命令会重新验证 fold 0 消融报告、folds 0–1 的 `EVALUATED` 状态、开发门禁和对应哈希；
-任一证据缺失或失败都会阻止 folds 2–4。
-
-完成冻结的 folds 2–4 后，先运行压力门禁：
-
-```powershell
-python scripts/check_hierarchical_v4_gates.py `
-  --config $config --mode stress --run-name $run --s0-run $s0Run
-```
-
-完成并评价 folds 0–4 后：
-
-```powershell
-python scripts/train_hierarchical_v4_final.py --config $config --run-name $run --fresh
-python scripts/export_hierarchical_v4_bundle.py --config $config --run-name $run --fresh
-```
-
-最终训练会再次要求 `stress_gate.json` 为 PASS，失败时不会读取全量标签或启动训练。
-它还会锁定当前 Git worktree、resolved config、v2 输入、五折 raw logits、proposal score、
-truth/ignore 哈希以及 state/verifier 三 seed checkpoint；任何父证据变化都会拒绝 resume。
-
-最终状态模型使用 `2026/2027/2028` 三个 seed，只平均 state/onset/offset logits。bundle
-中的 deep verifier 同样使用三个 seed 并平均 event/IoU logits。最终 Platt、proposal
-calibration、logistic verifier、acceptance/NMS 与 boundary 参数都从 pooled outer OOF
-重新拟合和选择，不复制 fold 0。bundle 包含 scaler、校准器、duration prior、胜出
-verifier、可选 endpoint refiner 和哈希清单，
-不包含原始数据、标签、个人绝对路径、凭据或任何 XGBoost 工件。
+`RawSessionInput` 必须是 `statsfusion-raw-v2`、毫秒时间戳、原生未标准化采样，并严格使用
+`[acc_x, acc_y, acc_z, gyro_x, gyro_y, gyro_z]` 通道顺序。bundle 不包含 XGBoost 工件、训练
+标签、受试者名单、个人绝对路径或凭据，并必须通过 `SHA256SUMS.json` 完整性校验。
 
 ## 验收
 
 ```powershell
 python -m pytest -q
-python -m ruff check src tests scripts
+python -m ruff check src tests scripts --no-cache
 python -m compileall -q src scripts
-python scripts/smoke_test_hierarchical_v4.py --config configs/hierarchical_v4_statsfusion.yaml
-python scripts/replay_hierarchical_v4_raw_session.py `
-  --config configs/hierarchical_v4_statsfusion.yaml
+git diff --check
+python scripts/smoke_test_hierarchical_v4.py --config $config
+python scripts/replay_hierarchical_v4_raw_session.py --config $config
 ```
 
-真实 replay 默认选择 fragment 数最多的完整 session，要求训练 dataset 与 raw-session
-preprocessor 的 motion、motion validity、PPG、PPG quality、PPG validity、PPG-to-motion
-映射、长上下文 block endpoint 索引和 24 维统计输入逐项最大误差均不超过 `1e-6`。
-随后还必须在禁止 `import xgboost` 的环境中执行 bundle
-replay；官方文件格式目前仍为 `UNKNOWN`，这里只冻结原始数组接口，不伪造官方 adapter。
-
-当前 RTX 4080 Laptop bf16 smoke 在 batch size 4、gradient accumulation 4、895 步输入下
-峰值约 `1.277 GB`，重复推理最大概率误差为 `0.0`。正式训练参数向 v3 对齐为
-`batch_size=16`、`gradient_accumulation=2`、`steps_per_epoch=1250`，即有效 batch 32、
-每轮 20000 个 clip 和 625 次参数更新。若环境变化后超过 10.5 GB，只降低物理 batch size
-并等比例提高 gradient accumulation，保持有效 batch 32、每轮样本量和参数更新次数不变。
-
-状态、verifier 和 boundary 的 epoch selector 保持受试者级隔离，但不再随机抽取 20%。
-默认选择约 35% 的可训练受试者（20 人时为 7 人），并联合平衡可评估事件数、同侧/异侧事件、
-短/长事件、事件总时长和观察 anchor 数。状态 selector 内部使用 leave-one-subject-out
-Platt 校准，并按最近 3 个 epoch 的指标中位数选择 epoch，减少少量事件造成的单轮 F1 跳变。
-split 统计和受试者名单写入 selector JSON；该配置变化会触发 strict resume identity，旧 run
-不能直接 resume，必须使用新的 run name 从 state 阶段重新训练。
-
-状态学习率与 v3 保持为 `0.0003`；v3 中的 `0.003` 是 early-stopping min delta，
-不是 learning rate。v4 每 2 个 epoch 验证一次，至少训练 12 个 epoch，连续 3 次检查没有达到
-`0.003` 的稳健提升后停止。选 epoch 阶段与全训练受试者重训阶段固定使用相同的 32-epoch
-cosine schedule horizon，避免因选中 epoch 较小而改变前期学习率轨迹。
+GPU smoke 要求峰值显存低于 10.5 GB，同 checkpoint 重复推理概率误差不超过 `1e-6`。最终还需
+在禁止 `import xgboost` 的最小环境中执行 bundle raw-session replay。官方文件适配器仍为
+`UNKNOWN`，收到官方接口后只增加薄 adapter，不改变模型预处理语义。

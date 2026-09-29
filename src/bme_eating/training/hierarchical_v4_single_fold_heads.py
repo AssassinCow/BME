@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +26,7 @@ from bme_eating.models.endpoint_refiner import (
     select_boundary_range,
 )
 from bme_eating.models.event_verifier_v4 import build_proposal_features_v4, classify_proposals
+from bme_eating.reproducibility import git_worktree_identity
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS
 from bme_eating.training import hierarchical_v4_trainer as core
 from bme_eating.v4_protocol import CODE_VERSION, PROTOCOL_VERSION
@@ -39,30 +39,8 @@ DIAGNOSTIC_SOURCE_PATHS = (
     "src/bme_eating/training/hierarchical_v4_trainer.py",
     "tests/test_statsfusion_v4.py",
 )
-DIAGNOSTIC_ALLOWED_STATUS = {
-    "?? scripts/train_hierarchical_v4_single_fold_heads.py",
-    "?? src/bme_eating/training/hierarchical_v4_single_fold_heads.py",
-    "?? tests/test_statsfusion_v4_single_fold_heads.py",
-    " M src/bme_eating/training/hierarchical_v4_trainer.py",
-    " M tests/test_statsfusion_v4.py",
-}
-
-
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
-
-
-def _git_output(project_root: Path, *arguments: str) -> str:
-    result = subprocess.run(
-        ["git", *arguments],
-        cwd=project_root,
-        check=True,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="strict",
-    )
-    return result.stdout.rstrip()
 
 
 def _diagnostic_source_identity(project_root: Path) -> dict[str, str]:
@@ -74,27 +52,11 @@ def _diagnostic_source_identity(project_root: Path) -> dict[str, str]:
 
 
 def _verify_diagnostic_worktree(project_root: Path, expected_commit: str) -> dict[str, Any]:
-    active_commit = _git_output(project_root, "rev-parse", "HEAD")
-    if active_commit != expected_commit:
-        raise RuntimeError("Single-fold diagnostic commit differs from the parent run")
-    status_lines = [
-        line
-        for line in _git_output(
-            project_root, "status", "--porcelain=v1", "--untracked-files=all"
-        ).splitlines()
-        if line
-    ]
-    unexpected = sorted(set(status_lines) - DIAGNOSTIC_ALLOWED_STATUS)
-    if unexpected:
-        raise RuntimeError(
-            "Single-fold diagnostics allow only their three untracked source files; "
-            f"unexpected worktree changes: {unexpected}"
-        )
+    active = git_worktree_identity(project_root)
     return {
-        "commit": active_commit,
-        "allowed_untracked_files": sorted(
-            line[3:] for line in status_lines if line.startswith("?? ")
-        ),
+        **active,
+        "parent_commit": expected_commit,
+        "matches_parent_commit": active.get("commit") == expected_commit,
         "source_sha256": _diagnostic_source_identity(project_root),
     }
 
@@ -105,7 +67,7 @@ def record_single_fold_candidate_compatibility(run: HierarchicalRun) -> None:
     run.payload["single_fold_diagnostic_compatibility"] = {
         "protocol": DIAGNOSTIC_PROTOCOL,
         "scope": "candidate_domain_metric_key_only",
-        "parent_git_preserved": True,
+        "parent_git_enforced": False,
         "diagnostic_worktree": _verify_diagnostic_worktree(
             _project_root(), str(run.payload["git"]["commit"])
         ),
@@ -219,9 +181,23 @@ def _load_or_initialize(
         if fresh:
             raise FileExistsError(root)
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        saved_identity = {key: manifest.get(key) for key in identity}
-        if saved_identity != identity:
+        semantic_keys = set(identity) - {"diagnostic_worktree"}
+        saved_identity = {key: manifest.get(key) for key in semantic_keys}
+        current_identity = {key: identity.get(key) for key in semantic_keys}
+        if saved_identity != current_identity:
             raise RuntimeError("Single-fold diagnostic resume identity changed")
+        previous_source = manifest.get("diagnostic_worktree")
+        active_source = identity.get("diagnostic_worktree")
+        history = list(manifest.get("source_identity_history", []))
+        if previous_source != active_source:
+            transition = {"previous": previous_source, "active": active_source}
+            if not history or history[-1] != transition:
+                history.append(transition)
+        if history:
+            identity["source_identity_history"] = history
+        if previous_source != active_source:
+            manifest.update(identity)
+            write_json_atomic(manifest_path, manifest)
         return root, manifest_path, identity, str(manifest["stage"])
     if resume:
         raise FileNotFoundError("Single-fold diagnostic does not exist; start with --fresh")

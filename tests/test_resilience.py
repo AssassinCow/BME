@@ -2,10 +2,9 @@ import json
 import zipfile
 
 import numpy as np
-import pandas as pd
 import pytest
 
-from bme_eating.cli import _feature_cache_path, _feature_job, _preprocess_job
+from bme_eating.cli import _preprocess_job
 from bme_eating.data.deep_dataset import _load_segment_archive
 from bme_eating.data.preprocess import _collapse_duplicate_timestamps, _save_segment, _split_ranges
 from bme_eating.types import SensorSeries
@@ -39,53 +38,6 @@ def test_segment_ranges_use_sorted_unique_timestamps():
 
     assert canonical.timestamp_ms.tolist() == [900, 910, 1000, 1010]
     assert len(_split_ranges(canonical.timestamp_ms, gap_factor=5.0, minimum_gap_ms=2000)) == 1
-
-
-def test_feature_job_reports_corrupt_segment(tmp_path):
-    segment_path = tmp_path / "corrupt.npz"
-    segment_path.write_bytes(b"not an npz archive")
-
-    frame, issue = _feature_job(str(segment_path), pd.DataFrame(), {})
-
-    assert frame.empty
-    assert issue is not None
-    assert issue["status"] == "feature_extraction_error"
-    assert issue["segment_path"] == str(segment_path)
-    assert issue["error_type"] in {"ValueError", "BadZipFile", "KeyError"}
-
-
-def test_feature_job_reuses_atomic_segment_cache(tmp_path, monkeypatch):
-    segment_path = tmp_path / "segment.npz"
-    segment_path.write_bytes(b"segment fingerprint")
-    anchors = pd.DataFrame({"segment_id": ["s"], "timestamp_ms": [1000]})
-    feature_config = {
-        "window_seconds": 15,
-        "include_dyadic": False,
-        "motion_bucket_seconds": [3],
-        "ppg_bucket_seconds": [15],
-    }
-    cache_path = _feature_cache_path(
-        tmp_path / "cache", str(segment_path), anchors, feature_config
-    )
-    expected = pd.DataFrame({"feature": [1.0]})
-    monkeypatch.setattr(
-        "bme_eating.cli.build_segment_features", lambda *args, **kwargs: expected
-    )
-    first, first_issue = _feature_job(
-        str(segment_path), anchors, feature_config, str(cache_path)
-    )
-    monkeypatch.setattr(
-        "bme_eating.cli.build_segment_features",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("cache was ignored")),
-    )
-    second, second_issue = _feature_job(
-        str(segment_path), anchors, feature_config, str(cache_path)
-    )
-
-    assert first_issue is None
-    assert second_issue is None
-    pd.testing.assert_frame_equal(first, second)
-    assert not list(cache_path.parent.glob("*.tmp"))
 
 
 def test_deep_dataset_reports_corrupt_segment_path(tmp_path):

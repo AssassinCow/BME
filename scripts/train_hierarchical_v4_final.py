@@ -11,7 +11,9 @@ from bme_eating.training.hierarchical_v4_trainer import train_hierarchical_final
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train final StatsFusion v4 models")
-    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion_r3.yaml")
+    parser.add_argument(
+        "--config", default="configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+    )
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--fold", type=int, choices=range(5), default=0)
     mode = parser.add_mutually_exclusive_group(required=True)

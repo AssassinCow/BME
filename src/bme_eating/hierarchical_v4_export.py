@@ -159,20 +159,40 @@ def export_hierarchical_v4_bundle(
         raise RuntimeError(
             f"V4 selection has incompatible protocol bindings: {mismatched_protocols}"
         )
+    config = yaml.safe_load((final_root / "resolved_config.yaml").read_text(encoding="utf-8"))
     resume_identity = manifest.get("resume_identity", {})
-    expected_git = resume_identity.get("git")
     active_git = git_worktree_identity(project_root)
-    if expected_git != active_git:
+    active_runtime_source = runtime_source_identity(project_root / "src" / "bme_eating")
+    project_config = config.get("project", {})
+    if bool(project_config.get("enforce_git_identity_on_resume", False)) and (
+        resume_identity.get("git") != active_git
+    ):
         raise RuntimeError("V4 export runtime worktree differs from final training")
-    source_root = project_root / "src" / "bme_eating"
-    active_runtime_source = runtime_source_identity(source_root)
-    if resume_identity.get("runtime_source_identity") != active_runtime_source:
+    if bool(project_config.get("enforce_runtime_source_identity_on_resume", False)) and (
+        resume_identity.get("runtime_source_identity") != active_runtime_source
+    ):
         raise RuntimeError("V4 export runtime source differs from final training")
+    source_identity_changed = (
+        resume_identity.get("git") != active_git
+        or resume_identity.get("runtime_source_identity") != active_runtime_source
+    )
+    if source_identity_changed:
+        transition = {
+            "training_git": resume_identity.get("git"),
+            "export_git": active_git,
+            "training_runtime_source_identity": resume_identity.get(
+                "runtime_source_identity"
+            ),
+            "export_runtime_source_identity": active_runtime_source,
+        }
+        history = manifest.setdefault("export_source_identity_history", [])
+        if not history or history[-1] != transition:
+            history.append(transition)
+    source_root = project_root / "src" / "bme_eating"
     if selection.get("candidate_minimum_seconds") != 3 or selection.get(
         "candidate_maximum_seconds"
     ) != 14_400:
         raise RuntimeError("V4 selection has invalid candidate duration bounds")
-    config = yaml.safe_load((final_root / "resolved_config.yaml").read_text(encoding="utf-8"))
     promotion_hashes = selection.get("promotion_evidence_sha256", {})
     promotion_protocol = str(
         selection.get("promotion_protocol", "registered_ablation_gates_v1")
@@ -271,6 +291,8 @@ def export_hierarchical_v4_bundle(
             _write_bundle_zip(bundle, zip_path)
             manifest.setdefault("artifact_hashes", {})["model_bundle.zip"] = sha256_file(zip_path)
             manifest["stage"] = "EXPORTED"
+            write_json_atomic(manifest_path, manifest)
+        if source_identity_changed:
             write_json_atomic(manifest_path, manifest)
         return bundle
     if resume:

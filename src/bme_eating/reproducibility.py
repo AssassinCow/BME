@@ -7,7 +7,6 @@ import platform
 import re
 import subprocess
 import sys
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -104,13 +103,6 @@ def git_worktree_identity(project_root: Path | None = None) -> dict[str, Any]:
 
 def require_git_worktree(project_root: Path | None = None) -> str:
     identity = git_worktree_identity(project_root)
-    if identity["dirty"]:
-        warnings.warn(
-            "Git worktree has uncommitted changes; execution is allowed and the exact "
-            "worktree fingerprint will be recorded in the run manifest",
-            RuntimeWarning,
-            stacklevel=2,
-        )
     return str(identity["commit"])
 
 

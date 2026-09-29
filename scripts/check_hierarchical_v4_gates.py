@@ -15,7 +15,9 @@ from bme_eating.reproducibility import require_git_worktree
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate StatsFusion v4 promotion gates")
-    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion_r3.yaml")
+    parser.add_argument(
+        "--config", default="configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+    )
     parser.add_argument("--mode", choices=("ablation", "development", "stress"), required=True)
     parser.add_argument("--run-name", required=True, help="Selected r3 candidate run name")
     parser.add_argument("--s0-run", required=True)

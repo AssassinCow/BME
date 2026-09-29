@@ -23,7 +23,9 @@ def main() -> None:
             "outer fold without pretending they are five-fold pooled evidence"
         )
     )
-    parser.add_argument("--config", default="configs/hierarchical_v4_r32_pooled_heads.yaml")
+    parser.add_argument(
+        "--config", default="configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+    )
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--fold", type=int, choices=range(5), required=True)
     mode = parser.add_mutually_exclusive_group(required=True)

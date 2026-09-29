@@ -11,11 +11,12 @@ from tqdm import tqdm
 
 from bme_eating.data.labels import assign_event_sessions, build_statsfusion_session_anchor_index
 from bme_eating.features.baseline import build_segment_features
-from bme_eating.fusion import ALIGNMENT_KEYS
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.metrics import partition_evaluation_events
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS
 from bme_eating.v4_protocol import PROTOCOL_VERSION
+
+ALIGNMENT_KEYS = ["subject_key", "session_id", "timestamp_ms"]
 
 CANONICAL_INPUT_DIRECTORY = "canonical_input_r3_2"
 CANONICAL_ANCHORS_FILE = "anchors.parquet"

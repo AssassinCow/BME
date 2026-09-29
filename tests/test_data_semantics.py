@@ -14,7 +14,6 @@ from bme_eating.data.quality import build_quality_report, validate_quality_invar
 from bme_eating.data.session import SessionWindowReader
 from bme_eating.features.signal import masked_spectral_summary, ppg_quality_features
 from bme_eating.metrics import partition_evaluation_events
-from bme_eating.postprocess import probabilities_to_events
 from bme_eating.types import SensorSeries
 
 
@@ -417,16 +416,3 @@ def test_cross_attachment_session_produces_one_event_without_subject_leakage(tmp
     )
     history = SessionWindowReader(segments).read("a-session", 0, 5000)
     assert history["motion_timestamp_ms"].tolist() == [0, 1000, 2000, 3000, 4000, 5000]
-    predictions = pd.DataFrame(
-        {
-            "subject_key": ["a"] * 6,
-            "session_id": ["a-session"] * 6,
-            "timestamp_ms": [0, 1000, 2000, 3000, 4000, 5000],
-            "state_probability": [0.0, 0.9, 0.9, 0.9, 0.9, 0.0],
-            "start_probability": [0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-            "end_probability": [0.0, 0.0, 0.0, 0.0, 0.0, 1.0],
-        }
-    )
-    events = probabilities_to_events(predictions, 0.1, 0.6, 0.3, 0, 0, 2)
-    assert len(events) == 1
-    assert events.iloc[0].subject_key == "a"

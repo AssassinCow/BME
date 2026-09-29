@@ -1,5 +1,0 @@
-extends: hierarchical_v4_statsfusion_r3.yaml
-experiment:
-  ablation_id: R3-S1
-model:
-  use_long_context: false

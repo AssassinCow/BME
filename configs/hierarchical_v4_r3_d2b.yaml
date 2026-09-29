@@ -1,5 +1,0 @@
-extends: hierarchical_v4_r3_d1.yaml
-experiment:
-  ablation_id: R3-D2b
-training:
-  rotation_augmentation_probability: 0.50

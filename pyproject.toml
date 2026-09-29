@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bme-eating-detection"
 version = "0.1.0"
-description = "Reproducible baselines and dyadic temporal pyramid models for the 2026 BME eating-detection competition"
+description = "StatsFusion v4.7.1 eating-event detection for the 2026 BME competition"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -16,7 +16,6 @@ dependencies = [
   "scikit-learn>=1.5,<2",
   "PyYAML>=6,<7",
   "tqdm>=4.66,<5",
-  "xgboost>=2.1,<4",
   "torch>=2.5,<3",
 ]
 

@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-CODE_VERSION = "v4.5.1"
+CODE_VERSION = "v4.7.1"
 PROTOCOL_VERSION = "statsfusion-r3.2"
 POOLED_HEAD_PROTOCOL = "outer_fold_crossfit_joint_tuning_v1"
 INPUT_SNAPSHOT_FILENAME = "input_snapshot_r3_2.json"
@@ -54,15 +54,10 @@ RUNTIME_SOURCE_FILES = (
 )
 R3_ABLATION_IDS = frozenset(
     {
-        "R3-S0",
-        "R3-S1",
         "R3-S2",
         "R3-D1",
         "R3-D2a",
-        "R3-D2b",
         "R3-D2c",
-        "R3-P1",
-        "R3-M1",
         "R3-DIRECT",
     }
 )
@@ -72,7 +67,6 @@ R3_ROOT_CONFIG_KEYS = frozenset(
         "project",
         "data",
         "experiment",
-        "features",
         "model",
         "sequence",
         "training",
@@ -201,16 +195,17 @@ def validate_r3_config(config: dict[str, Any]) -> None:
             checkpoint_selection_minimum_epoch = int(
                 training.get("checkpoint_selection_min_epoch", minimum_epochs)
             )
+            selector_rolling_epochs = int(training.get("selector_rolling_epochs", 1))
             patience_checks = int(training.get("early_stopping_patience_checks", 0))
             holdout_fraction = float(config.get("training", {}).get("single_holdout_fraction", 0.0))
             if maximum_epochs != 32:
                 raise ValueError("Single-holdout max_epochs must be 32")
             if not 1 <= minimum_epochs < maximum_epochs:
                 raise ValueError("Single-holdout early-stopping minimum must be in [1, 31]")
-            if not 1 <= checkpoint_selection_minimum_epoch <= minimum_epochs:
+            if not selector_rolling_epochs <= checkpoint_selection_minimum_epoch <= minimum_epochs:
                 raise ValueError(
-                    "Single-holdout checkpoint-selection minimum must be between 1 and the "
-                    "early-stopping minimum"
+                    "Single-holdout checkpoint-selection minimum must cover the robust selector "
+                    "window and not exceed the early-stopping minimum"
                 )
             if not 1 <= patience_checks <= 8:
                 raise ValueError("Single-holdout early-stopping patience must be in [1, 8]")
@@ -249,6 +244,12 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         raise ValueError("StatsFusion-r3 outputs must use artifact schema v4")
     if not bool(project.get("strict_resume_identity", False)):
         raise ValueError("StatsFusion-r3 requires strict_resume_identity: true")
+    for key in (
+        "enforce_git_identity_on_resume",
+        "enforce_runtime_source_identity_on_resume",
+    ):
+        if key in project and not isinstance(project[key], bool):
+            raise ValueError(f"project.{key} must be a boolean")
     decoder = config.get("decoder", {})
     minimum = float(decoder.get("candidate_minimum_seconds", 0))
     maximum = float(decoder.get("candidate_maximum_seconds", 0))

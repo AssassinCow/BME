@@ -165,7 +165,7 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path, mon
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "code_version": "v4.5.1",
+                "code_version": "v4.7.1",
                 "protocol_version": "statsfusion-r3.2",
                 "blocked_predecessors": [
                     "statsfusion-r0-blocked",
@@ -281,8 +281,14 @@ def test_v4_bundle_excludes_xgboost_and_imports_when_it_is_blocked(tmp_path, mon
         "runtime_source_identity",
         lambda _root: {"files": {}, "sha256": "f" * 64},
     )
-    with pytest.raises(RuntimeError, match="runtime source"):
+    assert (
         export_hierarchical_v4_bundle(project_root, final_root, fresh=False, resume=True)
+        == bundle
+    )
+    relaxed_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert relaxed_manifest["export_source_identity_history"][-1][
+        "export_runtime_source_identity"
+    ]["sha256"] == "f" * 64
 
 
 def test_v4_bundle_loader_fails_closed_without_hash_manifest(tmp_path) -> None:
@@ -304,7 +310,7 @@ def test_v4_export_rejects_incomplete_deep_verifier_seed_mirror(tmp_path) -> Non
     (final_root / "selected_pipeline.json").write_text(
         json.dumps(
             {
-                "code_version": "v4.5.1",
+                "code_version": "v4.7.1",
                 "protocol_version": "statsfusion-r3.2",
                 "blocked_predecessors": [
                     "statsfusion-r0-blocked",

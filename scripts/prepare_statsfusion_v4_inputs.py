@@ -14,7 +14,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build the session-wide canonical anchors and 15-second statistics for StatsFusion-r3"
     )
-    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion_r3.yaml")
+    parser.add_argument(
+        "--config", default="configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+    )
     parser.add_argument("--workers", type=int, default=8)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--fresh", action="store_true")

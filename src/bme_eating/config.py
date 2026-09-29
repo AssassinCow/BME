@@ -96,8 +96,7 @@ def feature_artifact_name(config: dict[str, Any]) -> str:
     """Return the configured feature artifact stem without allowing path traversal."""
 
     features = config.get("features", {})
-    default = "baseline_dyadic" if features.get("include_dyadic", False) else "baseline"
-    name = str(features.get("artifact_name", default)).strip()
+    name = str(features.get("artifact_name", "baseline")).strip()
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
         raise ValueError(f"Invalid features.artifact_name: {name!r}")
     return name

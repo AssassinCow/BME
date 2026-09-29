@@ -2,7 +2,7 @@ extends: hierarchical_v4_r32_fast_logistic.yaml
 
 experiment:
   name: hierarchical_v4_r32_pooled_heads
-  code_version: v4.5.1
+  code_version: v4.7.1
   variant: time_constrained_outer_single_holdout_pooled_heads
 
 verifier:

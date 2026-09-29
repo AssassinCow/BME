@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -11,44 +10,63 @@ from bme_eating.stats_features import STATS_FEATURE_COLUMNS
 from bme_eating.training.hierarchical_v4_trainer import (
     _decoder_configurations,
     _enforce_gradient_clipping_gate,
+    _final_resume_comparison_identity,
     _gradient_clipping_gate_passed,
     _selector_decoder_search_config,
 )
 from bme_eating.v4_protocol import validate_r3_config, validate_serialized_verifier_seeds
 
 
-def _flatten(value: Any, prefix: str = "") -> dict[str, Any]:
-    if not isinstance(value, dict):
-        return {prefix: value}
-    output: dict[str, Any] = {}
-    for key, item in value.items():
-        if str(key).startswith("_"):
-            continue
-        path = f"{prefix}.{key}" if prefix else str(key)
-        output.update(_flatten(item, path))
-    return output
-
-
-def _changed_paths(first: dict[str, Any], second: dict[str, Any]) -> set[str]:
-    left = _flatten(first)
-    right = _flatten(second)
-    return {key for key in left.keys() | right.keys() if left.get(key) != right.get(key)}
-
-
 def test_r3_config_is_strict_and_has_fixed_features() -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "configs" / "hierarchical_v4_statsfusion_r3.yaml")
     validate_r3_config(config)
-    assert config["experiment"]["code_version"] == "v4.5.1"
+    assert config["experiment"]["code_version"] == "v4.7.1"
     assert config["experiment"]["protocol_version"] == "statsfusion-r3.2"
     assert config["project"]["artifact_schema_version"] == "v4"
     assert config["project"]["strict_resume_identity"] is True
+    assert config["project"]["enforce_git_identity_on_resume"] is False
+    assert config["project"]["enforce_runtime_source_identity_on_resume"] is False
     assert tuple(config["model"]["stable_feature_columns"]) == STATS_FEATURE_COLUMNS
     assert config["hierarchical"]["maximum_event_latency_seconds"] == 60
     assert config["decoder"]["candidate_minimum_seconds"] == 3
     assert config["decoder"]["candidate_maximum_seconds"] == 14_400
     assert config["loss"]["smooth_beta"] == 0.5
     assert "postprocess_search" not in config
+
+
+def test_final_resume_ignores_only_source_identity_metadata() -> None:
+    config = {
+        "project": {
+            "enforce_git_identity_on_resume": False,
+            "enforce_runtime_source_identity_on_resume": False,
+        }
+    }
+    first = {
+        "git": {"commit": "old"},
+        "runtime_source_identity": {"sha256": "old"},
+        "input_hashes": {"anchors": "same"},
+        "parent_artifact_hashes": {
+            "fold_0/run_manifest.json": "old-manifest",
+            "fold_0/outer/window_logits.parquet": "same-logits",
+        },
+    }
+    second = {
+        "git": {"commit": "new"},
+        "runtime_source_identity": {"sha256": "new"},
+        "input_hashes": {"anchors": "same"},
+        "parent_artifact_hashes": {
+            "fold_0/run_manifest.json": "new-manifest",
+            "fold_0/outer/window_logits.parquet": "same-logits",
+        },
+    }
+    assert _final_resume_comparison_identity(first, config) == (
+        _final_resume_comparison_identity(second, config)
+    )
+    second["parent_artifact_hashes"]["fold_0/outer/window_logits.parquet"] = "changed"
+    assert _final_resume_comparison_identity(first, config) != (
+        _final_resume_comparison_identity(second, config)
+    )
 
 
 def test_r3_config_rejects_blocked_s4_ablation_name() -> None:
@@ -61,7 +79,8 @@ def test_r3_config_rejects_blocked_s4_ablation_name() -> None:
 
 def test_r32_rejects_r31_configuration() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
-    config = load_config(root / "hierarchical_v4_r31_direct_best.yaml")
+    config = load_config(root / "hierarchical_v4_r32_pooled_heads_early_select.yaml")
+    config["experiment"]["protocol_version"] = "statsfusion-r3.1"
     with pytest.raises(ValueError, match="statsfusion-r3.2"):
         validate_r3_config(config)
 
@@ -69,15 +88,10 @@ def test_r32_rejects_r31_configuration() -> None:
 def test_r3_architecture_configs_change_registered_components() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
     expected = {
-        "hierarchical_v4_r3_s0.yaml": ("R3-S0", False, False, False, False, 0.0, 0.0),
-        "hierarchical_v4_r3_s1.yaml": ("R3-S1", False, True, False, False, 0.0, 0.0),
         "hierarchical_v4_r3_s2.yaml": ("R3-S2", False, True, True, False, 0.0, 0.0),
         "hierarchical_v4_r3_d1.yaml": ("R3-D1", False, True, True, True, 0.2, 0.0),
         "hierarchical_v4_r3_d2a.yaml": ("R3-D2a", False, True, True, True, 0.2, 0.0),
-        "hierarchical_v4_r3_d2b.yaml": ("R3-D2b", False, True, True, True, 0.2, 0.5),
         "hierarchical_v4_r3_d2c.yaml": ("R3-D2c", False, True, True, True, 0.2, 0.5),
-        "hierarchical_v4_r3_p1.yaml": ("R3-P1", True, True, True, True, 0.2, 0.0),
-        "hierarchical_v4_r3_m1.yaml": ("R3-M1", True, True, True, True, 0.2, 0.0),
     }
     for filename, values in expected.items():
         config = load_config(root / filename)
@@ -90,7 +104,7 @@ def test_r3_architecture_configs_change_registered_components() -> None:
         assert config["model"]["separate_motion_branches"] is separate
         assert config["training"]["gyro_modality_dropout"] == gyro_dropout
         assert config["training"]["rotation_augmentation_probability"] == rotation
-        assert config["decoder"]["use_semi_markov"] is (ablation == "R3-M1")
+        assert config["decoder"]["use_semi_markov"] is False
 
 
 def test_r32_time_constrained_config_uses_single_holdout_and_pooled_logistic() -> None:
@@ -164,14 +178,14 @@ def test_r32_pooled_heads_config_keeps_fast_state_and_single_seed_heads() -> Non
     assert config["boundary"]["patience"] == 8
 
 
-def test_r32_early_select_decouples_early_stop_and_checkpoint_selection() -> None:
+def test_r32_early_select_uses_complete_robust_window() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
     config = load_config(root / "hierarchical_v4_r32_pooled_heads_early_select.yaml")
     validate_r3_config(config)
     assert config["training"]["max_epochs"] == 32
     assert config["training"]["early_stopping_min_epochs"] == 3
     assert config["training"]["early_stopping_patience_checks"] == 3
-    assert config["training"]["checkpoint_selection_min_epoch"] == 1
+    assert config["training"]["checkpoint_selection_min_epoch"] == 3
     assert config["hierarchical"]["downstream_mode"] == "pooled_heads"
 
 
@@ -218,6 +232,7 @@ def test_r32_fast_config_uses_one_nested_selector_holdout() -> None:
     [
         ("max_epochs", 31, "max_epochs"),
         ("early_stopping_min_epochs", 0, "early-stopping minimum"),
+        ("checkpoint_selection_min_epoch", 2, "robust selector window"),
         ("early_stopping_patience_checks", 0, "early-stopping patience"),
         ("single_holdout_fraction", 0.1, "Single-holdout fraction"),
         ("single_holdout_fraction", 0.5, "Single-holdout fraction"),
@@ -265,7 +280,7 @@ def test_r3_direct_config_requires_fixed_selector_decoder_search() -> None:
         validate_r3_config(config)
 
 
-def test_r3_registered_ablations_keep_gradient_clipping_gate() -> None:
+def test_r3_parent_config_keeps_gradient_clipping_gate() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
     config = load_config(root / "hierarchical_v4_r3_s2.yaml")
     assert _enforce_gradient_clipping_gate(config) is True
@@ -273,29 +288,17 @@ def test_r3_registered_ablations_keep_gradient_clipping_gate() -> None:
     assert _gradient_clipping_gate_passed(config, 0.21) is False
 
 
-def test_r3_training_ablations_change_only_declared_factors() -> None:
+def test_repository_keeps_only_current_config_chain() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
-    base = load_config(root / "hierarchical_v4_r3_s2.yaml")
-    cases = {
-        "hierarchical_v4_r3_ablation_A.yaml": {
-            "experiment.variant",
-            "training.validation_every_epochs",
-        },
-        "hierarchical_v4_r3_ablation_B.yaml": {
-            "experiment.variant",
-            "training.learning_rate",
-            "training.warmup_fraction",
-        },
-        "hierarchical_v4_r3_ablation_C1.yaml": {
-            "experiment.variant",
-            "training.steps_per_epoch",
-        },
-        "hierarchical_v4_r3_ablation_C2.yaml": {
-            "experiment.variant",
-            "training.gradient_accumulation",
-        },
+    expected = {
+        "base.yaml",
+        "hierarchical_v4_statsfusion_r3.yaml",
+        "hierarchical_v4_r3_s2.yaml",
+        "hierarchical_v4_r3_d1.yaml",
+        "hierarchical_v4_r3_d2a.yaml",
+        "hierarchical_v4_r3_d2c.yaml",
+        "hierarchical_v4_r32_fast_logistic.yaml",
+        "hierarchical_v4_r32_pooled_heads.yaml",
+        "hierarchical_v4_r32_pooled_heads_early_select.yaml",
     }
-    for filename, allowed in cases.items():
-        variant = load_config(root / filename)
-        validate_r3_config(variant)
-        assert _changed_paths(base, variant) == allowed
+    assert {path.name for path in root.glob("*.yaml")} == expected

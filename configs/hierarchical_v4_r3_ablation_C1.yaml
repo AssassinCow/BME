@@ -1,6 +1,0 @@
-extends: hierarchical_v4_r3_s2.yaml
-experiment:
-  ablation_id: R3-S2
-  variant: reduced_epoch_exposure
-training:
-  steps_per_epoch: 504

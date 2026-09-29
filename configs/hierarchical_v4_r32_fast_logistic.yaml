@@ -2,7 +2,7 @@ extends: hierarchical_v4_r3_d2c.yaml
 
 experiment:
   name: hierarchical_v4_r32_fast_logistic
-  code_version: v4.5.1
+  code_version: v4.7.1
   protocol_version: statsfusion-r3.2
   blocked_protocols:
     - statsfusion-r0-blocked

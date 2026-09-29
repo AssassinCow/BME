@@ -405,9 +405,13 @@ def test_proposal_calibration_fails_fast_on_empty_or_single_class_oof() -> None:
 
 
 def test_outer_training_never_loads_outer_anchor_labels(tmp_path, monkeypatch) -> None:
+    import bme_eating.training.hierarchical_v4_trainer as trainer
+
     input_root = tmp_path / "v2"
+    output_root = tmp_path / "v4"
     (input_root / "indices").mkdir(parents=True)
-    (input_root / "features").mkdir()
+    canonical_root = output_root / "canonical_input_r3_2"
+    canonical_root.mkdir(parents=True)
     anchors = pd.DataFrame(
         {
             "segment_id": ["g0", "g1"],
@@ -427,24 +431,39 @@ def test_outer_training_never_loads_outer_anchor_labels(tmp_path, monkeypatch) -
             "ppg_history_available_seconds": [0.0, 0.0],
         }
     )
-    anchors.to_parquet(input_root / "indices" / "anchors.parquet", index=False)
-    pd.DataFrame(
+    anchors_path = canonical_root / "anchors.parquet"
+    anchors.to_parquet(anchors_path, index=False)
+    events = pd.DataFrame(
         {
             "subject_key": ["train", "outer"],
+            "session_id": ["d0", "d1"],
             "event_id": ["e0", "e1"],
             "start_ms": [0, 0],
             "end_ms": [1000, 1000],
         }
-    ).to_parquet(input_root / "indices" / "events.parquet", index=False)
+    )
+    events_path = canonical_root / "events_with_session.parquet"
+    events.to_parquet(events_path, index=False)
     pd.DataFrame(
         columns=["session_id", "segment_id", "segment_path", "start_ms", "end_ms"]
     ).to_parquet(input_root / "indices" / "segments.parquet", index=False)
-    statistics = anchors[["segment_id", "session_id", "subject_key", "timestamp_ms"]].copy()
+    statistics = anchors[["session_id", "subject_key", "timestamp_ms"]].copy()
     for column in STATS_FEATURE_COLUMNS:
         statistics[column] = 0.0
-    statistics.to_parquet(input_root / "features" / "baseline.parquet", index=False)
+    statistics_path = canonical_root / "statistics.parquet"
+    statistics.to_parquet(statistics_path, index=False)
     (input_root / "indices" / "subject_folds.json").write_text(
         json.dumps({"train": 1, "outer": 0}), encoding="utf-8"
+    )
+    monkeypatch.setattr(trainer, "verify_canonical_statsfusion_inputs", lambda *_args: {})
+    monkeypatch.setattr(
+        trainer,
+        "canonical_input_paths",
+        lambda _root: {
+            "anchors": anchors_path,
+            "statistics": statistics_path,
+            "events": events_path,
+        },
     )
     original = pd.read_parquet
     anchor_reads: list[dict[str, object]] = []
@@ -455,8 +474,12 @@ def test_outer_training_never_loads_outer_anchor_labels(tmp_path, monkeypatch) -
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(pd, "read_parquet", tracked)
+    config = {
+        "experiment": {"protocol_version": "statsfusion-r3.2"},
+        "project": {"artifact_schema_version": "v4"},
+    }
     inputs = load_v4_inputs(
-        {"features": {"artifact_name": "baseline"}},
+        config,
         input_root,
         fold=0,
         event_role="outer_train",
@@ -468,13 +491,13 @@ def test_outer_training_never_loads_outer_anchor_labels(tmp_path, monkeypatch) -
     assert set(inputs.events["subject_key"]) == {"train"}
     with pytest.raises(RuntimeError, match="Outer-test labels require"):
         load_v4_inputs(
-            {"features": {"artifact_name": "baseline"}},
+            config,
             input_root,
             fold=0,
             event_role="outer_test",
         )
     evaluation_inputs = load_v4_inputs(
-        {"features": {"artifact_name": "baseline"}},
+        config,
         input_root,
         fold=0,
         event_role="outer_test",
@@ -553,7 +576,6 @@ def test_r3_loads_session_statistics_without_segment_id(tmp_path, monkeypatch) -
         {
             "experiment": {"protocol_version": "statsfusion-r3.2"},
             "project": {"artifact_schema_version": "v4"},
-            "features": {"artifact_name": "baseline"},
         },
         input_root,
         fold=0,

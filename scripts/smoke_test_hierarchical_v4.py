@@ -16,7 +16,9 @@ from bme_eating.models.stats_fusion_loss import StatsFusionStateLoss
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the StatsFusion v4 bf16 smoke test")
-    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion_r3.yaml")
+    parser.add_argument(
+        "--config", default="configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+    )
     parser.add_argument("--batch-size", type=int)
     args = parser.parse_args()
     config = load_config(args.config)

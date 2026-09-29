@@ -5,4 +5,4 @@ experiment:
 
 training:
   early_stopping_min_epochs: 3
-  checkpoint_selection_min_epoch: 1
+  checkpoint_selection_min_epoch: 3

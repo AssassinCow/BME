@@ -10,7 +10,6 @@ from typing import Any
 import torch
 import yaml
 
-from bme_eating.config import feature_artifact_name
 from bme_eating.data.stats_fusion_inputs import (
     canonical_input_paths,
     verify_canonical_statsfusion_inputs,
@@ -47,6 +46,12 @@ RESUME_RUNTIME_CONFIG_PATHS = frozenset(
         "training.inference_resume_chunk_rows",
     }
 )
+RESUME_POLICY_CONFIG_KEYS = frozenset(
+    {
+        "enforce_git_identity_on_resume",
+        "enforce_runtime_source_identity_on_resume",
+    }
+)
 
 
 def _public_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -59,6 +64,10 @@ def _public_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def _resume_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(_public_config(config))
+    project = normalized.get("project")
+    if isinstance(project, dict):
+        for key in RESUME_POLICY_CONFIG_KEYS:
+            project.pop(key, None)
     training = normalized.get("training")
     if isinstance(training, dict):
         for path in RESUME_RUNTIME_CONFIG_PATHS:
@@ -101,24 +110,7 @@ def _runtime_config_snapshot(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _has_only_pretraining_artifacts(run_root: Path) -> bool:
-    allowed = {"resolved_config.yaml", "run_manifest.json"}
-    return all(
-        path.relative_to(run_root).as_posix() in allowed
-        or (
-            path.name in {"statistics_scaler.json", "sensor_normalization.json"}
-            and len(path.relative_to(run_root).parts) == 4
-            and path.relative_to(run_root).parts[0] == "crossfit"
-            and path.relative_to(run_root).parts[1].startswith("partition_")
-            and path.relative_to(run_root).parts[2] == "state"
-        )
-        for path in run_root.rglob("*")
-        if path.is_file()
-    )
-
-
 def _tracked_inputs(config: dict[str, Any], input_root: Path) -> dict[str, Path]:
-    feature_name = feature_artifact_name(config)
     output_root = input_root.parent / str(config["project"]["artifact_schema_version"])
     canonical = canonical_input_paths(output_root)
     verify_canonical_statsfusion_inputs(input_root, output_root)
@@ -129,7 +121,6 @@ def _tracked_inputs(config: dict[str, Any], input_root: Path) -> dict[str, Path]
         "subject_folds": input_root / "indices" / "subject_folds.json",
         "subject_folds_manifest": input_root / "indices" / "subject_folds.manifest.json",
         "quality_report": input_root / "indices" / "quality_report.json",
-        "features": input_root / "features" / f"{feature_name}.parquet",
         "canonical_anchors": canonical["anchors"],
         "canonical_statistics": canonical["statistics"],
         "canonical_events": canonical["events"],
@@ -276,8 +267,9 @@ def validate_v4_freeze_manifest(
         "candidate_minimum_seconds": int(config["decoder"]["candidate_minimum_seconds"]),
         "candidate_maximum_seconds": int(config["decoder"]["candidate_maximum_seconds"]),
         "resume_config_sha256": expected_resume_config_sha256,
-        "git": expected_git,
     }
+    if bool(config.get("project", {}).get("enforce_git_identity_on_resume", False)):
+        expected_fields["git"] = expected_git
     for key, expected in expected_fields.items():
         if payload.get(key) != expected:
             raise RuntimeError(f"V4 freeze manifest has an invalid {key}")
@@ -356,19 +348,15 @@ def initialize_v4_run(
         run.verify_artifacts()
         previous_git = payload.get("git")
         if previous_git != git_identity:
-            if (
-                fold >= 2
-                or payload.get("stage") != "CREATED"
-                or not _has_only_pretraining_artifacts(run_root)
-                or not isinstance(previous_git, dict)
-                or previous_git.get("commit") != git_identity.get("commit")
+            if bool(
+                config.get("project", {}).get("enforce_git_identity_on_resume", False)
             ):
                 raise RuntimeError("Active v4 worktree differs from the run manifest")
-            payload.setdefault("pretraining_worktree_history", []).append(
+            payload.setdefault("source_identity_history", []).append(
                 {"previous": previous_git, "active": git_identity}
             )
             payload["git"] = git_identity
-            payload["recompute_pretraining_scalers"] = True
+        payload.pop("recompute_pretraining_scalers", None)
         if "runtime_config" in payload:
             previous_runtime = payload["runtime_config"]
         else:

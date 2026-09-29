@@ -12,7 +12,9 @@ from bme_eating.training.hierarchical_v4_trainer import load_v4_inputs, select_v
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Select and lock the StatsFusion v4 pipeline")
-    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion_r3.yaml")
+    parser.add_argument(
+        "--config", default="configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+    )
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--fold", type=int, choices=range(5), required=True)
     mode = parser.add_mutually_exclusive_group(required=True)

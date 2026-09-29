@@ -5,13 +5,15 @@ project:
   input_artifact_schema_version: v2
   artifact_schema_version: v4
   strict_resume_identity: true
+  enforce_git_identity_on_resume: false
+  enforce_runtime_source_identity_on_resume: false
 
 data:
   subject_folds: 5
 
 experiment:
   name: hierarchical_v4_statsfusion_r3
-  code_version: v4.5.1
+  code_version: v4.7.1
   protocol_version: statsfusion-r3.2
   blocked_protocols:
     - statsfusion-r0-blocked
@@ -20,9 +22,6 @@ experiment:
     - statsfusion-r3-blocked
     - statsfusion-r3.1-blocked
   ablation_id: R3-S2
-
-features:
-  artifact_name: baseline
 
 model:
   architecture: stats_fusion_state
@@ -229,13 +228,8 @@ promotion_gate:
   maximum_tp_to_fp_fraction: 0.01
 
 feature_provenance:
-  source_paths:
-    - experiments/baseline/fold_0/metadata.json
-    - experiments/baseline/fold_1/metadata.json
-    - experiments/baseline/fold_2/metadata.json
-    - experiments/baseline/fold_3/metadata.json
-    - experiments/baseline/fold_4/metadata.json
-  selection_note_path: docs/问题排查与当前诊断记录.md
+  source_paths: []
+  selection_note_path: docs/statsfusion_feature_provenance.md
   assumed_used_all_outer_folds: true
 
 final_training:

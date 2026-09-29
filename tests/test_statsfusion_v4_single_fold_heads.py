@@ -4,50 +4,26 @@ import json
 from types import SimpleNamespace
 
 import pandas as pd
-import pytest
 
 from bme_eating.training import hierarchical_v4_single_fold_heads as diagnostic
 
 
-def test_git_output_preserves_porcelain_leading_status_space(monkeypatch, tmp_path) -> None:
+def test_single_fold_diagnostic_worktree_records_source_without_enforcing_parent(
+    monkeypatch, tmp_path
+) -> None:
+    for relative in diagnostic.DIAGNOSTIC_SOURCE_PATHS:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(relative, encoding="utf-8")
     monkeypatch.setattr(
-        diagnostic.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(stdout=" M src/module.py\n"),
+        diagnostic,
+        "git_worktree_identity",
+        lambda _root: {"commit": "new-commit", "dirty": True, "worktree_sha256": "new"},
     )
-    assert diagnostic._git_output(tmp_path, "status", "--porcelain=v1") == " M src/module.py"
-
-
-def test_single_fold_diagnostic_worktree_rejects_unrelated_changes(monkeypatch, tmp_path) -> None:
-    for relative in diagnostic.DIAGNOSTIC_SOURCE_PATHS:
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(relative, encoding="utf-8")
-
-    def git_output(_root, *arguments):
-        if arguments == ("rev-parse", "HEAD"):
-            return "abc123"
-        return "?? scripts/train_hierarchical_v4_single_fold_heads.py\n M src/core.py"
-
-    monkeypatch.setattr(diagnostic, "_git_output", git_output)
-    with pytest.raises(RuntimeError, match="unexpected worktree changes"):
-        diagnostic._verify_diagnostic_worktree(tmp_path, "abc123")
-
-
-def test_single_fold_diagnostic_worktree_records_allowed_sources(monkeypatch, tmp_path) -> None:
-    for relative in diagnostic.DIAGNOSTIC_SOURCE_PATHS:
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(relative, encoding="utf-8")
-
-    def git_output(_root, *arguments):
-        if arguments == ("rev-parse", "HEAD"):
-            return "abc123"
-        return "\n".join(sorted(diagnostic.DIAGNOSTIC_ALLOWED_STATUS))
-
-    monkeypatch.setattr(diagnostic, "_git_output", git_output)
-    identity = diagnostic._verify_diagnostic_worktree(tmp_path, "abc123")
-    assert identity["commit"] == "abc123"
+    identity = diagnostic._verify_diagnostic_worktree(tmp_path, "parent-commit")
+    assert identity["commit"] == "new-commit"
+    assert identity["parent_commit"] == "parent-commit"
+    assert identity["matches_parent_commit"] is False
     assert set(identity["source_sha256"]) == set(diagnostic.DIAGNOSTIC_SOURCE_PATHS)
 
 

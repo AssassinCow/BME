@@ -22,7 +22,6 @@ from bme_eating.calibration_v4 import (
     state_calibration_metrics,
     subject_crossfit_platt,
 )
-from bme_eating.config import feature_artifact_name
 from bme_eating.data.deep_dataset import (
     Normalization,
     compute_normalization,
@@ -116,7 +115,6 @@ from bme_eating.v4_protocol import (
     runtime_source_identity,
 )
 
-LEGACY_ALIGNMENT_KEYS = ["segment_id", "session_id", "subject_key", "timestamp_ms"]
 SESSION_ALIGNMENT_KEYS = ["subject_key", "session_id", "timestamp_ms"]
 UNLABELED_ANCHOR_COLUMNS = [
     "segment_id",
@@ -327,16 +325,11 @@ def load_v4_inputs(
             (input_root / "indices" / "subject_folds.json").read_text(encoding="utf-8")
         ).items()
     }
-    formal_r3 = config.get("experiment", {}).get("protocol_version") == PROTOCOL_VERSION
-    if formal_r3:
-        output_root = input_root.parent / str(config["project"]["artifact_schema_version"])
-        verify_canonical_statsfusion_inputs(input_root, output_root)
-        canonical_paths = canonical_input_paths(output_root)
-        anchor_path = canonical_paths["anchors"]
-        event_path = canonical_paths["events"]
-    else:
-        anchor_path = input_root / "indices" / "anchors.parquet"
-        event_path = input_root / "indices" / "events.parquet"
+    output_root = input_root.parent / str(config["project"]["artifact_schema_version"])
+    verify_canonical_statsfusion_inputs(input_root, output_root)
+    canonical_paths = canonical_input_paths(output_root)
+    anchor_path = canonical_paths["anchors"]
+    event_path = canonical_paths["events"]
     outer_train_subjects = {
         subject for subject, subject_fold in subject_folds.items() if subject_fold != fold
     }
@@ -372,17 +365,11 @@ def load_v4_inputs(
             event_path,
             filters=[("subject_key", "in", selected)],
         )
-    feature_path = (
-        canonical_paths["statistics"]
-        if formal_r3
-        else input_root / "features" / f"{feature_artifact_name(config)}.parquet"
-    )
-    alignment_keys = SESSION_ALIGNMENT_KEYS if formal_r3 else LEGACY_ALIGNMENT_KEYS
     statistics = pd.read_parquet(
-        feature_path,
-        columns=[*alignment_keys, *STATS_FEATURE_COLUMNS],
+        canonical_paths["statistics"],
+        columns=[*SESSION_ALIGNMENT_KEYS, *STATS_FEATURE_COLUMNS],
     )
-    if statistics.duplicated(alignment_keys).any():
+    if statistics.duplicated(SESSION_ALIGNMENT_KEYS).any():
         raise RuntimeError("V4 statistics contain duplicate timeline keys")
     return V4Inputs(anchors, segments, events, statistics, subject_folds)
 
@@ -647,9 +634,7 @@ def _fit_scaler_and_transform(
 
 def _transform_with_scaler(inputs: V4Inputs, scaler: FoldRobustScaler) -> pd.DataFrame:
     transformed = scaler.transform_frame(inputs.statistics)
-    alignment_keys = (
-        LEGACY_ALIGNMENT_KEYS if "segment_id" in transformed.columns else SESSION_ALIGNMENT_KEYS
-    )
+    alignment_keys = SESSION_ALIGNMENT_KEYS
     statistics_columns = [
         *(f"stat_{name}" for name in STATS_FEATURE_COLUMNS),
         *(f"stat_{name}_missing" for name in STATS_FEATURE_COLUMNS),
@@ -7094,6 +7079,24 @@ def _fit_pooled_boundary_crossfit(
     return scores, report, fixed_epochs, artifacts
 
 
+def _final_resume_comparison_identity(
+    identity: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    comparable = dict(identity)
+    project = config.get("project", {})
+    if not bool(project.get("enforce_git_identity_on_resume", False)):
+        comparable.pop("git", None)
+        parent_hashes = dict(comparable.get("parent_artifact_hashes", {}))
+        comparable["parent_artifact_hashes"] = {
+            key: value
+            for key, value in parent_hashes.items()
+            if not key.endswith("/run_manifest.json")
+        }
+    if not bool(project.get("enforce_runtime_source_identity_on_resume", False)):
+        comparable.pop("runtime_source_identity", None)
+    return comparable
+
+
 def train_hierarchical_final_v4(
     config: dict[str, Any],
     input_root: Path,
@@ -7156,7 +7159,9 @@ def train_hierarchical_final_v4(
             raise RuntimeError(f"V4 fold {fold} was not produced by {PROTOCOL_VERSION}")
         if _saved_resume_config_hash(root, manifest) != identity["resolved_config_sha256"]:
             raise RuntimeError(f"V4 fold {fold} configuration differs from final training")
-        if manifest.get("git") != identity["git"]:
+        if bool(config.get("project", {}).get("enforce_git_identity_on_resume", False)) and (
+            manifest.get("git") != identity["git"]
+        ):
             raise RuntimeError(f"V4 fold {fold} worktree differs from final training")
         if manifest.get("input_hashes") != identity["input_hashes"]:
             raise RuntimeError(f"V4 fold {fold} v2 inputs differ from final training")
@@ -7251,8 +7256,26 @@ def train_hierarchical_final_v4(
     if existing_manifest is not None:
         if existing_manifest.get("protocol_version") != PROTOCOL_VERSION:
             raise RuntimeError("Legacy or blocked v4 final runs cannot be resumed")
-        if existing_manifest.get("resume_identity") != resume_identity:
+        saved_resume_identity = existing_manifest.get("resume_identity", {})
+        if _final_resume_comparison_identity(
+            saved_resume_identity, config
+        ) != _final_resume_comparison_identity(resume_identity, config):
             raise RuntimeError("V4 final resume identity differs from its locked evidence")
+        if saved_resume_identity != resume_identity:
+            existing_manifest.setdefault("source_identity_history", []).append(
+                {
+                    "previous_git": saved_resume_identity.get("git"),
+                    "active_git": resume_identity.get("git"),
+                    "previous_runtime_source_identity": saved_resume_identity.get(
+                        "runtime_source_identity"
+                    ),
+                    "active_runtime_source_identity": resume_identity.get(
+                        "runtime_source_identity"
+                    ),
+                }
+            )
+            existing_manifest["resume_identity"] = resume_identity
+            write_json_atomic(manifest_path, existing_manifest)
         if existing_manifest["stage"] == "COMPLETE":
             return final_root
     else:
@@ -8562,5 +8585,7 @@ def train_hierarchical_final_v4(
             "xgboost_scores",
         ],
     }
+    if existing_manifest is not None and existing_manifest.get("source_identity_history"):
+        manifest["source_identity_history"] = existing_manifest["source_identity_history"]
     write_json_atomic(manifest_path, manifest)
     return final_root

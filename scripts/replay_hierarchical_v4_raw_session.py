@@ -36,7 +36,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Replay one real multi-fragment session through canonical v4 preprocessing"
     )
-    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion_r3.yaml")
+    parser.add_argument(
+        "--config", default="configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+    )
     parser.add_argument("--segment-id")
     parser.add_argument("--session-id")
     parser.add_argument("--output")

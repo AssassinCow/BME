@@ -91,7 +91,7 @@ def test_feature_provenance_hashes_sources_and_marks_stress_evidence(tmp_path) -
     assert all(len(source["sha256"]) == 64 for source in result["sources"])
 
 
-def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> None:
+def test_v4_resume_records_and_allows_worktree_identity_change(tmp_path, monkeypatch) -> None:
     input_root = tmp_path / "v2"
     output_root = tmp_path / "v4"
     for relative in (
@@ -202,20 +202,18 @@ def test_v4_resume_rejects_worktree_identity_change(tmp_path, monkeypatch) -> No
     migrated = initialize_v4_run(
         runtime_changed, input_root, output_root, "strict-v4", 0, fresh=False
     )
-    assert migrated.payload["recompute_pretraining_scalers"] is True
+    assert "recompute_pretraining_scalers" not in migrated.payload
     assert migrated.payload["resolved_config_sha256"] == original_config_hash
-    assert len(migrated.payload["pretraining_worktree_history"]) == 1
+    assert len(migrated.payload["source_identity_history"]) == 1
     checkpoint_path = migrated.root / "crossfit" / "partition_0" / "state" / "seed_2026.pt"
     checkpoint_path.parent.mkdir(parents=True)
     checkpoint_path.write_bytes(b"model")
-    before = migrated.manifest_path.read_bytes()
-    try:
-        initialize_v4_run(runtime_changed, input_root, output_root, "strict-v4", 0, fresh=False)
-    except RuntimeError as error:
-        assert "worktree differs" in str(error)
-    else:
-        raise AssertionError("V4 resume accepted a changed worktree identity")
-    assert migrated.manifest_path.read_bytes() == before
+    resumed_with_checkpoint = initialize_v4_run(
+        runtime_changed, input_root, output_root, "strict-v4", 0, fresh=False
+    )
+    assert resumed_with_checkpoint.payload["git"]["commit"] == "b"
+    assert len(resumed_with_checkpoint.payload["source_identity_history"]) == 2
+    assert checkpoint_path.read_bytes() == b"model"
 
 
 def test_v4_snapshot_conflict_does_not_create_partial_run(tmp_path, monkeypatch) -> None:
@@ -264,6 +262,15 @@ def test_v4_resume_hash_ignores_execution_only_settings() -> None:
     )
     assert resume_config_hash(runtime_changed) == resume_config_hash(config)
 
+    policy_changed = deepcopy(config)
+    policy_changed["project"].update(
+        {
+            "enforce_git_identity_on_resume": False,
+            "enforce_runtime_source_identity_on_resume": False,
+        }
+    )
+    assert resume_config_hash(policy_changed) == resume_config_hash(config)
+
     result_changed = deepcopy(config)
     result_changed["training"]["learning_rate"] = 0.0001
     assert resume_config_hash(result_changed) != resume_config_hash(config)
@@ -310,7 +317,7 @@ def test_r3_freeze_manifest_hash_locks_promotion_and_selection_evidence(tmp_path
     config = {"decoder": {"candidate_minimum_seconds": 3, "candidate_maximum_seconds": 14_400}}
     freeze_path = experiment_root / "freeze_manifest.json"
     payload = {
-        "code_version": "v4.5.1",
+        "code_version": "v4.7.1",
         "protocol_version": "statsfusion-r3.2",
         "blocked_predecessors": [
             "statsfusion-r0-blocked",
@@ -339,6 +346,16 @@ def test_r3_freeze_manifest_hash_locks_promotion_and_selection_evidence(tmp_path
             output_root,
             expected_resume_config_sha256="config-sha",
             expected_git=git_identity,
+            config=config,
+        )
+        == payload
+    )
+    assert (
+        v4_artifacts.validate_v4_freeze_manifest(
+            freeze_path,
+            output_root,
+            expected_resume_config_sha256="config-sha",
+            expected_git={"commit": "changed", "dirty": True},
             config=config,
         )
         == payload

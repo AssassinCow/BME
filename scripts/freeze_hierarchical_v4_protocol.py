@@ -15,7 +15,9 @@ from bme_eating.v4_protocol import BLOCKED_PREDECESSORS, CODE_VERSION, PROTOCOL_
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Freeze v4 before folds 2-4")
-    parser.add_argument("--config", default="configs/hierarchical_v4_statsfusion_r3.yaml")
+    parser.add_argument(
+        "--config", default="configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+    )
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--fold", type=int, choices=range(5), default=1)
     mode = parser.add_mutually_exclusive_group(required=True)
