@@ -1,7 +1,7 @@
 # 2026 生医工进食检测：StatsFusion v4.7.1
 
 本仓库当前只支持 `statsfusion-r3.2` 主线。正式配置是
-`configs/hierarchical_v4_r32_pooled_heads_early_select.yaml`，公共推理入口是
+`configs/hierarchical_v4_r32_deep_frontier.yaml`，公共推理入口是
 `HierarchicalEatingDetectorV4.predict_session()`。
 
 旧 baseline、DTP fusion、hierarchical v3、StatsFusion r0/r1/r2/r3/r3.1 均已停止维护，
@@ -26,9 +26,9 @@ python scripts/check_environment.py
 已有冻结 v2 输入时，直接构建并核验 r3.2 canonical 输入：
 
 ```powershell
-$config = "configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
+$config = "configs/hierarchical_v4_r32_deep_frontier.yaml"
 python scripts/prepare_statsfusion_v4_inputs.py --config $config --workers 8 --resume
-python scripts/audit_statsfusion_feature_provenance.py --config $config --fresh
+python scripts/audit_statsfusion_feature_provenance.py --config $config --resume
 ```
 
 若需要从原始下载数据重建 v2 输入，依次执行：
@@ -45,19 +45,39 @@ python scripts/validate_data.py --config configs/base.yaml
 ## 正式训练
 
 ```powershell
-$config = "configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
-$run = "hierarchical_v4_r32_pooled_heads_early_select_20260928a"
+$config = "configs/hierarchical_v4_r32_deep_frontier.yaml"
+$run = "hierarchical_v4_r32_deep_frontier_20260930a"
 
-foreach ($fold in 0..4) {
+foreach ($fold in 0..1) {
   python scripts/train_hierarchical_v4_state.py --config $config --run-name $run --fold $fold --fresh
   python scripts/build_event_candidates_v4.py --config $config --run-name $run --fold $fold --resume
   python scripts/select_hierarchical_v4_pipeline.py --config $config --run-name $run --fold $fold --resume
   python scripts/evaluate_hierarchical_v4.py --config $config --run-name $run --fold $fold --resume
 }
 
+# Before final pooled heads, create promotion/development/stress reports and freeze the run.
+# Use a real hash-locked S0/baseline run name; never use $run as its own baseline.
+# $s0Run = "<existing-s0-run-name>"
+# python scripts/check_hierarchical_v4_gates.py --config $config --mode ablation --run-name $run --s0-run $s0Run --compare <TYPE>:<BASELINE>:<CANDIDATE>
+# python scripts/check_hierarchical_v4_gates.py --config $config --mode development --run-name $run --s0-run $s0Run
+# python scripts/freeze_hierarchical_v4_protocol.py --config $config --run-name $run --fold 1 --fresh
+
+foreach ($fold in 2..4) {
+  python scripts/train_hierarchical_v4_state.py --config $config --run-name $run --fold $fold --fresh
+  python scripts/build_event_candidates_v4.py --config $config --run-name $run --fold $fold --resume
+  python scripts/select_hierarchical_v4_pipeline.py --config $config --run-name $run --fold $fold --resume
+  python scripts/evaluate_hierarchical_v4.py --config $config --run-name $run --fold $fold --resume
+}
+
+# Run after folds 2-4 have been evaluated:
+# python scripts/check_hierarchical_v4_gates.py --config $config --mode stress --run-name $run --s0-run $s0Run
+
 python scripts/train_hierarchical_v4_final.py --config $config --run-name $run --fresh
 python scripts/export_hierarchical_v4_bundle.py --config $config --run-name $run --fresh
 ```
+
+没有有效 baseline/gate/freeze 证据时，五折 state 评估可以先跑；final 会安全拒绝继续，不能用当前 run
+自身冒充 baseline。
 
 中断后只对同一 run 使用 `--resume`；不要同时传入 `--fresh` 和 `--resume`。Git commit、
 dirty worktree 或运行时代码 SHA 变化不会阻断续跑，也不要求先提交；变化会记录到 manifest，
@@ -74,8 +94,8 @@ python -m pytest -q
 python -m ruff check src tests scripts --no-cache
 python -m compileall -q src scripts
 git diff --check
-python scripts/smoke_test_hierarchical_v4.py --config configs/hierarchical_v4_r32_pooled_heads_early_select.yaml
-python scripts/replay_hierarchical_v4_raw_session.py --config configs/hierarchical_v4_r32_pooled_heads_early_select.yaml
+python scripts/smoke_test_hierarchical_v4.py --config configs/hierarchical_v4_r32_deep_frontier.yaml
+python scripts/replay_hierarchical_v4_raw_session.py --config configs/hierarchical_v4_r32_deep_frontier.yaml
 ```
 
 正式结论必须同时保留数据哈希、配置、代码身份、随机种子、受试者划分、F1、边界 MAE、

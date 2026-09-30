@@ -17,6 +17,7 @@ from bme_eating.v4_protocol import (
     CODE_VERSION,
     IGNORE_PROTOCOL,
     OBSERVATION_GAP_PROTOCOL,
+    POOLED_HEAD_TRAINING_PROTOCOL,
     PROTOCOL_VERSION,
     RUNTIME_SOURCE_BINDING,
     RUNTIME_SOURCE_FILES,
@@ -160,6 +161,12 @@ def export_hierarchical_v4_bundle(
             f"V4 selection has incompatible protocol bindings: {mismatched_protocols}"
         )
     config = yaml.safe_load((final_root / "resolved_config.yaml").read_text(encoding="utf-8"))
+    configured_downstream = str(config.get("hierarchical", {}).get("downstream_mode", "full"))
+    if configured_downstream in {"pooled_logistic", "pooled_heads", "pooled_deep_only"} and (
+        selection.get("pooled_head_training_protocol") != POOLED_HEAD_TRAINING_PROTOCOL
+        or manifest.get("pooled_head_training_protocol") != POOLED_HEAD_TRAINING_PROTOCOL
+    ):
+        raise RuntimeError("V4 pooled heads lack fully excluded nested state OOF evidence")
     resume_identity = manifest.get("resume_identity", {})
     active_git = git_worktree_identity(project_root)
     active_runtime_source = runtime_source_identity(project_root / "src" / "bme_eating")
@@ -235,6 +242,8 @@ def export_hierarchical_v4_bundle(
     if missing_state:
         raise FileNotFoundError(f"V4 state artifacts are missing: {missing_state}")
     verifier_kind = str(selection.get("verifier_kind", ""))
+    if configured_downstream == "pooled_deep_only" and verifier_kind != "deep":
+        raise RuntimeError("Deep-only v4 export requires verifier_kind=deep")
     selected_verifier_files: list[str] = []
     if verifier_kind == "deep":
         verifier_seeds = validate_serialized_verifier_seeds(

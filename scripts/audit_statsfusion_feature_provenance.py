@@ -7,6 +7,7 @@ import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.hierarchical_artifacts import write_json_atomic
+from bme_eating.hierarchical_v4_artifacts import feature_provenance_artifact_path
 from bme_eating.stats_features import audit_feature_provenance
 
 
@@ -23,11 +24,6 @@ def main() -> None:
     args = parser.parse_args()
     config = load_config(args.config)
     _, input_root, output_root = resolve_artifact_roots(config)
-    target = output_root / "feature_provenance.json"
-    if target.exists() and args.fresh:
-        raise FileExistsError(target)
-    if not target.exists() and args.resume:
-        raise FileNotFoundError(target)
     provenance = audit_feature_provenance(
         project_root=Path(__file__).resolve().parents[1],
         input_root=input_root,
@@ -37,6 +33,11 @@ def main() -> None:
             config["feature_provenance"].get("assumed_used_all_outer_folds", True)
         ),
     )
+    target = feature_provenance_artifact_path(output_root, provenance)
+    if target.exists() and args.fresh:
+        raise FileExistsError(target)
+    if not target.exists() and args.resume:
+        raise FileNotFoundError(target)
     if target.exists():
         import json
 

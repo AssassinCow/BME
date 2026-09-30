@@ -131,10 +131,23 @@ def _tracked_inputs(config: dict[str, Any], input_root: Path) -> dict[str, Path]
 
 
 def _input_snapshot_matches(existing: dict[str, Any], current: dict[str, Any]) -> bool:
-    return existing.get("version") in {5, 6} and all(
-        existing.get(key) == current.get(key)
-        for key in ("protocol_version", "input_artifact_schema_version", "hashes")
+    existing_hashes = existing.get("hashes")
+    current_hashes = current.get("hashes")
+    return (
+        existing.get("version") in {5, 6}
+        and existing.get("protocol_version") == current.get("protocol_version")
+        and existing.get("input_artifact_schema_version")
+        == current.get("input_artifact_schema_version")
+        and isinstance(existing_hashes, dict)
+        and isinstance(current_hashes, dict)
+        and all(existing_hashes.get(name) == digest for name, digest in current_hashes.items())
     )
+
+
+def feature_provenance_artifact_path(
+    output_root: Path, provenance: dict[str, Any]
+) -> Path:
+    return output_root / "feature_provenance" / f"{_canonical_hash(provenance)}.json"
 
 
 def _m1_comparison_identity(config: dict[str, Any]) -> dict[str, Any]:
@@ -240,7 +253,8 @@ def current_v4_identity(config: dict[str, Any], input_root: Path) -> dict[str, A
         "protocol_version": PROTOCOL_VERSION,
         "pooled_head_protocol": (
             POOLED_HEAD_PROTOCOL
-            if config.get("hierarchical", {}).get("downstream_mode") == "pooled_heads"
+            if config.get("hierarchical", {}).get("downstream_mode")
+            in {"pooled_heads", "pooled_deep_only"}
             else None
         ),
         "resolved_config_sha256": resume_config_hash(config),
@@ -402,7 +416,7 @@ def initialize_v4_run(
             provenance_config.get("assumed_used_all_outer_folds", True)
         ),
     )
-    provenance_path = output_root / "feature_provenance.json"
+    provenance_path = feature_provenance_artifact_path(output_root, provenance)
     if provenance_path.is_file() and (
         json.loads(provenance_path.read_text(encoding="utf-8")) != provenance
     ):
@@ -443,6 +457,7 @@ def initialize_v4_run(
         "resume_config_sha256": config_hash,
         "runtime_config": _runtime_config_snapshot(config),
         "input_hashes": input_hashes,
+        "feature_provenance_path": provenance_path.relative_to(output_root).as_posix(),
         "feature_provenance_sha256": sha256_file(provenance_path),
         "random_seeds": {
             "state": [
@@ -454,13 +469,13 @@ def initialize_v4_run(
             "verifier": (
                 []
                 if config.get("hierarchical", {}).get("downstream_mode")
-                in {"state_only", "pooled_logistic", "pooled_heads"}
+                in {"state_only", "pooled_logistic", "pooled_heads", "pooled_deep_only"}
                 else [int(value) for value in config["verifier"]["seeds"]]
             ),
             "boundary": (
                 []
                 if config.get("hierarchical", {}).get("downstream_mode")
-                in {"state_only", "pooled_logistic", "pooled_heads"}
+                in {"state_only", "pooled_logistic", "pooled_heads", "pooled_deep_only"}
                 else [int(value) for value in config["boundary"]["seeds"]]
             ),
         },

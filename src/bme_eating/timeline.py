@@ -91,8 +91,14 @@ def deduplicate_consistent_timeline(
                 values = group[column]
                 if pd.api.types.is_numeric_dtype(values):
                     numeric = values.to_numpy(dtype=np.float64)
+                    column_tolerance = (
+                        max(float(tolerance), 1e-5)
+                        if str(column).startswith("state_hidden_")
+                        else float(tolerance)
+                    )
                     if not np.isfinite(numeric).all() or (
-                        len(numeric) and float(numeric.max() - numeric.min()) > tolerance
+                        len(numeric)
+                        and float(numeric.max() - numeric.min()) > column_tolerance
                     ):
                         conflict_columns.append(column)
                 elif values.astype(str).nunique(dropna=False) > 1:

@@ -1,0 +1,22 @@
+extends: hierarchical_v4_r32_deep_only_transition.yaml
+
+experiment:
+  name: hierarchical_v4_r32_deep_frontier
+  frontier_enhancements:
+    - learned_query_verifier_pooling_v1
+    - proposal_conditioned_boundary_film_v1
+    - temporal_contrastive_state_regularization_v1
+
+verifier:
+  use_learned_query_pooling: true
+  attention_heads: 4
+
+boundary:
+  use_proposal_conditioning: true
+  proposal_condition_dim: 4
+
+loss:
+  temporal_contrastive_weight: 0.003
+  temporal_contrastive_temperature: 0.1
+  temporal_contrastive_radius_steps: 1
+  temporal_contrastive_maximum_pairs: 512

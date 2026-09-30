@@ -107,6 +107,7 @@ from bme_eating.v4_protocol import (
     IGNORE_PROTOCOL,
     OBSERVATION_GAP_PROTOCOL,
     POOLED_HEAD_PROTOCOL,
+    POOLED_HEAD_TRAINING_PROTOCOL,
     PROTOCOL_VERSION,
     RAW_INPUT_SCHEMA,
     RUNTIME_SOURCE_BINDING,
@@ -305,6 +306,13 @@ class PooledFoldProposalData:
     upstream_lineage: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class PooledNestedStateOOF:
+    prediction_fold: int
+    windows: pd.DataFrame
+    lineage: tuple[dict[str, Any], ...]
+
+
 def load_v4_inputs(
     config: dict[str, Any],
     input_root: Path,
@@ -405,6 +413,7 @@ def _fold_uses_state_only_downstream(config: dict[str, Any]) -> bool:
         "state_only",
         "pooled_logistic",
         "pooled_heads",
+        "pooled_deep_only",
     }
 
 
@@ -702,6 +711,18 @@ def _state_loss(config: dict[str, Any]) -> StatsFusionStateLoss:
         smooth_weight=float(config["loss"]["smooth_weight"]),
         smooth_beta=float(config["loss"]["smooth_beta"]),
         boundary_weight=float(config["loss"]["boundary_weight"]),
+        temporal_contrastive_weight=float(
+            config["loss"].get("temporal_contrastive_weight", 0.0)
+        ),
+        temporal_contrastive_temperature=float(
+            config["loss"].get("temporal_contrastive_temperature", 0.1)
+        ),
+        temporal_contrastive_radius_steps=int(
+            config["loss"].get("temporal_contrastive_radius_steps", 1)
+        ),
+        temporal_contrastive_maximum_pairs=int(
+            config["loss"].get("temporal_contrastive_maximum_pairs", 512)
+        ),
     )
 
 
@@ -806,9 +827,14 @@ def _train_state_epochs(
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(epoch_offset, epoch_offset + int(epochs)):
         sampler.set_epoch(epoch)
-        loss_sums = {name: 0.0 for name in ("total", "state", "onset", "offset", "smooth")}
+        loss_sums = {
+            name: 0.0
+            for name in ("total", "state", "onset", "offset", "smooth", "contrastive")
+        }
         gradient_norms: list[float] = []
-        component_gradient_norms = {name: [] for name in ("state", "onset", "offset", "smooth")}
+        component_gradient_norms = {
+            name: [] for name in ("state", "onset", "offset", "smooth", "contrastive")
+        }
         clipping_count = 0
         eligible_points = 0.0
         positive_points = 0.0
@@ -816,6 +842,8 @@ def _train_state_epochs(
         importance_sum = 0.0
         importance_squared_sum = 0.0
         importance_max = 0.0
+        contrastive_pair_count = 0.0
+        contrastive_negative_pair_count = 0.0
         actual_samples = 0
         learning_rate_sum = 0.0
         learning_rate_last = float(optimizer.param_groups[0]["lr"])
@@ -839,15 +867,29 @@ def _train_state_epochs(
                 output = model(tensors)
                 loss, components = criterion(output, tensors)
                 loss_sums["total"] += float(loss.detach().cpu())
-                for name in ("state", "onset", "offset", "smooth"):
+                for name in ("state", "onset", "offset", "smooth", "contrastive"):
                     value = components.get(name)
                     if value is not None:
                         loss_sums[name] += float(value.detach().cpu())
+                contrastive_pair_count += float(
+                    components.get(
+                        "contrastive_active_pairs", torch.zeros((), device=device)
+                    )
+                    .detach()
+                    .cpu()
+                )
+                contrastive_negative_pair_count += float(
+                    components.get(
+                        "contrastive_negative_pairs", torch.zeros((), device=device)
+                    )
+                    .detach()
+                    .cpu()
+                )
                 if step <= int(config["training"].get("gradient_probe_batches", 8)):
                     parameters = [
                         parameter for parameter in model.parameters() if parameter.requires_grad
                     ]
-                    for name in ("state", "onset", "offset", "smooth"):
+                    for name in ("state", "onset", "offset", "smooth", "contrastive"):
                         component = components.get(name)
                         if component is None or not component.requires_grad:
                             continue
@@ -936,6 +978,9 @@ def _train_state_epochs(
             "onset_loss_mean": loss_sums["onset"] / max(batch_count, 1),
             "offset_loss_mean": loss_sums["offset"] / max(batch_count, 1),
             "smooth_loss_mean": loss_sums["smooth"] / max(batch_count, 1),
+            "contrastive_loss_mean": loss_sums["contrastive"] / max(batch_count, 1),
+            "contrastive_active_pairs": float(contrastive_pair_count),
+            "contrastive_negative_pairs": float(contrastive_negative_pair_count),
             "gradient_norm_mean": float(gradient_array.mean()) if len(gradient_array) else 0.0,
             "gradient_norm_p50": float(np.quantile(gradient_array, 0.50))
             if len(gradient_array)
@@ -1667,6 +1712,12 @@ def infer_state_windows(
                     .numpy()[mask],
                     "gyro_gate": output["gyro_gate"][sample].float().cpu().numpy()[mask],
                     "invariant_gate": output["invariant_gate"][sample].float().cpu().numpy()[mask],
+                    "modality_quality_gate": output.get(
+                        "modality_quality_gate", output["statistics_gate"]
+                    )[sample]
+                    .float()
+                    .cpu()
+                    .numpy()[mask],
                     "ppg_valid_fraction": output["ppg_valid_fraction"][sample]
                     .float()
                     .cpu()
@@ -1680,6 +1731,11 @@ def infer_state_windows(
                     "stacking_partition": int(stacking_partition),
                 }
             )
+            hidden = output.get("state_hidden")
+            if hidden is not None:
+                hidden_values = hidden[sample].float().cpu().numpy()[mask]
+                for index in range(hidden_values.shape[1]):
+                    frame[f"state_hidden_{index:03d}"] = hidden_values[:, index]
             statistics = tensors["statistics"][sample].float().cpu().numpy()[mask]
             for index, name in enumerate(statistic_names):
                 frame[name] = statistics[:, index]
@@ -1708,6 +1764,7 @@ def _gate_diagnostics(windows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, An
         "gyro_valid_fraction",
         "gyro_gate",
         "invariant_gate",
+        "modality_quality_gate",
         "ppg_valid_fraction",
         "statistics_missing_fraction",
         "missing_fraction",
@@ -2544,7 +2601,7 @@ def build_candidates_v4(
     )
     calibration_checks = {
         "ece": metrics["ece"] <= float(config["promotion_gate"]["maximum_state_ece"]),
-        "brier": metrics["brier"] < metrics["uncalibrated_brier"],
+        "brier": metrics["brier"] <= metrics["uncalibrated_brier"] + 1e-12,
         "prevalence_ratio": metrics["mean_probability_to_prevalence"]
         <= float(config["promotion_gate"]["maximum_state_prevalence_ratio"]),
     }
@@ -2619,6 +2676,7 @@ def build_candidates_v4(
             "state_only_nms_iou_threshold": float(state_only_point["nms_iou_threshold"]),
             **state_only_hand,
             "state_calibration_gate_passed": bool(all(calibration_checks.values())),
+            "state_calibration_method": calibrator.method,
         }
     )
     candidate_gate_passed = candidate_metrics["candidate_recall"] >= float(
@@ -3893,10 +3951,15 @@ def train_verifier_crossfit_v4(
     inputs: V4Inputs,
 ) -> None:
     run.require_stage("PROPOSALS_COMPLETE")
-    if run.payload.get("downstream_mode") in {"state_only", "pooled_logistic", "pooled_heads"}:
+    if run.payload.get("downstream_mode") in {
+        "state_only",
+        "pooled_logistic",
+        "pooled_heads",
+        "pooled_deep_only",
+    }:
         raise RuntimeError(
             "Fold-local verifier training is disabled for the time-constrained route; "
-            "pooled Logistic is fitted only from cross-fitted outer OOF predictions"
+            "pooled verifier heads are fitted only from cross-fitted outer OOF predictions"
         )
     candidate_metrics = json.loads(
         (run.root / "decoder" / "candidate_metrics.json").read_text(encoding="utf-8")
@@ -4630,6 +4693,10 @@ def _train_endpoint_model(
                 "start_weight": torch.from_numpy(features.start_weight[indices]).to(device),
                 "end_weight": torch.from_numpy(features.end_weight[indices]).to(device),
             }
+            if getattr(features, "proposal_condition", None) is not None:
+                batch["proposal_condition"] = torch.from_numpy(
+                    features.proposal_condition[indices]
+                ).to(device)
             output = model(batch)
             loss, _ = endpoint_loss(output, batch)
             epoch_loss_total += loss.detach()
@@ -4722,6 +4789,10 @@ def _select_boundary_epoch(
                 "start_weight": torch.from_numpy(fit_features.start_weight[indices]).to(device),
                 "end_weight": torch.from_numpy(fit_features.end_weight[indices]).to(device),
             }
+            if getattr(fit_features, "proposal_condition", None) is not None:
+                batch["proposal_condition"] = torch.from_numpy(
+                    fit_features.proposal_condition[indices]
+                ).to(device)
             output = model(batch)
             loss, _ = endpoint_loss(output, batch)
             optimizer.zero_grad(set_to_none=True)
@@ -4867,6 +4938,10 @@ def _infer_endpoint_model(model, features, config: dict[str, Any]):
             "start_mask": torch.from_numpy(features.start_mask[selected]).to(device),
             "end_mask": torch.from_numpy(features.end_mask[selected]).to(device),
         }
+        if getattr(features, "proposal_condition", None) is not None:
+            batch["proposal_condition"] = torch.from_numpy(
+                features.proposal_condition[selected]
+            ).to(device)
         output = model(batch)
         start_offset, start_entropy = local_soft_argmax(
             output["start_logit"],
@@ -5387,6 +5462,7 @@ def select_v4_pipeline(
         "state_only",
         "pooled_logistic",
         "pooled_heads",
+        "pooled_deep_only",
     }:
         windows = pd.read_parquet(run.root / "oof" / "window_predictions.parquet")
         proposals = pd.read_parquet(run.root / "oof" / "proposals_labeled.parquet")
@@ -5883,12 +5959,282 @@ def _fit_duration_prior_from_truth(
     )
 
 
+def _prepare_pooled_nested_state_oof(
+    inputs: V4Inputs,
+    outer_logits: list[pd.DataFrame],
+    outer_state_epochs: list[dict[int, int]],
+    config: dict[str, Any],
+    final_root: Path,
+    *,
+    resume: bool,
+    input_identity_sha256: str,
+) -> tuple[list[PooledNestedStateOOF], list[Path]]:
+    all_subjects = set(inputs.anchors["subject_key"].astype(str))
+    state_seeds = configured_state_seeds(config)
+    if len(outer_state_epochs) != len(outer_logits):
+        raise ValueError("Pooled nested state epoch choices must align with outer folds")
+    epoch_cap = min(
+        int(config["training"]["max_epochs"]),
+        int(config["training"].get("pooled_head_nested_state_epochs", 5)),
+    )
+    if epoch_cap <= 0:
+        raise ValueError("Pooled nested state training requires positive fixed epochs")
+    runtime_sha256 = runtime_source_identity(Path(__file__).resolve().parents[1])["sha256"]
+    results: list[PooledNestedStateOOF] = []
+    artifacts: list[Path] = []
+    for prediction_fold, fold_logits in enumerate(outer_logits):
+        epochs_by_seed = {
+            seed: min(epoch_cap, int(outer_state_epochs[prediction_fold][seed]))
+            for seed in state_seeds
+        }
+        if any(epochs <= 0 for epochs in epochs_by_seed.values()):
+            raise ValueError("Pooled nested state selected epochs must be positive")
+        excluded_subjects = set(fold_logits["subject_key"].astype(str))
+        expected_excluded = {
+            subject
+            for subject, fold in inputs.subject_folds.items()
+            if fold == prediction_fold and subject in all_subjects
+        }
+        if excluded_subjects != expected_excluded:
+            raise RuntimeError("Pooled nested state outer fold subjects are misaligned")
+        training_subjects = all_subjects - excluded_subjects
+        local_inputs = V4Inputs(
+            anchors=inputs.anchors[
+                inputs.anchors["subject_key"].astype(str).isin(training_subjects)
+            ].copy(),
+            segments=inputs.segments[
+                inputs.segments["subject_key"].astype(str).isin(training_subjects)
+            ].copy(),
+            events=inputs.events[
+                inputs.events["subject_key"].astype(str).isin(training_subjects)
+            ].copy(),
+            statistics=inputs.statistics[
+                inputs.statistics["subject_key"].astype(str).isin(training_subjects)
+            ].copy(),
+            subject_folds={
+                subject: fold
+                for subject, fold in inputs.subject_folds.items()
+                if subject in training_subjects
+            },
+        )
+        partitions = stacking_partitions(
+            training_subjects,
+            min(3, len(training_subjects)),
+            int(config["training"]["random_seed"]) + 610_000 + prediction_fold,
+        )
+        predicted: list[pd.DataFrame] = []
+        lineage: list[dict[str, Any]] = []
+        for partition in sorted(set(partitions.values())):
+            prediction_subjects = {
+                subject for subject, value in partitions.items() if value == partition
+            }
+            model_subjects = training_subjects - prediction_subjects
+            assert_disjoint_subjects(
+                training_subjects=model_subjects,
+                prediction_subjects=prediction_subjects,
+                globally_excluded_subjects=excluded_subjects,
+            )
+            root = (
+                final_root
+                / "pooled_heads"
+                / "nested_state"
+                / f"holdout_{prediction_fold}"
+                / f"partition_{partition}"
+            )
+            prediction_path = root / "window_logits.parquet"
+            lineage_path = root / "lineage.json"
+            scaler_path = root / "statistics_scaler.json"
+            normalization_path = root / "sensor_normalization.json"
+            checkpoint_paths = {seed: root / f"seed_{seed}.pt" for seed in state_seeds}
+            cache_payload = {
+                "protocol": "pooled_head_excluded_state_oof_v1",
+                "prediction_fold": prediction_fold,
+                "partition": partition,
+                "training_subjects": sorted(model_subjects),
+                "prediction_subjects": sorted(prediction_subjects),
+                "globally_excluded_subjects": sorted(excluded_subjects),
+                "state_seeds": state_seeds,
+                "epochs_by_seed": {str(seed): epochs for seed, epochs in epochs_by_seed.items()},
+                "model": config["model"],
+                "sequence": config["sequence"],
+                "training": config["training"],
+                "loss": config["loss"],
+                "runtime_sha256": runtime_sha256,
+                "trainer_sha256": sha256_file(Path(__file__)),
+                "input_identity_sha256": input_identity_sha256,
+            }
+            cache_sha256 = hashlib.sha256(
+                json.dumps(cache_payload, sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            if resume and lineage_path.is_file():
+                saved = json.loads(lineage_path.read_text(encoding="utf-8"))
+                if saved.get("cache_sha256") != cache_sha256:
+                    raise RuntimeError("Pooled nested state cache identity changed")
+                paths = {
+                    "window_logits": prediction_path,
+                    "statistics_scaler": scaler_path,
+                    "sensor_normalization": normalization_path,
+                    **{f"seed_{seed}": path for seed, path in checkpoint_paths.items()},
+                }
+                if any(
+                    not path.is_file() or sha256_file(path) != saved["artifact_sha256"].get(name)
+                    for name, path in paths.items()
+                ):
+                    raise RuntimeError("Pooled nested state cache artifact changed")
+                predicted.append(pd.read_parquet(prediction_path))
+                lineage.extend(saved["model_lineage"])
+                artifacts.extend((*paths.values(), lineage_path))
+                continue
+            scaler, transformed = _fit_scaler_and_transform(local_inputs, model_subjects)
+            normalization = _compute_sensor_normalization(
+                local_inputs.segments, model_subjects, config
+            )
+            write_json_atomic(scaler_path, scaler.to_json())
+            save_normalization(normalization, normalization_path)
+            artifacts.extend((scaler_path, normalization_path))
+            training_rows = transformed[
+                transformed["subject_key"].astype(str).isin(model_subjects)
+            ].reset_index(drop=True)
+            prediction_rows = transformed[
+                transformed["subject_key"].astype(str).isin(prediction_subjects)
+            ].reset_index(drop=True)
+            training_events = local_inputs.events[
+                local_inputs.events["subject_key"].astype(str).isin(model_subjects)
+            ]
+            prediction_events = local_inputs.events[
+                local_inputs.events["subject_key"].astype(str).isin(prediction_subjects)
+            ]
+            prediction_dataset = _make_dataset(
+                prediction_rows, local_inputs, prediction_events, normalization,
+                config, training=False, seed=int(config["training"]["random_seed"]),
+            )
+            seed_predictions: list[pd.DataFrame] = []
+            partition_lineage: list[dict[str, Any]] = []
+            for seed in state_seeds:
+                epochs = epochs_by_seed[seed]
+                checkpoint_path = checkpoint_paths[seed]
+                model = _build_seeded_state_model(config, seed)
+                dataset = _make_dataset(
+                    training_rows, local_inputs, training_events, normalization,
+                    config, training=True, seed=seed,
+                )
+                _train_state_with_checkpoints(
+                    model, dataset, config, epochs=epochs, seed=seed,
+                    subjects={"train": model_subjects, "holdout": prediction_subjects},
+                    checkpoint_path=root / f"retrain_seed_{seed}_last.pt",
+                    resume=resume,
+                    progress_label=(
+                        f"pooled state holdout={prediction_fold} partition={partition} seed={seed}"
+                    ),
+                )
+                _save_torch_atomic(
+                    checkpoint_path,
+                    {
+                        "model": model.state_dict(),
+                        "model_config": config["model"],
+                        "epochs": epochs,
+                        "seed": seed,
+                        "training_subjects": sorted(model_subjects),
+                        "prediction_subjects": sorted(prediction_subjects),
+                        "globally_excluded_subjects": sorted(excluded_subjects),
+                        "parent_artifact_sha256": {
+                            "statistics_scaler": sha256_file(scaler_path),
+                            "sensor_normalization": sha256_file(normalization_path),
+                        },
+                    },
+                )
+                seed_predictions.append(
+                    infer_state_windows(
+                        model, prediction_dataset, config, stacking_partition=partition,
+                        progress_label=(
+                            f"pooled state holdout={prediction_fold} partition={partition} inference"
+                        ),
+                    )
+                )
+                partition_lineage.append(
+                    {
+                        "seed": seed,
+                        "epochs": epochs,
+                        "training_subjects": sorted(model_subjects),
+                        "prediction_subjects": sorted(prediction_subjects),
+                        "globally_excluded_subjects": sorted(excluded_subjects),
+                        "checkpoint_sha256": sha256_file(checkpoint_path),
+                    }
+                )
+                artifacts.append(checkpoint_path)
+            output = _average_state_prediction_frames(seed_predictions)
+            if set(output["subject_key"].astype(str)) != prediction_subjects:
+                raise RuntimeError("Pooled nested state prediction subjects are incomplete")
+            write_parquet_atomic(prediction_path, output)
+            write_json_atomic(
+                lineage_path,
+                {
+                    "cache_sha256": cache_sha256,
+                    "model_lineage": partition_lineage,
+                    "artifact_sha256": {
+                        "window_logits": sha256_file(prediction_path),
+                        "statistics_scaler": sha256_file(scaler_path),
+                        "sensor_normalization": sha256_file(normalization_path),
+                        **{
+                            f"seed_{seed}": sha256_file(path)
+                            for seed, path in checkpoint_paths.items()
+                        },
+                    },
+                },
+            )
+            predicted.append(output)
+            lineage.extend(partition_lineage)
+            artifacts.extend((prediction_path, lineage_path))
+        combined, _ = deduplicate_consistent_timeline(
+            pd.concat(predicted, ignore_index=True)
+        )
+        if set(combined["subject_key"].astype(str)) != training_subjects:
+            raise RuntimeError("Pooled nested state OOF does not cover all training subjects")
+        results.append(PooledNestedStateOOF(prediction_fold, combined, tuple(lineage)))
+    return results, artifacts
+
+
+def _verify_pooled_outer_state_lineage(
+    fold_roots: list[Path], inputs: V4Inputs, state_seeds: list[int]
+) -> None:
+    all_subjects = set(inputs.anchors["subject_key"].astype(str))
+    for fold, root in enumerate(fold_roots):
+        excluded = {
+            subject
+            for subject, subject_fold in inputs.subject_folds.items()
+            if subject_fold == fold and subject in all_subjects
+        }
+        training = all_subjects - excluded
+        state_root = root / "outer" / "state"
+        scaler_path = state_root / "statistics_scaler.json"
+        normalization_path = state_root / "sensor_normalization.json"
+        scaler = json.loads(scaler_path.read_text(encoding="utf-8"))
+        if set(scaler.get("training_subjects", [])) != training:
+            raise RuntimeError(f"Outer fold {fold} state scaler includes prediction subjects")
+        expected_parents = {
+            "statistics_scaler": sha256_file(scaler_path),
+            "sensor_normalization": sha256_file(normalization_path),
+        }
+        for seed in state_seeds:
+            checkpoint = torch.load(
+                state_root / f"state_seed_{seed}.pt", map_location="cpu", weights_only=True
+            )
+            if (
+                set(checkpoint.get("training_subjects", [])) != training
+                or set(checkpoint.get("prediction_subjects", [])) != excluded
+                or set(checkpoint.get("globally_excluded_subjects", [])) != excluded
+                or checkpoint.get("parent_artifact_sha256") != expected_parents
+            ):
+                raise RuntimeError(f"Outer fold {fold} state lineage is not subject-isolated")
+
+
 def _build_isolated_pooled_fold_data(
     outer_logits: list[pd.DataFrame],
     outer_windows: list[pd.DataFrame],
     outer_truth: list[pd.DataFrame],
     outer_ignore: list[pd.DataFrame],
     config: dict[str, Any],
+    nested_state_oof: list[PooledNestedStateOOF] | None = None,
 ) -> list[PooledFoldProposalData]:
     fold_count = len(outer_windows)
     if not (
@@ -5896,17 +6242,64 @@ def _build_isolated_pooled_fold_data(
         and len(outer_logits) == fold_count
         and len(outer_truth) == fold_count
         and len(outer_ignore) == fold_count
+        and (nested_state_oof is None or len(nested_state_oof) == fold_count)
     ):
         raise ValueError("Pooled fold inputs must contain aligned data for at least two folds")
     from bme_eating.calibration_v4 import PlattCalibration
 
+    if nested_state_oof is None and config.get("hierarchical", {}).get("downstream_mode") != (
+        "state_only"
+    ):
+        raise RuntimeError("Pooled learned heads require fully excluded nested state OOF")
+
     results: list[PooledFoldProposalData] = []
+    outer_subject_sets = [set(frame["subject_key"].astype(str)) for frame in outer_logits]
+    for prediction_fold, subjects in enumerate(outer_subject_sets):
+        if not subjects or any(
+            subjects & other
+            for other_fold, other in enumerate(outer_subject_sets)
+            if other_fold != prediction_fold
+        ):
+            raise RuntimeError("Pooled outer fold subjects must be nonempty and disjoint")
     statistic_columns = [f"stat_{name}" for name in STATS_FEATURE_COLUMNS]
     for prediction_fold in range(fold_count):
         training_folds = [fold for fold in range(fold_count) if fold != prediction_fold]
-        training_logits = pd.concat(
-            [outer_logits[fold] for fold in training_folds], ignore_index=True
+        excluded_subjects = set(outer_logits[prediction_fold]["subject_key"].astype(str))
+        training_subjects_expected = set().union(
+            *(set(outer_logits[fold]["subject_key"].astype(str)) for fold in training_folds)
         )
+        nested = None if nested_state_oof is None else nested_state_oof[prediction_fold]
+        if nested is None:
+            training_logits = pd.concat(
+                [outer_logits[fold] for fold in training_folds], ignore_index=True
+            )
+        else:
+            if nested.prediction_fold != prediction_fold:
+                raise RuntimeError("Pooled nested state fold identity is misaligned")
+            training_logits = nested.windows
+            if set(training_logits["subject_key"].astype(str)) != training_subjects_expected:
+                raise RuntimeError("Pooled nested state OOF does not cover its training subjects")
+            if not nested.lineage:
+                raise RuntimeError("Pooled nested state OOF lacks upstream model lineage")
+            for artifact in nested.lineage:
+                training_subjects = set(artifact["training_subjects"])
+                prediction_subjects = set(artifact["prediction_subjects"])
+                globally_excluded = set(artifact["globally_excluded_subjects"])
+                if (
+                    training_subjects & excluded_subjects
+                    or prediction_subjects & excluded_subjects
+                    or training_subjects & prediction_subjects
+                ):
+                    raise RuntimeError("Pooled nested state lineage includes excluded subjects")
+                if (
+                    globally_excluded != excluded_subjects
+                    or training_subjects | prediction_subjects != training_subjects_expected
+                ):
+                    raise RuntimeError("Pooled nested state lineage has incomplete isolation")
+            if set().union(*(set(item["prediction_subjects"]) for item in nested.lineage)) != (
+                training_subjects_expected
+            ):
+                raise RuntimeError("Pooled nested state lineage does not cover training predictions")
         calibration_rows = training_logits[
             training_logits["state_loss_mask"].to_numpy(dtype=float) > 0
         ]
@@ -5925,8 +6318,16 @@ def _build_isolated_pooled_fold_data(
             [outer_ignore[fold] for fold in training_folds], ignore_index=True
         )
         prior = _fit_duration_prior_from_truth(training_truth, config)
+        calibrated_training = _apply_state_calibration_to_windows(training_logits, calibrator)
         calibrated_windows = [
-            _apply_state_calibration_to_windows(frame, calibrator) for frame in outer_windows
+            _apply_state_calibration_to_windows(outer_windows[fold], calibrator)
+            if fold == prediction_fold
+            else calibrated_training[
+                calibrated_training["subject_key"].astype(str).isin(
+                    set(outer_logits[fold]["subject_key"].astype(str))
+                )
+            ].reset_index(drop=True)
+            for fold in range(fold_count)
         ]
         training_windows = pd.concat(
             [calibrated_windows[fold] for fold in training_folds], ignore_index=True
@@ -6017,12 +6418,26 @@ def _build_isolated_pooled_fold_data(
                     "training_subjects": sorted(training_subjects),
                     "prediction_subjects": sorted(prediction_subjects),
                     "globally_excluded_subjects": sorted(prediction_subjects),
+                    "nested_state_lineage": [] if nested is None else list(nested.lineage),
+                    "upstream_isolation": (
+                        "state_only_joint_tuning_development"
+                        if nested is None
+                        else "fully_excluded_nested_state_oof_v1"
+                    ),
                     "state_calibration": calibrator.to_json(),
-                    "state_calibration_source": "other_outer_folds_only",
+                    "state_calibration_source": (
+                        "other_outer_folds_development"
+                        if nested is None
+                        else "fully_excluded_nested_training_oof"
+                    ),
                     "duration_prior": prior.to_json(),
                     "duration_prior_source": "other_outer_fold_truth_only",
                     "decoder": decoder_config,
-                    "decoder_source": "other_outer_fold_oof_only",
+                    "decoder_source": (
+                        "other_outer_folds_development"
+                        if nested is None
+                        else "fully_excluded_nested_training_oof"
+                    ),
                     "decoder_search_sha256": _dataframe_sha256(
                         decoder_search,
                         sorted(decoder_search.columns),
@@ -7137,15 +7552,19 @@ def train_hierarchical_final_v4(
     state_only_downstream = downstream_mode == "state_only"
     pooled_logistic_downstream = downstream_mode == "pooled_logistic"
     pooled_heads_downstream = downstream_mode == "pooled_heads"
+    pooled_deep_only_downstream = downstream_mode == "pooled_deep_only"
+    pooled_learned_heads_downstream = pooled_heads_downstream or pooled_deep_only_downstream
     fold_state_only_downstream = (
-        state_only_downstream or pooled_logistic_downstream or pooled_heads_downstream
+        state_only_downstream
+        or pooled_logistic_downstream
+        or pooled_learned_heads_downstream
     )
     expected_verifier_seeds = (
         [] if fold_state_only_downstream else [int(value) for value in config["verifier"]["seeds"]]
     )
     deployment_verifier_seeds = (
         [int(value) for value in config["verifier"]["seeds"]]
-        if pooled_heads_downstream or not fold_state_only_downstream
+        if pooled_learned_heads_downstream or not fold_state_only_downstream
         else []
     )
     for fold, root in enumerate(fold_roots):
@@ -7182,7 +7601,7 @@ def train_hierarchical_final_v4(
             root / "evaluation" / "truth_events.parquet",
             root / "evaluation" / "ignore_events.parquet",
             root / "evaluation" / "truth_ignore_snapshot.json",
-            *(root / "outer" / f"state_seed_{seed}.pt" for seed in expected_state_seeds),
+            *(root / "outer" / "state" / f"state_seed_{seed}.pt" for seed in expected_state_seeds),
         ]
         if not fold_state_only_downstream:
             required_parent_paths.extend(
@@ -7277,6 +7696,14 @@ def train_hierarchical_final_v4(
             existing_manifest["resume_identity"] = resume_identity
             write_json_atomic(manifest_path, existing_manifest)
         if existing_manifest["stage"] == "COMPLETE":
+            if (
+                pooled_logistic_downstream or pooled_learned_heads_downstream
+            ) and existing_manifest.get("pooled_head_training_protocol") != (
+                POOLED_HEAD_TRAINING_PROTOCOL
+            ):
+                raise RuntimeError(
+                    "Existing pooled final lacks fully excluded nested state OOF evidence"
+                )
             return final_root
     else:
         final_root.mkdir(parents=True, exist_ok=True)
@@ -7306,6 +7733,8 @@ def train_hierarchical_final_v4(
         raise RuntimeError(
             f"V4 truth/ignore contract changed: expected {expected_partition}, got {actual_partition}"
         )
+    if fold_state_only_downstream:
+        _verify_pooled_outer_state_lineage(fold_roots, inputs, expected_state_seeds)
     fold_selections = [
         json.loads((root / "selection" / "selected_pipeline.json").read_text(encoding="utf-8"))
         for root in fold_roots
@@ -7336,6 +7765,10 @@ def train_hierarchical_final_v4(
         for seed, values in epochs_by_seed.items():
             values.append(int(payload["fixed_outer_epoch_by_seed"][str(seed)]))
     fixed_epochs = {seed: int(np.median(values)) for seed, values in epochs_by_seed.items()}
+    outer_state_epochs = [
+        {seed: values[fold] for seed, values in epochs_by_seed.items()}
+        for fold in range(len(fold_roots))
+    ]
     artifacts: list[Path] = []
     if fold_state_only_downstream:
         time_constrained_evidence_path = final_root / "time_constrained_protocol.json"
@@ -7358,9 +7791,15 @@ def train_hierarchical_final_v4(
                         "inside its training subjects with a separate selector split."
                     ),
                     (
-                        "Fold-local verifier and boundary stages are disabled; pooled Logistic, "
-                        "Deep verifier, and Boundary heads are cross-fitted after all outer folds."
-                        if pooled_heads_downstream
+                        (
+                            "Fold-local verifier and boundary stages are disabled; pooled Deep "
+                            "verifier and Boundary heads are cross-fitted after all outer folds."
+                            if pooled_deep_only_downstream
+                            else "Fold-local verifier and boundary stages are disabled; pooled "
+                            "Logistic, Deep verifier, and Boundary heads are cross-fitted after "
+                            "all outer folds."
+                        )
+                        if pooled_learned_heads_downstream
                         else (
                             "Fold-local verifier and boundary stages are disabled; a pooled "
                             "subject-crossfit Logistic verifier is evaluated after all outer folds."
@@ -7534,7 +7973,7 @@ def train_hierarchical_final_v4(
                     ["subject_key", "session_id", "event_id", "start_ms", "end_ms"],
                 ),
                 "state_checkpoint_sha256": {
-                    str(seed): sha256_file(root / "outer" / f"state_seed_{seed}.pt")
+                    str(seed): sha256_file(root / "outer" / "state" / f"state_seed_{seed}.pt")
                     for seed in expected_state_seeds
                 },
                 "verifier_checkpoint_sha256": {
@@ -7598,7 +8037,7 @@ def train_hierarchical_final_v4(
     boundary_positive_parts = []
     deployment_parts: list[pd.DataFrame] = []
     deployment_feature_parts: list[ProposalFeatureBatchV4] = []
-    if pooled_logistic_downstream or pooled_heads_downstream:
+    if pooled_logistic_downstream or pooled_learned_heads_downstream:
         for fold, (windows, evaluable, ignored) in enumerate(
             zip(window_parts, truth_parts, ignore_parts)
         ):
@@ -7638,12 +8077,28 @@ def train_hierarchical_final_v4(
     )
     pooled_fold_data: list[PooledFoldProposalData] = []
     if fold_state_only_downstream:
+        nested_state_oof = None
+        if pooled_logistic_downstream or pooled_learned_heads_downstream:
+            input_identity_sha256 = hashlib.sha256(
+                json.dumps(identity["input_hashes"], sort_keys=True).encode("utf-8")
+            ).hexdigest()
+            nested_state_oof, nested_artifacts = _prepare_pooled_nested_state_oof(
+                inputs,
+                outer_logits_parts,
+                outer_state_epochs,
+                config,
+                final_root,
+                resume=resume,
+                input_identity_sha256=input_identity_sha256,
+            )
+            artifacts.extend(nested_artifacts)
         pooled_fold_data = _build_isolated_pooled_fold_data(
             outer_logits_parts,
             window_parts,
             truth_parts,
             ignore_parts,
             config,
+            nested_state_oof=nested_state_oof,
         )
         calibration_frame, prediction_features = _pooled_prediction_frame_and_features(
             pooled_fold_data
@@ -7869,6 +8324,109 @@ def train_hierarchical_final_v4(
             logistic_path = final_root / "logistic_verifier.json"
             write_json_atomic(logistic_path, logistic.to_json())
             artifacts.append(logistic_path)
+    elif pooled_deep_only_downstream:
+        if set(calibration_frame["is_positive"].astype(int).unique()) != {0, 1}:
+            raise RuntimeError(
+                "Pooled Deep-only requires positive and negative outer OOF proposals"
+            )
+        verifier_features = _concatenate_proposal_features(proposal_feature_parts)
+        _assert_proposal_feature_alignment(
+            verifier_features,
+            calibration_frame,
+            context="Pooled Deep-only outer OOF",
+        )
+        baseline_scores = calibration_frame.copy()
+        baseline_scores["state_score"] = baseline_scores["generator_score"]
+        baseline_scores["final_score"] = baseline_scores["generator_score"]
+        current_diagnostics, _ = _pooled_head_diagnostics(
+            baseline_scores,
+            "final_score",
+            pooled_truth,
+            pooled_windows,
+            pooled_ignore,
+            config,
+        )
+        pooled_verifier_parent_sha256 = {
+            "state_calibration": sha256_file(state_calibration_path),
+            "duration_prior": sha256_file(prior_path),
+            "decoder_search": sha256_file(decoder_search_path),
+            "selected_decoder": sha256_file(selected_decoder_path),
+            "truth_snapshots": hashlib.sha256(
+                json.dumps(
+                    [value["truth_ignore_snapshot_sha256"] for value in pooled_evidence],
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+        }
+        (
+            deep_scores,
+            deployment_calibration,
+            pooled_deep_report,
+            fixed_deep_epochs,
+            deep_artifacts,
+        ) = _fit_pooled_deep_crossfit(
+            pooled_fold_data,
+            calibration_frame,
+            pooled_truth,
+            pooled_ignore,
+            pooled_windows,
+            config,
+            final_root,
+            resume=resume,
+            parent_artifact_sha256=pooled_verifier_parent_sha256,
+        )
+        artifacts.extend(deep_artifacts)
+        verifier_epoch_by_seed.update(fixed_deep_epochs)
+        deep_diagnostics, _ = _pooled_head_diagnostics(
+            deep_scores,
+            "final_score",
+            pooled_truth,
+            pooled_windows,
+            pooled_ignore,
+            config,
+        )
+        deep_promotion = _pooled_head_promotion(
+            current_diagnostics,
+            deep_diagnostics,
+            minimum_f1_gain=float(config["promotion_gate"]["minimum_verifier_f1_improvement"]),
+            config=config,
+        )
+        pooled_deep_report.update(
+            {
+                "baseline_kind": "state_only_diagnostic",
+                "baseline": current_diagnostics,
+                "deep": deep_diagnostics,
+                "promotion": deep_promotion,
+            }
+        )
+        deep_report_path = final_root / "deep_crossfit.json"
+        deep_scores_path = final_root / "deep_crossfit_scores.parquet"
+        write_json_atomic(deep_report_path, pooled_deep_report)
+        write_parquet_atomic(deep_scores_path, deep_scores)
+        artifacts.extend((deep_report_path, deep_scores_path))
+        if not bool(deep_promotion["passed"]):
+            raise RuntimeError(
+                "Deep-only promotion gate failed; no Logistic or state-only fallback is allowed"
+            )
+        if deployment_features is None or deployment_frame.empty:
+            raise RuntimeError("Pooled Deep-only deployment features are missing")
+        verifier_kind = "deep"
+        pooled_scores = deep_scores
+        point = deep_diagnostics["point"]
+        proposal_calibration_path = final_root / "proposal_calibration.json"
+        write_json_atomic(proposal_calibration_path, deployment_calibration.to_json())
+        artifacts.append(proposal_calibration_path)
+        artifacts.extend(
+            _train_pooled_deep_deployment(
+                deployment_features,
+                deployment_frame,
+                config,
+                final_root,
+                epochs_by_seed=fixed_deep_epochs,
+                resume=resume,
+                parent_artifact_sha256=pooled_verifier_parent_sha256,
+            )
+        )
     else:
         if set(calibration_frame["is_positive"].astype(int).unique()) != {0, 1}:
             raise RuntimeError(
@@ -7978,11 +8536,18 @@ def train_hierarchical_final_v4(
         "decoder_config": selected_decoder,
         "masking_protocol": "zero_mask_layernorm_v1",
         "candidate_budget_scope": "session",
-        "pooled_head_protocol": POOLED_HEAD_PROTOCOL if pooled_heads_downstream else None,
+        "pooled_head_protocol": (
+            POOLED_HEAD_PROTOCOL if pooled_learned_heads_downstream else None
+        ),
+        "pooled_head_training_protocol": (
+            POOLED_HEAD_TRAINING_PROTOCOL
+            if pooled_logistic_downstream or pooled_learned_heads_downstream
+            else None
+        ),
         "evidence_class": "development_stress_only",
         "meta_crossfit_protocol": (
             POOLED_HEAD_PROTOCOL
-            if pooled_heads_downstream
+            if pooled_learned_heads_downstream
             else "outer_fold_subject_disjoint_logistic_crossfit_v1"
             if pooled_logistic_downstream
             else "outer_subject_oof_single_holdout_tuning_v1"
@@ -8007,7 +8572,7 @@ def train_hierarchical_final_v4(
         "pooled_deep_promotion": pooled_deep_report,
         "verifier_feature_calibration_source": (
             "outer_fold_crossfit_logits_only"
-            if pooled_heads_downstream and verifier_kind == "deep"
+            if pooled_learned_heads_downstream and verifier_kind == "deep"
             else "outer_fold_oof_calibration"
             if pooled_logistic_downstream
             else "pooled_outer_oof_calibration"
@@ -8039,7 +8604,7 @@ def train_hierarchical_final_v4(
 
     pooled_boundary_fixed_epochs: dict[int, int] = {}
     pooled_boundary_positive: pd.DataFrame | None = None
-    if pooled_heads_downstream:
+    if pooled_learned_heads_downstream:
         accepted = _accepted_from_point(pooled_scores, point, "final_score")
         pooled_boundary_positive = _attach_truth_boundaries(
             pooled_scores[pooled_scores["max_iou"] > 0.25], pooled_truth
@@ -8254,7 +8819,7 @@ def train_hierarchical_final_v4(
     boundary_score_files_complete = all(
         (root / "outer" / "boundary_scores.parquet").is_file() for root in fold_roots
     )
-    if not pooled_heads_downstream:
+    if not pooled_learned_heads_downstream:
         selection["boundary_selection_diagnostics"] = {
             "all_folds_enabled": all_fold_boundary_enabled,
             "score_files_complete": boundary_score_files_complete,
@@ -8263,7 +8828,7 @@ def train_hierarchical_final_v4(
             "covered_count": 0,
         }
     if (
-        not pooled_heads_downstream
+        not pooled_learned_heads_downstream
         and all_fold_boundary_enabled
         and boundary_score_files_complete
     ):
@@ -8367,7 +8932,7 @@ def train_hierarchical_final_v4(
                     }
                 )
 
-    if selection["boundary_enabled"] and pooled_heads_downstream:
+    if selection["boundary_enabled"] and pooled_learned_heads_downstream:
         if pooled_boundary_positive is None or not pooled_boundary_fixed_epochs:
             raise RuntimeError("Selected pooled Boundary is missing its crossfit evidence")
         if deployment_frame.empty:
@@ -8558,6 +9123,7 @@ def train_hierarchical_final_v4(
         "stage": "COMPLETE",
         "run_name": run_name,
         "protocol_version": PROTOCOL_VERSION,
+        "pooled_head_training_protocol": selection["pooled_head_training_protocol"],
         "blocked_predecessors": list(BLOCKED_PREDECESSORS),
         "state_seeds": [int(value) for value in config["final_training"]["state_seeds"]],
         "fixed_state_epoch_by_seed": {str(seed): epoch for seed, epoch in fixed_epochs.items()},

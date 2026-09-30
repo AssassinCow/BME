@@ -39,7 +39,9 @@ def partition_evaluation_events(
     missing = required - set(events.columns)
     if missing:
         raise ValueError(f"Events are missing columns: {sorted(missing)}")
-    selected = events[events["subject_key"].isin(subject_keys) & events["valid_duration"]]
+    selected = events[
+        events["subject_key"].astype(str).isin(subject_keys) & events["valid_duration"]
+    ]
     if "evaluable" in selected.columns:
         evaluable = selected["evaluable"].fillna(False).astype(bool)
     elif "coverage" in selected.columns:
@@ -87,7 +89,9 @@ def prediction_ignore_mask(
         raise ValueError(f"Unknown ignore-overlap policy: {policy}")
     if not np.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
         raise ValueError("Ignore-overlap threshold must be in [0, 1]")
-    session_aware = "session_id" in prediction.columns and "session_id" in ignore.columns
+    if ("session_id" in prediction.columns) != ("session_id" in ignore.columns):
+        raise ValueError("Prediction and ignore must both provide session_id")
+    session_aware = "session_id" in prediction.columns
     grouping = ["subject_key", "session_id"] if session_aware else ["subject_key"]
     grouped = {
         tuple(str(value) for value in key)
@@ -227,9 +231,11 @@ def evaluate_events(
     total_truth = 0
     total_prediction = 0
     ignored_predictions = 0
-    session_aware = all(
-        "session_id" in frame.columns for frame in (truth, prediction, ignore) if len(frame)
-    ) and any("session_id" in frame.columns for frame in (truth, prediction, ignore))
+    nonempty = [frame for frame in (truth, prediction, ignore) if len(frame)]
+    has_session = ["session_id" in frame.columns for frame in nonempty]
+    if any(has_session) and not all(has_session):
+        raise ValueError("Nonempty truth, prediction, and ignore must share session_id")
+    session_aware = bool(has_session) and all(has_session)
     prepared = []
     for frame in (truth, prediction, ignore):
         current = frame.copy()

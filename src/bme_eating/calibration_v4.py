@@ -82,6 +82,11 @@ class TemperatureCalibrationV4:
 class SoftPlattCalibration:
     coefficient: float
     intercept: float
+    method: str = "soft_platt"
+
+    @classmethod
+    def identity(cls) -> SoftPlattCalibration:
+        return cls(1.0, 0.0, "identity")
 
     @classmethod
     def fit(
@@ -129,17 +134,25 @@ class SoftPlattCalibration:
         )
         if not result.success or not np.isfinite(result.x).all():
             raise RuntimeError(f"Soft Platt calibration failed: {result.message}")
-        return cls(float(result.x[0]), float(result.x[1]))
+        return cls(float(result.x[0]), float(result.x[1]), "soft_platt")
 
     def transform(self, logits: np.ndarray) -> np.ndarray:
         return sigmoid(self.coefficient * np.asarray(logits, dtype=np.float64) + self.intercept)
 
-    def to_json(self) -> dict[str, float]:
-        return {"coefficient": self.coefficient, "intercept": self.intercept}
+    def to_json(self) -> dict[str, float | str]:
+        return {
+            "coefficient": self.coefficient,
+            "intercept": self.intercept,
+            "method": self.method,
+        }
 
     @classmethod
     def from_json(cls, payload: dict[str, Any]) -> SoftPlattCalibration:
-        return cls(float(payload["coefficient"]), float(payload["intercept"]))
+        return cls(
+            float(payload["coefficient"]),
+            float(payload["intercept"]),
+            str(payload.get("method", "soft_platt")),
+        )
 
 
 PlattCalibration = SoftPlattCalibration
@@ -201,6 +214,7 @@ def subject_crossfit_platt(
     logit_column: str = "state_logit",
     target_column: str = "state_target",
     fit_mask_column: str | None = None,
+    identity_fallback: bool = True,
 ) -> tuple[pd.DataFrame, SoftPlattCalibration]:
     required = {"subject_key", partition_column, logit_column, target_column}
     if fit_mask_column is not None:
@@ -235,11 +249,21 @@ def subject_crossfit_platt(
         )
     if not np.isfinite(calibrated).all():
         raise RuntimeError("Crossfit calibration left unscored rows")
-    output["state_probability"] = calibrated
     final = SoftPlattCalibration.fit(
         output.loc[eligible, logit_column].to_numpy(),
         output.loc[eligible, target_column].to_numpy(),
     )
+    if identity_fallback:
+        raw = sigmoid(output[logit_column].to_numpy(dtype=np.float64))
+        targets = output[target_column].to_numpy(dtype=np.float64)
+        raw_brier = float(np.mean((raw[eligible] - targets[eligible]) ** 2))
+        calibrated_brier = float(
+            np.mean((calibrated[eligible] - targets[eligible]) ** 2)
+        )
+        if not calibrated_brier < raw_brier - 1e-12:
+            calibrated = raw
+            final = SoftPlattCalibration.identity()
+    output["state_probability"] = calibrated
     return output, final
 
 

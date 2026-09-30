@@ -178,15 +178,68 @@ def test_r32_pooled_heads_config_keeps_fast_state_and_single_seed_heads() -> Non
     assert config["boundary"]["patience"] == 8
 
 
-def test_r32_early_select_uses_complete_robust_window() -> None:
+def test_r32_early_select_can_reselect_epochs_before_stopping_floor() -> None:
     root = Path(__file__).resolve().parents[1] / "configs"
     config = load_config(root / "hierarchical_v4_r32_pooled_heads_early_select.yaml")
     validate_r3_config(config)
     assert config["training"]["max_epochs"] == 32
     assert config["training"]["early_stopping_min_epochs"] == 3
     assert config["training"]["early_stopping_patience_checks"] == 3
-    assert config["training"]["checkpoint_selection_min_epoch"] == 3
+    assert config["training"]["checkpoint_selection_min_epoch"] == 1
     assert config["hierarchical"]["downstream_mode"] == "pooled_heads"
+
+
+def test_r32_transition_config_registers_twelve_decoder_combinations() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r32_pooled_heads_transition.yaml")
+
+    validate_r3_config(config)
+
+    assert config["experiment"]["variant"] == (
+        "time_constrained_outer_single_holdout_pooled_heads_transition"
+    )
+    assert config["decoder"]["use_transition_candidates"] is True
+    assert -3 in config["decoder"]["jitter_seconds"]
+    assert 3 in config["decoder"]["jitter_seconds"]
+    assert len(_decoder_configurations(config)) == 12
+
+
+def test_r32_deep_only_transition_config_disables_logistic_deployment() -> None:
+    root = Path(__file__).resolve().parents[1] / "configs"
+    config = load_config(root / "hierarchical_v4_r32_deep_only_transition.yaml")
+
+    validate_r3_config(config)
+
+    assert config["experiment"]["variant"] == (
+        "time_constrained_outer_single_holdout_deep_only_transition"
+    )
+    assert config["hierarchical"]["downstream_mode"] == "pooled_deep_only"
+    assert config["verifier"]["seeds"] == [2026]
+    assert config["final_training"]["state_seeds"] == [2026]
+
+
+def test_deep_only_loader_rejects_non_deep_selection() -> None:
+    from bme_eating.hierarchical_v4_pipeline import HierarchicalEatingDetectorV4
+
+    config = {
+        "hierarchical": {"maximum_event_latency_seconds": 60, "downstream_mode": "pooled_deep_only"},
+        "decoder": {"fixed_lag_seconds": 60},
+    }
+    with pytest.raises(ValueError, match="Deep-only"):
+        HierarchicalEatingDetectorV4(
+            state_models=[object()],
+            state_calibration=None,
+            verifier=None,
+            logistic_verifier=None,
+            proposal_calibration=None,
+            boundary=None,
+            statistics_scaler=None,
+            sensor_normalization=None,
+            duration_prior=None,
+            boundary_range=None,
+            config=config,
+            selection={"verifier_kind": "state_only"},
+        )
 
 
 def test_verifier_seed_profiles_allow_single_or_three_seed_deployment() -> None:
@@ -232,7 +285,7 @@ def test_r32_fast_config_uses_one_nested_selector_holdout() -> None:
     [
         ("max_epochs", 31, "max_epochs"),
         ("early_stopping_min_epochs", 0, "early-stopping minimum"),
-        ("checkpoint_selection_min_epoch", 2, "robust selector window"),
+        ("checkpoint_selection_min_epoch", 0, "checkpoint-selection minimum"),
         ("early_stopping_patience_checks", 0, "early-stopping patience"),
         ("single_holdout_fraction", 0.1, "Single-holdout fraction"),
         ("single_holdout_fraction", 0.5, "Single-holdout fraction"),
@@ -300,5 +353,8 @@ def test_repository_keeps_only_current_config_chain() -> None:
         "hierarchical_v4_r32_fast_logistic.yaml",
         "hierarchical_v4_r32_pooled_heads.yaml",
         "hierarchical_v4_r32_pooled_heads_early_select.yaml",
+        "hierarchical_v4_r32_pooled_heads_transition.yaml",
+        "hierarchical_v4_r32_deep_only_transition.yaml",
+        "hierarchical_v4_r32_deep_frontier.yaml",
     }
     assert {path.name for path in root.glob("*.yaml")} == expected

@@ -1,0 +1,122 @@
+[
+  {
+    "id": "mixstyle_2023_ijcv",
+    "title": "MixStyle Neural Networks for Domain Generalization and Adaptation",
+    "author": "Kaiyang Zhou; Yongxin Yang; Yu Qiao; Tao Xiang",
+    "year": 2023,
+    "type": "article",
+    "journal": "International Journal of Computer Vision",
+    "doi": "10.1007/s11263-023-01913-8",
+    "url": "https://doi.org/10.1007/s11263-023-01913-8",
+    "purpose": "feature-level domain generalization for subject and wearing-domain shifts",
+    "origin": "SEARCHED",
+    "retrieval_provider": "Crossref and Semantic Scholar",
+    "retrieval_timestamp": "2026-09-29T18:43:24Z",
+    "source_fetch_status": "FETCHED",
+    "metadata_verification": {
+      "status": "VERIFIED",
+      "verified_identifier": "10.1007/s11263-023-01913-8",
+      "evidence": "Crossref DOI, title, authors, venue and year match; Semantic Scholar abstract agrees"
+    },
+    "content_relevance_evidence": {
+      "supports": "mixing feature statistics between random instances as a plug-and-play domain-generalization module",
+      "location": "Semantic Scholar abstract"
+    }
+  },
+  {
+    "id": "ts_tcc_2021_ijcai",
+    "title": "Time-Series Representation Learning via Temporal and Contextual Contrasting",
+    "author": "Emadeldeen Eldele; Mohamed Ragab; Zhenghua Chen; Min Wu; Chee Keong Kwoh; Xiaoli Li; Cuntai Guan",
+    "year": 2021,
+    "type": "inproceedings",
+    "booktitle": "Proceedings of the Thirtieth International Joint Conference on Artificial Intelligence",
+    "doi": "10.24963/ijcai.2021/324",
+    "url": "https://doi.org/10.24963/ijcai.2021/324",
+    "purpose": "self-supervised temporal pretraining for unlabeled wearable time series",
+    "origin": "SEARCHED",
+    "retrieval_provider": "Crossref and Semantic Scholar",
+    "retrieval_timestamp": "2026-09-29T18:43:24Z",
+    "source_fetch_status": "FETCHED",
+    "metadata_verification": {
+      "status": "VERIFIED",
+      "verified_identifier": "10.24963/ijcai.2021/324",
+      "evidence": "Crossref DOI, title, authors, venue and year match; IJCAI page and abstract are available"
+    },
+    "content_relevance_evidence": {
+      "supports": "weak/strong augmented views with temporal and contextual contrasting for unlabeled time series",
+      "location": "IJCAI abstract"
+    }
+  },
+  {
+    "id": "tinyhar_2022_ismar",
+    "title": "TinyHAR: A Lightweight Deep Learning Model Designed for Human Activity Recognition",
+    "author": "Yexu Zhou; Haibin Zhao; Yiran Huang; Till Riedel; Michael Hefenbrock; Michael Beigl",
+    "year": 2022,
+    "type": "inproceedings",
+    "booktitle": "Proceedings of the 2022 ACM International Symposium on Wearable Computers",
+    "doi": "10.1145/3544794.3558467",
+    "url": "https://doi.org/10.1145/3544794.3558467",
+    "purpose": "lightweight multimodal collaboration and temporal feature extraction for wearable sensing",
+    "origin": "SEARCHED",
+    "retrieval_provider": "Crossref and Semantic Scholar",
+    "retrieval_timestamp": "2026-09-29T18:43:24Z",
+    "source_fetch_status": "FETCHED",
+    "metadata_verification": {
+      "status": "VERIFIED",
+      "verified_identifier": "10.1145/3544794.3558467",
+      "evidence": "Crossref DOI, title, authors, venue and year match; repository copy and abstract metadata are available"
+    },
+    "content_relevance_evidence": {
+      "supports": "multimodal collaboration, saliency differences and temporal information under wearable data and limited labels",
+      "location": "Semantic Scholar abstract"
+    }
+  },
+  {
+    "id": "bmn_2019_iccv",
+    "title": "BMN: Boundary-Matching Network for Temporal Action Proposal Generation",
+    "author": "Tianwei Lin; Xiao Liu; Xin Li; Errui Ding; Shilei Wen",
+    "year": 2019,
+    "type": "inproceedings",
+    "booktitle": "2019 IEEE/CVF International Conference on Computer Vision",
+    "doi": "10.1109/iccv.2019.00399",
+    "url": "https://doi.org/10.1109/iccv.2019.00399",
+    "purpose": "joint temporal boundary quality and proposal confidence modeling",
+    "origin": "SEARCHED",
+    "retrieval_provider": "Crossref, CVF Open Access and Semantic Scholar",
+    "retrieval_timestamp": "2026-09-29T18:43:24Z",
+    "source_fetch_status": "FETCHED",
+    "metadata_verification": {
+      "status": "VERIFIED",
+      "verified_identifier": "10.1109/iccv.2019.00399",
+      "evidence": "Crossref DOI, title, authors, venue and year match; CVF Open Access abstract is available"
+    },
+    "content_relevance_evidence": {
+      "supports": "boundary-matching confidence maps and joint proposal scoring rather than independent boundary post-processing",
+      "location": "CVF Open Access abstract"
+    }
+  },
+  {
+    "id": "actionformer_2022_eccv",
+    "title": "ActionFormer: Localizing Moments of Actions with Transformers",
+    "author": "Chen-Lin Zhang; Jianxin Wu; Yin Li",
+    "year": 2022,
+    "type": "inproceedings",
+    "booktitle": "Computer Vision – ECCV 2022",
+    "doi": "10.1007/978-3-031-19772-7_29",
+    "url": "https://doi.org/10.1007/978-3-031-19772-7_29",
+    "purpose": "multiscale temporal localization with local attention and boundary estimation",
+    "origin": "SEARCHED",
+    "retrieval_provider": "Crossref and Semantic Scholar",
+    "retrieval_timestamp": "2026-09-29T18:43:24Z",
+    "source_fetch_status": "FETCHED",
+    "metadata_verification": {
+      "status": "VERIFIED",
+      "verified_identifier": "10.1007/978-3-031-19772-7_29",
+      "evidence": "Crossref DOI, title, authors, venue and year match; abstract metadata is available"
+    },
+    "content_relevance_evidence": {
+      "supports": "multiscale representation, local temporal attention and simultaneous moment/boundary prediction",
+      "location": "Semantic Scholar abstract"
+    }
+  }
+]

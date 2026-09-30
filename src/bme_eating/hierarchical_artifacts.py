@@ -29,6 +29,16 @@ RUN_STAGES = (
     "EVALUATED",
 )
 
+ALLOWED_RUN_TRANSITIONS = {
+    "CREATED": frozenset({"STATE_COMPLETE"}),
+    "STATE_COMPLETE": frozenset({"PROPOSALS_COMPLETE"}),
+    "PROPOSALS_COMPLETE": frozenset({"VERIFIER_COMPLETE", "SELECTED"}),
+    "VERIFIER_COMPLETE": frozenset({"BOUNDARY_COMPLETE"}),
+    "BOUNDARY_COMPLETE": frozenset({"SELECTED"}),
+    "SELECTED": frozenset({"EVALUATED"}),
+    "EVALUATED": frozenset(),
+}
+
 RESUMABLE_STATE_ARTIFACT_NAMES = frozenset(
     {
         "best.pt",
@@ -255,9 +265,7 @@ class HierarchicalRun:
     ) -> None:
         if next_stage not in RUN_STAGES:
             raise ValueError(f"Unknown hierarchical run stage: {next_stage}")
-        current_index = RUN_STAGES.index(self.stage)
-        next_index = RUN_STAGES.index(next_stage)
-        if next_index != current_index + 1:
+        if next_stage not in ALLOWED_RUN_TRANSITIONS[self.stage]:
             raise RuntimeError(f"Invalid run transition: {self.stage} -> {next_stage}")
         hashes = dict(self.payload.get("artifact_hashes", {}))
         for path in artifacts:

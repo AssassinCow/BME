@@ -8,6 +8,7 @@ from typing import Any
 CODE_VERSION = "v4.7.1"
 PROTOCOL_VERSION = "statsfusion-r3.2"
 POOLED_HEAD_PROTOCOL = "outer_fold_crossfit_joint_tuning_v1"
+POOLED_HEAD_TRAINING_PROTOCOL = "fully_excluded_nested_state_oof_v1"
 INPUT_SNAPSHOT_FILENAME = "input_snapshot_r3_2.json"
 BLOCKED_PREDECESSORS = (
     "statsfusion-r0-blocked",
@@ -48,6 +49,7 @@ RUNTIME_SOURCE_FILES = (
     "models/dtp_sqf.py",
     "models/endpoint_refiner.py",
     "models/event_verifier_v4.py",
+    "models/stats_fusion_loss.py",
     "models/factory.py",
     "models/hierarchical_state.py",
     "models/stats_fusion_state.py",
@@ -143,9 +145,14 @@ def validate_r3_config(config: dict[str, Any]) -> None:
     if ablation_id not in R3_ABLATION_IDS:
         raise ValueError(f"StatsFusion-r3 uses an unsupported ablation_id: {ablation_id!r}")
     if ablation_id == "R3-DIRECT":
+        pooled_variants = {
+            "time_constrained_outer_single_holdout_pooled_heads",
+            "time_constrained_outer_single_holdout_pooled_heads_transition",
+            "time_constrained_outer_single_holdout_deep_only_transition",
+        }
         direct_variants = {
             "time_constrained_outer_single_holdout_logistic",
-            "time_constrained_outer_single_holdout_pooled_heads",
+            *pooled_variants,
         }
         if experiment.get("variant") not in direct_variants:
             raise ValueError("R3-DIRECT requires the registered time-constrained variant")
@@ -164,8 +171,14 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         decoder = config.get("decoder", {})
         if bool(decoder.get("use_semi_markov", False)):
             raise ValueError("R3-DIRECT disables Semi-Markov for the time-constrained route")
-        if bool(decoder.get("use_transition_candidates", True)):
-            raise ValueError("R3-DIRECT disables transition candidates")
+        transition_variant = experiment.get("variant") in {
+            "time_constrained_outer_single_holdout_pooled_heads_transition",
+            "time_constrained_outer_single_holdout_deep_only_transition",
+        }
+        if bool(decoder.get("use_transition_candidates", False)) != transition_variant:
+            raise ValueError(
+                "R3-DIRECT transition candidates must match the registered transition variant"
+            )
         if config.get("training", {}).get("selector_decoder_search") != "fixed":
             raise ValueError("R3-DIRECT requires fixed decoder search during state selection")
         single_holdout = bool(experiment.get("time_constrained_single_holdout", False))
@@ -177,12 +190,16 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         if single_holdout:
             if state_crossfit_mode != "single_holdout":
                 raise ValueError("Single-holdout direct training requires state_crossfit_mode")
-            expected_downstream = (
-                "pooled_heads"
-                if experiment.get("variant")
-                == "time_constrained_outer_single_holdout_pooled_heads"
-                else "pooled_logistic"
-            )
+            if experiment.get("variant") == (
+                "time_constrained_outer_single_holdout_deep_only_transition"
+            ):
+                expected_downstream = "pooled_deep_only"
+            else:
+                expected_downstream = (
+                    "pooled_heads"
+                    if experiment.get("variant") in pooled_variants
+                    else "pooled_logistic"
+                )
             if downstream_mode != expected_downstream:
                 raise ValueError(
                     "Single-holdout direct training downstream mode does not match its variant"
@@ -195,17 +212,16 @@ def validate_r3_config(config: dict[str, Any]) -> None:
             checkpoint_selection_minimum_epoch = int(
                 training.get("checkpoint_selection_min_epoch", minimum_epochs)
             )
-            selector_rolling_epochs = int(training.get("selector_rolling_epochs", 1))
             patience_checks = int(training.get("early_stopping_patience_checks", 0))
             holdout_fraction = float(config.get("training", {}).get("single_holdout_fraction", 0.0))
             if maximum_epochs != 32:
                 raise ValueError("Single-holdout max_epochs must be 32")
             if not 1 <= minimum_epochs < maximum_epochs:
                 raise ValueError("Single-holdout early-stopping minimum must be in [1, 31]")
-            if not selector_rolling_epochs <= checkpoint_selection_minimum_epoch <= minimum_epochs:
+            if not 1 <= checkpoint_selection_minimum_epoch <= minimum_epochs:
                 raise ValueError(
-                    "Single-holdout checkpoint-selection minimum must cover the robust selector "
-                    "window and not exceed the early-stopping minimum"
+                    "Single-holdout checkpoint-selection minimum must be positive and not "
+                    "exceed the early-stopping minimum"
                 )
             if not 1 <= patience_checks <= 8:
                 raise ValueError("Single-holdout early-stopping patience must be in [1, 8]")
@@ -261,6 +277,26 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         raise ValueError("StatsFusion-r3 uses smooth_beta, not the blocked smooth_tau loss")
     if float(config.get("loss", {}).get("smooth_beta", 0)) != 0.5:
         raise ValueError("StatsFusion-r3 Huber smooth_beta must be 0.5")
+    verifier_config = config.get("verifier", {})
+    if bool(verifier_config.get("use_learned_query_pooling", False)):
+        channels = int(verifier_config.get("hidden_channels", 64))
+        heads = int(verifier_config.get("attention_heads", 4))
+        if heads <= 0 or channels % heads:
+            raise ValueError("Learned-query verifier attention_heads must divide hidden_channels")
+    boundary_config = config.get("boundary", {})
+    if bool(boundary_config.get("use_proposal_conditioning", False)) and int(
+        boundary_config.get("proposal_condition_dim", 0)
+    ) != 4:
+        raise ValueError("Proposal-conditioned Boundary requires proposal_condition_dim: 4")
+    loss_config = config.get("loss", {})
+    contrastive_weight = float(loss_config.get("temporal_contrastive_weight", 0.0))
+    if contrastive_weight < 0:
+        raise ValueError("temporal_contrastive_weight must be non-negative")
+    if contrastive_weight > 0:
+        if float(loss_config.get("temporal_contrastive_temperature", 0.0)) <= 0:
+            raise ValueError("Enabled temporal contrastive loss requires positive temperature")
+        if int(loss_config.get("temporal_contrastive_radius_steps", 0)) <= 0:
+            raise ValueError("Enabled temporal contrastive loss requires positive radius")
     selector_decoder_search = str(config.get("training", {}).get("selector_decoder_search", "full"))
     if selector_decoder_search not in {"full", "fixed"}:
         raise ValueError("training.selector_decoder_search must be 'full' or 'fixed'")
@@ -271,7 +307,10 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         raise ValueError(
             f"{ablation_id or 'StatsFusion-r3'} requires verifier seeds {expected_verifier_seeds}"
         )
-    if str(config.get("hierarchical", {}).get("downstream_mode", "full")) == "pooled_heads":
+    if str(config.get("hierarchical", {}).get("downstream_mode", "full")) in {
+        "pooled_heads",
+        "pooled_deep_only",
+    }:
         if config.get("hierarchical", {}).get("pooled_head_protocol") != POOLED_HEAD_PROTOCOL:
             raise ValueError(
                 f"Pooled heads require pooled_head_protocol: {POOLED_HEAD_PROTOCOL}"

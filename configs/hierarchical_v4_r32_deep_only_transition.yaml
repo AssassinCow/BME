@@ -1,0 +1,22 @@
+extends: hierarchical_v4_r32_pooled_heads_transition.yaml
+
+experiment:
+  name: hierarchical_v4_r32_deep_only_transition
+  variant: time_constrained_outer_single_holdout_deep_only_transition
+
+model:
+  use_mixstyle: true
+  mixstyle_probability: 0.15
+  mixstyle_alpha: 0.30
+  use_quality_conditioned_fusion: true
+  use_local_cross_scale_attention: true
+  local_attention_window_steps: 8
+
+verifier:
+  use_state_latent_bridge: true
+  state_latent_dim: 64
+  use_boundary_quality_features: true
+
+hierarchical:
+  downstream_mode: pooled_deep_only
+  pooled_head_protocol: outer_fold_crossfit_joint_tuning_v1

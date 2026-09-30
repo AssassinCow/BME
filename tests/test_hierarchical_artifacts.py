@@ -60,6 +60,27 @@ def test_manifested_upstream_artifact_tampering_is_rejected(tmp_path) -> None:
         run.require_stage("STATE_COMPLETE")
 
 
+def test_state_only_run_can_skip_disabled_heads_after_proposals(tmp_path) -> None:
+    manifest_path = tmp_path / "run_manifest.json"
+    payload = {"stage": "PROPOSALS_COMPLETE", "artifact_hashes": {}}
+    write_json_atomic(manifest_path, payload)
+    run = HierarchicalRun(tmp_path, manifest_path, payload)
+
+    run.transition("SELECTED", [])
+
+    assert run.stage == "SELECTED"
+
+
+def test_created_run_cannot_skip_directly_to_selection(tmp_path) -> None:
+    manifest_path = tmp_path / "run_manifest.json"
+    payload = {"stage": "CREATED", "artifact_hashes": {}}
+    write_json_atomic(manifest_path, payload)
+    run = HierarchicalRun(tmp_path, manifest_path, payload)
+
+    with pytest.raises(RuntimeError, match="CREATED -> SELECTED"):
+        run.transition("SELECTED", [])
+
+
 def test_created_run_allows_resumable_migration_artifacts_to_change(tmp_path) -> None:
     state = tmp_path / "crossfit_1" / "state"
     state.mkdir(parents=True)

@@ -1,0 +1,17 @@
+extends: hierarchical_v4_r32_pooled_heads_early_select.yaml
+
+experiment:
+  name: hierarchical_v4_r32_pooled_heads_transition
+  variant: time_constrained_outer_single_holdout_pooled_heads_transition
+
+decoder:
+  use_transition_candidates: true
+  jitter_seconds: [-30, -15, -3, 0, 3, 15, 30]
+
+decoder_search:
+  high_threshold: [0.08, 0.10]
+  low_threshold: [0.04]
+  ema_half_life_seconds: [6, 12]
+  gap_merge_seconds: [15, 30, 60]
+  transition_threshold: [0.20]
+  semi_markov_duration_weight: [1.0]

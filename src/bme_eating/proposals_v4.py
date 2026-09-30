@@ -135,14 +135,18 @@ def _transition_candidates(
     output: list[tuple[int, int, float, int]] = []
     for start_index in onset_peaks:
         duration = timestamps[offset_peaks] - timestamps[start_index]
-        eligible = offset_peaks[(duration >= minimum_ms) & (duration <= maximum_ms)]
+        eligible = offset_peaks[(duration >= 0) & (duration <= maximum_ms)]
         if not len(eligible):
             continue
         end_index = int(eligible[0])
+        start_ms = int(timestamps[start_index])
+        end_ms = max(int(timestamps[end_index]), start_ms + minimum_ms)
+        if end_ms > int(timestamps[-1]) or end_ms - start_ms > maximum_ms:
+            continue
         output.append(
             (
-                int(timestamps[start_index]),
-                int(timestamps[end_index]),
+                start_ms,
+                end_ms,
                 float(np.sqrt(onset[start_index] * offset[end_index])),
                 int(ProposalSource.TRANSITION),
             )

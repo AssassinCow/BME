@@ -23,6 +23,7 @@ from bme_eating.data.stats_fusion_inputs import (
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.hierarchical_v4_artifacts import (
     _input_snapshot_matches,
+    feature_provenance_artifact_path,
     initialize_v4_run,
     resume_config_hash,
 )
@@ -48,8 +49,14 @@ def test_input_snapshot_identity_ignores_code_version_but_not_input_hashes() -> 
         "code_version": "v4.4.2",
     }
     assert _input_snapshot_matches(legacy, current)
+    legacy_with_retired_input = deepcopy(legacy)
+    legacy_with_retired_input["hashes"]["retired_feature_artifact"] = "c" * 64
+    assert _input_snapshot_matches(legacy_with_retired_input, current)
     assert not _input_snapshot_matches(
         {**legacy, "hashes": {"anchors": "b" * 64}}, current
+    )
+    assert not _input_snapshot_matches(
+        {**legacy, "hashes": {"retired_feature_artifact": "c" * 64}}, current
     )
 
 
@@ -179,11 +186,20 @@ def test_v4_resume_records_and_allows_worktree_identity_change(tmp_path, monkeyp
     )
     legacy_snapshot = {"code_version": "v4.3", "protocol_version": "statsfusion-r3"}
     write_json_atomic(output_root / "input_snapshot_r3.json", legacy_snapshot)
+    legacy_provenance_path = output_root / "feature_provenance.json"
+    write_json_atomic(legacy_provenance_path, {"legacy": True})
     initial = initialize_v4_run(config, input_root, output_root, "strict-v4", 0, fresh=True)
     assert json.loads((output_root / "input_snapshot_r3.json").read_text(encoding="utf-8")) == (
         legacy_snapshot
     )
     assert (output_root / INPUT_SNAPSHOT_FILENAME).is_file()
+    assert json.loads(legacy_provenance_path.read_text(encoding="utf-8")) == {"legacy": True}
+    active_provenance_path = output_root / initial.payload["feature_provenance_path"]
+    assert active_provenance_path.is_file()
+    assert active_provenance_path == feature_provenance_artifact_path(
+        output_root,
+        json.loads(active_provenance_path.read_text(encoding="utf-8")),
+    )
     legacy = dict(initial.payload)
     legacy.pop("runtime_config")
     legacy.pop("resume_config_sha256")

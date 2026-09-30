@@ -204,6 +204,19 @@ class EventVerifierV4(nn.Module):
         channels = int(config.get("hidden_channels", 64))
         hidden = int(config.get("hidden_dim", 128))
         dropout = float(config.get("dropout", 0.1))
+        self.use_learned_query_pooling = bool(config.get("use_learned_query_pooling", False))
+        attention_heads = int(config.get("attention_heads", 4))
+        if self.use_learned_query_pooling:
+            if attention_heads <= 0 or channels % attention_heads:
+                raise ValueError("attention_heads must divide hidden_channels")
+            self.learned_query = nn.Parameter(torch.zeros(1, 1, channels))
+            self.query_attention = nn.MultiheadAttention(
+                channels,
+                attention_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            nn.init.normal_(self.learned_query, mean=0.0, std=0.02)
         self.input_projection = nn.Conv1d(sequence_dim, channels, kernel_size=1, bias=False)
         self.blocks = nn.ModuleList(
             [
@@ -211,8 +224,9 @@ class EventVerifierV4(nn.Module):
                 DepthwiseVerifierBlock(channels, dropout),
             ]
         )
+        pooled_dim = (3 if self.use_learned_query_pooling else 2) * channels
         self.projection = nn.Sequential(
-            nn.Linear(2 * channels + scalar_dim, hidden),
+            nn.Linear(pooled_dim + scalar_dim, hidden),
             nn.LayerNorm(hidden),
             nn.SiLU(),
             nn.Dropout(dropout),
@@ -224,7 +238,11 @@ class EventVerifierV4(nn.Module):
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         mask = batch["sequence_mask"].bool()
-        values = batch["sequence"] * mask.unsqueeze(-1).to(batch["sequence"].dtype)
+        values = torch.where(
+            mask.unsqueeze(-1),
+            torch.nan_to_num(batch["sequence"]),
+            torch.zeros_like(batch["sequence"]),
+        )
         sequence = self.input_projection(values.transpose(1, 2))
         for block in self.blocks:
             sequence = block(sequence, mask)
@@ -232,7 +250,24 @@ class EventVerifierV4(nn.Module):
         mean = (sequence * weights).sum(dim=-1) / weights.sum(dim=-1).clamp_min(1.0)
         maximum = sequence.masked_fill(~mask.unsqueeze(1), -torch.inf).amax(dim=-1)
         maximum = torch.where(torch.isfinite(maximum), maximum, torch.zeros_like(maximum))
-        hidden = self.projection(torch.cat((mean, maximum, batch["scalar"]), dim=-1))
+        pooled = [mean, maximum]
+        if self.use_learned_query_pooling:
+            sequence_tokens = sequence.transpose(1, 2)
+            valid_rows = mask.any(dim=-1)
+            attention_pool = torch.zeros_like(mean)
+            if valid_rows.any():
+                query = self.learned_query.expand(int(valid_rows.sum()), -1, -1)
+                attended, _ = self.query_attention(
+                    query,
+                    sequence_tokens[valid_rows],
+                    sequence_tokens[valid_rows],
+                    key_padding_mask=~mask[valid_rows],
+                    need_weights=False,
+                )
+                attention_pool[valid_rows] = attended[:, 0, :]
+            pooled.append(attention_pool)
+        scalar = torch.nan_to_num(batch["scalar"])
+        hidden = self.projection(torch.cat((*pooled, scalar), dim=-1))
         event_logit = self.event_head(hidden).squeeze(-1)
         iou_logit = self.iou_head(hidden).squeeze(-1)
         return {
@@ -356,6 +391,22 @@ def build_proposal_features_v4(
         "statistics_missing_fraction",
         *statistics_columns,
     ]
+    use_latent_bridge = bool(config.get("use_state_latent_bridge", False))
+    use_boundary_quality = bool(config.get("use_boundary_quality_features", False))
+    latent_columns = []
+    if use_latent_bridge:
+        latent_dim = int(config.get("state_latent_dim", 64))
+        if latent_dim <= 0:
+            raise ValueError("state_latent_dim must be positive")
+        latent_columns = [f"state_hidden_{index:03d}" for index in range(latent_dim)]
+        missing_latent = set(latent_columns) - set(windows.columns)
+        if missing_latent:
+            raise ValueError(
+                "Verifier windows are missing state latent columns: "
+                f"{sorted(missing_latent)[:5]}"
+            )
+    if use_boundary_quality:
+        base_columns.append("state_probability_derivative")
     required = {"subject_key", "session_id", "timestamp_ms", *base_columns}
     missing = required - set(windows.columns)
     if missing:
@@ -367,19 +418,37 @@ def build_proposal_features_v4(
     sequences: list[np.ndarray] = []
     masks: list[np.ndarray] = []
     scalars: list[np.ndarray] = []
+    latent_summaries: list[np.ndarray] = []
+    boundary_summaries: list[np.ndarray] = []
     for proposal in proposals.itertuples(index=False):
         group = groups.get((str(proposal.subject_key), str(proposal.session_id)))
         if group is None:
             raise ValueError(f"No verifier windows for proposal {proposal.proposal_id}")
         timestamps = group["timestamp_ms"].to_numpy(dtype=np.int64)
         values = group[base_columns].to_numpy(dtype=np.float64)
+        latent_values = (
+            group[latent_columns].to_numpy(dtype=np.float64)
+            if latent_columns
+            else None
+        )
         bins: list[np.ndarray] = []
         valid_bins: list[bool] = []
+        selected_latent_rows: list[np.ndarray] = []
+        selected_boundary_rows: list[np.ndarray] = []
         for left, right, region, relative in _bin_specs(
             int(proposal.coarse_start_ms), int(proposal.coarse_end_ms), config
         ):
             selected = (timestamps > left) & (timestamps <= right)
             selected_values = values[selected]
+            if len(selected_values) and use_latent_bridge:
+                if latent_values is None:
+                    raise RuntimeError("Latent bridge values were not loaded")
+                selected_latent_rows.append(latent_values[selected])
+            if len(selected_values) and use_boundary_quality:
+                derivative_index = base_columns.index("state_probability_derivative")
+                selected_boundary_rows.append(
+                    selected_values[:, [1, 2, derivative_index]]
+                )
             valid_bins.append(bool(len(selected_values)))
             if len(selected_values):
                 finite = np.isfinite(selected_values)
@@ -433,6 +502,30 @@ def build_proposal_features_v4(
                 dtype=np.float32,
             )
         )
+        if use_latent_bridge and selected_latent_rows:
+            latent_values = np.concatenate(selected_latent_rows, axis=0)
+            latent_summaries.append(
+                np.concatenate(
+                    (np.nanmean(latent_values, axis=0), np.nanmax(latent_values, axis=0))
+                ).astype(np.float32)
+            )
+        elif use_latent_bridge:
+            latent_summaries.append(np.zeros(2 * len(latent_columns), dtype=np.float32))
+        if use_boundary_quality and selected_boundary_rows:
+            boundary_values = np.concatenate(selected_boundary_rows, axis=0)
+            boundary_summaries.append(
+                np.asarray(
+                    [
+                        float(np.nanmean(boundary_values[:, 0])),
+                        float(np.nanmean(boundary_values[:, 1])),
+                        float(np.nanmean(np.abs(boundary_values[:, 2]))),
+                        float(boundary_values[0, 0] + boundary_values[-1, 1]),
+                    ],
+                    dtype=np.float32,
+                )
+            )
+        elif use_boundary_quality:
+            boundary_summaries.append(np.zeros(4, dtype=np.float32))
         sequences.append(np.stack(bins))
         masks.append(np.asarray(valid_bins, dtype=bool))
     event_target = (
@@ -444,13 +537,28 @@ def build_proposal_features_v4(
     weights = normalized_proposal_weights(proposals) if "max_iou" in proposals else None
     bin_count = int(config["left_bins"]) + int(config["event_bins"]) + int(config["right_bins"])
     feature_dim = 5 * len(base_columns) + 6
+    scalar_values = np.stack(scalars) if scalars else np.empty((0, 8), np.float32)
+    if use_latent_bridge:
+        latent_values = (
+            np.stack(latent_summaries)
+            if latent_summaries
+            else np.empty((0, 2 * len(latent_columns)), np.float32)
+        )
+        scalar_values = np.concatenate((scalar_values, latent_values), axis=1)
+    if use_boundary_quality:
+        boundary_values = (
+            np.stack(boundary_summaries)
+            if boundary_summaries
+            else np.empty((0, 4), np.float32)
+        )
+        scalar_values = np.concatenate((scalar_values, boundary_values), axis=1)
     return ProposalFeatureBatchV4(
         proposal_ids=proposals["proposal_id"].astype(str).to_numpy(),
         sequence=np.stack(sequences)
         if sequences
         else np.empty((0, bin_count, feature_dim), np.float32),
         sequence_mask=np.stack(masks) if masks else np.empty((0, bin_count), bool),
-        scalar=np.stack(scalars) if scalars else np.empty((0, 8), np.float32),
+        scalar=scalar_values,
         event_target=event_target,
         iou_target=iou_target,
         sample_weight=weights,

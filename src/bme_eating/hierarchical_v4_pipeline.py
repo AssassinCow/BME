@@ -53,9 +53,11 @@ from bme_eating.types import Event
 from bme_eating.v4_protocol import (
     IGNORE_PROTOCOL,
     OBSERVATION_GAP_PROTOCOL,
+    POOLED_HEAD_TRAINING_PROTOCOL,
     PROTOCOL_VERSION,
     RAW_INPUT_SCHEMA,
     RUNTIME_SOURCE_BINDING,
+    runtime_source_identity,
     validate_serialized_state_seeds,
     validate_serialized_verifier_seeds,
 )
@@ -67,6 +69,13 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _verify_bundle_runtime_source(root: Path) -> None:
+    bundled = runtime_source_identity(root / "runtime" / "bme_eating")
+    active = runtime_source_identity(Path(__file__).resolve().parent)
+    if bundled != active:
+        raise RuntimeError("V4 bundle runtime differs from the imported bme_eating source")
 
 
 def _iter_tail_aligned_raw_state_batches(
@@ -166,6 +175,11 @@ class HierarchicalEatingDetectorV4:
         if int(config["decoder"]["fixed_lag_seconds"]) > 60:
             raise ValueError("V4 decoder exceeds the 60-second fixed lag")
         verifier_kind = str(selection.get("verifier_kind", "deep"))
+        configured_downstream = str(
+            config.get("hierarchical", {}).get("downstream_mode", "full")
+        )
+        if configured_downstream == "pooled_deep_only" and verifier_kind != "deep":
+            raise ValueError("Deep-only v4 configuration cannot load a non-Deep verifier")
         if verifier_kind == "deep" and (verifier is None or proposal_calibration is None):
             raise ValueError("Deep verifier selection requires model and calibration")
         if verifier_kind == "logistic" and logistic_verifier is None:
@@ -227,6 +241,10 @@ class HierarchicalEatingDetectorV4:
             name: torch.stack([output[name].float() for output in outputs]).mean(dim=0)
             for name in names
         }
+        if all("state_hidden" in output for output in outputs):
+            averaged["state_hidden"] = torch.stack(
+                [output["state_hidden"].float() for output in outputs]
+            ).mean(dim=0)
         primary = outputs[0]
         if averaged["state_logit"].shape[0] != 1:
             raise ValueError("predict_session currently accepts one session batch")
@@ -259,6 +277,7 @@ class HierarchicalEatingDetectorV4:
                 "offset_probability": torch.sigmoid(averaged["offset_logit"][0]).cpu().numpy(),
                 "ppg_gate": diagnostic("ppg_gate"),
                 "statistics_gate": diagnostic("statistics_gate"),
+                "long_gate": diagnostic("long_gate"),
                 "missing_fraction": diagnostic("missing_fraction"),
                 "active_modality_missing_fraction": diagnostic(
                     "active_modality_missing_fraction", "missing_fraction"
@@ -269,8 +288,16 @@ class HierarchicalEatingDetectorV4:
                 "statistics_missing_fraction": diagnostic("statistics_missing_fraction"),
                 "gyro_gate": diagnostic("gyro_gate"),
                 "invariant_gate": diagnostic("invariant_gate"),
+                "modality_quality_gate": diagnostic(
+                    "modality_quality_gate", "statistics_gate"
+                ),
             }
         )
+        hidden = averaged.get("state_hidden")
+        if hidden is not None:
+            hidden_values = hidden[0].float().cpu().numpy()
+            for index in range(hidden_values.shape[1]):
+                frame[f"state_hidden_{index:03d}"] = hidden_values[:, index]
         for index, name in enumerate(self.statistics_columns):
             frame[name] = statistics[:, index]
         model_config = getattr(self, "config", {}).get("model", {})
@@ -351,6 +378,10 @@ class HierarchicalEatingDetectorV4:
             "start_mask": torch.from_numpy(features.start_mask).to(self.device),
             "end_mask": torch.from_numpy(features.end_mask).to(self.device),
         }
+        if features.proposal_condition is not None:
+            batch["proposal_condition"] = torch.from_numpy(
+                features.proposal_condition
+            ).to(self.device)
         prediction = self.boundary(batch)
         start_offset, start_entropy = local_soft_argmax(
             prediction["start_logit"],
@@ -468,6 +499,7 @@ def load_hierarchical_v4_bundle(
     for relative, expected in expected_files.items():
         if _sha256_file(root / relative) != expected:
             raise RuntimeError(f"V4 bundle artifact hash mismatch: {relative}")
+    _verify_bundle_runtime_source(root)
     config = yaml.safe_load((root / "resolved_config.yaml").read_text(encoding="utf-8"))
     selection = json.loads((root / "selected_pipeline.json").read_text(encoding="utf-8"))
     if selection.get("protocol_version") != PROTOCOL_VERSION:
@@ -480,6 +512,10 @@ def load_hierarchical_v4_bundle(
     config = {**config, "decoder": dict(selected_decoder)}
     if selection.get("selection_source") != "pooled_outer_oof":
         raise RuntimeError("V4 bundle selection must come from pooled outer OOF")
+    if config.get("hierarchical", {}).get("downstream_mode") in {
+        "pooled_logistic", "pooled_heads", "pooled_deep_only"
+    } and selection.get("pooled_head_training_protocol") != POOLED_HEAD_TRAINING_PROTOCOL:
+        raise RuntimeError("V4 pooled bundle lacks fully excluded nested state OOF evidence")
     if selection.get("promotion_protocol") == "time_constrained_single_holdout_v1":
         evidence_path = root / "time_constrained_protocol.json"
         expected = selection.get("promotion_evidence_sha256", {}).get(
@@ -512,7 +548,7 @@ def load_hierarchical_v4_bundle(
     state_models: list[torch.nn.Module] = []
     for seed in state_seeds:
         checkpoint = torch.load(
-            root / f"state_seed_{seed}.pt", map_location=device, weights_only=False
+            root / f"state_seed_{seed}.pt", map_location=device, weights_only=True
         )
         model = build_state_model(checkpoint["model_config"])
         model.load_state_dict(checkpoint["model"])
@@ -536,7 +572,7 @@ def load_hierarchical_v4_bundle(
     elif verifier_kind not in {"logistic", "state_only"}:
         raise RuntimeError(f"Unsupported v4 verifier kind: {verifier_kind}")
     for verifier_path in verifier_paths:
-        checkpoint = torch.load(verifier_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(verifier_path, map_location=device, weights_only=True)
         verifier_model = EventVerifierV4(
             int(checkpoint["sequence_dim"]), int(checkpoint["scalar_dim"]), checkpoint["config"]
         )
@@ -549,7 +585,7 @@ def load_hierarchical_v4_bundle(
             raise FileNotFoundError("Selected v4 boundary checkpoint is missing")
         if not (root / "boundary_range.json").is_file():
             raise FileNotFoundError("Selected v4 boundary range is missing")
-        checkpoint = torch.load(boundary_path, map_location=device, weights_only=False)
+        checkpoint = torch.load(boundary_path, map_location=device, weights_only=True)
         boundary = EndpointRefiner(int(checkpoint["input_dim"]), checkpoint["config"])
         boundary.load_state_dict(checkpoint["model"])
     logistic_path = root / "logistic_verifier.json"

@@ -83,8 +83,11 @@ def normalized_entropy(
 
 
 class EndpointNetwork(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, dropout: float) -> None:
+    def __init__(
+        self, input_dim: int, hidden_dim: int, dropout: float, condition_dim: int = 0
+    ) -> None:
         super().__init__()
+        self.condition_dim = int(condition_dim)
         self.input_convolution = nn.Conv1d(
             input_dim, hidden_dim, kernel_size=3, padding=1, bias=False
         )
@@ -101,22 +104,43 @@ class EndpointNetwork(nn.Module):
         self.pointwise = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=1, bias=False)
         self.output_norm = nn.LayerNorm(hidden_dim)
         self.output_convolution = nn.Conv1d(hidden_dim, 1, kernel_size=1)
+        if self.condition_dim:
+            self.condition_scale = nn.Linear(self.condition_dim, hidden_dim)
+            self.condition_shift = nn.Linear(self.condition_dim, hidden_dim)
+            nn.init.zeros_(self.condition_scale.weight)
+            nn.init.zeros_(self.condition_scale.bias)
+            nn.init.zeros_(self.condition_shift.weight)
+            nn.init.zeros_(self.condition_shift.bias)
 
-    def forward(self, values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        values: torch.Tensor,
+        mask: torch.Tensor,
+        condition: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         valid = mask.bool()
         weights = valid.unsqueeze(1).to(values.dtype)
+        values = torch.nan_to_num(values)
         hidden = self.input_convolution(
             (values * valid.unsqueeze(-1).to(values.dtype)).transpose(1, 2)
         )
         hidden = self.dropout(
             torch.nn.functional.silu(self.input_norm(hidden.transpose(1, 2)))
         ).transpose(1, 2)
+        if self.condition_dim:
+            if condition is None or condition.shape != (values.shape[0], self.condition_dim):
+                raise ValueError("Boundary proposal condition has an incompatible shape")
+            condition = torch.nan_to_num(condition)
+            scale = self.condition_scale(condition).unsqueeze(-1)
+            shift = self.condition_shift(condition).unsqueeze(-1)
+            hidden = hidden * (1.0 + scale) + shift
         hidden *= weights
         hidden = self.pointwise(self.depthwise(hidden)).transpose(1, 2)
         hidden = torch.nn.functional.silu(self.output_norm(hidden)).transpose(1, 2)
         hidden *= weights
         logits = self.output_convolution(hidden).squeeze(1)
-        return logits.masked_fill(~valid, -torch.inf)
+        logits = logits.masked_fill(~valid, -torch.inf)
+        return torch.where(valid.any(dim=-1, keepdim=True), logits, torch.zeros_like(logits))
 
 
 class EndpointRefiner(nn.Module):
@@ -124,13 +148,25 @@ class EndpointRefiner(nn.Module):
         super().__init__()
         hidden = int(config.get("hidden_dim", 64))
         dropout = float(config.get("dropout", 0.1))
-        self.start_network = EndpointNetwork(input_dim, hidden, dropout)
-        self.end_network = EndpointNetwork(input_dim, hidden, dropout)
+        self.use_proposal_conditioning = bool(config.get("use_proposal_conditioning", False))
+        self.proposal_condition_dim = (
+            int(config.get("proposal_condition_dim", 4))
+            if self.use_proposal_conditioning
+            else 0
+        )
+        if self.use_proposal_conditioning and self.proposal_condition_dim <= 0:
+            raise ValueError("proposal_condition_dim must be positive when enabled")
+        self.start_network = EndpointNetwork(input_dim, hidden, dropout, self.proposal_condition_dim)
+        self.end_network = EndpointNetwork(input_dim, hidden, dropout, self.proposal_condition_dim)
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {
-            "start_logit": self.start_network(batch["start_sequence"], batch["start_mask"]),
-            "end_logit": self.end_network(batch["end_sequence"], batch["end_mask"]),
+            "start_logit": self.start_network(
+                batch["start_sequence"], batch["start_mask"], batch.get("proposal_condition")
+            ),
+            "end_logit": self.end_network(
+                batch["end_sequence"], batch["end_mask"], batch.get("proposal_condition")
+            ),
         }
 
 
@@ -245,6 +281,7 @@ class EndpointFeatureBatch:
     end_weight: np.ndarray | None
     start_offsets_seconds: np.ndarray
     end_offsets_seconds: np.ndarray
+    proposal_condition: np.ndarray | None = None
 
 
 def _nearest_features(
@@ -317,6 +354,11 @@ def build_endpoint_features(
     start_weights: list[float] = []
     end_weights: list[float] = []
     kept_indices: list[int] = []
+    use_proposal_conditioning = bool(config.get("use_proposal_conditioning", False))
+    condition_dim = int(config.get("proposal_condition_dim", 4)) if use_proposal_conditioning else 0
+    proposal_conditions: list[np.ndarray] = []
+    if use_proposal_conditioning and condition_dim != 4:
+        raise ValueError("Current boundary proposal conditioning requires dimension 4")
     for proposal_index, proposal in enumerate(proposals.itertuples(index=False)):
         group = groups[(str(proposal.subject_key), str(proposal.session_id))]
         observation_end = min(
@@ -357,6 +399,27 @@ def build_endpoint_features(
             )
         start_sequences.append(np.concatenate((start_values, start_relative), axis=1))
         end_sequences.append(np.concatenate((end_values, end_relative), axis=1))
+        if use_proposal_conditioning:
+            duration_seconds = max(
+                0.0, (int(proposal.coarse_end_ms) - int(proposal.coarse_start_ms)) / 1000.0
+            )
+            generator_score = float(getattr(proposal, "generator_score", 0.0))
+            state_score = float(getattr(proposal, "state_score", generator_score))
+            source_mask = float(getattr(proposal, "source_mask", 0.0))
+            generator_score = float(np.nan_to_num(generator_score, nan=0.0, posinf=10.0, neginf=-10.0))
+            state_score = float(np.nan_to_num(state_score, nan=generator_score, posinf=10.0, neginf=-10.0))
+            source_mask = float(np.nan_to_num(source_mask, nan=0.0, posinf=7.0, neginf=0.0))
+            proposal_conditions.append(
+                np.asarray(
+                    [
+                        np.clip(np.log1p(duration_seconds) / np.log1p(14_400.0), 0.0, 1.0),
+                        np.clip(generator_score, -10.0, 10.0),
+                        np.clip(state_score, -10.0, 10.0),
+                        np.clip(source_mask / 7.0, 0.0, 1.0),
+                    ],
+                    dtype=np.float32,
+                )
+            )
         start_masks.append(start_valid)
         end_masks.append(end_valid)
         kept_indices.append(proposal_index)
@@ -384,6 +447,7 @@ def build_endpoint_features(
             end_weight=None,
             start_offsets_seconds=start_offsets,
             end_offsets_seconds=end_offsets,
+            proposal_condition=np.empty((0, condition_dim), dtype=np.float32),
         )
     return EndpointFeatureBatch(
         sample_ids=sample_ids,
@@ -402,6 +466,11 @@ def build_endpoint_features(
         end_weight=np.asarray(end_weights, dtype=np.float32) if end_targets else None,
         start_offsets_seconds=start_offsets,
         end_offsets_seconds=end_offsets,
+        proposal_condition=(
+            np.stack(proposal_conditions).astype(np.float32)
+            if use_proposal_conditioning
+            else None
+        ),
     )
 
 
@@ -483,20 +552,47 @@ def apply_boundary_refinement(
             output.at[index, "refined_start_ms"] = start
             output.at[index, "refined_end_ms"] = end
         for previous_index, index in pairwise(ordered):
-            previous_end = int(output.at[previous_index, "refined_end_ms"])
-            start = int(output.at[index, "refined_start_ms"])
-            if previous_end + safety_gap_ms <= start:
-                continue
-            for affected in (previous_index, index):
-                output.at[affected, "refined_start_ms"] = int(
-                    output.at[affected, "coarse_start_ms"]
-                )
-                output.at[affected, "refined_end_ms"] = int(
-                    output.at[affected, "coarse_end_ms"]
-                )
-                output.at[affected, "start_fallback"] = True
-                output.at[affected, "end_fallback"] = True
-                output.at[affected, "boundary_fallback"] = True
+            if (
+                int(output.at[previous_index, "coarse_end_ms"]) + safety_gap_ms
+                > int(output.at[index, "coarse_start_ms"])
+            ):
+                raise RuntimeError("Accepted coarse events violate the neighboring-event gap")
+        for _ in range(2 * len(ordered)):
+            changed = False
+            for previous_index, index in pairwise(ordered):
+                if (
+                    int(output.at[previous_index, "refined_end_ms"]) + safety_gap_ms
+                    <= int(output.at[index, "refined_start_ms"])
+                ):
+                    continue
+                for affected, endpoint in (
+                    (previous_index, "end"),
+                    (index, "start"),
+                ):
+                    column = f"refined_{endpoint}_ms"
+                    coarse = int(output.at[affected, f"coarse_{endpoint}_ms"])
+                    if int(output.at[affected, column]) != coarse:
+                        changed = True
+                    output.at[affected, column] = coarse
+                    output.at[affected, f"{endpoint}_fallback"] = True
+                    if (
+                        int(output.at[affected, "refined_start_ms"])
+                        >= int(output.at[affected, "refined_end_ms"])
+                    ):
+                        output.at[affected, "refined_start_ms"] = int(
+                            output.at[affected, "coarse_start_ms"]
+                        )
+                        output.at[affected, "refined_end_ms"] = int(
+                            output.at[affected, "coarse_end_ms"]
+                        )
+                        output.at[affected, "start_fallback"] = True
+                        output.at[affected, "end_fallback"] = True
+                        changed = True
+            if not changed:
+                break
+        else:
+            raise RuntimeError("Boundary gap fallback did not converge")
+    output["boundary_fallback"] = output["start_fallback"] | output["end_fallback"]
     if len(output) != len(accepted) or set(output["proposal_id"]) != set(accepted["proposal_id"]):
         raise RuntimeError("Boundary refinement changed proposal identity or count")
     if (output["refined_start_ms"] >= output["refined_end_ms"]).any():

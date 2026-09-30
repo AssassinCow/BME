@@ -16,6 +16,7 @@ from bme_eating.calibration_v4 import (
     LogisticScoreCombiner,
     PlattCalibration,
     ProposalCalibrationV4,
+    SoftPlattCalibration,
     binary_state_targets,
     state_calibration_metrics,
     subject_crossfit_platt,
@@ -39,6 +40,7 @@ from bme_eating.hierarchical_artifacts import sha256_file
 from bme_eating.hierarchical_v4_pipeline import (
     HierarchicalEatingDetectorV4,
     _iter_tail_aligned_raw_state_batches,
+    _verify_bundle_runtime_source,
 )
 from bme_eating.metrics import (
     evaluate_events,
@@ -46,9 +48,12 @@ from bme_eating.metrics import (
     partition_evaluation_events,
 )
 from bme_eating.models.endpoint_refiner import (
+    BoundaryRange,
     EndpointNetwork,
+    EndpointRefiner,
     apply_boundary_refinement,
     augment_boundary_training_proposals,
+    build_endpoint_features,
     endpoint_loss,
     local_soft_argmax,
     select_boundary_range,
@@ -64,6 +69,7 @@ from bme_eating.models.event_verifier_v4 import (
 )
 from bme_eating.models.stats_fusion_loss import (
     StatsFusionStateLoss,
+    _temporal_contrastive_loss,
     one_sided_transition_targets,
 )
 from bme_eating.models.stats_fusion_state import (
@@ -77,7 +83,9 @@ from bme_eating.proposals_v4 import (
     ProposalSource,
     _hysteresis,
     _jitter,
+    _transition_candidates,
     generate_event_candidates_v4,
+    interval_iou,
     observed_hours_v4,
 )
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
@@ -93,12 +101,14 @@ from bme_eating.timeline import (
 )
 from bme_eating.training.hierarchical_v4_trainer import (
     UNLABELED_ANCHOR_COLUMNS,
+    PooledNestedStateOOF,
     V4Inputs,
     _add_robust_epoch_metrics,
     _apply_state_calibration_to_windows,
     _assert_nested_lineage,
     _assert_proposal_feature_alignment,
     _attach_truth_boundaries,
+    _average_state_prediction_frames,
     _build_isolated_pooled_fold_data,
     _build_seeded_state_model,
     _candidate_domain_metrics,
@@ -115,14 +125,17 @@ from bme_eating.training.hierarchical_v4_trainer import (
     _nested_cache_artifacts,
     _nested_cache_key,
     _prepare_nested_meta_cache,
+    _prepare_pooled_nested_state_oof,
     _selector_early_stopping_improved,
     _selector_split,
     _state_samples_per_epoch,
     _truth_event_durations,
+    _verify_pooled_outer_state_lineage,
     _write_outer_event_snapshot,
     infer_state_windows,
     load_v4_inputs,
 )
+from bme_eating.v4_protocol import RUNTIME_SOURCE_FILES
 
 
 def test_inference_endpoints_tile_tail_without_overlapping_supervision() -> None:
@@ -266,6 +279,7 @@ def test_pooled_fold_upstream_and_model_inputs_exclude_heldout_labels(monkeypatc
     monkeypatch.setattr(trainer, "generate_event_candidates_v4", candidates)
     monkeypatch.setattr(trainer, "build_proposal_features_v4", proposal_features)
     config = {
+        "hierarchical": {"downstream_mode": "pooled_deep_only"},
         "decoder": {
             "duration_lower_quantile": 0.0,
             "duration_upper_quantile": 1.0,
@@ -274,11 +288,34 @@ def test_pooled_fold_upstream_and_model_inputs_exclude_heldout_labels(monkeypatc
         },
         "verifier": {},
     }
-    baseline = _build_isolated_pooled_fold_data(logits, windows, truth, ignore, config)
+    nested = []
+    for heldout in range(5):
+        training_folds = [fold for fold in range(5) if fold != heldout]
+        nested.append(
+            PooledNestedStateOOF(
+                prediction_fold=heldout,
+                windows=pd.concat([logits[fold] for fold in training_folds], ignore_index=True),
+                lineage=tuple(
+                    {
+                        "training_subjects": [
+                            f"s{other}" for other in training_folds if other != fold
+                        ],
+                        "prediction_subjects": [f"s{fold}"],
+                        "globally_excluded_subjects": [f"s{heldout}"],
+                    }
+                    for fold in training_folds
+                ),
+            )
+        )
+    with pytest.raises(RuntimeError, match="fully excluded nested state OOF"):
+        _build_isolated_pooled_fold_data(logits, windows, truth, ignore, config)
+    baseline = _build_isolated_pooled_fold_data(
+        logits, windows, truth, ignore, config, nested
+    )
     changed_truth = [frame.copy() for frame in truth]
     changed_truth[0] = changed_truth[0].assign(start_ms=30_000, end_ms=36_000)
     changed = _build_isolated_pooled_fold_data(
-        logits, windows, changed_truth, ignore, config
+        logits, windows, changed_truth, ignore, config, nested
     )
     baseline_fold = baseline[0]
     changed_fold = changed[0]
@@ -292,6 +329,171 @@ def test_pooled_fold_upstream_and_model_inputs_exclude_heldout_labels(monkeypatc
             getattr(baseline_fold.features, name)[baseline_fold.prediction_indices],
             getattr(changed_fold.features, name)[changed_fold.prediction_indices],
         )
+    contaminated = list(nested)
+    contaminated[0] = PooledNestedStateOOF(
+        prediction_fold=0,
+        windows=nested[0].windows,
+        lineage=({
+            "training_subjects": ["s0", "s2", "s3", "s4"],
+            "prediction_subjects": ["s1"],
+            "globally_excluded_subjects": ["s0"],
+        },),
+    )
+    with pytest.raises(RuntimeError, match="includes excluded subjects"):
+        _build_isolated_pooled_fold_data(
+            logits, windows, truth, ignore, config, contaminated
+        )
+
+
+def test_state_ensemble_averages_logits_but_preserves_primary_latent() -> None:
+    reference = pd.DataFrame({
+        "subject_key": ["s"],
+        "session_id": ["d"],
+        "timestamp_ms": [3_000],
+        "state_logit": [1.0],
+        "onset_logit": [2.0],
+        "offset_logit": [3.0],
+        "state_hidden_0": [10.0],
+    })
+    alternate = reference.copy()
+    alternate[["state_logit", "onset_logit", "offset_logit"]] = [3.0, 4.0, 5.0]
+    alternate["state_hidden_0"] = 99.0
+    result = _average_state_prediction_frames([reference, alternate])
+    assert result.loc[0, "state_logit"] == 2.0
+    assert result.loc[0, "onset_logit"] == 3.0
+    assert result.loc[0, "offset_logit"] == 4.0
+    assert result.loc[0, "state_hidden_0"] == 10.0
+
+
+def test_pooled_nested_state_excludes_outer_subjects_and_resumes(tmp_path, monkeypatch) -> None:
+    import bme_eating.training.hierarchical_v4_trainer as trainer
+
+    subjects = [f"s{fold}" for fold in range(5)]
+    anchors = pd.DataFrame({
+        "subject_key": subjects,
+        "session_id": [f"d{fold}" for fold in range(5)],
+        "timestamp_ms": [3_000] * 5,
+        "state_target": [0.0] * 5,
+        "state_loss_mask": [1.0] * 5,
+    })
+    inputs = V4Inputs(
+        anchors=anchors,
+        segments=anchors[["subject_key"]].copy(),
+        events=anchors[["subject_key"]].copy(),
+        statistics=anchors[["subject_key"]].copy(),
+        subject_folds=dict(zip(subjects, range(5))),
+    )
+    outer_logits = [anchors.loc[[fold]].copy() for fold in range(5)]
+    outer_epochs = [{2026: fold + 1} for fold in range(5)]
+    config = {
+        "experiment": {"ablation_id": "R3-DIRECT"},
+        "final_training": {"state_seeds": [2026]},
+        "training": {"random_seed": 2026, "max_epochs": 32},
+        "model": {},
+        "sequence": {},
+        "loss": {},
+    }
+    training_calls = []
+
+    def fit_scaler(local_inputs, model_subjects):
+        assert set(local_inputs.anchors["subject_key"]) >= model_subjects
+        return SimpleNamespace(to_json=lambda: {"training_subjects": sorted(model_subjects)}), (
+            local_inputs.anchors.copy()
+        )
+
+    def make_dataset(rows, local_inputs, events, _normalization, _config, **_kwargs):
+        assert set(events["subject_key"]).issubset(set(local_inputs.anchors["subject_key"]))
+        return SimpleNamespace(rows=rows.copy(), events=events.copy())
+
+    def train_model(_model, dataset, _config, *, epochs, subjects, **_kwargs):
+        assert set(dataset.rows["subject_key"]) == subjects["train"]
+        assert set(dataset.events["subject_key"]) == subjects["train"]
+        training_calls.append((frozenset(subjects["train"]), epochs))
+
+    def infer(_model, dataset, _config, **_kwargs):
+        result = dataset.rows.copy()
+        result["state_logit"] = 0.0
+        result["onset_logit"] = 0.0
+        result["offset_logit"] = 0.0
+        return result
+
+    monkeypatch.setattr(trainer, "_fit_scaler_and_transform", fit_scaler)
+    monkeypatch.setattr(trainer, "_compute_sensor_normalization", lambda *_: "normalization")
+    monkeypatch.setattr(
+        trainer, "save_normalization", lambda _value, path: path.write_text("{}")
+    )
+    monkeypatch.setattr(trainer, "_make_dataset", make_dataset)
+    monkeypatch.setattr(trainer, "_build_seeded_state_model", lambda *_: torch.nn.Linear(1, 1))
+    monkeypatch.setattr(trainer, "_train_state_with_checkpoints", train_model)
+    monkeypatch.setattr(trainer, "infer_state_windows", infer)
+    outputs, artifacts = _prepare_pooled_nested_state_oof(
+        inputs, outer_logits, outer_epochs, config, tmp_path,
+        resume=False, input_identity_sha256="input-snapshot",
+    )
+    assert len(training_calls) == 15
+    assert len(outputs) == 5
+    assert all(path.is_file() for path in artifacts)
+    for fold, output in enumerate(outputs):
+        expected = set(subjects) - {subjects[fold]}
+        assert set(output.windows["subject_key"]) == expected
+        assert all(
+            subjects[fold] not in model["training_subjects"]
+            and subjects[fold] not in model["prediction_subjects"]
+            for model in output.lineage
+        )
+        assert all(model["epochs"] == fold + 1 for model in output.lineage)
+    cached, _ = _prepare_pooled_nested_state_oof(
+        inputs, outer_logits, outer_epochs, config, tmp_path,
+        resume=True, input_identity_sha256="input-snapshot",
+    )
+    assert len(training_calls) == 15
+    assert all(left.windows.equals(right.windows) for left, right in zip(outputs, cached))
+    changed_epochs = list(outer_epochs)
+    changed_epochs[0] = {2026: 2}
+    with pytest.raises(RuntimeError, match="cache identity changed"):
+        _prepare_pooled_nested_state_oof(
+            inputs, outer_logits, changed_epochs, config, tmp_path,
+            resume=True, input_identity_sha256="input-snapshot",
+        )
+
+
+def test_pooled_outer_state_lineage_uses_actual_checkpoint_path(tmp_path) -> None:
+    subjects = [f"s{fold}" for fold in range(5)]
+    inputs = V4Inputs(
+        anchors=pd.DataFrame({"subject_key": subjects}),
+        segments=pd.DataFrame(),
+        events=pd.DataFrame(),
+        statistics=pd.DataFrame(),
+        subject_folds=dict(zip(subjects, range(5))),
+    )
+    fold_roots = [tmp_path / f"fold_{fold}" for fold in range(5)]
+    for fold, root in enumerate(fold_roots):
+        state_root = root / "outer" / "state"
+        state_root.mkdir(parents=True)
+        training = sorted(set(subjects) - {subjects[fold]})
+        scaler_path = state_root / "statistics_scaler.json"
+        normalization_path = state_root / "sensor_normalization.json"
+        scaler_path.write_text(json.dumps({"training_subjects": training}))
+        normalization_path.write_text("{}")
+        torch.save(
+            {
+                "training_subjects": training,
+                "prediction_subjects": [subjects[fold]],
+                "globally_excluded_subjects": [subjects[fold]],
+                "parent_artifact_sha256": {
+                    "statistics_scaler": sha256_file(scaler_path),
+                    "sensor_normalization": sha256_file(normalization_path),
+                },
+            },
+            state_root / "state_seed_2026.pt",
+        )
+    _verify_pooled_outer_state_lineage(fold_roots, inputs, [2026])
+    contaminated_path = fold_roots[0] / "outer" / "state" / "state_seed_2026.pt"
+    contaminated = torch.load(contaminated_path, weights_only=True)
+    contaminated["training_subjects"].append("s0")
+    torch.save(contaminated, contaminated_path)
+    with pytest.raises(RuntimeError, match="not subject-isolated"):
+        _verify_pooled_outer_state_lineage(fold_roots, inputs, [2026])
 
 
 def _model_config() -> dict[str, object]:
@@ -324,6 +526,39 @@ def test_timewise_layer_norm_keeps_low_variance_gradients_finite() -> None:
     assert values.grad is not None
     assert torch.isfinite(values.grad).all()
     assert float(values.grad.norm()) < 1e4
+
+
+def test_statsfusion_optional_fusion_modules_are_finite_and_causal() -> None:
+    torch.manual_seed(2026)
+    config = _model_config()
+    config.update(
+        {
+            "use_mixstyle": True,
+            "mixstyle_probability": 1.0,
+            "mixstyle_alpha": 0.3,
+            "use_quality_conditioned_fusion": True,
+            "use_local_cross_scale_attention": True,
+            "local_attention_window_steps": 3,
+        }
+    )
+    batch = _state_batch(20)
+    for key in (
+        "motion_blocks",
+        "motion_valid",
+        "ppg_blocks",
+        "ppg_quality",
+        "ppg_valid",
+        "ppg_to_motion_index",
+        "long_block_end_indices",
+        "statistics",
+    ):
+        batch[key] = batch[key].repeat(2, *([1] * (batch[key].ndim - 1)))
+    model = StatsFusionStateModel(config).train()
+    output = model(batch)
+    assert output["state_hidden"].shape == (2, 20, 8)
+    assert output["modality_quality_gate"].shape == (2, 20)
+    assert torch.isfinite(output["state_logit"]).all()
+    assert torch.isfinite(output["state_hidden"]).all()
 
 
 def _state_batch(steps: int = 20) -> dict[str, torch.Tensor]:
@@ -667,6 +902,8 @@ def test_disabled_modality_cannot_leak_values_or_validity(disabled: str) -> None
         changed["ppg_blocks"] -= 100.0
         changed["ppg_quality"] += 100.0
         changed["ppg_valid"].zero_()
+        changed["statistics"][:, :, 9] += 100.0
+        changed["statistics"][:, :, 21].zero_()
     with torch.no_grad():
         original = model(batch)["state_logit"]
         modified = model(changed)["state_logit"]
@@ -916,6 +1153,29 @@ def test_jitter_is_clipped_to_observed_session_bounds() -> None:
     assert variants
     assert min(value[0] for value in variants) == 0
     assert max(value[1] for value in variants) <= 90_000
+
+
+def test_same_anchor_transition_with_three_second_jitter_can_recall_two_second_truth() -> None:
+    seeds = _transition_candidates(
+        np.asarray([3_000, 6_000], dtype=np.int64),
+        np.asarray([0.9, 0.0], dtype=np.float64),
+        np.asarray([0.9, 0.0], dtype=np.float64),
+        threshold=0.5,
+        minimum_ms=3_000,
+        maximum_ms=60_000,
+    )
+    assert seeds == [(3_000, 6_000, pytest.approx(0.9), int(ProposalSource.TRANSITION))]
+    variants = _jitter(
+        [(*seeds[0], "transition-family")],
+        [-3, 0, 3],
+        maximum_variants=9,
+        minimum_ms=3_000,
+        maximum_ms=60_000,
+        observation_start_ms=0,
+        observation_end_ms=9_000,
+    )
+
+    assert any(interval_iou(start, end, 0, 2_000) > 0.25 for start, end, *_ in variants)
 
 
 def test_candidate_budget_is_independent_per_session() -> None:
@@ -1410,6 +1670,153 @@ def test_masked_temporal_models_ignore_invalid_bin_values() -> None:
         first_endpoint = endpoint(sequence, mask)
         second_endpoint = endpoint(changed, mask)
     assert torch.allclose(first_endpoint[mask], second_endpoint[mask], atol=1e-7, rtol=0)
+
+
+def test_learned_query_verifier_pooling_is_mask_safe_and_finite() -> None:
+    verifier = EventVerifierV4(
+        4,
+        2,
+        {
+            "hidden_channels": 8,
+            "hidden_dim": 16,
+            "dropout": 0.0,
+            "use_learned_query_pooling": True,
+            "attention_heads": 2,
+        },
+    ).eval()
+    mask = torch.tensor([[True, True, False, False], [False, False, False, False]])
+    sequence = torch.randn(2, 4, 4)
+    changed = sequence.clone()
+    changed[0, 2:] = 1000.0
+    scalar = torch.zeros(2, 2)
+    with torch.no_grad():
+        first = verifier({"sequence": sequence, "sequence_mask": mask, "scalar": scalar})
+        second = verifier({"sequence": changed, "sequence_mask": mask, "scalar": scalar})
+    assert torch.isfinite(first["event_logit"]).all()
+    assert torch.isfinite(first["iou_logit"]).all()
+    assert torch.allclose(first["event_logit"], second["event_logit"], atol=1e-7, rtol=0)
+    assert torch.allclose(first["iou_logit"], second["iou_logit"], atol=1e-7, rtol=0)
+
+
+def test_boundary_proposal_conditioning_is_finite_and_label_free() -> None:
+    proposals = pd.DataFrame(
+        [
+            {
+                "proposal_id": "p",
+                "subject_key": "s",
+                "session_id": "x",
+                "coarse_start_ms": 10_000,
+                "coarse_end_ms": 20_000,
+                "generator_score": 0.7,
+                "state_score": 0.6,
+                "source_mask": 1,
+            }
+        ]
+    )
+    timestamps = np.arange(0, 80_001, 3_000, dtype=np.int64)
+    windows = pd.DataFrame(
+        {
+            "subject_key": "s",
+            "session_id": "x",
+            "timestamp_ms": timestamps,
+            "state_probability": 0.5,
+            "state_probability_derivative": 0.0,
+            "onset_probability": 0.1,
+            "offset_probability": 0.1,
+            "ppg_gate": 0.2,
+            "missing_fraction": 0.0,
+            "stat_a": 0.1,
+            "stat_b": 0.2,
+        }
+    )
+    features = build_endpoint_features(
+        proposals,
+        windows,
+        ["stat_a", "stat_b"],
+        BoundaryRange(60, 60, 0.0),
+        {
+            "bin_seconds": 3,
+            "gaussian_sigma_seconds": 9,
+            "use_proposal_conditioning": True,
+            "proposal_condition_dim": 4,
+        },
+    )
+    model = EndpointRefiner(
+        features.start_sequence.shape[-1],
+        {"hidden_dim": 8, "dropout": 0.0, "use_proposal_conditioning": True},
+    ).eval()
+    batch = {
+        "start_sequence": torch.from_numpy(features.start_sequence),
+        "end_sequence": torch.from_numpy(features.end_sequence),
+        "start_mask": torch.from_numpy(features.start_mask),
+        "end_mask": torch.from_numpy(features.end_mask),
+        "proposal_condition": torch.from_numpy(features.proposal_condition),
+    }
+    with torch.no_grad():
+        output = model(batch)
+    assert torch.isfinite(output["start_logit"][features.start_mask]).all()
+    assert torch.isfinite(output["end_logit"][features.end_mask]).all()
+    assert np.isfinite(features.proposal_condition).all()
+
+
+def test_temporal_contrastive_regularizer_uses_finite_hidden_gradients() -> None:
+    logits = torch.zeros(2, 5, requires_grad=True)
+    hidden = torch.randn(2, 5, 6, requires_grad=True)
+    batch = {
+        "state_target": torch.zeros_like(logits),
+        "onset_target": torch.zeros_like(logits),
+        "offset_target": torch.zeros_like(logits),
+        "supervision_mask": torch.ones_like(logits),
+        "state_loss_mask": torch.ones_like(logits),
+        "onset_loss_mask": torch.ones_like(logits),
+        "offset_loss_mask": torch.ones_like(logits),
+        "smooth_loss_mask": torch.ones_like(logits),
+        "smooth_mask": torch.ones_like(logits),
+        "timestamp_ms": torch.arange(5).repeat(2, 1) * 3_000,
+        "subject_key": ["first", "second"],
+        "session_id": ["a", "b"],
+    }
+    loss, components = StatsFusionStateLoss(
+        smooth_weight=0.0,
+        smooth_beta=0.5,
+        boundary_weight=0.0,
+        temporal_contrastive_weight=0.01,
+    )(
+        {
+            "state_logit": logits,
+            "onset_logit": logits,
+            "offset_logit": logits,
+            "state_hidden": hidden,
+        },
+        batch,
+    )
+    loss.backward()
+    assert components["contrastive_active_pairs"] > 0
+    assert torch.isfinite(hidden.grad).all()
+
+
+def test_temporal_contrastive_uses_absolute_session_time_for_negatives() -> None:
+    hidden = torch.randn(2, 2, 8)
+    valid = torch.ones(2, 2, dtype=torch.bool)
+    nearby_time = torch.tensor([[0, 3_000], [0, 3_000]])
+    distant_time = torch.tensor([[0, 3_000], [100_000, 103_000]])
+    nearby_loss, pairs, nearby_negatives = _temporal_contrastive_loss(
+        hidden, valid, nearby_time, ["same", "same"], ["session", "session"],
+        radius_steps=1, temperature=0.1, maximum_pairs=512,
+    )
+    distant_loss, _, distant_negatives = _temporal_contrastive_loss(
+        hidden, valid, distant_time, ["same", "same"], ["session", "session"],
+        radius_steps=1, temperature=0.1, maximum_pairs=512,
+    )
+    _, _, other_subject_negatives = _temporal_contrastive_loss(
+        hidden, valid, nearby_time, ["first", "second"], ["session", "session"],
+        radius_steps=1, temperature=0.1, maximum_pairs=512,
+    )
+    assert pairs == 2
+    assert nearby_negatives == 0
+    assert nearby_loss == 0
+    assert distant_negatives == other_subject_negatives == 2
+    assert distant_loss > 0
 
 
 def test_all_invalid_endpoint_forces_finite_fallback_decode() -> None:
@@ -1978,8 +2385,8 @@ def test_boundary_refinement_enforces_neighbor_safety_gap() -> None:
     )
     refined = apply_boundary_refinement(
         accepted,
-        np.asarray([0.0, -5.0]),
-        np.asarray([5.0, 0.0]),
+        np.asarray([1.0, -5.0]),
+        np.asarray([5.0, -1.0]),
         np.zeros(2),
         np.zeros(2),
         entropy_threshold=0.5,
@@ -1989,9 +2396,37 @@ def test_boundary_refinement_enforces_neighbor_safety_gap() -> None:
     assert set(refined["proposal_id"]) == {"left", "right"}
     assert refined.iloc[0].refined_end_ms == refined.iloc[0].coarse_end_ms
     assert refined.iloc[1].refined_start_ms == refined.iloc[1].coarse_start_ms
-    assert refined.iloc[0].refined_start_ms == refined.iloc[0].coarse_start_ms
-    assert refined.iloc[1].refined_end_ms == refined.iloc[1].coarse_end_ms
-    assert refined[["start_fallback", "end_fallback", "boundary_fallback"]].all().all()
+    assert refined.iloc[0].refined_start_ms == 1_000
+    assert refined.iloc[1].refined_end_ms == 19_000
+    assert refined["start_fallback"].tolist() == [False, True]
+    assert refined["end_fallback"].tolist() == [True, False]
+    assert refined["boundary_fallback"].all()
+
+
+def test_boundary_chain_conflict_keeps_gap_safe_coarse_events() -> None:
+    accepted = pd.DataFrame(
+        {
+            "proposal_id": ["first", "second", "third"],
+            "subject_key": ["s"] * 3,
+            "session_id": ["d"] * 3,
+            "coarse_start_ms": [0, 20_000, 40_000],
+            "coarse_end_ms": [10_000, 30_000, 50_000],
+        }
+    )
+    refined = apply_boundary_refinement(
+        accepted,
+        np.asarray([0.0, 6.0, 0.0]),
+        np.asarray([8.0, 9.0, 0.0]),
+        np.zeros(3),
+        np.zeros(3),
+        entropy_threshold=0.5,
+        safety_gap_seconds=3,
+    )
+    assert refined["proposal_id"].tolist() == accepted["proposal_id"].tolist()
+    assert refined["refined_start_ms"].tolist() == [0, 26_000, 40_000]
+    assert refined["refined_end_ms"].tolist() == [18_000, 30_000, 50_000]
+    assert refined["start_fallback"].tolist() == [False, False, True]
+    assert refined["end_fallback"].tolist() == [False, True, False]
 
 
 def test_boundary_neighbor_conflict_cannot_create_non_positive_event() -> None:
@@ -2013,9 +2448,23 @@ def test_boundary_neighbor_conflict_cannot_create_non_positive_event() -> None:
         entropy_threshold=0.5,
         safety_gap_seconds=3,
     )
-    assert refined["refined_start_ms"].tolist() == accepted["coarse_start_ms"].tolist()
-    assert refined["refined_end_ms"].tolist() == accepted["coarse_end_ms"].tolist()
+    assert refined["refined_start_ms"].tolist() == [95_000, 123_000]
+    assert refined["refined_end_ms"].tolist() == [100_000, 125_000]
     assert (refined["refined_start_ms"] < refined["refined_end_ms"]).all()
+
+
+def test_bundle_rejects_different_imported_runtime(tmp_path) -> None:
+    source = Path(importlib.import_module("bme_eating").__file__).parent
+    runtime = tmp_path / "runtime" / "bme_eating"
+    for relative in RUNTIME_SOURCE_FILES:
+        target = runtime / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((source / relative).read_bytes())
+    _verify_bundle_runtime_source(tmp_path)
+    preprocessing = runtime / "data" / "stats_fusion_preprocess.py"
+    preprocessing.write_bytes(preprocessing.read_bytes() + b"\n")
+    with pytest.raises(RuntimeError, match="differs"):
+        _verify_bundle_runtime_source(tmp_path)
 
 
 def test_v4_pipeline_import_does_not_import_xgboost(monkeypatch) -> None:
@@ -2160,6 +2609,30 @@ def test_small_ignore_overlap_does_not_exempt_long_false_prediction() -> None:
     )
     assert primary["false_positive"] == 1
     assert sensitivity["ignored_predictions"] == 1
+
+
+def test_evaluation_rejects_mixed_session_identity() -> None:
+    truth = pd.DataFrame(
+        {"subject_key": ["s"], "session_id": ["first"], "start_ms": [0], "end_ms": [10_000]}
+    )
+    prediction = pd.DataFrame(
+        {"subject_key": ["s"], "start_ms": [0], "end_ms": [10_000]}
+    )
+    with pytest.raises(ValueError, match="session_id"):
+        evaluate_events(truth, prediction)
+
+
+def test_partition_evaluation_events_normalizes_subject_identity() -> None:
+    events = pd.DataFrame(
+        {
+            "subject_key": [123],
+            "valid_duration": [True],
+            "evaluable": [True],
+        }
+    )
+    truth, ignore = partition_evaluation_events(events, {"123"})
+    assert len(truth) == 1
+    assert ignore.empty
 
 
 def test_ignore_overlap_is_removed_even_if_truth_label_is_positive() -> None:
@@ -3591,8 +4064,43 @@ def test_state_platt_fits_only_unmasked_windows_but_scores_full_timeline() -> No
         frame.loc[eligible, "state_target"].to_numpy(),
     )
     assert np.isfinite(calibrated["state_probability"]).all()
-    assert final.coefficient == pytest.approx(expected.coefficient)
-    assert final.intercept == pytest.approx(expected.intercept)
+    raw = PlattCalibration.identity().transform(frame["state_logit"].to_numpy())
+    expected_crossfit_brier = np.mean(
+        (calibrated.loc[eligible, "state_probability"] - frame.loc[eligible, "state_target"])
+        ** 2
+    )
+    raw_brier = np.mean((raw[eligible] - frame.loc[eligible, "state_target"]) ** 2)
+    if final.method == "identity":
+        assert expected_crossfit_brier == pytest.approx(raw_brier)
+    else:
+        assert final.coefficient == pytest.approx(expected.coefficient)
+        assert final.intercept == pytest.approx(expected.intercept)
+        assert expected_crossfit_brier < raw_brier
+
+
+def test_state_platt_falls_back_to_identity_when_crossfit_brier_worsens(
+    monkeypatch,
+) -> None:
+    frame = pd.DataFrame(
+        {
+            "subject_key": ["s0", "s0", "s1", "s1"],
+            "stacking_partition": [0, 0, 1, 1],
+            "state_logit": [-2.0, 2.0, -1.0, 1.0],
+            "state_target": [0.0, 1.0, 0.0, 1.0],
+        }
+    )
+
+    monkeypatch.setattr(
+        SoftPlattCalibration,
+        "fit",
+        classmethod(lambda cls, *_args, **_kwargs: cls(-1.0, 0.0, "soft_platt")),
+    )
+    calibrated, final = subject_crossfit_platt(frame)
+
+    assert final == SoftPlattCalibration.identity()
+    assert calibrated["state_probability"].to_numpy() == pytest.approx(
+        SoftPlattCalibration.identity().transform(frame["state_logit"].to_numpy())
+    )
 
 
 def test_state_calibration_recomputes_deployment_probability_and_derivative() -> None:

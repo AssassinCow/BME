@@ -154,6 +154,20 @@ class CausalCompletedBlockPool(nn.Module):
         )
         return held * valid.unsqueeze(-1).to(held.dtype)
 
+    def hold_completed_validity(
+        self, low_rate_validity: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        if indices.ndim != 2 or indices.shape[0] != low_rate_validity.shape[0]:
+            raise ValueError("Completed-block validity hold indices have an incompatible shape")
+        if low_rate_validity.shape[1] == 0:
+            return low_rate_validity.new_zeros((low_rate_validity.shape[0], indices.shape[1]))
+        if torch.any(indices >= low_rate_validity.shape[1]):
+            raise ValueError("Completed-block validity hold refers to a missing token")
+        valid = indices >= 0
+        safe = indices.clamp(0, low_rate_validity.shape[1] - 1)
+        held = low_rate_validity.gather(1, safe)
+        return held * valid.to(held.dtype)
+
 
 class StatsFusionStateModel(nn.Module):
     def __init__(self, config: dict[str, Any]) -> None:
@@ -171,6 +185,22 @@ class StatsFusionStateModel(nn.Module):
         self.use_long_context = bool(config.get("use_long_context", True))
         self.separate_motion_branches = bool(config.get("separate_motion_branches", False))
         self.use_invariant_motion_branch = bool(config.get("use_invariant_motion_branch", False))
+        self.use_mixstyle = bool(config.get("use_mixstyle", False))
+        self.mixstyle_probability = float(config.get("mixstyle_probability", 0.15))
+        self.mixstyle_alpha = float(config.get("mixstyle_alpha", 0.3))
+        self.use_quality_conditioned_fusion = bool(
+            config.get("use_quality_conditioned_fusion", False)
+        )
+        self.use_local_cross_scale_attention = bool(
+            config.get("use_local_cross_scale_attention", False)
+        )
+        self.local_attention_window_steps = int(config.get("local_attention_window_steps", 8))
+        if not 0.0 <= self.mixstyle_probability <= 1.0:
+            raise ValueError("mixstyle_probability must lie in [0, 1]")
+        if self.mixstyle_alpha <= 0:
+            raise ValueError("mixstyle_alpha must be positive")
+        if self.local_attention_window_steps < 0:
+            raise ValueError("local_attention_window_steps must be non-negative")
         stable_features = tuple(str(value) for value in config.get("stable_feature_columns", ()))
         self.ppg_statistics_index = (
             stable_features.index("local_ppg_valid_fraction")
@@ -290,6 +320,26 @@ class StatsFusionStateModel(nn.Module):
         nn.init.constant_(self.long_gate_network.bias, gate_bias)
         nn.init.constant_(self.statistics_gate_network[-1].bias, gate_bias)
 
+        if self.use_quality_conditioned_fusion:
+            self.quality_condition_network = nn.Sequential(
+                nn.Linear(hidden_dim + 4, hidden_dim),
+                nn.SiLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+            )
+            self.quality_residual = nn.Linear(hidden_dim, hidden_dim, bias=False)
+            nn.init.constant_(self.quality_condition_network[-1].bias, gate_bias)
+        if self.use_local_cross_scale_attention:
+            attention_heads = 4 if hidden_dim % 4 == 0 else 1
+            self.cross_scale_attention = nn.MultiheadAttention(
+                hidden_dim,
+                attention_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
+            self.cross_scale_projection = nn.Linear(hidden_dim, hidden_dim, bias=False)
+            self.cross_scale_gate = nn.Linear(hidden_dim + hidden_dim, hidden_dim)
+            nn.init.constant_(self.cross_scale_gate.bias, gate_bias)
+
         self.final_norm = nn.LayerNorm(hidden_dim)
         self.state_head = nn.Linear(hidden_dim, 1)
         self.onset_head = nn.Sequential(nn.Linear(hidden_dim, 32), nn.SiLU(), nn.Linear(32, 1))
@@ -310,6 +360,30 @@ class StatsFusionStateModel(nn.Module):
         safe = indices.clamp(0, max(0, values.shape[1] - 1))
         aligned = values.gather(1, safe.unsqueeze(-1).expand(-1, -1, values.shape[-1]))
         return aligned * (indices >= 0).unsqueeze(-1).to(aligned.dtype)
+
+    def _apply_mixstyle(
+        self, values: torch.Tensor, valid: torch.Tensor
+    ) -> torch.Tensor:
+        if not self.training or not self.use_mixstyle or values.shape[0] < 2:
+            return values
+        if torch.rand((), device=values.device) >= self.mixstyle_probability:
+            return values
+        weights = valid.to(values.dtype).unsqueeze(-1)
+        count = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        mean = (values * weights).sum(dim=1, keepdim=True) / count
+        variance = ((values - mean) ** 2 * weights).sum(dim=1, keepdim=True) / count
+        std = variance.clamp_min(1e-6).sqrt()
+        shift = int(
+            torch.randint(1, values.shape[0], (), device=values.device).item()
+        )
+        permutation = torch.arange(values.shape[0], device=values.device).roll(shift)
+        lam = torch.distributions.Beta(
+            self.mixstyle_alpha, self.mixstyle_alpha
+        ).sample((values.shape[0], 1, 1)).to(values.device, values.dtype)
+        mixed_mean = lam * mean + (1.0 - lam) * mean[permutation]
+        mixed_std = lam * std + (1.0 - lam) * std[permutation]
+        normalized = (values - mean) / std
+        return (normalized * mixed_std + mixed_mean) * weights + values * (1.0 - weights)
 
     @property
     def short_receptive_field_seconds(self) -> int:
@@ -414,6 +488,10 @@ class StatsFusionStateModel(nn.Module):
             )
         )
         statistics_input = batch["statistics"].to(short.dtype)
+        if not self.use_ppg and self.ppg_statistics_index is not None:
+            statistics_input = statistics_input.clone()
+            statistics_input[..., self.ppg_statistics_index] = 0.0
+            statistics_input[..., 12 + self.ppg_statistics_index] = 1.0
         statistics_missing = statistics_input[..., 12:]
         if not self.use_ppg and self.ppg_statistics_index is not None:
             active_statistics = torch.ones(
@@ -431,6 +509,13 @@ class StatsFusionStateModel(nn.Module):
         quality = torch.stack(
             (acc_valid, gyro_valid, ppg_fusion_valid, statistics_reliability), dim=-1
         )
+        short = self._apply_mixstyle(short, torch.maximum(motion_fusion_valid, ppg_fusion_valid) > 0)
+        quality_conditioned_gate = torch.zeros_like(short)
+        if self.use_quality_conditioned_fusion:
+            quality_conditioned_gate = torch.sigmoid(
+                self.quality_condition_network(torch.cat((short, quality), dim=-1))
+            )
+            short = short + quality_conditioned_gate * self.quality_residual(short)
         statistics_gate = torch.sigmoid(
             self.statistics_gate_network(torch.cat((short, statistics, quality), dim=-1))
         )
@@ -446,19 +531,56 @@ class StatsFusionStateModel(nn.Module):
         block_end_indices = batch.get("long_block_end_indices")
         if block_end_indices is None:
             raise ValueError("StatsFusion requires session-phased long_block_end_indices")
-        low, _ = self.long_pool(combined, combined_valid, block_end_indices)
+        low, low_validity = self.long_pool(combined, combined_valid, block_end_indices)
         if low.shape[1]:
             if ppg_indices is None:
                 raise ValueError("StatsFusion requires session-phased completed-block mapping")
             long = self.long_pool.hold_completed(self.long_tcn(low), ppg_indices)
+            long_validity = self.long_pool.hold_completed_validity(
+                low_validity, ppg_indices
+            )
         else:
             long = short.new_zeros(short.shape)
+            long_validity = combined_valid.new_zeros(combined_valid.shape)
         if not self.use_long_context:
             long = torch.zeros_like(long)
+            long_validity = torch.zeros_like(long_validity)
+        cross_scale = torch.zeros_like(short)
+        if self.use_local_cross_scale_attention and long.shape[1]:
+            steps = long.shape[1]
+            indices = torch.arange(steps, device=long.device)
+            distance = indices.unsqueeze(1) - indices.unsqueeze(0)
+            allowed = (distance >= 0) & (distance <= self.local_attention_window_steps)
+            attention_mask = ~allowed
+            key_padding_mask = ~(long_validity > 0)
+            no_valid = key_padding_mask.all(dim=1)
+            safe_key_padding_mask = key_padding_mask.clone()
+            safe_key_padding_mask[no_valid] = False
+            cross_scale, _ = self.cross_scale_attention(
+                short,
+                long,
+                long,
+                attn_mask=attention_mask,
+                key_padding_mask=safe_key_padding_mask,
+                need_weights=False,
+            )
+            cross_scale = self.cross_scale_projection(cross_scale)
+            cross_scale = torch.where(
+                no_valid[:, None, None], torch.zeros_like(cross_scale), cross_scale
+            )
+            cross_scale_gate = torch.sigmoid(
+                self.cross_scale_gate(torch.cat((short, long), dim=-1))
+            )
+            cross_scale = (
+                cross_scale_gate
+                * cross_scale
+                * long_validity.unsqueeze(-1).to(cross_scale.dtype)
+            )
         long_gate = torch.sigmoid(self.long_gate_network(torch.cat((short, long), dim=-1)))
         final = self.final_norm(
             short
             + long_gate * self.long_to_hidden(long)
+            + cross_scale
             + statistics_gate
             * statistics_reliability.unsqueeze(-1)
             * self.statistics_to_hidden(statistics)
@@ -472,6 +594,7 @@ class StatsFusionStateModel(nn.Module):
             active_validity.append(1.0 - statistics_missing_fraction)
         missing_fraction = 1.0 - torch.stack(active_validity, dim=0).mean(dim=0)
         return {
+            "state_hidden": final,
             "state_logit": self.state_head(final).squeeze(-1),
             "onset_logit": self.onset_head(final).squeeze(-1),
             "offset_logit": self.offset_head(final).squeeze(-1),
@@ -486,6 +609,7 @@ class StatsFusionStateModel(nn.Module):
             "gyro_valid_fraction": gyro_valid,
             "gyro_gate": gyro_gate.mean(dim=-1),
             "invariant_gate": invariant_gate.mean(dim=-1),
+            "modality_quality_gate": quality_conditioned_gate.mean(dim=-1),
             "ppg_valid_fraction": ppg_valid_aligned,
             "statistics_missing_fraction": statistics_missing_fraction,
         }
