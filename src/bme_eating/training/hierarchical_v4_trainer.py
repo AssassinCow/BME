@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import math
@@ -64,6 +65,7 @@ from bme_eating.models.endpoint_refiner import (
     EndpointRefiner,
     apply_boundary_refinement,
     augment_boundary_training_proposals,
+    boundary_geometric_feasibility,
     build_endpoint_features,
     endpoint_loss,
     local_soft_argmax,
@@ -99,6 +101,7 @@ from bme_eating.timeline import (
     deduplicate_consistent_timeline,
     tail_aligned_chunk_endpoints,
 )
+from bme_eating.training.pooled_nested_cache import compatible_postprocess_cache
 from bme_eating.v4_protocol import (
     BLOCKED_PREDECESSORS,
     CALIBRATION_PROTOCOL,
@@ -278,6 +281,11 @@ def _assert_proposal_feature_alignment(
         raise RuntimeError(f"{context} proposal IDs are not globally unique")
     if not np.array_equal(feature_ids, frame_ids):
         raise RuntimeError(f"{context} proposal feature rows are not aligned with score rows")
+    if features.raw_imu is not None and (
+        features.raw_imu.shape[:3] != (len(frame_ids), 3, 12)
+        or not np.isfinite(features.raw_imu).all()
+    ):
+        raise RuntimeError(f"{context} raw IMU features are invalid or misaligned")
     if features.event_target is not None and "is_positive" in frame:
         targets = frame["is_positive"].to_numpy(dtype=np.float32)
         if not np.array_equal(features.event_target.astype(np.float32), targets):
@@ -428,6 +436,16 @@ def _apply_state_calibration_to_windows(frame: pd.DataFrame, calibrator: Any) ->
     output["state_probability"] = calibrator.transform(
         output["state_logit"].to_numpy(dtype=np.float64)
     )
+    transition_logits = {"onset_logit", "offset_logit"}
+    if transition_logits & set(output.columns):
+        missing_logits = transition_logits - set(output.columns)
+        if missing_logits:
+            raise ValueError(
+                f"State calibration windows are missing columns: {sorted(missing_logits)}"
+            )
+        for endpoint in ("onset", "offset"):
+            logits = output[f"{endpoint}_logit"].to_numpy(dtype=np.float64)
+            output[f"{endpoint}_probability"] = 1.0 / (1.0 + np.exp(-logits))
     output["state_probability_derivative"] = (
         output.groupby(["subject_key", "session_id"], sort=False)["state_probability"]
         .diff()
@@ -683,7 +701,12 @@ def _make_dataset(
     training: bool,
     seed: int,
 ) -> StatsFusionSequenceDataset:
-    return StatsFusionSequenceDataset(
+    dataset_type = StatsFusionSequenceDataset
+    if bool(config["model"].get("use_proposal_head", False)):
+        from bme_eating.training.v48_targets import V48ProposalSequenceDataset
+
+        dataset_type = V48ProposalSequenceDataset
+    return dataset_type(
         anchors,
         inputs.segments,
         events,
@@ -723,6 +746,7 @@ def _state_loss(config: dict[str, Any]) -> StatsFusionStateLoss:
         temporal_contrastive_maximum_pairs=int(
             config["loss"].get("temporal_contrastive_maximum_pairs", 512)
         ),
+        proposal_weight=float(config["loss"].get("proposal_weight", 0.0)),
     )
 
 
@@ -825,15 +849,18 @@ def _train_state_epochs(
         torch.bfloat16 if config["training"].get("amp_dtype") == "bfloat16" else torch.float16
     )
     optimizer.zero_grad(set_to_none=True)
+    proposal_warmup_batches = max(
+        1, len(loader) * int(config["training"].get("proposal_warmup_epochs", 0))
+    )
     for epoch in range(epoch_offset, epoch_offset + int(epochs)):
         sampler.set_epoch(epoch)
         loss_sums = {
             name: 0.0
-            for name in ("total", "state", "onset", "offset", "smooth", "contrastive")
+            for name in ("total", "state", "onset", "offset", "smooth", "contrastive", "proposal")
         }
         gradient_norms: list[float] = []
         component_gradient_norms = {
-            name: [] for name in ("state", "onset", "offset", "smooth", "contrastive")
+            name: [] for name in ("state", "onset", "offset", "smooth", "contrastive", "proposal")
         }
         clipping_count = 0
         eligible_points = 0.0
@@ -857,6 +884,9 @@ def _train_state_epochs(
             dynamic_ncols=True,
         )
         for step, batch in enumerate(progress, start=1):
+            criterion.proposal_scale = min(
+                1.0, (epoch * len(loader) + step) / proposal_warmup_batches
+            )
             tensors = {
                 key: value.to(device, non_blocking=True)
                 if isinstance(value, torch.Tensor)
@@ -867,7 +897,7 @@ def _train_state_epochs(
                 output = model(tensors)
                 loss, components = criterion(output, tensors)
                 loss_sums["total"] += float(loss.detach().cpu())
-                for name in ("state", "onset", "offset", "smooth", "contrastive"):
+                for name in ("state", "onset", "offset", "smooth", "contrastive", "proposal"):
                     value = components.get(name)
                     if value is not None:
                         loss_sums[name] += float(value.detach().cpu())
@@ -889,7 +919,7 @@ def _train_state_epochs(
                     parameters = [
                         parameter for parameter in model.parameters() if parameter.requires_grad
                     ]
-                    for name in ("state", "onset", "offset", "smooth", "contrastive"):
+                    for name in ("state", "onset", "offset", "smooth", "contrastive", "proposal"):
                         component = components.get(name)
                         if component is None or not component.requires_grad:
                             continue
@@ -979,6 +1009,7 @@ def _train_state_epochs(
             "offset_loss_mean": loss_sums["offset"] / max(batch_count, 1),
             "smooth_loss_mean": loss_sums["smooth"] / max(batch_count, 1),
             "contrastive_loss_mean": loss_sums["contrastive"] / max(batch_count, 1),
+            "proposal_loss_mean": loss_sums["proposal"] / max(batch_count, 1),
             "contrastive_active_pairs": float(contrastive_pair_count),
             "contrastive_negative_pairs": float(contrastive_negative_pair_count),
             "gradient_norm_mean": float(gradient_array.mean()) if len(gradient_array) else 0.0,
@@ -1643,18 +1674,34 @@ def infer_state_windows(
     *,
     stacking_partition: int,
     progress_label: str = "state inference",
+    batch_size: int | None = None,
+    num_workers: int | None = None,
 ) -> pd.DataFrame:
     device = _device(config)
     model.to(device).eval()
+    effective_batch_size = int(
+        config["training"]["inference_batch_size"] if batch_size is None else batch_size
+    )
+    effective_num_workers = int(
+        config["training"].get(
+            "inference_num_workers", config["training"].get("num_workers", 0)
+        )
+        if num_workers is None
+        else num_workers
+    )
+    if effective_batch_size <= 0:
+        raise ValueError("inference batch size must be positive")
+    if effective_num_workers < 0:
+        raise ValueError("inference worker count cannot be negative")
     loader = DataLoader(
         dataset,
-        batch_size=int(config["training"]["inference_batch_size"]),
+        batch_size=effective_batch_size,
         sampler=_inference_endpoints(dataset),
-        num_workers=int(
-            config["training"].get(
-                "inference_num_workers", config["training"].get("num_workers", 0)
-            )
-        ),
+        num_workers=effective_num_workers,
+    )
+    amp_enabled = device.type == "cuda"
+    amp_dtype = (
+        torch.bfloat16 if config["training"].get("amp_dtype") == "bfloat16" else torch.float16
     )
     frames: list[pd.DataFrame] = []
     previous_chunks: dict[tuple[str, str], pd.DataFrame] = {}
@@ -1670,7 +1717,10 @@ def infer_state_windows(
             key: value.to(device) if isinstance(value, torch.Tensor) else value
             for key, value in batch.items()
         }
-        output = model(tensors)
+        # Keep inference numerics aligned with training and avoid retaining full-fp32
+        # intermediate activations for the large pooled nested state model.
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            output = model(tensors)
         for sample in range(output["state_logit"].shape[0]):
             mask = tensors["supervision_mask"][sample].bool().cpu().numpy()
             timestamps = tensors["timestamp_ms"][sample].cpu().numpy()[mask]
@@ -1731,6 +1781,10 @@ def infer_state_windows(
                     "stacking_partition": int(stacking_partition),
                 }
             )
+            if "proposal_logit" in output:
+                frame["proposal_logit"] = (
+                    output["proposal_logit"][sample].float().cpu().numpy()[mask]
+                )
             hidden = output.get("state_hidden")
             if hidden is not None:
                 hidden_values = hidden[sample].float().cpu().numpy()[mask]
@@ -1748,6 +1802,7 @@ def infer_state_windows(
             claimed = claim_new_timeline_rows(frame, previous_chunks)
             if not claimed.empty:
                 frames.append(claimed)
+        del output, tensors
     if not frames:
         return pd.DataFrame()
     output, _ = deduplicate_consistent_timeline(pd.concat(frames, ignore_index=True))
@@ -1895,7 +1950,14 @@ def _average_state_prediction_frames(
     for frame in ordered:
         if not reference[keys].equals(frame[keys]):
             raise RuntimeError("State seed predictions are not timeline-aligned")
-    for column in ("state_logit", "onset_logit", "offset_logit"):
+    if any("proposal_logit" in frame for frame in ordered) and not all(
+        "proposal_logit" in frame for frame in ordered
+    ):
+        raise RuntimeError("State seeds disagree about the v4.8 proposal head")
+    columns = ["state_logit", "onset_logit", "offset_logit"]
+    if "proposal_logit" in reference:
+        columns.append("proposal_logit")
+    for column in columns:
         reference[column] = np.mean(
             [frame[column].to_numpy(dtype=np.float64) for frame in ordered], axis=0
         )
@@ -3312,6 +3374,7 @@ def _slice_proposal_features(features, indices: np.ndarray):
         sample_weight=features.sample_weight[indices]
         if features.sample_weight is not None
         else None,
+        raw_imu=features.raw_imu[indices] if features.raw_imu is not None else None,
     )
 
 
@@ -5706,6 +5769,15 @@ def select_v4_pipeline(
         "target_semantics": TARGET_SEMANTICS,
         "calibration_protocol": CALIBRATION_PROTOCOL,
         "decoder_protocol": DECODER_PROTOCOL,
+        "candidate_protocol": config["decoder"].get("candidate_protocol", "legacy_v4"),
+        "proposal_head_protocol": (
+            "causal_event_nomination_v1"
+            if config["model"].get("use_proposal_head", False) else None
+        ),
+        "raw_imu_verifier_protocol": (
+            "three_causal_30s_snippets_v1"
+            if config["verifier"].get("use_raw_imu_branch", False) else None
+        ),
         "raw_input_schema": RAW_INPUT_SCHEMA,
         "decoder_config": decoder_selection["decoder"],
         "masking_protocol": "zero_mask_layernorm_v1",
@@ -5938,6 +6010,7 @@ def _concatenate_proposal_features(parts: list[ProposalFeatureBatchV4]) -> Propo
         event_target=optional("event_target"),
         iou_target=optional("iou_target"),
         sample_weight=optional("sample_weight"),
+        raw_imu=optional("raw_imu"),
     )
 
 
@@ -6046,8 +6119,21 @@ def _prepare_pooled_nested_state_oof(
             scaler_path = root / "statistics_scaler.json"
             normalization_path = root / "sensor_normalization.json"
             checkpoint_paths = {seed: root / f"seed_{seed}.pt" for seed in state_seeds}
+            runtime_training_keys = {
+                "num_workers",
+                "inference_num_workers",
+                "inference_batch_size",
+                "inference_resume_chunk_rows",
+            }
+            training_identity = {
+                key: value
+                for key, value in config["training"].items()
+                if key not in runtime_training_keys
+            }
             cache_payload = {
+                "cache_identity_version": 2,
                 "protocol": "pooled_head_excluded_state_oof_v1",
+                "implementation_protocol": "nested_state_memory_safe_v1",
                 "prediction_fold": prediction_fold,
                 "partition": partition,
                 "training_subjects": sorted(model_subjects),
@@ -6057,7 +6143,7 @@ def _prepare_pooled_nested_state_oof(
                 "epochs_by_seed": {str(seed): epochs for seed, epochs in epochs_by_seed.items()},
                 "model": config["model"],
                 "sequence": config["sequence"],
-                "training": config["training"],
+                "training": training_identity,
                 "loss": config["loss"],
                 "runtime_sha256": runtime_sha256,
                 "trainer_sha256": sha256_file(Path(__file__)),
@@ -6068,21 +6154,87 @@ def _prepare_pooled_nested_state_oof(
             ).hexdigest()
             if resume and lineage_path.is_file():
                 saved = json.loads(lineage_path.read_text(encoding="utf-8"))
-                if saved.get("cache_sha256") != cache_sha256:
-                    raise RuntimeError("Pooled nested state cache identity changed")
                 paths = {
                     "window_logits": prediction_path,
                     "statistics_scaler": scaler_path,
                     "sensor_normalization": normalization_path,
                     **{f"seed_{seed}": path for seed, path in checkpoint_paths.items()},
                 }
+                artifact_hashes = saved.get("artifact_sha256", {})
                 if any(
-                    not path.is_file() or sha256_file(path) != saved["artifact_sha256"].get(name)
+                    not path.is_file() or sha256_file(path) != artifact_hashes.get(name)
                     for name, path in paths.items()
                 ):
                     raise RuntimeError("Pooled nested state cache artifact changed")
-                predicted.append(pd.read_parquet(prediction_path))
-                lineage.extend(saved["model_lineage"])
+                cached_windows = pd.read_parquet(prediction_path)
+                expected_keys = ["subject_key", "session_id", "timestamp_ms"]
+                if any(key not in cached_windows.columns for key in expected_keys):
+                    raise RuntimeError("Pooled nested state cache is missing timeline keys")
+                if cached_windows.duplicated(expected_keys).any():
+                    raise RuntimeError("Pooled nested state cache contains duplicate anchors")
+                if set(cached_windows["subject_key"].astype(str)) != prediction_subjects:
+                    raise RuntimeError("Pooled nested state cache prediction subjects are incomplete")
+                model_lineage = saved.get("model_lineage", [])
+                expected_epochs = epochs_by_seed
+                if len(model_lineage) != len(state_seeds):
+                    raise RuntimeError("Pooled nested state cache lineage is incomplete")
+                for item in model_lineage:
+                    seed = int(item.get("seed", -1))
+                    if seed not in state_seeds:
+                        raise RuntimeError("Pooled nested state cache has an unexpected seed")
+                    if int(item.get("epochs", -1)) != expected_epochs[seed]:
+                        raise RuntimeError("Pooled nested state cache identity changed: epoch")
+                    if set(item.get("training_subjects", [])) != model_subjects:
+                        raise RuntimeError("Pooled nested state cache training subjects changed")
+                    if set(item.get("prediction_subjects", [])) != prediction_subjects:
+                        raise RuntimeError("Pooled nested state cache prediction subjects changed")
+                    if set(item.get("globally_excluded_subjects", [])) != excluded_subjects:
+                        raise RuntimeError("Pooled nested state cache excluded subjects changed")
+                scaler_payload = json.loads(scaler_path.read_text(encoding="utf-8"))
+                if set(scaler_payload.get("training_subjects", [])) != model_subjects:
+                    raise RuntimeError("Pooled nested state cache scaler subjects changed")
+                expected_parents = {
+                    "statistics_scaler": artifact_hashes["statistics_scaler"],
+                    "sensor_normalization": artifact_hashes["sensor_normalization"],
+                }
+                for seed in state_seeds:
+                    checkpoint = torch.load(
+                        checkpoint_paths[seed], map_location="cpu", weights_only=True
+                    )
+                    if (
+                        checkpoint.get("model_config") != config["model"]
+                        or int(checkpoint.get("seed", -1)) != int(seed)
+                        or int(checkpoint.get("epochs", -1)) != epochs_by_seed[seed]
+                        or set(checkpoint.get("training_subjects", [])) != model_subjects
+                        or set(checkpoint.get("prediction_subjects", [])) != prediction_subjects
+                        or set(checkpoint.get("globally_excluded_subjects", []))
+                        != excluded_subjects
+                        or checkpoint.get("parent_artifact_sha256") != expected_parents
+                    ):
+                        raise RuntimeError("Pooled nested state cache checkpoint lineage changed")
+                current_identity_version = int(saved.get("cache_identity_version", 0))
+                if saved.get("cache_sha256") != cache_sha256:
+                    postprocess_only = current_identity_version == 2 and compatible_postprocess_cache(
+                        saved.get("cache_payload", {}), cache_payload, saved.get("cache_sha256")
+                    )
+                    if current_identity_version >= 2 and not postprocess_only:
+                        raise RuntimeError("Pooled nested state cache identity changed")
+                    saved["cache_migration"] = {
+                        "from_cache_sha256": saved.get("cache_sha256"),
+                        "reason": (
+                            "probability_projection_after_cached_logits_v1"
+                            if postprocess_only
+                            else "memory_safe_inference_runtime_only"
+                        ),
+                    }
+                    saved["cache_identity_version"] = 2
+                    saved["cache_payload"] = cache_payload
+                    saved["cache_sha256"] = cache_sha256
+                    write_json_atomic(lineage_path, saved)
+                elif current_identity_version < 2:
+                    raise RuntimeError("Pooled nested state cache identity version is invalid")
+                predicted.append(cached_windows)
+                lineage.extend(model_lineage)
                 artifacts.extend((*paths.values(), lineage_path))
                 continue
             scaler, transformed = _fit_scaler_and_transform(local_inputs, model_subjects)
@@ -6146,6 +6298,8 @@ def _prepare_pooled_nested_state_oof(
                 seed_predictions.append(
                     infer_state_windows(
                         model, prediction_dataset, config, stacking_partition=partition,
+                        batch_size=1,
+                        num_workers=0,
                         progress_label=(
                             f"pooled state holdout={prediction_fold} partition={partition} inference"
                         ),
@@ -6162,6 +6316,10 @@ def _prepare_pooled_nested_state_oof(
                     }
                 )
                 artifacts.append(checkpoint_path)
+                del dataset, model
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             output = _average_state_prediction_frames(seed_predictions)
             if set(output["subject_key"].astype(str)) != prediction_subjects:
                 raise RuntimeError("Pooled nested state prediction subjects are incomplete")
@@ -6169,7 +6327,9 @@ def _prepare_pooled_nested_state_oof(
             write_json_atomic(
                 lineage_path,
                 {
+                    "cache_identity_version": 2,
                     "cache_sha256": cache_sha256,
+                    "cache_payload": cache_payload,
                     "model_lineage": partition_lineage,
                     "artifact_sha256": {
                         "window_logits": sha256_file(prediction_path),
@@ -6185,6 +6345,10 @@ def _prepare_pooled_nested_state_oof(
             predicted.append(output)
             lineage.extend(partition_lineage)
             artifacts.extend((prediction_path, lineage_path))
+            del prediction_dataset, seed_predictions, output
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         combined, _ = deduplicate_consistent_timeline(
             pd.concat(predicted, ignore_index=True)
         )
@@ -6235,6 +6399,7 @@ def _build_isolated_pooled_fold_data(
     outer_ignore: list[pd.DataFrame],
     config: dict[str, Any],
     nested_state_oof: list[PooledNestedStateOOF] | None = None,
+    raw_segments: pd.DataFrame | None = None,
 ) -> list[PooledFoldProposalData]:
     fold_count = len(outer_windows)
     if not (
@@ -6380,6 +6545,7 @@ def _build_isolated_pooled_fold_data(
                     calibrated_windows[source_fold],
                     statistic_columns,
                     config["verifier"],
+                    raw_segments=raw_segments,
                 )
             )
         proposals = pd.concat(proposal_parts, ignore_index=True)
@@ -6507,6 +6673,123 @@ def _pooled_head_diagnostics(
         },
         accepted,
     )
+
+
+def _v48_candidate_gate(
+    proposals: pd.DataFrame, truth: pd.DataFrame, config: dict[str, Any]
+) -> dict[str, Any]:
+    baseline = config["promotion_gate"]["v48_frozen_baseline"]
+    recall = _candidate_recall(proposals, truth)
+    relation = truth["hand_relation"].fillna("unknown").astype(str)
+    same_total = int(relation.eq("same").sum())
+    different_total = int(relation.eq("different").sum())
+    counts = {
+        "covered": round(recall["candidate_recall"] * len(truth)),
+        "same_covered": round(recall["same_candidate_recall"] * same_total),
+        "different_covered": round(
+            recall["different_candidate_recall"] * different_total
+        ),
+    }
+    checks = {
+        "overall_gain": counts["covered"] >= int(baseline["candidate_covered"]) + 5,
+        "same_retained": counts["same_covered"]
+        >= int(baseline["same_candidate_covered"]) - 2,
+        "different_retained": counts["different_covered"]
+        >= int(baseline["different_candidate_covered"]) - 2,
+    }
+    if bool(config["model"].get("use_proposal_head", False)):
+        checks["proposal_head_overall_target"] = counts["covered"] >= 126
+        checks["proposal_head_different_target"] = counts["different_covered"] >= 63
+    return {
+        "evidence_class": "development_stress_only",
+        "counts": counts,
+        "checks": checks,
+        "passed": all(checks.values()),
+    }
+
+
+def _paired_boundary_matches(
+    coarse_matches: pd.DataFrame, refined_matches: pd.DataFrame
+) -> pd.DataFrame:
+    identities = ["subject_key", "session_id", "event_id"]
+    errors = ["start_absolute_error_ms", "end_absolute_error_ms"]
+    columns = [*identities, "hand_relation", *(f"{name}_coarse" for name in errors),
+               *(f"{name}_refined" for name in errors)]
+    if coarse_matches.empty or refined_matches.empty:
+        return pd.DataFrame(columns=columns)
+    return coarse_matches[[*identities, "hand_relation", *errors]].merge(
+        refined_matches[[*identities, *errors]],
+        on=identities,
+        how="inner",
+        suffixes=("_coarse", "_refined"),
+        validate="one_to_one",
+    )
+
+
+def _v48_deep_gate(
+    diagnostics: dict[str, Any], config: dict[str, Any]
+) -> dict[str, Any]:
+    baseline = config["promotion_gate"]["v48_frozen_baseline"]
+    point = diagnostics["point"]
+    hand = diagnostics["hand"]
+    checks = {
+        "f1_gain": float(point["f1"]) >= float(baseline["final_f1"]) + 0.010,
+        "fp_per_hour": float(point["fp_per_hour"])
+        <= float(baseline["fp_per_hour"]) * 1.10,
+        "same_recall": float(hand["same_sensitivity"])
+        >= float(baseline["same_sensitivity"]) - 0.02,
+        "different_recall": float(hand["different_sensitivity"])
+        >= float(baseline["different_sensitivity"]) - 0.02,
+        "matching_stability": not _matching_ranking_reversal(
+            float(point["f1"]) - float(baseline["final_f1"]),
+            float(diagnostics["greedy_f1"]) - float(baseline["greedy_f1"]),
+            tolerance=0.005,
+        ),
+    }
+    return {"checks": checks, "passed": all(checks.values())}
+
+
+def _v48_subject_bootstrap(
+    accepted: pd.DataFrame,
+    truth: pd.DataFrame,
+    ignore: pd.DataFrame,
+    *,
+    seed: int = 2026,
+    replicates: int = 1000,
+) -> dict[str, Any]:
+    predictions = _prediction_events(accepted)
+    counts: list[list[float]] = []
+    for subject in sorted(truth["subject_key"].astype(str).unique()):
+        subject_truth = truth[truth["subject_key"].astype(str).eq(subject)]
+        subject_predictions = predictions[
+            predictions["subject_key"].astype(str).eq(subject)
+        ]
+        subject_ignore = ignore[ignore["subject_key"].astype(str).eq(subject)]
+        metrics, _ = evaluate_events(
+            subject_truth, subject_predictions,
+            method="max_cardinality_iou", ignore=subject_ignore,
+        )
+        counts.append([
+            float(metrics["true_positive"]),
+            float(metrics["false_positive"]),
+            float(metrics["false_negative"]),
+        ])
+    matrix = np.asarray(counts, dtype=np.float64)
+    rng = np.random.default_rng(seed)
+    sampled = matrix[rng.integers(0, len(matrix), size=(replicates, len(matrix)))].sum(axis=1)
+    denominator = 2 * sampled[:, 0] + sampled[:, 1] + sampled[:, 2]
+    values = np.divide(
+        2 * sampled[:, 0], denominator,
+        out=np.zeros(replicates, dtype=np.float64), where=denominator > 0,
+    )
+    return {
+        "seed": seed,
+        "replicates": replicates,
+        "evidence_class": "development_stress_joint_tuning_optimistic",
+        "f1_p025": float(np.quantile(values, 0.025)),
+        "f1_p975": float(np.quantile(values, 0.975)),
+        "probability_above_frozen_baseline": float((values > 0.5375).mean()),
+    }
 
 
 def _pooled_head_promotion(
@@ -7576,6 +7859,8 @@ def train_hierarchical_final_v4(
             raise RuntimeError(f"V4 fold {fold} must be EVALUATED before final training")
         if manifest.get("protocol_version") != PROTOCOL_VERSION:
             raise RuntimeError(f"V4 fold {fold} was not produced by {PROTOCOL_VERSION}")
+        if manifest.get("code_version") != CODE_VERSION:
+            raise RuntimeError(f"V4 fold {fold} is a frozen predecessor code generation")
         if _saved_resume_config_hash(root, manifest) != identity["resolved_config_sha256"]:
             raise RuntimeError(f"V4 fold {fold} configuration differs from final training")
         if bool(config.get("project", {}).get("enforce_git_identity_on_resume", False)) and (
@@ -7603,7 +7888,7 @@ def train_hierarchical_final_v4(
             root / "evaluation" / "truth_ignore_snapshot.json",
             *(root / "outer" / "state" / f"state_seed_{seed}.pt" for seed in expected_state_seeds),
         ]
-        if not fold_state_only_downstream:
+        if not fold_state_only_downstream and not pooled_learned_heads_downstream:
             required_parent_paths.extend(
                 [
                     root / "outer" / "proposal_scores.parquet",
@@ -7675,6 +7960,8 @@ def train_hierarchical_final_v4(
     if existing_manifest is not None:
         if existing_manifest.get("protocol_version") != PROTOCOL_VERSION:
             raise RuntimeError("Legacy or blocked v4 final runs cannot be resumed")
+        if existing_manifest.get("code_version") != CODE_VERSION:
+            raise RuntimeError("Frozen v4.7.1 final runs cannot be resumed with v4.8 code")
         saved_resume_identity = existing_manifest.get("resume_identity", {})
         if _final_resume_comparison_identity(
             saved_resume_identity, config
@@ -7927,6 +8214,7 @@ def train_hierarchical_final_v4(
                     windows,
                     [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
                     config["verifier"],
+                    raw_segments=inputs.segments,
                 )
             )
             scored = pd.read_parquet(root / "outer" / "proposal_scores.parquet")
@@ -8065,6 +8353,7 @@ def train_hierarchical_final_v4(
                     deployment_windows,
                     [f"stat_{name}" for name in STATS_FEATURE_COLUMNS],
                     config["verifier"],
+                    raw_segments=inputs.segments,
                 )
             )
     deployment_frame = (
@@ -8099,6 +8388,7 @@ def train_hierarchical_final_v4(
             ignore_parts,
             config,
             nested_state_oof=nested_state_oof,
+            raw_segments=inputs.segments,
         )
         calibration_frame, prediction_features = _pooled_prediction_frame_and_features(
             pooled_fold_data
@@ -8149,6 +8439,15 @@ def train_hierarchical_final_v4(
         raise RuntimeError("Pooled outer OOF produced no proposals")
     if calibration_frame["proposal_id"].astype(str).duplicated().any():
         raise RuntimeError("Pooled outer OOF proposal IDs are not globally unique")
+    if config["decoder"].get("candidate_protocol") == "v4.8":
+        v48_candidate_report = _v48_candidate_gate(
+            calibration_frame, pooled_truth, config
+        )
+        v48_candidate_path = final_root / "v48_candidate_gate.json"
+        write_json_atomic(v48_candidate_path, v48_candidate_report)
+        artifacts.append(v48_candidate_path)
+        if not v48_candidate_report["passed"]:
+            raise RuntimeError("v4.8 candidate gate failed; Deep training is not eligible")
     verifier_epoch_by_seed: dict[int, int] = {}
     pooled_logistic_report: dict[str, Any] | None = None
     pooled_deep_report: dict[str, Any] | None = None
@@ -8391,6 +8690,15 @@ def train_hierarchical_final_v4(
             minimum_f1_gain=float(config["promotion_gate"]["minimum_verifier_f1_improvement"]),
             config=config,
         )
+        if config["decoder"].get("candidate_protocol") == "v4.8":
+            v48_absolute_gate = _v48_deep_gate(deep_diagnostics, config)
+            v48_absolute_gate["subject_bootstrap"] = _v48_subject_bootstrap(
+                _accepted_from_point(
+                    deep_scores, deep_diagnostics["point"], "final_score"
+                ),
+                pooled_truth, pooled_ignore,
+            )
+            pooled_deep_report["v48_frozen_baseline_gate"] = v48_absolute_gate
         pooled_deep_report.update(
             {
                 "baseline_kind": "state_only_diagnostic",
@@ -8408,6 +8716,10 @@ def train_hierarchical_final_v4(
             raise RuntimeError(
                 "Deep-only promotion gate failed; no Logistic or state-only fallback is allowed"
             )
+        if config["decoder"].get("candidate_protocol") == "v4.8" and not bool(
+            pooled_deep_report["v48_frozen_baseline_gate"]["passed"]
+        ):
+            raise RuntimeError("v4.8 Deep did not beat the frozen v4.7.1 baseline gate")
         if deployment_features is None or deployment_frame.empty:
             raise RuntimeError("Pooled Deep-only deployment features are missing")
         verifier_kind = "deep"
@@ -8532,6 +8844,15 @@ def train_hierarchical_final_v4(
         "target_semantics": TARGET_SEMANTICS,
         "calibration_protocol": CALIBRATION_PROTOCOL,
         "decoder_protocol": DECODER_PROTOCOL,
+        "candidate_protocol": config["decoder"].get("candidate_protocol", "legacy_v4"),
+        "proposal_head_protocol": (
+            "causal_event_nomination_v1"
+            if config["model"].get("use_proposal_head", False) else None
+        ),
+        "raw_imu_verifier_protocol": (
+            "three_causal_30s_snippets_v1"
+            if config["verifier"].get("use_raw_imu_branch", False) else None
+        ),
         "raw_input_schema": RAW_INPUT_SCHEMA,
         "decoder_config": selected_decoder,
         "masking_protocol": "zero_mask_layernorm_v1",
@@ -8621,7 +8942,23 @@ def train_hierarchical_final_v4(
             "minimum_independent_events": int(config["boundary"]["minimum_independent_events"]),
             "enabled": False,
         }
-        if independent_events >= int(config["boundary"]["minimum_independent_events"]):
+        v48_boundary = config["decoder"].get("candidate_protocol") == "v4.8"
+        if v48_boundary:
+            boundary_report["geometric_feasibility"] = boundary_geometric_feasibility(
+                pooled_boundary_positive,
+                maximum_seconds=int(config["boundary"]["maximum_range_seconds"]),
+                minimum_start_seconds=int(config["boundary"]["minimum_range_seconds"]),
+                maximum_end_lookahead_seconds=int(
+                    config["boundary"].get("maximum_end_lookahead_seconds", 60)
+                ),
+            )
+        minimum_boundary_events = int(config["boundary"]["minimum_independent_events"])
+        correctable_enough = (
+            not v48_boundary
+            or boundary_report["geometric_feasibility"].get("both_correctable_count", 0)
+            >= minimum_boundary_events
+        )
+        if independent_events >= minimum_boundary_events and correctable_enough:
             boundary_parent_sha256 = {
                 "selected_head_scores": _dataframe_sha256(
                     pooled_scores,
@@ -8693,11 +9030,19 @@ def train_hierarchical_final_v4(
                         method="max_cardinality_iou",
                         ignore=pooled_ignore,
                     )
+                    paired = _paired_boundary_matches(coarse_matches, matches)
+                    paired_mae = {
+                        endpoint: {
+                            version: float(paired[f"{endpoint}_absolute_error_ms_{version}"].mean())
+                            for version in ("coarse", "refined")
+                        }
+                        for endpoint in ("start", "end")
+                    }
                     start_improved = bool(
-                        np.isfinite(metrics["start_mae_seconds"])
-                        and np.isfinite(coarse_metrics["start_mae_seconds"])
-                        and metrics["start_mae_seconds"]
-                        <= coarse_metrics["start_mae_seconds"]
+                        np.isfinite(paired_mae["start"]["coarse"])
+                        and np.isfinite(paired_mae["start"]["refined"])
+                        and paired_mae["start"]["refined"]
+                        <= paired_mae["start"]["coarse"]
                         * (
                             1.0
                             - float(
@@ -8706,10 +9051,10 @@ def train_hierarchical_final_v4(
                         )
                     )
                     end_improved = bool(
-                        np.isfinite(metrics["end_mae_seconds"])
-                        and np.isfinite(coarse_metrics["end_mae_seconds"])
-                        and metrics["end_mae_seconds"]
-                        <= coarse_metrics["end_mae_seconds"]
+                        np.isfinite(paired_mae["end"]["coarse"])
+                        and np.isfinite(paired_mae["end"]["refined"])
+                        and paired_mae["end"]["refined"]
+                        <= paired_mae["end"]["coarse"]
                         * (
                             1.0
                             - float(
@@ -8720,24 +9065,19 @@ def train_hierarchical_final_v4(
                     hand_gate: dict[str, Any] = {}
                     hand_passed = True
                     for relation in ("same", "different"):
-                        coarse_relation = coarse_matches[
-                            coarse_matches.get("hand_relation", pd.Series(dtype=str)) == relation
-                        ]
-                        refined_relation = matches[
-                            matches.get("hand_relation", pd.Series(dtype=str)) == relation
-                        ]
-                        enough = len(coarse_relation) >= 5 and len(refined_relation) >= 5
+                        relation_pairs = paired[paired["hand_relation"] == relation]
+                        enough = len(relation_pairs) >= 5
                         endpoint_checks: dict[str, bool] = {}
                         for endpoint in ("start", "end"):
                             column = f"{endpoint}_absolute_error_ms"
                             coarse_value = (
-                                float(coarse_relation[column].mean())
-                                if len(coarse_relation)
+                                float(relation_pairs[f"{column}_coarse"].mean())
+                                if len(relation_pairs)
                                 else float("nan")
                             )
                             refined_value = (
-                                float(refined_relation[column].mean())
-                                if len(refined_relation)
+                                float(relation_pairs[f"{column}_refined"].mean())
+                                if len(relation_pairs)
                                 else float("nan")
                             )
                             endpoint_checks[endpoint] = bool(
@@ -8748,13 +9088,11 @@ def train_hierarchical_final_v4(
                         relation_passed = enough and all(endpoint_checks.values())
                         hand_passed &= relation_passed
                         hand_gate[relation] = {
-                            "matched_events": len(refined_relation),
+                            "matched_events": len(relation_pairs),
                             "endpoint_checks": endpoint_checks,
                             "passed": relation_passed,
                         }
-                    matched_enough = len(matches) >= int(
-                        config["boundary"]["minimum_independent_events"]
-                    )
+                    matched_enough = len(paired) >= minimum_boundary_events
                     passed = bool(
                         identity_preserved
                         and matched_enough
@@ -8770,6 +9108,8 @@ def train_hierarchical_final_v4(
                         "passed": passed,
                         "identity_preserved": identity_preserved,
                         "matched_events": len(matches),
+                        "paired_matched_events": len(paired),
+                        "paired_mae_ms": paired_mae,
                         "start_mae_improved_10pct": start_improved,
                         "end_mae_improved_10pct": end_improved,
                         "f1": float(metrics["f1"]),
@@ -8781,7 +9121,8 @@ def train_hierarchical_final_v4(
                         winners.append(
                             (
                                 float(np.nanmean(
-                                    [metrics["start_mae_seconds"], metrics["end_mae_seconds"]]
+                                    [paired_mae["start"]["refined"],
+                                     paired_mae["end"]["refined"]]
                                 )),
                                 float(threshold),
                                 metrics,
@@ -8807,7 +9148,10 @@ def train_hierarchical_final_v4(
             except (ValueError, RuntimeError) as error:
                 boundary_report["disabled_reason"] = f"{type(error).__name__}: {error}"
         else:
-            boundary_report["disabled_reason"] = "insufficient_independent_matched_events"
+            boundary_report["disabled_reason"] = (
+                "insufficient_correctable_events"
+                if not correctable_enough else "insufficient_independent_matched_events"
+            )
         boundary_report_path = final_root / "boundary_crossfit.json"
         write_json_atomic(boundary_report_path, boundary_report)
         artifacts.append(boundary_report_path)

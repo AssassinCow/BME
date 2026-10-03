@@ -355,6 +355,12 @@ def test_repository_keeps_only_current_config_chain() -> None:
         "hierarchical_v4_r32_pooled_heads_early_select.yaml",
         "hierarchical_v4_r32_pooled_heads_transition.yaml",
         "hierarchical_v4_r32_deep_only_transition.yaml",
-        "hierarchical_v4_r32_deep_frontier.yaml",
+            "hierarchical_v4_r32_deep_frontier.yaml",
+            "hierarchical_v4_v48_candidate_repair.yaml",
+            "hierarchical_v4_v48_proposal_head.yaml",
+            "hierarchical_v4_v48_raw_imu.yaml",
+            "hierarchical_v4_v48_proposal_head_raw_imu.yaml",
+            "hierarchical_v4_v48_proposal_head_no_mixstyle.yaml",
+            "hierarchical_v4_v48_proposal_head_no_contrastive.yaml",
     }
     assert {path.name for path in root.glob("*.yaml")} == expected

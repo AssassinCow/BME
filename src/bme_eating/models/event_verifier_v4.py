@@ -27,6 +27,7 @@ class ProposalFeatureBatchV4:
     event_target: np.ndarray | None = None
     iou_target: np.ndarray | None = None
     sample_weight: np.ndarray | None = None
+    raw_imu: np.ndarray | None = None
 
 
 def pooled_logistic_features(features: ProposalFeatureBatchV4) -> np.ndarray:
@@ -67,6 +68,8 @@ class ProposalDatasetV4(Dataset[dict[str, torch.Tensor | str]]):
             "sequence_mask": torch.from_numpy(self.features.sequence_mask[index]),
             "scalar": torch.from_numpy(self.features.scalar[index]),
         }
+        if self.features.raw_imu is not None:
+            output["raw_imu"] = torch.from_numpy(self.features.raw_imu[index].astype(np.float32))
         for name in ("event_target", "iou_target", "sample_weight"):
             values = getattr(self.features, name)
             if values is not None:
@@ -235,6 +238,17 @@ class EventVerifierV4(nn.Module):
         )
         self.event_head = nn.Linear(64, 1)
         self.iou_head = nn.Linear(64, 1)
+        self.use_raw_imu_branch = bool(config.get("use_raw_imu_branch", False))
+        if self.use_raw_imu_branch:
+            self.raw_imu_encoder = nn.Sequential(
+                nn.Conv1d(12, 16, kernel_size=7, stride=2, padding=3),
+                nn.SiLU(),
+                nn.Conv1d(16, 16, kernel_size=5, stride=2, padding=2, groups=16),
+                nn.Conv1d(16, 16, kernel_size=1),
+                nn.SiLU(),
+            )
+            self.raw_imu_projection = nn.Linear(3 * 32, 64)
+            self.raw_imu_gate = nn.Parameter(torch.tensor(-3.0))
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         mask = batch["sequence_mask"].bool()
@@ -268,6 +282,22 @@ class EventVerifierV4(nn.Module):
             pooled.append(attention_pool)
         scalar = torch.nan_to_num(batch["scalar"])
         hidden = self.projection(torch.cat((*pooled, scalar), dim=-1))
+        if self.use_raw_imu_branch:
+            raw_imu = batch.get("raw_imu")
+            if raw_imu is None or raw_imu.ndim != 4 or raw_imu.shape[1:3] != (3, 12):
+                raise ValueError("Raw IMU verifier requires three aligned 12-channel snippets")
+            raw_imu = torch.nan_to_num(raw_imu)
+            raw_validity = raw_imu[:, :, 6:, :].mean(dim=(1, 2, 3)).clamp(0, 1)
+            encoded = self.raw_imu_encoder(
+                raw_imu.reshape(-1, 12, raw_imu.shape[-1])
+            )
+            raw_summary = torch.cat((encoded.mean(dim=-1), encoded.amax(dim=-1)), dim=-1)
+            raw_summary = raw_summary.reshape(raw_imu.shape[0], -1)
+            hidden = hidden + (
+                torch.sigmoid(self.raw_imu_gate)
+                * raw_validity.unsqueeze(-1)
+                * self.raw_imu_projection(raw_summary)
+            )
         event_logit = self.event_head(hidden).squeeze(-1)
         iou_logit = self.iou_head(hidden).squeeze(-1)
         return {
@@ -374,7 +404,19 @@ def build_proposal_features_v4(
     windows: pd.DataFrame,
     statistics_columns: list[str],
     config: dict[str, Any],
+    *,
+    raw_segments: pd.DataFrame | None = None,
+    raw_session: Any | None = None,
 ) -> ProposalFeatureBatchV4:
+    use_raw_imu = bool(config.get("use_raw_imu_branch", False))
+    source_bits = 7 if bool(config.get("include_v48_source_flags", False)) else 4
+    if use_raw_imu and (raw_segments is None) == (raw_session is None):
+        raise ValueError("Raw IMU verifier requires exactly one raw input source")
+    reader = None
+    if raw_segments is not None and use_raw_imu:
+        from bme_eating.data.session import SessionWindowReader
+
+        reader = SessionWindowReader(raw_segments)
     base_columns = [
         "state_probability",
         "onset_probability",
@@ -420,7 +462,42 @@ def build_proposal_features_v4(
     scalars: list[np.ndarray] = []
     latent_summaries: list[np.ndarray] = []
     boundary_summaries: list[np.ndarray] = []
-    for proposal in proposals.itertuples(index=False):
+    raw_imu_snippets: list[np.ndarray] = []
+    raw_by_index: dict[int, np.ndarray] = {}
+    if reader is not None:
+        indexed = proposals.reset_index(drop=True).reset_index(names="proposal_row_index")
+        for (subject_key, session_id), session_proposals in indexed.groupby(
+            ["subject_key", "session_id"], sort=False
+        ):
+            payload = reader.read(
+                str(session_id),
+                int(session_proposals["coarse_start_ms"].min()) - 15_000,
+                int(session_proposals["coarse_end_ms"].max()) + 15_000,
+                subject_key=str(subject_key),
+            )
+            for candidate in session_proposals.itertuples(index=False):
+                raw_by_index[int(candidate.proposal_row_index)] = _raw_imu_proposal_snippets(
+                    payload["motion_timestamp_ms"],
+                    payload["motion_values"],
+                    payload["motion_mask"],
+                    int(candidate.coarse_start_ms),
+                    int(candidate.coarse_end_ms),
+                )
+    for proposal_index, proposal in enumerate(proposals.itertuples(index=False)):
+        if use_raw_imu:
+            if reader is not None:
+                raw_imu_snippets.append(raw_by_index[proposal_index])
+            else:
+                if (str(raw_session.subject_key), str(raw_session.session_id)) != (
+                    str(proposal.subject_key), str(proposal.session_id)
+                ):
+                    raise ValueError("Raw session identity does not match verifier proposal")
+                raw_imu_snippets.append(_raw_imu_proposal_snippets(
+                    raw_session.motion_timestamp_ms,
+                    raw_session.motion_values,
+                    raw_session.motion_mask,
+                    int(proposal.coarse_start_ms), int(proposal.coarse_end_ms),
+                ))
         group = groups.get((str(proposal.subject_key), str(proposal.session_id)))
         if group is None:
             raise ValueError(f"No verifier windows for proposal {proposal.proposal_id}")
@@ -496,7 +573,7 @@ def build_proposal_features_v4(
                     np.log1p(max(duration_seconds, 0.0)),
                     float(proposal.generator_score),
                     state_mean,
-                    *((source_mask & (1 << bit)) > 0 for bit in range(4)),
+                    *((source_mask & (1 << bit)) > 0 for bit in range(source_bits)),
                     float(np.mean(valid_bins)),
                 ],
                 dtype=np.float32,
@@ -537,7 +614,7 @@ def build_proposal_features_v4(
     weights = normalized_proposal_weights(proposals) if "max_iou" in proposals else None
     bin_count = int(config["left_bins"]) + int(config["event_bins"]) + int(config["right_bins"])
     feature_dim = 5 * len(base_columns) + 6
-    scalar_values = np.stack(scalars) if scalars else np.empty((0, 8), np.float32)
+    scalar_values = np.stack(scalars) if scalars else np.empty((0, 4 + source_bits), np.float32)
     if use_latent_bridge:
         latent_values = (
             np.stack(latent_summaries)
@@ -562,4 +639,41 @@ def build_proposal_features_v4(
         event_target=event_target,
         iou_target=iou_target,
         sample_weight=weights,
+        raw_imu=np.stack(raw_imu_snippets) if use_raw_imu and raw_imu_snippets else None,
     )
+
+
+def _raw_imu_proposal_snippets(
+    timestamps: np.ndarray,
+    values: np.ndarray,
+    mask: np.ndarray,
+    start_ms: int,
+    end_ms: int,
+) -> np.ndarray:
+    from bme_eating.data.deep_dataset import _sample_grid
+
+    centers = (start_ms, (start_ms + end_ms) // 2, end_ms)
+    snippets: list[np.ndarray] = []
+    for center in centers:
+        sampled, sampled_mask = _sample_grid(
+            np.asarray(timestamps, dtype=np.int64),
+            np.asarray(values, dtype=np.float32),
+            np.asarray(mask, dtype=bool),
+            int(center) - 15_000,
+            30,
+            10,
+        )
+        normalized = np.zeros_like(sampled)
+        sampled_mask &= np.isfinite(sampled)
+        for channel in range(6):
+            valid = sampled_mask[:, channel]
+            if not valid.any():
+                continue
+            median = np.median(sampled[valid, channel])
+            spread = max(float(np.percentile(sampled[valid, channel], 75)
+                               - np.percentile(sampled[valid, channel], 25)), 1e-3)
+            normalized[valid, channel] = np.clip(
+                (sampled[valid, channel] - median) / spread, -10, 10
+            )
+        snippets.append(np.concatenate((normalized, sampled_mask.astype(np.float32)), axis=1).T)
+    return np.stack(snippets).astype(np.float16)

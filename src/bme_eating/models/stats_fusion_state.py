@@ -344,6 +344,9 @@ class StatsFusionStateModel(nn.Module):
         self.state_head = nn.Linear(hidden_dim, 1)
         self.onset_head = nn.Sequential(nn.Linear(hidden_dim, 32), nn.SiLU(), nn.Linear(32, 1))
         self.offset_head = nn.Sequential(nn.Linear(hidden_dim, 32), nn.SiLU(), nn.Linear(32, 1))
+        self.proposal_head = (
+            nn.Linear(hidden_dim, 1) if bool(config.get("use_proposal_head", False)) else None
+        )
 
     @staticmethod
     def _encode_blocks(encoder: nn.Module, blocks: torch.Tensor) -> torch.Tensor:
@@ -593,7 +596,7 @@ class StatsFusionStateModel(nn.Module):
         if self.use_statistics:
             active_validity.append(1.0 - statistics_missing_fraction)
         missing_fraction = 1.0 - torch.stack(active_validity, dim=0).mean(dim=0)
-        return {
+        result = {
             "state_hidden": final,
             "state_logit": self.state_head(final).squeeze(-1),
             "onset_logit": self.onset_head(final).squeeze(-1),
@@ -613,3 +616,6 @@ class StatsFusionStateModel(nn.Module):
             "ppg_valid_fraction": ppg_valid_aligned,
             "statistics_missing_fraction": statistics_missing_fraction,
         }
+        if self.proposal_head is not None:
+            result["proposal_logit"] = self.proposal_head(final).squeeze(-1)
+        return result

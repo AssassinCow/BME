@@ -1,0 +1,7 @@
+extends: hierarchical_v4_v48_proposal_head.yaml
+
+experiment:
+  name: hierarchical_v4_v48_proposal_head_raw_imu
+
+verifier:
+  use_raw_imu_branch: true

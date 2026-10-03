@@ -117,6 +117,7 @@ class StatsFusionStateLoss(nn.Module):
         temporal_contrastive_temperature: float = 0.1,
         temporal_contrastive_radius_steps: int = 1,
         temporal_contrastive_maximum_pairs: int = 512,
+        proposal_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.smooth_weight = float(smooth_weight)
@@ -125,6 +126,10 @@ class StatsFusionStateLoss(nn.Module):
             raise ValueError("Smooth Huber beta must be positive")
         self.boundary_weight = float(boundary_weight)
         self.temporal_contrastive_weight = float(temporal_contrastive_weight)
+        self.proposal_weight = float(proposal_weight)
+        self.proposal_scale = 1.0
+        if self.proposal_weight < 0:
+            raise ValueError("Proposal loss weight must be non-negative")
         self.temporal_contrastive_temperature = float(temporal_contrastive_temperature)
         self.temporal_contrastive_radius_steps = int(temporal_contrastive_radius_steps)
         self.temporal_contrastive_maximum_pairs = int(temporal_contrastive_maximum_pairs)
@@ -220,11 +225,23 @@ class StatsFusionStateLoss(nn.Module):
                 temperature=self.temporal_contrastive_temperature,
                 maximum_pairs=self.temporal_contrastive_maximum_pairs,
             )
+        proposal = state * 0.0
+        if self.proposal_weight:
+            if "proposal_logit" not in output:
+                raise ValueError("Enabled proposal loss requires proposal_logit")
+            proposal_element = F.binary_cross_entropy_with_logits(
+                output["proposal_logit"], batch["proposal_target"], reduction="none"
+            )
+            proposal = self._weighted_mean(
+                proposal_element,
+                supervision * importance * global_mask * batch["proposal_weight"],
+            )
         total = (
             state
             + self.smooth_weight * smooth
             + self.boundary_weight * (onset + offset)
             + self.temporal_contrastive_weight * contrastive
+            + self.proposal_weight * self.proposal_scale * proposal
         )
         if not torch.isfinite(total):
             raise FloatingPointError("StatsFusion state loss became non-finite")
@@ -236,6 +253,7 @@ class StatsFusionStateLoss(nn.Module):
             "smooth_active_count": smooth_active,
             "smooth_large_jump_fraction": smooth_large_jump,
             "contrastive": contrastive,
+            "proposal": proposal,
             "contrastive_active_pairs": torch.as_tensor(
                 float(contrastive_pairs), device=total.device
             ),

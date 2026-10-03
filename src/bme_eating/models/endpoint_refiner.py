@@ -17,6 +17,54 @@ class BoundaryRange:
     clipped_fraction: float
 
 
+def boundary_geometric_feasibility(
+    positive_proposals: pd.DataFrame,
+    *,
+    maximum_seconds: int = 900,
+    minimum_start_seconds: int = 60,
+    maximum_end_lookahead_seconds: int = 60,
+) -> dict[str, float | int | str]:
+    if positive_proposals.empty:
+        return {"independent_events": 0, "both_correctable_fraction": 0.0}
+    required = {
+        "subject_key", "session_id", "matched_event_id", "max_iou",
+        "coarse_start_ms", "coarse_end_ms", "truth_start_ms", "truth_end_ms",
+    }
+    missing = required - set(positive_proposals.columns)
+    if missing:
+        raise ValueError(f"Boundary feasibility is missing columns: {sorted(missing)}")
+    representatives = (
+        positive_proposals.sort_values("max_iou", ascending=False, kind="stable")
+        .drop_duplicates(["subject_key", "session_id", "matched_event_id"])
+    )
+    duration = (
+        representatives["coarse_end_ms"] - representatives["coarse_start_ms"]
+    ).to_numpy(dtype=float) / 1000.0
+    start_residual = (
+        representatives["truth_start_ms"] - representatives["coarse_start_ms"]
+    ).to_numpy(dtype=float) / 1000.0
+    end_residual = (
+        representatives["truth_end_ms"] - representatives["coarse_end_ms"]
+    ).to_numpy(dtype=float) / 1000.0
+    start_limit = np.minimum(maximum_seconds, np.maximum(minimum_start_seconds, duration))
+    start_possible = np.isfinite(start_residual) & (np.abs(start_residual) <= start_limit)
+    end_possible = (
+        np.isfinite(end_residual)
+        & (end_residual >= -maximum_seconds)
+        & (end_residual <= maximum_end_lookahead_seconds)
+    )
+    return {
+        "independent_events": len(representatives),
+        "semantics": "best_iou_per_truth_pre_verifier_upper_bound",
+        "start_correctable_fraction": float(start_possible.mean()),
+        "end_correctable_fraction": float(end_possible.mean()),
+        "both_correctable_count": int((start_possible & end_possible).sum()),
+        "both_correctable_fraction": float((start_possible & end_possible).mean()),
+        "start_residual_mae_seconds": float(np.nanmean(np.abs(start_residual))),
+        "end_residual_mae_seconds": float(np.nanmean(np.abs(end_residual))),
+    }
+
+
 def select_boundary_range(
     start_residual_seconds: np.ndarray,
     end_residual_seconds: np.ndarray,
@@ -339,9 +387,14 @@ def build_endpoint_features(
         bin_seconds,
         dtype=np.float32,
     )
+    end_forward_seconds = (
+        min(boundary_range.end_seconds, int(config.get("maximum_end_lookahead_seconds", 60)))
+        if bool(config.get("adaptive_start_range", False))
+        else boundary_range.end_seconds
+    )
     end_offsets = np.arange(
         -boundary_range.end_seconds,
-        boundary_range.end_seconds + bin_seconds,
+        end_forward_seconds + bin_seconds,
         bin_seconds,
         dtype=np.float32,
     )
@@ -368,6 +421,18 @@ def build_endpoint_features(
         end_grid = int(proposal.coarse_end_ms) + (end_offsets * 1000).astype(np.int64)
         start_values, start_valid = _nearest_features(group, start_grid, columns, observation_end)
         end_values, end_valid = _nearest_features(group, end_grid, columns, observation_end)
+        if bool(config.get("adaptive_start_range", False)):
+            duration_seconds = max(
+                0, (int(proposal.coarse_end_ms) - int(proposal.coarse_start_ms)) // 1000
+            )
+            start_limit = min(
+                boundary_range.start_seconds,
+                max(int(config.get("minimum_range_seconds", 60)), duration_seconds),
+            )
+            start_valid &= np.abs(start_offsets) <= start_limit
+            end_valid &= end_offsets <= int(config.get("maximum_end_lookahead_seconds", 60))
+            start_values[~start_valid] = 0.0
+            end_values[~end_valid] = 0.0
         start_relative = (start_offsets / max(boundary_range.start_seconds, 1))[:, None]
         end_relative = (end_offsets / max(boundary_range.end_seconds, 1))[:, None]
         start_weight = 1.0

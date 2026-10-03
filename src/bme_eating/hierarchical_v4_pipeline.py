@@ -143,11 +143,14 @@ def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
 def _feature_batch_to_tensors(
     features: ProposalFeatureBatchV4, device: torch.device
 ) -> dict[str, torch.Tensor]:
-    return {
+    tensors = {
         "sequence": torch.from_numpy(features.sequence).to(device),
         "sequence_mask": torch.from_numpy(features.sequence_mask).to(device),
         "scalar": torch.from_numpy(features.scalar).to(device),
     }
+    if features.raw_imu is not None:
+        tensors["raw_imu"] = torch.from_numpy(features.raw_imu.astype(np.float32)).to(device)
+    return tensors
 
 
 class HierarchicalEatingDetectorV4:
@@ -241,6 +244,10 @@ class HierarchicalEatingDetectorV4:
             name: torch.stack([output[name].float() for output in outputs]).mean(dim=0)
             for name in names
         }
+        if all("proposal_logit" in output for output in outputs):
+            averaged["proposal_logit"] = torch.stack(
+                [output["proposal_logit"].float() for output in outputs]
+            ).mean(dim=0)
         if all("state_hidden" in output for output in outputs):
             averaged["state_hidden"] = torch.stack(
                 [output["state_hidden"].float() for output in outputs]
@@ -293,6 +300,8 @@ class HierarchicalEatingDetectorV4:
                 ),
             }
         )
+        if "proposal_logit" in averaged:
+            frame["proposal_logit"] = averaged["proposal_logit"][0].cpu().numpy()
         hidden = averaged.get("state_hidden")
         if hidden is not None:
             hidden_values = hidden[0].float().cpu().numpy()
@@ -313,7 +322,10 @@ class HierarchicalEatingDetectorV4:
         return pooled_logistic_features(features)
 
     @torch.no_grad()
-    def _score_proposals(self, proposals: pd.DataFrame, windows: pd.DataFrame) -> pd.DataFrame:
+    def _score_proposals(
+        self, proposals: pd.DataFrame, windows: pd.DataFrame,
+        raw_session: RawSessionInput | None = None,
+    ) -> pd.DataFrame:
         if self.selection.get("verifier_kind") == "state_only":
             output = proposals.copy().reset_index(drop=True)
             output["state_score"] = output["generator_score"]
@@ -326,6 +338,7 @@ class HierarchicalEatingDetectorV4:
             windows,
             self.statistics_columns,
             self.config["verifier"],
+            raw_session=raw_session,
         )
         output = proposals.copy().reset_index(drop=True)
         output["state_score"] = features.scalar[:, 2]
@@ -405,7 +418,9 @@ class HierarchicalEatingDetectorV4:
             safety_gap_seconds=int(self.config["boundary"]["safety_gap_seconds"]),
         )
 
-    def _events_from_windows(self, windows: pd.DataFrame) -> list[Event]:
+    def _events_from_windows(
+        self, windows: pd.DataFrame, raw_session: RawSessionInput | None = None
+    ) -> list[Event]:
         if windows.empty:
             return []
         proposals = generate_event_candidates_v4(
@@ -416,7 +431,7 @@ class HierarchicalEatingDetectorV4:
         )
         if proposals.empty:
             return []
-        scored = self._score_proposals(proposals, windows)
+        scored = self._score_proposals(proposals, windows, raw_session)
         accepted = scored[
             scored["final_score"] >= float(self.selection["acceptance_threshold"])
         ].copy()
@@ -475,7 +490,7 @@ class HierarchicalEatingDetectorV4:
             pd.concat(frames, ignore_index=True)
         )
         self.last_duplicate_anchor_diagnostics = duplicate_diagnostics
-        return self._events_from_windows(windows)
+        return self._events_from_windows(windows, session)
 
 
 def load_hierarchical_v4_bundle(
@@ -506,6 +521,17 @@ def load_hierarchical_v4_bundle(
         raise RuntimeError(f"Only {PROTOCOL_VERSION} bundles are supported")
     if selection.get("raw_input_schema") != RAW_INPUT_SCHEMA:
         raise RuntimeError("V4 bundle raw input schema is incompatible")
+    if config.get("decoder", {}).get("candidate_protocol") == "v4.8":
+        if selection.get("candidate_protocol") != "v4.8":
+            raise RuntimeError("v4.8 bundle candidate protocol binding is missing")
+        if bool(config.get("model", {}).get("use_proposal_head", False)) != (
+            selection.get("proposal_head_protocol") == "causal_event_nomination_v1"
+        ):
+            raise RuntimeError("v4.8 bundle proposal-head binding is incompatible")
+        if bool(config.get("verifier", {}).get("use_raw_imu_branch", False)) != (
+            selection.get("raw_imu_verifier_protocol") == "three_causal_30s_snippets_v1"
+        ):
+            raise RuntimeError("v4.8 bundle raw IMU binding is incompatible")
     selected_decoder = selection.get("decoder_config")
     if not isinstance(selected_decoder, dict):
         raise TypeError("V4 bundle selection has no hash-locked decoder configuration")

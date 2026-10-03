@@ -18,6 +18,9 @@ class ProposalSource(IntFlag):
     SEMI_MARKOV = 2
     TRANSITION = 4
     JITTER = 8
+    BACKTRACK = 16
+    START_EXPANSION = 32
+    PROPOSAL_HEAD = 64
 
 
 ALLOWED_SOURCE_MASK = int(
@@ -25,6 +28,9 @@ ALLOWED_SOURCE_MASK = int(
     | ProposalSource.SEMI_MARKOV
     | ProposalSource.TRANSITION
     | ProposalSource.JITTER
+    | ProposalSource.BACKTRACK
+    | ProposalSource.START_EXPANSION
+    | ProposalSource.PROPOSAL_HEAD
 )
 
 
@@ -59,6 +65,7 @@ def _hysteresis(
     high: float,
     low: float,
     step_ms: int,
+    backtrack_seconds: int = 0,
 ) -> list[tuple[int, int, float, int]]:
     if not 0 <= low <= high <= 1:
         raise ValueError("Hysteresis thresholds must satisfy 0 <= low <= high <= 1")
@@ -69,6 +76,10 @@ def _hysteresis(
         if not active and probability >= high:
             active = True
             start = index
+            if backtrack_seconds:
+                earliest = max(0, index - backtrack_seconds * 1000 // step_ms)
+                while start > earliest and probabilities[start - 1] >= low:
+                    start -= 1
         elif active and probability < low:
             start_ms, end_ms = right_endpoint_run_to_interval(timestamps, start, index, step_ms)
             events.append(
@@ -76,7 +87,7 @@ def _hysteresis(
                     start_ms,
                     end_ms,
                     float(np.max(probabilities[start:index])),
-                    int(ProposalSource.HYSTERESIS),
+                    int(ProposalSource.HYSTERESIS | (ProposalSource.BACKTRACK if backtrack_seconds else 0)),
                 )
             )
             active = False
@@ -89,7 +100,7 @@ def _hysteresis(
                 start_ms,
                 end_ms,
                 float(np.max(probabilities[start:])),
-                int(ProposalSource.HYSTERESIS),
+                int(ProposalSource.HYSTERESIS | (ProposalSource.BACKTRACK if backtrack_seconds else 0)),
             )
         )
     return events
@@ -190,20 +201,32 @@ def _jitter(
     *,
     observation_start_ms: int,
     observation_end_ms: int,
+    symmetric_v48: bool = False,
 ) -> list[tuple[int, int, float, int, str]]:
     if observation_end_ms <= observation_start_ms:
         raise ValueError("Proposal jitter requires a positive observation interval")
-    shifts = sorted(
-        ((left, right) for left in jitter_seconds for right in jitter_seconds),
-        key=lambda value: (abs(value[0]) + abs(value[1]), abs(value[0] - value[1]), value),
-    )[:maximum_variants]
+    if symmetric_v48:
+        shifts = [(0, 0)]
+        for distance in (3, 15, 30):
+            for sign in (-1, 1):
+                shifts.extend(((sign * distance, 0), (0, sign * distance)))
+        shifts.extend(((15, 15), (-15, -15), (15, -15), (-15, 15)))
+    else:
+        shifts = sorted(
+            ((left, right) for left in jitter_seconds for right in jitter_seconds),
+            key=lambda value: (abs(value[0]) + abs(value[1]), abs(value[0] - value[1]), value),
+        )[:maximum_variants]
     output: list[tuple[int, int, float, int, str]] = []
     for start, end, score, source, family_id in events:
         for left, right in shifts:
-            candidate_start = max(int(observation_start_ms), start + left * 1000)
-            candidate_end = min(int(observation_end_ms), end + right * 1000)
+            candidate_start = start + left * 1000
+            candidate_end = end + right * 1000
+            if not symmetric_v48:
+                candidate_start = max(int(observation_start_ms), candidate_start)
+                candidate_end = min(int(observation_end_ms), candidate_end)
             duration = candidate_end - candidate_start
-            if minimum_ms <= duration <= maximum_ms:
+            if (observation_start_ms <= candidate_start < candidate_end <= observation_end_ms
+                    and minimum_ms <= duration <= maximum_ms):
                 mask = source | (int(ProposalSource.JITTER) if left or right else 0)
                 penalty = np.exp(-0.01 * (abs(left) + abs(right)))
                 output.append(
@@ -345,6 +368,7 @@ def generate_event_candidates_v4(
         raise ValueError(f"V4 window predictions are missing columns: {sorted(missing)}")
     rows: list[dict[str, Any]] = []
     observed_hours: dict[tuple[str, str], float] = {}
+    v48 = config.get("candidate_protocol") == "v4.8"
     for (subject, session), group in windows.groupby(["subject_key", "session_id"], sort=False):
         session_key = (str(subject), str(session))
         runs, step_ms = _valid_timeline_runs(group)
@@ -373,6 +397,23 @@ def generate_event_candidates_v4(
                 step_ms=step_ms,
             )
             seeds = _merge_gaps(seeds, int(config["gap_merge_seconds"]) * 1000)
+            original_hysteresis = list(seeds)
+            if v48:
+                for backtrack_seconds in config.get("backtrack_seconds", ()):
+                    if int(backtrack_seconds) <= 0:
+                        continue
+                    seeds.extend(
+                        _merge_gaps(
+                            _hysteresis(
+                                timestamps, smoothed,
+                                high=float(config["high_threshold"]),
+                                low=float(config["low_threshold"]),
+                                step_ms=step_ms,
+                                backtrack_seconds=int(backtrack_seconds),
+                            ),
+                            int(config["gap_merge_seconds"]) * 1000,
+                        )
+                    )
             grid_ms = int(config["grid_seconds"]) * 1000
             grid_start = int(-(-int(timestamps[0]) // grid_ms) * grid_ms)
             grid_end = int(timestamps[-1] // grid_ms * grid_ms)
@@ -423,7 +464,68 @@ def generate_event_candidates_v4(
                 maximum_ms,
                 observation_start_ms=int(timestamps[0] - step_ms),
                 observation_end_ms=int(timestamps[-1]),
+                symmetric_v48=v48,
             )
+            if v48:
+                for start, end, score, source in original_hysteresis:
+                    for extension_seconds in config.get("start_expansion_seconds", ()):
+                        extension_seconds = int(extension_seconds)
+                        if extension_seconds <= 0:
+                            continue
+                        expanded_start = start - extension_seconds * 1000
+                        if (expanded_start < int(timestamps[0] - step_ms)
+                                or not minimum_ms <= end - expanded_start <= maximum_ms):
+                            continue
+                        expanded_source = source | int(ProposalSource.START_EXPANSION)
+                        family_id = _proposal_id(
+                            str(subject), str(session), start, end, source
+                        )
+                        variants.append(
+                            (expanded_start, end,
+                             float(score * np.exp(-extension_seconds / 600.0)),
+                             expanded_source, family_id)
+                        )
+                if bool(config.get("use_proposal_head", False)):
+                    if "proposal_logit" not in run:
+                        raise ValueError("v4.8 proposal-head candidates require proposal_logit")
+                    logits = run["proposal_logit"].to_numpy(dtype=np.float64)
+                    proposal_probability = 1.0 / (1.0 + np.exp(-np.clip(logits, -40, 40)))
+                    threshold = float(config.get("proposal_peak_threshold", 0.5))
+                    peak_indices = np.flatnonzero(
+                        (proposal_probability >= threshold)
+                        & (proposal_probability >= np.r_[0.0, proposal_probability[:-1]])
+                        & (proposal_probability >= np.r_[proposal_probability[1:], 0.0])
+                    )
+                    chosen_peaks: list[int] = []
+                    for peak in sorted(peak_indices, key=lambda index: (-proposal_probability[index], index)):
+                        if all(abs(int(timestamps[peak] - timestamps[previous])) >= 15_000
+                               for previous in chosen_peaks):
+                            chosen_peaks.append(int(peak))
+                    for peak in chosen_peaks:
+                        end = int(timestamps[peak])
+                        active_start = peak
+                        while (active_start > 0
+                               and proposal_probability[active_start - 1] >= threshold
+                               and int(timestamps[peak] - timestamps[active_start - 1]) < 120_000):
+                            active_start -= 1
+                        active_seconds = max(3, int(
+                            (timestamps[peak] - timestamps[active_start]) // 1000
+                        ) + step_ms // 1000)
+                        for duration_seconds in (3, 6, 15, 30, 60, 120):
+                            start = end - duration_seconds * 1000
+                            if start < int(timestamps[0] - step_ms):
+                                continue
+                            source = int(ProposalSource.PROPOSAL_HEAD)
+                            family_id = _proposal_id(
+                                str(subject), str(session), end, end, source
+                            )
+                            variants.append(
+                                (start, end,
+                                 float(proposal_probability[peak] * np.exp(
+                                     -abs(np.log(duration_seconds / active_seconds))
+                                 )),
+                                 source, family_id)
+                            )
             deduplicated = _deduplicate(variants, float(config["deduplication_iou"]))
             for start, end, score, source, family_id in deduplicated:
                 if source & ~ALLOWED_SOURCE_MASK:
@@ -482,11 +584,42 @@ def generate_event_candidates_v4(
             .sort_values(ordering, ascending=ascending, kind="stable")
             .index.tolist()
         )
+        head_indices: set[int] = set()
+        if v48 and bool(config.get("use_proposal_head", False)):
+            short_head = ranked_group[
+                (ranked_group["source_mask"].astype(int)
+                 & int(ProposalSource.PROPOSAL_HEAD)) > 0
+            ]
+            short_limit = max(1, int(np.ceil(observed_hours[session_key] * 2)))
+            head_ranked = short_head.head(min(short_limit, budget)).index.tolist()
+            head_indices = set(head_ranked)
+            preferred = list(dict.fromkeys([
+                *head_ranked, *preferred
+            ]))
+        def allowed_index(index: int, permitted_head_indices: set[int] = head_indices) -> bool:
+            return (
+                not v48
+                or not bool(int(unbudgeted.at[index, "source_mask"])
+                            & int(ProposalSource.PROPOSAL_HEAD))
+                or index in permitted_head_indices
+            )
         family_ranked = family_representatives.index.tolist()
-        variant_ranked = ranked_group.index.tolist()
+        if v48:
+            family_queues = [
+                family.index.tolist()
+                for _, family in ranked_group.groupby("proposal_family_id", sort=False)
+            ]
+            variant_ranked = [
+                index
+                for depth in range(max(map(len, family_queues)))
+                for family in family_queues
+                for index in family[depth:depth + 1]
+            ]
+        else:
+            variant_ranked = ranked_group.index.tolist()
         selected: list[int] = []
         for index in [*preferred, *family_ranked, *variant_ranked]:
-            if index not in selected:
+            if allowed_index(index) and index not in selected:
                 selected.append(index)
             if len(selected) >= budget:
                 break

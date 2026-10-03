@@ -5,7 +5,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-CODE_VERSION = "v4.7.1"
+CODE_VERSION = "v4.8"
+LEGACY_CODE_VERSION = "v4.7.1"
 PROTOCOL_VERSION = "statsfusion-r3.2"
 POOLED_HEAD_PROTOCOL = "outer_fold_crossfit_joint_tuning_v1"
 POOLED_HEAD_TRAINING_PROTOCOL = "fully_excluded_nested_state_oof_v1"
@@ -139,8 +140,34 @@ def validate_r3_config(config: dict[str, Any]) -> None:
     protocol = experiment.get("protocol_version")
     if protocol != PROTOCOL_VERSION:
         raise ValueError(f"Formal {CODE_VERSION} runs require protocol_version: {PROTOCOL_VERSION}")
-    if experiment.get("code_version") != CODE_VERSION:
+    if experiment.get("code_version") not in {CODE_VERSION, LEGACY_CODE_VERSION}:
         raise ValueError(f"Formal {PROTOCOL_VERSION} runs require code_version: {CODE_VERSION}")
+    candidate_protocol = config.get("decoder", {}).get("candidate_protocol")
+    if candidate_protocol == "v4.8":
+        if experiment.get("code_version") != CODE_VERSION:
+            raise ValueError("v4.8 candidates require v4.8 code_version")
+        if experiment.get("variant") != "time_constrained_outer_single_holdout_deep_only_v48":
+            raise ValueError("v4.8 candidates require the registered deep-only variant")
+        if not bool(config.get("verifier", {}).get("include_v48_source_flags", False)):
+            raise ValueError("v4.8 verifier requires all candidate-source flags")
+        if int(config.get("decoder", {}).get("maximum_variants_per_event", 0)) != 17:
+            raise ValueError("v4.8 requires the 17-way symmetric jitter set")
+        if float(config["decoder"].get("low_threshold", -1)) != 0.04:
+            raise ValueError("v4.8 requires low_threshold: 0.04")
+        if float(config["decoder"].get("high_threshold", -1)) not in {0.06, 0.08}:
+            raise ValueError("v4.8 high threshold must be 0.06 or 0.08")
+        if bool(config.get("verifier", {}).get("use_raw_imu_branch", False)) and (
+            config.get("hierarchical", {}).get("downstream_mode") != "pooled_deep_only"
+        ):
+            raise ValueError("v4.8 raw IMU verifier requires pooled Deep mode")
+        if bool(config.get("model", {}).get("use_proposal_head", False)) != bool(
+            config.get("decoder", {}).get("use_proposal_head", False)
+        ):
+            raise ValueError("v4.8 proposal head model and decoder flags must agree")
+        if bool(config.get("model", {}).get("use_proposal_head", False)) != (
+            float(config.get("loss", {}).get("proposal_weight", 0.0)) == 0.1
+        ):
+            raise ValueError("v4.8 enabled proposal head requires loss weight 0.1")
     ablation_id = str(experiment.get("ablation_id", ""))
     if ablation_id not in R3_ABLATION_IDS:
         raise ValueError(f"StatsFusion-r3 uses an unsupported ablation_id: {ablation_id!r}")
@@ -149,6 +176,7 @@ def validate_r3_config(config: dict[str, Any]) -> None:
             "time_constrained_outer_single_holdout_pooled_heads",
             "time_constrained_outer_single_holdout_pooled_heads_transition",
             "time_constrained_outer_single_holdout_deep_only_transition",
+            "time_constrained_outer_single_holdout_deep_only_v48",
         }
         direct_variants = {
             "time_constrained_outer_single_holdout_logistic",
@@ -190,9 +218,10 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         if single_holdout:
             if state_crossfit_mode != "single_holdout":
                 raise ValueError("Single-holdout direct training requires state_crossfit_mode")
-            if experiment.get("variant") == (
-                "time_constrained_outer_single_holdout_deep_only_transition"
-            ):
+            if experiment.get("variant") in {
+                "time_constrained_outer_single_holdout_deep_only_transition",
+                "time_constrained_outer_single_holdout_deep_only_v48",
+            }:
                 expected_downstream = "pooled_deep_only"
             else:
                 expected_downstream = (

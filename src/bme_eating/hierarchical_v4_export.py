@@ -16,6 +16,7 @@ from bme_eating.v4_protocol import (
     BLOCKED_PREDECESSORS,
     CODE_VERSION,
     IGNORE_PROTOCOL,
+    LEGACY_CODE_VERSION,
     OBSERVATION_GAP_PROTOCOL,
     POOLED_HEAD_TRAINING_PROTOCOL,
     PROTOCOL_VERSION,
@@ -140,7 +141,7 @@ def export_hierarchical_v4_bundle(
     selection = json.loads((final_root / "selected_pipeline.json").read_text(encoding="utf-8"))
     if selection.get("protocol_version") != PROTOCOL_VERSION:
         raise RuntimeError(f"V4 selection is not {PROTOCOL_VERSION}")
-    if selection.get("code_version") != CODE_VERSION:
+    if selection.get("code_version") not in {CODE_VERSION, LEGACY_CODE_VERSION}:
         raise RuntimeError(f"V4 selection is not {CODE_VERSION}")
     if selection.get("blocked_predecessors") != list(BLOCKED_PREDECESSORS):
         raise RuntimeError("V4 selection does not block every predecessor protocol")
@@ -161,6 +162,38 @@ def export_hierarchical_v4_bundle(
             f"V4 selection has incompatible protocol bindings: {mismatched_protocols}"
         )
     config = yaml.safe_load((final_root / "resolved_config.yaml").read_text(encoding="utf-8"))
+    if config.get("decoder", {}).get("candidate_protocol") == "v4.8":
+        if selection.get("code_version") != CODE_VERSION:
+            raise RuntimeError("v4.8 bundle requires a v4.8 selection")
+        if selection.get("candidate_protocol") != "v4.8":
+            raise RuntimeError("v4.8 bundle selection lacks candidate protocol binding")
+        if bool(config.get("model", {}).get("use_proposal_head", False)) != (
+            selection.get("proposal_head_protocol") == "causal_event_nomination_v1"
+        ):
+            raise RuntimeError("v4.8 bundle proposal-head binding differs from its model")
+        if bool(config.get("verifier", {}).get("use_raw_imu_branch", False)) != (
+            selection.get("raw_imu_verifier_protocol") == "three_causal_30s_snippets_v1"
+        ):
+            raise RuntimeError("v4.8 bundle raw IMU binding differs from its verifier")
+        if bool(config.get("verifier", {}).get("use_raw_imu_branch", False)):
+            gate_path = final_root / "v48_raw_imu_gate.json"
+            if not gate_path.is_file():
+                raise RuntimeError("Raw IMU verifier requires identical-pool promotion evidence")
+            gate = json.loads(gate_path.read_text(encoding="utf-8"))
+            if (
+                gate.get("protocol") != "v48_raw_imu_identical_candidate_gate_v1"
+                or not gate.get("passed")
+                or gate.get("current_deep_sha256") != sha256_file(
+                    final_root / "deep_crossfit.json"
+                )
+                or gate.get("current_scores_sha256") != sha256_file(
+                    final_root / "deep_crossfit_scores.parquet"
+                )
+                or gate.get("current_config_sha256") != sha256_file(
+                    final_root / "resolved_config.yaml"
+                )
+            ):
+                raise RuntimeError("Raw IMU verifier did not pass its hash-locked gate")
     configured_downstream = str(config.get("hierarchical", {}).get("downstream_mode", "full"))
     if configured_downstream in {"pooled_logistic", "pooled_heads", "pooled_deep_only"} and (
         selection.get("pooled_head_training_protocol") != POOLED_HEAD_TRAINING_PROTOCOL

@@ -31,6 +31,7 @@ from bme_eating.v4_protocol import (
     CODE_VERSION,
     DECODER_PROTOCOL,
     INPUT_SNAPSHOT_FILENAME,
+    LEGACY_CODE_VERSION,
     POOLED_HEAD_PROTOCOL,
     PROTOCOL_VERSION,
     RAW_INPUT_SCHEMA,
@@ -274,8 +275,15 @@ def validate_v4_freeze_manifest(
     if not freeze_path.is_file():
         raise FileNotFoundError("V4 folds 2-4 require freeze_manifest.json")
     payload = json.loads(freeze_path.read_text(encoding="utf-8"))
+    frozen_version = payload.get("code_version")
+    allowed_versions = (
+        {CODE_VERSION}
+        if config.get("decoder", {}).get("candidate_protocol") == "v4.8"
+        else {CODE_VERSION, LEGACY_CODE_VERSION}
+    )
+    if frozen_version not in allowed_versions:
+        raise RuntimeError("V4 freeze manifest has an invalid code_version")
     expected_fields = {
-        "code_version": CODE_VERSION,
         "protocol_version": PROTOCOL_VERSION,
         "blocked_predecessors": list(BLOCKED_PREDECESSORS),
         "candidate_minimum_seconds": int(config["decoder"]["candidate_minimum_seconds"]),
@@ -347,6 +355,8 @@ def initialize_v4_run(
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if payload.get("protocol_version") != PROTOCOL_VERSION:
             raise RuntimeError(f"Blocked predecessor runs cannot be resumed as {PROTOCOL_VERSION}")
+        if payload.get("code_version") != CODE_VERSION:
+            raise RuntimeError("A frozen predecessor run cannot be resumed with v4.8 code")
         saved_config_hash = _saved_resume_config_hash(run_root, payload)
         if saved_config_hash != config_hash:
             raise RuntimeError("Active v4 configuration differs from the run manifest")
@@ -440,6 +450,15 @@ def initialize_v4_run(
         "target_semantics": TARGET_SEMANTICS,
         "calibration_protocol": CALIBRATION_PROTOCOL,
         "decoder_protocol": DECODER_PROTOCOL,
+        "candidate_protocol": config["decoder"].get("candidate_protocol", "legacy_v4"),
+        "proposal_head_protocol": (
+            "causal_event_nomination_v1"
+            if config["model"].get("use_proposal_head", False) else None
+        ),
+        "raw_imu_verifier_protocol": (
+            "three_causal_30s_snippets_v1"
+            if config["verifier"].get("use_raw_imu_branch", False) else None
+        ),
         "raw_input_schema": RAW_INPUT_SCHEMA,
         "promotion_protocol": (
             "time_constrained_single_holdout_v1"

@@ -1,0 +1,55 @@
+extends: hierarchical_v4_r32_deep_frontier.yaml
+
+experiment:
+  name: hierarchical_v4_v48_candidate_repair
+  code_version: v4.8
+  variant: time_constrained_outer_single_holdout_deep_only_v48
+
+model:
+  use_proposal_head: false
+
+loss:
+  proposal_weight: 0.0
+
+decoder:
+  candidate_protocol: v4.8
+  use_transition_candidates: false
+  use_proposal_head: false
+  maximum_variants_per_event: 17
+  high_threshold: 0.06
+  low_threshold: 0.04
+  ema_half_life_seconds: 6
+  gap_merge_seconds: 120
+  backtrack_seconds: [600]
+  start_expansion_seconds: [600]
+
+decoder_search:
+  high_threshold: [0.06]
+  low_threshold: [0.04]
+  ema_half_life_seconds: [6]
+  gap_merge_seconds: [120]
+  transition_threshold: [0.20]
+  semi_markov_duration_weight: [1.0]
+
+verifier:
+  include_v48_source_flags: true
+
+training:
+  early_stopping_min_epochs: 3
+  checkpoint_selection_min_epoch: 1
+
+boundary:
+  adaptive_start_range: true
+  maximum_range_seconds: 900
+  maximum_end_lookahead_seconds: 60
+
+promotion_gate:
+  v48_frozen_baseline:
+    candidate_covered: 115
+    same_candidate_covered: 57
+    different_candidate_covered: 58
+    final_f1: 0.5375
+    fp_per_hour: 0.05538519900104321
+    same_sensitivity: 0.6428571428571429
+    different_sensitivity: 0.45054945054945056
+    greedy_f1: 0.5375

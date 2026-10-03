@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import hashlib
 import importlib
 import json
 import sys
@@ -135,6 +136,7 @@ from bme_eating.training.hierarchical_v4_trainer import (
     infer_state_windows,
     load_v4_inputs,
 )
+from bme_eating.training.pooled_nested_cache import LEGACY_TRAINER_SHA256
 from bme_eating.v4_protocol import RUNTIME_SOURCE_FILES
 
 
@@ -206,6 +208,8 @@ def test_pooled_fold_upstream_and_model_inputs_exclude_heldout_labels(monkeypatc
                 "session_id": session,
                 "timestamp_ms": timestamp,
                 "state_logit": [-2.0, -0.5, 0.5, 2.0],
+                "onset_logit": [-1.0, 0.0, 1.0, 2.0],
+                "offset_logit": [2.0, 1.0, 0.0, -1.0],
                 "state_target": [0.0, 0.25, 0.75, 1.0],
                 "state_loss_mask": 1.0,
             }
@@ -227,7 +231,10 @@ def test_pooled_fold_upstream_and_model_inputs_exclude_heldout_labels(monkeypatc
             pd.DataFrame(columns=["subject_key", "session_id", "start_ms", "end_ms"])
         )
 
-    def select_decoder(*_args, **_kwargs):
+    def select_decoder(*args, **_kwargs):
+        assert {"state_probability", "onset_probability", "offset_probability"}.issubset(
+            args[0].columns
+        )
         return (
             {
                 "grid_seconds": 15,
@@ -238,6 +245,9 @@ def test_pooled_fold_upstream_and_model_inputs_exclude_heldout_labels(monkeypatc
         )
 
     def candidates(frame, *_args, **_kwargs):
+        assert {"state_probability", "onset_probability", "offset_probability"}.issubset(
+            frame.columns
+        )
         subject = str(frame.iloc[0].subject_key)
         session = str(frame.iloc[0].session_id)
         return pd.DataFrame(
@@ -448,8 +458,29 @@ def test_pooled_nested_state_excludes_outer_subjects_and_resumes(tmp_path, monke
     )
     assert len(training_calls) == 15
     assert all(left.windows.equals(right.windows) for left, right in zip(outputs, cached))
+    lineage_path = (
+        tmp_path / "pooled_heads" / "nested_state" / "holdout_0" / "partition_0"
+        / "lineage.json"
+    )
+    saved = json.loads(lineage_path.read_text(encoding="utf-8"))
+    saved["cache_payload"]["trainer_sha256"] = LEGACY_TRAINER_SHA256
+    saved["cache_sha256"] = hashlib.sha256(
+        json.dumps(saved["cache_payload"], sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    lineage_path.write_text(json.dumps(saved), encoding="utf-8")
     changed_epochs = list(outer_epochs)
     changed_epochs[0] = {2026: 2}
+    with pytest.raises(RuntimeError, match="cache identity changed"):
+        _prepare_pooled_nested_state_oof(
+            inputs, outer_logits, changed_epochs, config, tmp_path,
+            resume=True, input_identity_sha256="input-snapshot",
+        )
+    with pytest.raises(RuntimeError, match="cache identity changed"):
+        _prepare_pooled_nested_state_oof(
+            inputs, outer_logits, outer_epochs, config, tmp_path,
+            resume=True, input_identity_sha256="input-snapshot",
+        )
+    assert len(training_calls) == 15
     with pytest.raises(RuntimeError, match="cache identity changed"):
         _prepare_pooled_nested_state_oof(
             inputs, outer_logits, changed_epochs, config, tmp_path,
@@ -4110,7 +4141,11 @@ def test_state_calibration_recomputes_deployment_probability_and_derivative() ->
             "session_id": ["a", "a", "b"],
             "timestamp_ms": [6_000, 3_000, 3_000],
             "state_logit": [1.0, 0.0, -1.0],
+            "onset_logit": [2.0, 0.0, -2.0],
+            "offset_logit": [-2.0, 0.0, 2.0],
             "state_probability": [0.99, 0.99, 0.99],
+            "onset_probability": [0.99, 0.99, 0.99],
+            "offset_probability": [0.99, 0.99, 0.99],
         }
     )
     calibrator = PlattCalibration(coefficient=2.0, intercept=-0.5)
@@ -4118,9 +4153,17 @@ def test_state_calibration_recomputes_deployment_probability_and_derivative() ->
     expected = calibrator.transform(np.asarray([0.0, 1.0, -1.0]))
     assert output["timestamp_ms"].tolist() == [3_000, 6_000, 3_000]
     assert output["state_probability"].to_numpy() == pytest.approx(expected)
+    assert output["onset_probability"].to_numpy() == pytest.approx(
+        1.0 / (1.0 + np.exp(-np.asarray([0.0, 2.0, -2.0])))
+    )
+    assert output["offset_probability"].to_numpy() == pytest.approx(
+        1.0 / (1.0 + np.exp(-np.asarray([0.0, -2.0, 2.0])))
+    )
     assert output["state_probability_derivative"].to_numpy() == pytest.approx(
         [0.0, expected[1] - expected[0], 0.0]
     )
+    with pytest.raises(ValueError, match="offset_logit"):
+        _apply_state_calibration_to_windows(frame.drop(columns="offset_logit"), calibrator)
 
 
 def test_state_only_pipeline_uses_generator_score_without_verifier() -> None:
