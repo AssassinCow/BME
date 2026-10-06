@@ -10,6 +10,7 @@ import torch
 import yaml
 
 from bme_eating.config import load_config
+from bme_eating.hierarchical_v4_gates import _bootstrap_probability
 from bme_eating.models.endpoint_refiner import boundary_geometric_feasibility
 from bme_eating.models.event_verifier_v4 import (
     EventVerifierV4,
@@ -151,6 +152,26 @@ def test_v48_candidate_budget_and_proposal_head() -> None:
     assert len(proposals) <= 21
     assert ((proposals["source_mask"] & int(ProposalSource.PROPOSAL_HEAD)) > 0).sum() <= 2
     assert (proposals["coarse_start_ms"] >= 0).all()
+    assert proposals["proposal_id"].is_unique
+    assert proposals[[
+        "proposal_family_id", "ancestor_proposal_id", "parent_candidate_hash",
+        "generation_parameters",
+    ]].notna().all().all()
+
+
+def test_v49_bootstrap_includes_subjects_with_only_false_positives() -> None:
+    candidate = pd.DataFrame({
+        "subject_key": ["truth", "fp-only"],
+        "true_positive": [1, 0], "false_positive": [0, 1],
+        "false_negative": [0, 0], "observed_hours": [1.0, 1.0],
+    })
+    baseline = pd.DataFrame({
+        "subject_key": ["truth"],
+        "true_positive": [1], "false_positive": [0],
+        "false_negative": [0], "observed_hours": [1.0],
+    })
+    probability = _bootstrap_probability(candidate, baseline, replicates=100, seed=7)
+    assert 0.0 <= probability < 1.0
 
 
 def test_v48_synthetic_candidate_to_deep_forward() -> None:

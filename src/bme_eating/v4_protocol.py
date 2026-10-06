@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 
 CODE_VERSION = "v4.8"
+V49_CODE_VERSION = "v4.9"
 LEGACY_CODE_VERSION = "v4.7.1"
 PROTOCOL_VERSION = "statsfusion-r3.2"
 POOLED_HEAD_PROTOCOL = "outer_fold_crossfit_joint_tuning_v1"
@@ -83,6 +84,7 @@ R3_ROOT_CONFIG_KEYS = frozenset(
         "promotion_gate",
         "feature_provenance",
         "final_training",
+        "v49",
     }
 )
 
@@ -140,16 +142,22 @@ def validate_r3_config(config: dict[str, Any]) -> None:
     protocol = experiment.get("protocol_version")
     if protocol != PROTOCOL_VERSION:
         raise ValueError(f"Formal {CODE_VERSION} runs require protocol_version: {PROTOCOL_VERSION}")
-    if experiment.get("code_version") not in {CODE_VERSION, LEGACY_CODE_VERSION}:
+    if experiment.get("code_version") not in {CODE_VERSION, V49_CODE_VERSION, LEGACY_CODE_VERSION}:
         raise ValueError(f"Formal {PROTOCOL_VERSION} runs require code_version: {CODE_VERSION}")
     candidate_protocol = config.get("decoder", {}).get("candidate_protocol")
-    if candidate_protocol == "v4.8":
-        if experiment.get("code_version") != CODE_VERSION:
-            raise ValueError("v4.8 candidates require v4.8 code_version")
-        if experiment.get("variant") != "time_constrained_outer_single_holdout_deep_only_v48":
-            raise ValueError("v4.8 candidates require the registered deep-only variant")
+    if candidate_protocol in {"v4.8", "v4.9"}:
+        expected_code = V49_CODE_VERSION if candidate_protocol == "v4.9" else CODE_VERSION
+        if experiment.get("code_version") != expected_code:
+            raise ValueError(f"{candidate_protocol} candidates require {expected_code} code_version")
+        expected_variant = (
+            "time_constrained_outer_single_holdout_deep_only_v49"
+            if candidate_protocol == "v4.9"
+            else "time_constrained_outer_single_holdout_deep_only_v48"
+        )
+        if experiment.get("variant") != expected_variant:
+            raise ValueError(f"{candidate_protocol} candidates require the registered deep-only variant")
         if not bool(config.get("verifier", {}).get("include_v48_source_flags", False)):
-            raise ValueError("v4.8 verifier requires all candidate-source flags")
+            raise ValueError(f"{candidate_protocol} verifier requires all candidate-source flags")
         if int(config.get("decoder", {}).get("maximum_variants_per_event", 0)) != 17:
             raise ValueError("v4.8 requires the 17-way symmetric jitter set")
         if float(config["decoder"].get("low_threshold", -1)) != 0.04:
@@ -177,6 +185,7 @@ def validate_r3_config(config: dict[str, Any]) -> None:
             "time_constrained_outer_single_holdout_pooled_heads_transition",
             "time_constrained_outer_single_holdout_deep_only_transition",
             "time_constrained_outer_single_holdout_deep_only_v48",
+            "time_constrained_outer_single_holdout_deep_only_v49",
         }
         direct_variants = {
             "time_constrained_outer_single_holdout_logistic",
@@ -221,6 +230,7 @@ def validate_r3_config(config: dict[str, Any]) -> None:
             if experiment.get("variant") in {
                 "time_constrained_outer_single_holdout_deep_only_transition",
                 "time_constrained_outer_single_holdout_deep_only_v48",
+                "time_constrained_outer_single_holdout_deep_only_v49",
             }:
                 expected_downstream = "pooled_deep_only"
             else:

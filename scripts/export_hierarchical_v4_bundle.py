@@ -7,6 +7,7 @@ import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.hierarchical_v4_export import export_hierarchical_v4_bundle
+from bme_eating.integrated_v49 import run_cli_with_failure_report
 from bme_eating.reproducibility import require_git_worktree
 
 
@@ -34,4 +35,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_cli_with_failure_report(main, "export")

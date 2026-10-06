@@ -1,0 +1,90 @@
+extends: hierarchical_v4_v48_candidate_repair.yaml
+
+project:
+  enforce_git_identity_on_resume: true
+
+experiment:
+  name: hierarchical_v4_v49_integrated_repair
+  code_version: v4.9
+  variant: time_constrained_outer_single_holdout_deep_only_v49
+
+model:
+  use_proposal_head: true
+
+loss:
+  proposal_weight: 0.1
+
+decoder:
+  candidate_protocol: v4.9
+  use_transition_candidates: false
+  use_proposal_head: true
+  maximum_variants_per_event: 17
+  high_threshold: 0.06
+  low_threshold: 0.04
+  ema_half_life_seconds: 6
+  gap_merge_seconds: 120
+  backtrack_seconds: [600]
+  start_expansion_seconds: [600]
+
+decoder_search:
+  high_threshold: [0.06]
+  low_threshold: [0.04]
+  ema_half_life_seconds: [6]
+  gap_merge_seconds: [120]
+  transition_threshold: [0.20]
+  semi_markov_duration_weight: [1.0]
+
+verifier:
+  include_v48_source_flags: true
+  include_v49_lineage: true
+
+training:
+  early_stopping_min_epochs: 3
+  checkpoint_selection_min_epoch: 3
+  selector_requires_promotion_qualification: true
+  gradient_clipping_abort_fraction: 0.50
+  gradient_clipping_promotion_fraction: 0.20
+  hard_negative_sampling_protocol: subject_hand_iou_missingness_duration_source_family_v1
+
+boundary:
+  adaptive_start_range: true
+  maximum_range_seconds: 900
+  maximum_end_lookahead_seconds: 60
+  maximum_clipped_fraction: 0.05
+  entropy_thresholds: [0.65]
+
+promotion_gate:
+  minimum_boundary_mae_improvement: 0.10
+  maximum_boundary_f1_drop: 0.005
+  candidate_coverage_minimum: 125
+  candidate_coverage_target: 126
+  minimum_final_f1: 0.5475
+  maximum_fp_per_hour: 0.0609237
+  minimum_positive_bootstrap_probability: 0.80
+  maximum_stress_fold_f1_drop: 0.03
+  boundary:
+    minimum_mae_improvement: 0.10
+    maximum_f1_drop: 0.005
+    maximum_tp_to_fp_rate: 0.01
+    maximum_residual_clipping_rate: 0.05
+  v48_frozen_baseline:
+    candidate_covered: 115
+    same_candidate_covered: 57
+    different_candidate_covered: 58
+    final_f1: 0.5375
+    fp_per_hour: 0.05538519900104321
+    same_sensitivity: 0.6428571428571429
+    different_sensitivity: 0.45054945054945056
+    greedy_f1: 0.5375
+
+v49:
+  protocol: integrated_repair_v1
+  run_name_prefix: hierarchical_v4_v49_integrated_repair
+  require_full_outer_folds: true
+  gate_manifest: v49_gate_manifest.json
+  failure_report: failure_report.json
+  bootstrap_cohort_protocol: truth_prediction_ignore_window_subject_union_v1
+  proposal_lineage_protocol: proposal_family_ancestor_parent_hash_v1
+  endpoint_refiner_protocol: crossfit_gate_then_optional_v1
+  forbid_predecessor_artifact_reuse: true
+  frozen_reference_run: hierarchical_v4_r32_deep_frontier_20260930a

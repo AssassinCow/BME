@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from enum import IntFlag
 from typing import Any
 
@@ -240,6 +241,48 @@ def _proposal_id(subject: str, session: str, start: int, end: int, source: int) 
     return hashlib.sha256(payload).hexdigest()[:24]
 
 
+def validate_proposal_lineage(proposals: pd.DataFrame) -> None:
+    required = {
+        "proposal_id", "proposal_family_id", "ancestor_proposal_id",
+        "parent_candidate_hash", "parent_start_ms", "parent_end_ms", "parent_source_mask",
+        "coarse_start_ms", "coarse_end_ms", "source_mask", "generation_parameters",
+        "subject_key", "session_id",
+    }
+    if required - set(proposals):
+        raise RuntimeError("v4.9 candidate lineage is incomplete")
+    if proposals[list(required)].isna().any().any() or not proposals["proposal_id"].is_unique:
+        raise RuntimeError("v4.9 candidate lineage is missing or duplicated")
+    for family_id, group in proposals.groupby("proposal_family_id", sort=False):
+        if group[["subject_key", "session_id", "parent_candidate_hash"]].drop_duplicates().shape[0] != 1:
+            raise RuntimeError("v4.9 candidate family has inconsistent ownership or parent lineage")
+        for row in group.itertuples(index=False):
+            parent = {
+                "subject_key": str(row.subject_key), "session_id": str(row.session_id),
+                "coarse_start_ms": int(row.parent_start_ms), "coarse_end_ms": int(row.parent_end_ms),
+                "source_mask": int(row.parent_source_mask),
+            }
+            expected = hashlib.sha256(json.dumps(parent, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            parameters = json.loads(row.generation_parameters)
+            if str(row.ancestor_proposal_id) != str(family_id) or expected != row.parent_candidate_hash:
+                raise RuntimeError("v4.9 candidate parent hash or ancestor changed")
+            if (
+                not 0 < int(row.source_mask) <= ALLOWED_SOURCE_MASK
+                or parameters.get("source_mask") != int(row.source_mask)
+                or parameters.get("candidate_protocol") != "v4.9"
+            ):
+                raise RuntimeError("v4.9 candidate source flags or generation protocol changed")
+            if (
+                int(row.coarse_start_ms) >= int(row.coarse_end_ms)
+                or parameters.get("variant_start_ms") != int(row.coarse_start_ms)
+                or parameters.get("variant_end_ms") != int(row.coarse_end_ms)
+                or str(row.proposal_id).rsplit(":", 1)[-1] != _proposal_id(
+                    str(row.subject_key), str(row.session_id), int(row.coarse_start_ms),
+                    int(row.coarse_end_ms), int(row.source_mask),
+                )
+            ):
+                raise RuntimeError("v4.9 candidate identity or generated boundaries changed")
+
+
 def decoder_valid_mask(windows: pd.DataFrame) -> np.ndarray:
     if windows.empty:
         return np.zeros(0, dtype=bool)
@@ -368,7 +411,7 @@ def generate_event_candidates_v4(
         raise ValueError(f"V4 window predictions are missing columns: {sorted(missing)}")
     rows: list[dict[str, Any]] = []
     observed_hours: dict[tuple[str, str], float] = {}
-    v48 = config.get("candidate_protocol") == "v4.8"
+    v48 = config.get("candidate_protocol") in {"v4.8", "v4.9"}
     for (subject, session), group in windows.groupby(["subject_key", "session_id"], sort=False):
         session_key = (str(subject), str(session))
         runs, step_ms = _valid_timeline_runs(group)
@@ -456,6 +499,14 @@ def generate_event_candidates_v4(
                 )
                 for event in seeds
             ]
+            family_parents = {
+                str(family_id): {
+                    "subject_key": str(subject), "session_id": str(session),
+                    "coarse_start_ms": int(start), "coarse_end_ms": int(end),
+                    "source_mask": int(source),
+                }
+                for start, end, score, source, family_id in family_seeds
+            }
             variants = _jitter(
                 family_seeds,
                 [int(value) for value in config["jitter_seconds"]],
@@ -519,6 +570,11 @@ def generate_event_candidates_v4(
                             family_id = _proposal_id(
                                 str(subject), str(session), end, end, source
                             )
+                            family_parents[family_id] = {
+                                "subject_key": str(subject), "session_id": str(session),
+                                "coarse_start_ms": int(timestamps[active_start] - step_ms),
+                                "coarse_end_ms": end, "source_mask": source,
+                            }
                             variants.append(
                                 (start, end,
                                  float(proposal_probability[peak] * np.exp(
@@ -530,10 +586,35 @@ def generate_event_candidates_v4(
             for start, end, score, source, family_id in deduplicated:
                 if source & ~ALLOWED_SOURCE_MASK:
                     raise RuntimeError("A non-deep proposal source entered the v4 pipeline")
+                parent = family_parents.get(str(family_id), {
+                    "subject_key": str(subject),
+                    "session_id": str(session),
+                    "coarse_start_ms": int(start),
+                    "coarse_end_ms": int(end),
+                    "source_mask": int(source),
+                })
+                parent_payload = json.dumps(parent, sort_keys=True, separators=(",", ":"))
                 rows.append(
                     {
                         "proposal_id": _proposal_id(str(subject), str(session), start, end, source),
                         "proposal_family_id": family_id,
+                        "ancestor_proposal_id": str(family_id),
+                        "parent_candidate_hash": hashlib.sha256(parent_payload.encode()).hexdigest(),
+                        "parent_start_ms": int(parent["coarse_start_ms"]),
+                        "parent_end_ms": int(parent["coarse_end_ms"]),
+                        "parent_source_mask": int(parent["source_mask"]),
+                        "generation_parameters": json.dumps({
+                            "candidate_protocol": str(config.get("candidate_protocol", "legacy_v4")),
+                            "source_mask": int(source),
+                            "variant_start_ms": int(start),
+                            "variant_end_ms": int(end),
+                            "variant_score": float(score),
+                            "parent_start_ms": int(parent["coarse_start_ms"]),
+                            "parent_end_ms": int(parent["coarse_end_ms"]),
+                            "backtrack_seconds": list(config.get("backtrack_seconds", ())),
+                            "start_expansion_seconds": list(config.get("start_expansion_seconds", ())),
+                            "decoder_config": config,
+                        }, sort_keys=True),
                         "subject_key": str(subject),
                         "session_id": str(session),
                         "coarse_start_ms": int(start),
@@ -547,6 +628,12 @@ def generate_event_candidates_v4(
     columns = [
         "proposal_id",
         "proposal_family_id",
+        "ancestor_proposal_id",
+        "parent_candidate_hash",
+        "parent_start_ms",
+        "parent_end_ms",
+        "parent_source_mask",
+        "generation_parameters",
         "subject_key",
         "session_id",
         "coarse_start_ms",

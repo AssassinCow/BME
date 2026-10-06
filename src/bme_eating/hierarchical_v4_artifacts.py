@@ -36,6 +36,7 @@ from bme_eating.v4_protocol import (
     PROTOCOL_VERSION,
     RAW_INPUT_SCHEMA,
     TARGET_SEMANTICS,
+    V49_CODE_VERSION,
     validate_r3_config,
 )
 
@@ -65,6 +66,8 @@ def _public_config(config: dict[str, Any]) -> dict[str, Any]:
 
 def _resume_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(_public_config(config))
+    if config.get("decoder", {}).get("candidate_protocol") == "v4.9":
+        return normalized
     project = normalized.get("project")
     if isinstance(project, dict):
         for key in RESUME_POLICY_CONFIG_KEYS:
@@ -349,13 +352,17 @@ def initialize_v4_run(
     if missing:
         raise FileNotFoundError(f"Required StatsFusion inputs are missing: {missing}")
     input_hashes = {name: sha256_file(path) for name, path in tracked.items()}
+    if config.get("decoder", {}).get("candidate_protocol") == "v4.9":
+        config["_v49_input_files"] = {
+            str(path): [path.stat().st_size, path.stat().st_mtime_ns] for path in tracked.values()
+        }
     if manifest_path.is_file():
         if fresh:
             raise FileExistsError(f"V4 run already exists: {run_root}")
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
         if payload.get("protocol_version") != PROTOCOL_VERSION:
             raise RuntimeError(f"Blocked predecessor runs cannot be resumed as {PROTOCOL_VERSION}")
-        if payload.get("code_version") != CODE_VERSION:
+        if payload.get("code_version") not in {CODE_VERSION, V49_CODE_VERSION}:
             raise RuntimeError("A frozen predecessor run cannot be resumed with v4.8 code")
         saved_config_hash = _saved_resume_config_hash(run_root, payload)
         if saved_config_hash != config_hash:
@@ -444,7 +451,7 @@ def initialize_v4_run(
     write_yaml_atomic(run_root / "resolved_config.yaml", public_config)
     payload = {
         "version": 5,
-        "code_version": CODE_VERSION,
+        "code_version": V49_CODE_VERSION if config.get("decoder", {}).get("candidate_protocol") == "v4.9" else CODE_VERSION,
         "protocol_version": PROTOCOL_VERSION,
         "blocked_predecessors": list(BLOCKED_PREDECESSORS),
         "target_semantics": TARGET_SEMANTICS,

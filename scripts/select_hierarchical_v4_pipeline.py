@@ -6,6 +6,7 @@ import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
 from bme_eating.hierarchical_v4_artifacts import initialize_v4_run
+from bme_eating.integrated_v49 import run_cli_with_failure_report
 from bme_eating.reproducibility import require_git_worktree
 from bme_eating.training.hierarchical_v4_trainer import load_v4_inputs, select_v4_pipeline
 
@@ -35,4 +36,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_cli_with_failure_report(main, "pipeline_selection")

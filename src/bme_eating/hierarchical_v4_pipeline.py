@@ -521,9 +521,10 @@ def load_hierarchical_v4_bundle(
         raise RuntimeError(f"Only {PROTOCOL_VERSION} bundles are supported")
     if selection.get("raw_input_schema") != RAW_INPUT_SCHEMA:
         raise RuntimeError("V4 bundle raw input schema is incompatible")
-    if config.get("decoder", {}).get("candidate_protocol") == "v4.8":
-        if selection.get("candidate_protocol") != "v4.8":
-            raise RuntimeError("v4.8 bundle candidate protocol binding is missing")
+    candidate_protocol = config.get("decoder", {}).get("candidate_protocol")
+    if candidate_protocol in {"v4.8", "v4.9"}:
+        if selection.get("candidate_protocol") != candidate_protocol:
+            raise RuntimeError(f"{candidate_protocol} bundle candidate protocol binding is missing")
         if bool(config.get("model", {}).get("use_proposal_head", False)) != (
             selection.get("proposal_head_protocol") == "causal_event_nomination_v1"
         ):

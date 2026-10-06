@@ -50,11 +50,17 @@ from bme_eating.hierarchical_artifacts import (
 )
 from bme_eating.hierarchical_v4_artifacts import (
     _saved_resume_config_hash,
+    _tracked_inputs,
     current_v4_identity,
     resume_config_hash,
     validate_v4_freeze_manifest,
 )
 from bme_eating.hierarchical_v4_gates import verify_gate_evidence
+from bme_eating.integrated_v49 import (
+    candidate_coverage,
+    is_v49,
+    validate_v49_gate_manifest,
+)
 from bme_eating.metrics import (
     evaluate_events,
     evaluation_event_partition_summary,
@@ -995,6 +1001,12 @@ def _train_state_epochs(
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 optimizer_updates += 1
+                if (
+                    is_v49(config)
+                    and epoch + 1 > max(1, math.ceil(schedule_total * float(config["training"]["warmup_fraction"])))
+                    and clipping_count / len(gradient_norms) > _gradient_clipping_abort_fraction(config)
+                ):
+                    raise RuntimeError("v4.9 State clipping abort fraction exceeded after warmup")
                 learning_rate_last = float(optimizer.param_groups[0]["lr"])
                 learning_rate_sum += learning_rate_last
             if step == 1 or step % 10 == 0 or step == len(loader):
@@ -1046,8 +1058,31 @@ def _train_state_epochs(
             "batch_count": int(batch_count),
             "optimizer_updates": int(optimizer_updates),
         }
+        monitor["finite_gate_passed"] = bool(
+            all(
+                np.isfinite(float(monitor[name]))
+                for name in (
+                    "train_loss_mean",
+                    "state_loss_mean",
+                    "onset_loss_mean",
+                    "offset_loss_mean",
+                    "smooth_loss_mean",
+                    "contrastive_loss_mean",
+                    "proposal_loss_mean",
+                    "gradient_norm_mean",
+                    "gradient_norm_p50",
+                    "gradient_norm_p90",
+                    "gradient_norm_p99",
+                    "gradient_norm_max",
+                    "clipping_fraction",
+                )
+            )
+        )
+        if not monitor["finite_gate_passed"]:
+            raise FloatingPointError("State training monitor became non-finite")
         if monitor_history is not None:
             monitor_history.append(monitor)
+        model._bme_training_monitor = dict(monitor)
         warmup_epoch = max(
             1, math.ceil(schedule_total * float(config["training"]["warmup_fraction"]))
         )
@@ -1087,6 +1122,23 @@ def _save_state_epoch(
     extra: dict[str, Any] | None = None,
     scheduler_state: dict[str, Any] | None = None,
 ) -> None:
+    for name, value in model.state_dict().items():
+        if not torch.isfinite(value.detach()).all():
+            raise RuntimeError(f"Refusing to save non-finite state checkpoint tensor: {name}")
+    if config.get("decoder", {}).get("candidate_protocol") == "v4.9":
+        _validate_state_checkpoint_binding(config, subjects)
+        if {"resume_config_sha256", "subjects", "epoch", "kind", "seed", "model", "optimizer"} & set(extra or {}):
+            raise RuntimeError("v4.9 checkpoint metadata cannot override protected identity fields")
+        metrics = (extra or {}).get("training_metrics", [])
+        if not metrics:
+            raise RuntimeError("v4.9 checkpoint lacks finite and clipping training evidence")
+        if metrics:
+            latest = metrics[-1]
+            if not bool(latest.get("finite_gate_passed", True)):
+                raise RuntimeError("Refusing to save v4.9 checkpoint after finite gate failure")
+            warmup_epochs = max(1, math.ceil(int(config["training"]["max_epochs"]) * float(config["training"]["warmup_fraction"])))
+            if epoch > warmup_epochs and float(latest.get("clipping_fraction", 0.0)) > _gradient_clipping_abort_fraction(config):
+                raise RuntimeError("Refusing to save v4.9 checkpoint after clipping abort gate")
     scheduler = getattr(optimizer, "_bme_scheduler", None)
     if scheduler is not None:
         scheduler_state = scheduler.state_dict()
@@ -1180,6 +1232,8 @@ def _train_state_with_checkpoints(
         if int(checkpoint.get("target_epochs", -1)) != epochs:
             raise RuntimeError("State retraining checkpoint target epoch count differs")
         training_metrics = list(checkpoint.get("training_metrics", []))
+        if training_metrics:
+            model._bme_training_monitor = dict(training_metrics[-1])
     for epoch in range(completed_epochs + 1, epochs + 1):
         optimizer = _train_state_epochs(
             model,
@@ -1407,19 +1461,28 @@ def _choose_conservative_state_epoch(
     *,
     minimum_delta: float,
     minimum_epoch: int = 1,
+    require_qualified: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     eligible_metrics = [
-        value for value in epoch_metrics if int(value["epoch"]) >= int(minimum_epoch)
+        value for value in epoch_metrics
+        if int(value["epoch"]) >= int(minimum_epoch)
+        and all(np.isfinite(float(value[key])) for key in (
+            "robust_candidate_recall", "robust_subject_macro_soft_bce",
+            "robust_soft_bce_standard_error", "robust_state_fragment_count", "robust_ece",
+        ))
     ]
     if not eligible_metrics:
         raise ValueError("State epoch selection has no metrics at or after the minimum epoch")
     qualified = [
-        value for value in qualified if int(value["epoch"]) >= int(minimum_epoch)
+        value for value in qualified
+        if value in eligible_metrics and value.get("promotion_eligible", True)
     ]
     if qualified:
         eligible = qualified
         promotion_eligible = True
     else:
+        if require_qualified:
+            raise RuntimeError("No State epoch satisfies finite, completion and promotion qualification gates")
         best_recall = max(
             float(value["robust_candidate_recall"]) for value in eligible_metrics
         )
@@ -1620,19 +1683,28 @@ def _select_epoch(
         int(value["epoch"]): bool(value.get("clipping_gate_passed", False))
         for value in training_metrics
     }
+    finite_by_epoch = {
+        int(value["epoch"]): bool(value.get("finite_gate_passed", False))
+        for value in training_metrics
+    }
     qualified = [
         value
         for value in epoch_metrics
         if value["robust_candidate_recall"] >= minimum_recall
         and bool(value["robust_calibration_passed"])
         and clipping_by_epoch.get(int(value["epoch"]), False)
+        and (not is_v49(config) or finite_by_epoch.get(int(value["epoch"]), False))
+        and int(value["epoch"]) <= completed_training_epochs
     ]
     best, promotion_eligible = _choose_conservative_state_epoch(
         epoch_metrics,
         qualified,
         minimum_delta=minimum_delta,
         minimum_epoch=checkpoint_selection_minimum_epoch,
+        require_qualified=bool(config.get("training", {}).get("selector_requires_promotion_qualification", False)),
     )
+    if bool(config.get("training", {}).get("selector_requires_promotion_qualification", False)) and not promotion_eligible:
+        raise RuntimeError("No v4.9 state epoch satisfies promotion qualification and clipping gates")
     return int(best["epoch"]), {
         "selected_epoch": int(best["epoch"]),
         "promotion_eligible": promotion_eligible,
@@ -1859,10 +1931,51 @@ def _gate_diagnostics(windows: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, An
 
 
 def _save_torch_atomic(path: Path, payload: dict[str, Any]) -> None:
+    for name, tensor in payload.get("model", {}).items():
+        if not torch.isfinite(tensor).all():
+            raise RuntimeError(f"Refusing to save non-finite model tensor: {name}")
+    training = set(payload.get("training_subjects", []))
+    excluded = set(payload.get("globally_excluded_subjects", []))
+    prediction = set(payload.get("prediction_subjects", []))
+    if training & (excluded | prediction):
+        raise RuntimeError("Refusing to save checkpoint with overlapping subject lineage")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
     torch.save(payload, temporary)
     temporary.replace(path)
+
+
+def _validate_state_checkpoint_binding(config: dict[str, Any], subjects: dict[str, set[str]]) -> None:
+    binding = config.get("_v49_checkpoint_identity")
+    if not isinstance(binding, dict) or not binding.get("input_hashes"):
+        raise RuntimeError("v4.9 checkpoint lacks data and source identity")
+    if binding.get("resolved_config_sha256") != resume_config_hash(config):
+        raise RuntimeError("v4.9 checkpoint config hash changed")
+    if binding.get("trainer_sha256") != sha256_file(Path(__file__)):
+        raise RuntimeError("v4.9 checkpoint trainer source changed")
+    from bme_eating.reproducibility import git_worktree_identity
+
+    if binding.get("git") != git_worktree_identity(Path(__file__).resolve().parents[3]):
+        raise RuntimeError("v4.9 checkpoint worktree source changed")
+    if binding.get("runtime_sha256") != runtime_source_identity(Path(__file__).resolve().parents[1])["sha256"]:
+        raise RuntimeError("v4.9 checkpoint runtime source changed")
+    for file_name, expected in binding.get("input_file_signatures", {}).items():
+        path = Path(file_name)
+        if not path.is_file() or [path.stat().st_size, path.stat().st_mtime_ns] != expected:
+            raise RuntimeError("v4.9 checkpoint input data changed")
+    groups = list(subjects.values())
+    if any(first & second for first, second in combinations(groups, 2)):
+        raise RuntimeError("v4.9 checkpoint subject lineage overlaps")
+
+
+def _state_promotion_evidence(model: torch.nn.Module, config: dict[str, Any]) -> dict[str, Any]:
+    if not is_v49(config):
+        return {}
+    _validate_state_checkpoint_binding(config, {})
+    monitor = getattr(model, "_bme_training_monitor", {})
+    if not monitor.get("finite_gate_passed") or not _gradient_clipping_gate_passed(config, monitor.get("clipping_fraction", float("inf"))):
+        raise RuntimeError("v4.9 State checkpoint failed finite or clipping promotion qualification")
+    return {"v49_training_qualification": monitor, "v49_checkpoint_identity": config["_v49_checkpoint_identity"]}
 
 
 def _save_head_epoch(
@@ -1973,6 +2086,15 @@ def train_state_crossfit_v4(
     resume: bool,
 ) -> None:
     run.require_stage("CREATED")
+    if is_v49(config):
+        config["_v49_checkpoint_identity"] = {
+            "resolved_config_sha256": resume_config_hash(config),
+            "input_hashes": run.payload["input_hashes"],
+            "git": run.payload["git"],
+            "input_file_signatures": config.get("_v49_input_files", {}),
+            "trainer_sha256": sha256_file(Path(__file__)),
+            "runtime_sha256": runtime_source_identity(Path(__file__).resolve().parents[1])["sha256"],
+        }
     outer_train, outer_test = outer_subject_sets(inputs, int(run.payload["outer_fold"]))
     crossfit_mode = _state_crossfit_mode(config)
     single_holdout_report: dict[str, Any] | None = None
@@ -2149,6 +2271,7 @@ def train_state_crossfit_v4(
                     {
                         "model": model.state_dict(),
                         "model_config": config["model"],
+                        **_state_promotion_evidence(model, config),
                         "epochs": epochs,
                         "seed": seed,
                         "training_subjects": sorted(training_subjects),
@@ -2315,6 +2438,7 @@ def train_state_crossfit_v4(
                 {
                     "model": outer_model.state_dict(),
                     "model_config": config["model"],
+                    **_state_promotion_evidence(model, config),
                     "epochs": epochs,
                     "seed": seed,
                     "training_subjects": sorted(outer_train),
@@ -2706,6 +2830,12 @@ def build_candidates_v4(
         label_event_candidates(proposals, evaluable, 0.25), ignored
     )
     candidate_metrics = _candidate_recall(proposals, evaluable)
+    candidate_metrics["evaluable_event_count"] = len(evaluable)
+    candidate_metrics["covered"] = round(candidate_metrics["candidate_recall"] * len(evaluable))
+    same_event_count = evaluable["hand_relation"].fillna("unknown").eq("same").sum()
+    different_event_count = evaluable["hand_relation"].fillna("unknown").eq("different").sum()
+    candidate_metrics["same_covered"] = round(candidate_metrics["same_candidate_recall"] * same_event_count)
+    candidate_metrics["different_covered"] = round(candidate_metrics["different_candidate_recall"] * different_event_count)
     candidate_metrics.update(hysteresis_fragment_diagnostics(calibrated, decoder_config))
     candidate_metrics["candidate_count"] = float(len(proposals))
     candidate_metrics["candidates_per_hour"] = float(
@@ -3223,6 +3353,7 @@ def _prepare_nested_meta_cache(
             checkpoint_payload = {
                 "model": model.state_dict(),
                 "model_config": config["model"],
+                **_state_promotion_evidence(model, config),
                 "epochs": epochs,
                 "seed": seed,
                 "training_subjects": sorted(model_subjects),
@@ -3375,6 +3506,11 @@ def _slice_proposal_features(features, indices: np.ndarray):
         if features.sample_weight is not None
         else None,
         raw_imu=features.raw_imu[indices] if features.raw_imu is not None else None,
+        sampling_metadata=(
+            {name: values[indices] for name, values in features.sampling_metadata.items()}
+            if features.sampling_metadata is not None
+            else None
+        ),
     )
 
 
@@ -3408,6 +3544,7 @@ def _train_verifier_model_v4(
         steps_per_epoch=steps,
         seed=seed,
         target_weights=features.sample_weight,
+        sampling_metadata=features.sampling_metadata,
     )
     loader = DataLoader(dataset, batch_sampler=sampler)
     optimizer = torch.optim.AdamW(
@@ -3501,6 +3638,7 @@ def _select_verifier_epoch(
         steps_per_epoch=max(1, math.ceil(len(dataset) / batch_size)),
         seed=seed,
         target_weights=fit_features.sample_weight,
+        sampling_metadata=fit_features.sampling_metadata,
     )
     loader = DataLoader(dataset, batch_sampler=sampler)
     optimizer = torch.optim.AdamW(
@@ -3841,6 +3979,7 @@ def _best_verifier_operating_point(
     score_column: str,
     config: dict[str, Any],
     ignore: pd.DataFrame | None = None,
+    search_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, float]:
     best: dict[str, float] | None = None
     values = scores[score_column].to_numpy(dtype=np.float64)
@@ -3878,6 +4017,8 @@ def _best_verifier_operating_point(
                 "nms_iou_threshold": float(nms_threshold),
                 **metrics,
             }
+            if search_records is not None:
+                search_records.append(dict(point))
             if best is None or (point["f1"], -point["fp_per_hour"]) > (
                 best["f1"],
                 -best["fp_per_hour"],
@@ -5493,6 +5634,8 @@ def _per_subject_metrics_v4(
     subjects = sorted(
         set(events.get("subject_key", pd.Series(dtype=str)).astype(str))
         | set(predictions.get("subject_key", pd.Series(dtype=str)).astype(str))
+        | set(ignore.get("subject_key", pd.Series(dtype=str)).astype(str))
+        | set(windows.get("subject_key", pd.Series(dtype=str)).astype(str))
     )
     for subject in subjects:
         truth = events[events["subject_key"].astype(str) == subject]
@@ -5551,7 +5694,7 @@ def select_v4_pipeline(
         metrics["fp_per_hour"] = metrics["false_positive"] / max(_observed_hours(windows), 1e-9)
         selection = {
             "schema_version": 5,
-            "code_version": CODE_VERSION,
+            "code_version": "v4.9" if is_v49(config) else CODE_VERSION,
             "protocol_version": PROTOCOL_VERSION,
             "blocked_predecessors": list(BLOCKED_PREDECESSORS),
             "anchor_semantics": "right_endpoint_half_open",
@@ -5612,7 +5755,7 @@ def select_v4_pipeline(
     score_column = "final_score" if verifier_kind == "deep" else "logistic_score"
     point = preselection[verifier_kind]
     accepted = _accepted_from_point(scores, point, score_column)
-    subjects = set(scores["subject_key"].astype(str))
+    subjects = set(windows["subject_key"].astype(str))
     truth, ignore = partition_evaluation_events(inputs.events, subjects)
     coarse_predictions = _prediction_events(accepted)
     coarse_metrics, coarse_matches = evaluate_events(
@@ -5762,7 +5905,7 @@ def select_v4_pipeline(
     )
     selection = {
         "schema_version": 5,
-        "code_version": CODE_VERSION,
+        "code_version": "v4.9" if is_v49(config) else CODE_VERSION,
         "protocol_version": PROTOCOL_VERSION,
         "blocked_predecessors": list(BLOCKED_PREDECESSORS),
         "anchor_semantics": "right_endpoint_half_open",
@@ -5912,6 +6055,8 @@ def evaluate_v4_outer(
             ),
         }
     )
+    if is_v49(config):
+        outer_candidate_metrics.update(candidate_coverage(state_only_proposals, truth))
     metrics = {
         "max_cardinality_iou": max_metrics,
         "greedy": greedy_metrics,
@@ -6011,6 +6156,14 @@ def _concatenate_proposal_features(parts: list[ProposalFeatureBatchV4]) -> Propo
         iou_target=optional("iou_target"),
         sample_weight=optional("sample_weight"),
         raw_imu=optional("raw_imu"),
+        sampling_metadata=(
+            {
+                name: np.concatenate([part.sampling_metadata[name] for part in parts])
+                for name in parts[0].sampling_metadata
+            }
+            if all(part.sampling_metadata is not None for part in parts)
+            else None
+        ),
     )
 
 
@@ -6284,6 +6437,7 @@ def _prepare_pooled_nested_state_oof(
                     {
                         "model": model.state_dict(),
                         "model_config": config["model"],
+                        **_state_promotion_evidence(model, config),
                         "epochs": epochs,
                         "seed": seed,
                         "training_subjects": sorted(model_subjects),
@@ -6675,6 +6829,89 @@ def _pooled_head_diagnostics(
     )
 
 
+def _v49_locked_deep_diagnostics(
+    scores: pd.DataFrame, truth: pd.DataFrame, ignore: pd.DataFrame,
+    windows: pd.DataFrame, report: dict[str, Any],
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    if "locked_acceptance" not in scores or scores["locked_acceptance"].isna().any():
+        raise RuntimeError("v4.9 Deep scores lack training-fold locked operating points")
+    points = [lineage.get("locked_operating_point") for lineage in report["lineage"]]
+    if len(points) != 5 or any(point is None for point in points):
+        raise RuntimeError("v4.9 Deep requires five training-fold operating points")
+    accepted = scores.loc[scores["locked_acceptance"].astype(bool)].copy()
+    predictions = _prediction_events(accepted)
+    metrics, _ = evaluate_events(truth, predictions, method="max_cardinality_iou", ignore=ignore)
+    greedy, _ = evaluate_events(truth, predictions, method="greedy", ignore=ignore)
+    metrics["fp_per_hour"] = metrics["false_positive"] / max(_observed_hours(windows), 1e-9)
+    point = {
+        **metrics,
+        "acceptance_threshold": float(np.median([value["acceptance_threshold"] for value in points])),
+        "nms_iou_threshold": float(np.median([value["nms_iou_threshold"] for value in points])),
+    }
+    return {
+        "point": point, "hand": _hand_metrics(truth, predictions, ignore),
+        "greedy_f1": greedy["f1"], "accepted_proposal_ids": accepted["proposal_id"].astype(str).tolist(),
+        "operating_point_source": "median_of_training_fold_locked_points",
+        "evaluation_protocol": "outer_oof_with_training_fold_locked_acceptance_v1",
+    }, accepted
+
+
+def _v49_deep_gate(
+    scores: pd.DataFrame, accepted: pd.DataFrame, diagnostics: dict[str, Any],
+    truth: pd.DataFrame, ignore: pd.DataFrame, windows: pd.DataFrame,
+    config: dict[str, Any], output_root: Path,
+) -> dict[str, Any]:
+    from bme_eating.hierarchical_v4_gates import _bootstrap_probability
+
+    root = output_root / "final" / str(config["v49"]["frozen_reference_run"])
+    baseline_report = json.loads((root / "deep_crossfit.json").read_text(encoding="utf-8"))
+    baseline_scores = pd.read_parquet(root / "deep_crossfit_scores.parquet")
+    baseline_point = baseline_report["deep"]["point"]
+    baseline_accepted = _accepted_from_point(baseline_scores, baseline_point, "final_score")
+    baseline_predictions = _prediction_events(baseline_accepted)
+    baseline_metrics, _ = evaluate_events(truth, baseline_predictions, method="max_cardinality_iou", ignore=ignore)
+    frozen = config["promotion_gate"]["v48_frozen_baseline"]
+    if not np.isclose(baseline_metrics["f1"], frozen["final_f1"], atol=1e-8):
+        raise RuntimeError("Frozen Deep predictions no longer reproduce the declared reference F1")
+    candidate_subjects = _per_subject_metrics_v4(truth, _prediction_events(accepted), windows, ignore)
+    baseline_subjects = _per_subject_metrics_v4(truth, baseline_predictions, windows, ignore)
+    probability = _bootstrap_probability(candidate_subjects, baseline_subjects)
+    fold_rows = []
+    for fold in range(5):
+        subject_keys = set(scores.loc[scores["outer_fold"].eq(fold), "subject_key"].astype(str))
+        subject_keys |= set(windows.loc[windows["outer_fold"].eq(fold), "subject_key"].astype(str)) if "outer_fold" in windows else set()
+        fold_truth = truth[truth["subject_key"].astype(str).isin(subject_keys)]
+        fold_ignore = ignore[ignore["subject_key"].astype(str).isin(subject_keys)]
+        fold_accepted = accepted[accepted["subject_key"].astype(str).isin(subject_keys)]
+        metrics, matches = evaluate_events(fold_truth, _prediction_events(fold_accepted), method="max_cardinality_iou", ignore=fold_ignore)
+        signed_start = float(matches["start_signed_error_ms"].mean() / 1000) if "start_signed_error_ms" in matches and len(matches) else None
+        fold_scores = scores.loc[scores["outer_fold"].eq(fold)]
+        fold_rows.append({"fold": fold, "metrics": metrics, "subjects": sorted(subject_keys),
+                          "start_signed_error_seconds": signed_start,
+                          "acceptance_threshold": float(fold_scores["locked_acceptance_threshold"].iloc[0]) if len(fold_scores) else None})
+    development = candidate_subjects[candidate_subjects["subject_key"].isin(
+        set(fold_rows[0]["subjects"]) | set(fold_rows[1]["subjects"])
+    )]
+    development_denominator = (2 * development.true_positive + development.false_positive + development.false_negative).sum()
+    development_f1 = 2 * development.true_positive.sum() / max(development_denominator, 1)
+    gate = config["promotion_gate"]
+    checks = {
+        "f1": diagnostics["point"]["f1"] >= float(gate["minimum_final_f1"]),
+        "fp_per_hour": diagnostics["point"]["fp_per_hour"] <= float(gate["maximum_fp_per_hour"]),
+        "same_recall": diagnostics["hand"]["same_sensitivity"] >= frozen["same_sensitivity"] - 0.02,
+        "different_recall": diagnostics["hand"]["different_sensitivity"] >= frozen["different_sensitivity"] - 0.02,
+        "paired_subject_bootstrap": probability >= float(gate["minimum_positive_bootstrap_probability"]),
+        "matching_ranking": not _matching_ranking_reversal(
+            diagnostics["point"]["f1"] - frozen["final_f1"], diagnostics["greedy_f1"] - frozen["greedy_f1"], tolerance=0.0,
+        ),
+        "stress_fold_drop": all(row["metrics"]["f1"] >= development_f1 - float(gate["maximum_stress_fold_f1_drop"]) for row in fold_rows[2:]),
+    }
+    return {"protocol": "v49_deep_promotion_v1", "checks": checks, "passed": all(checks.values()),
+            "paired_bootstrap_probability": probability, "bootstrap_seed": 2026, "bootstrap_replicates": 2000,
+            "cohort_subjects": candidate_subjects["subject_key"].astype(str).tolist(),
+            "reference_metrics": baseline_metrics, "folds": fold_rows, "development_f1": float(development_f1)}
+
+
 def _v48_candidate_gate(
     proposals: pd.DataFrame, truth: pd.DataFrame, config: dict[str, Any]
 ) -> dict[str, Any]:
@@ -6697,7 +6934,13 @@ def _v48_candidate_gate(
         "different_retained": counts["different_covered"]
         >= int(baseline["different_candidate_covered"]) - 2,
     }
-    if bool(config["model"].get("use_proposal_head", False)):
+    if is_v49(config):
+        checks = {
+            "overall_coverage": counts["covered"] >= int(config["promotion_gate"]["candidate_coverage_minimum"]),
+            "same_retained": counts["same_covered"] >= int(baseline["same_candidate_covered"]),
+            "different_retained": counts["different_covered"] >= int(baseline["different_candidate_covered"]),
+        }
+    if bool(config["model"].get("use_proposal_head", False)) and not is_v49(config):
         checks["proposal_head_overall_target"] = counts["covered"] >= 126
         checks["proposal_head_different_target"] = counts["different_covered"] >= 63
     return {
@@ -6759,7 +7002,15 @@ def _v48_subject_bootstrap(
 ) -> dict[str, Any]:
     predictions = _prediction_events(accepted)
     counts: list[list[float]] = []
-    for subject in sorted(truth["subject_key"].astype(str).unique()):
+    subject_columns = [
+        frame["subject_key"].astype(str)
+        for frame in (truth, predictions, ignore)
+        if "subject_key" in frame.columns
+    ]
+    subjects = sorted(set().union(*subject_columns))
+    if not subjects:
+        raise ValueError("Subject bootstrap requires at least one timeline subject")
+    for subject in subjects:
         subject_truth = truth[truth["subject_key"].astype(str).eq(subject)]
         subject_predictions = predictions[
             predictions["subject_key"].astype(str).eq(subject)
@@ -6785,6 +7036,8 @@ def _v48_subject_bootstrap(
     return {
         "seed": seed,
         "replicates": replicates,
+        "subject_count": len(subjects),
+        "subjects": subjects,
         "evidence_class": "development_stress_joint_tuning_optimistic",
         "f1_p025": float(np.quantile(values, 0.025)),
         "f1_p975": float(np.quantile(values, 0.975)),
@@ -7188,6 +7441,45 @@ def _fit_pooled_deep_crossfit(
         prediction_proposals_fold = data.proposals.iloc[data.prediction_indices].reset_index(
             drop=True
         )
+        if is_v49(config):
+            if set(train_proposals["proposal_family_id"]) & set(prediction_proposals_fold["proposal_family_id"]):
+                raise RuntimeError("v4.9 proposal family leaks into a held-out fold")
+            if train_features.sampling_metadata is None:
+                raise RuntimeError("v4.9 hard-negative training lacks stratification metadata")
+            metadata = train_features.sampling_metadata
+            training_truth = truth.loc[truth["subject_key"].astype(str).isin(training_subjects)]
+            if "wear_hand" in training_truth:
+                hand_groups = training_truth.groupby("subject_key")["wear_hand"].agg(
+                    lambda values: str(values.iloc[0]) if values.dropna().nunique() == 1 else "unknown"
+                )
+                metadata["wear_hand"] = np.asarray([
+                    str(hand_groups.get(str(subject), "unknown")) for subject in metadata["subject_key"]
+                ], dtype=object)
+            relation_map = {
+                (str(row.subject_key), str(row.session_id), str(row.event_id)): str(row.hand_relation)
+                for row in training_truth.itertuples(index=False)
+            }
+            metadata["hand_relation"] = np.asarray([
+                relation_map.get((str(row.subject_key), str(row.session_id), str(row.matched_event_id)), "unknown")
+                if bool(row.is_positive) else "unknown"
+                for row in train_proposals.itertuples(index=False)
+            ], dtype=object)
+            sampling_frame = pd.DataFrame(train_features.sampling_metadata)
+            sampling_frame["category"] = classify_proposals(train_proposals)
+            sampling_path = head_root / f"fold_{fold}_hard_negative_statistics.json"
+            strata_columns = ["subject_key", "wear_hand", "hand_relation", "iou_bin", "gyro_missingness_bin",
+                              "duration_bin", "source_mask", "category"]
+            statistics = sampling_frame.groupby(strata_columns, dropna=False).agg(
+                candidate_count=("proposal_family_id", "size"),
+                independent_family_count=("proposal_family_id", "nunique"),
+            ).reset_index()
+            write_json_atomic(sampling_path, {
+                "protocol": config["training"]["hard_negative_sampling_protocol"],
+                "training_subjects": sorted(training_subjects),
+                "globally_excluded_subjects": sorted(prediction_subjects),
+                "strata": statistics.to_dict("records"),
+            })
+            artifacts.append(sampling_path)
         train_subject_values = train_proposals["subject_key"].astype(str).to_numpy()
         fit_indices = np.flatnonzero(np.isin(train_subject_values, sorted(fit_subjects)))
         selector_indices = np.flatnonzero(
@@ -7277,8 +7569,14 @@ def _fit_pooled_deep_crossfit(
                     "fit_subjects": sorted(fit_subjects),
                     "selector_subjects": sorted(selector_subjects),
                     "outer_fold": fold,
-                    "state_calibration_source": "pooled_outer_oof_joint_tuning",
-                    "duration_prior_source": "pooled_outer_oof_joint_tuning",
+                    "state_calibration_source": (
+                        "fully_excluded_nested_state_oof" if is_v49(config)
+                        else "pooled_outer_oof_joint_tuning"
+                    ),
+                    "duration_prior_source": (
+                        "other_outer_training_truth_only" if is_v49(config)
+                        else "pooled_outer_oof_joint_tuning"
+                    ),
                 },
             )
             selector_path = head_root / f"fold_{fold}_seed_{seed}_selector.json"
@@ -7381,7 +7679,32 @@ def _fit_pooled_deep_crossfit(
             else np.asarray(prediction_features.sample_weight, dtype=np.float64)
         )
         raw_prediction_parts.append(prediction_raw)
-        calibrated_parts.append(calibration.apply(prediction_raw))
+        calibrated = calibration.apply(prediction_raw)
+        locked_point = None
+        if is_v49(config):
+            training_truth = truth[truth["subject_key"].astype(str).isin(training_subjects)]
+            training_ignore = ignore[ignore["subject_key"].astype(str).isin(training_subjects)]
+            training_windows = data.windows[data.windows["subject_key"].astype(str).isin(training_subjects)]
+            search_records: list[dict[str, Any]] = []
+            locked_point = _best_verifier_operating_point(
+                calibration.apply(training_raw), training_truth, training_windows,
+                "final_score", config, training_ignore, search_records,
+            )
+            accepted_ids = set(_accepted_from_point(calibrated, locked_point, "final_score")["proposal_id"])
+            calibrated["locked_acceptance"] = calibrated["proposal_id"].isin(accepted_ids)
+            calibrated["locked_acceptance_threshold"] = locked_point["acceptance_threshold"]
+            calibrated["locked_nms_iou_threshold"] = locked_point["nms_iou_threshold"]
+            search_path = head_root / f"fold_{fold}_operating_point_search.json"
+            write_json_atomic(search_path, {
+                "protocol": "training_fold_joint_operating_point_v1",
+                "training_subjects": sorted(training_subjects),
+                "globally_excluded_subjects": sorted(prediction_subjects),
+                "selected_point": locked_point, "search": search_records,
+                "gap_merge_seconds": config["decoder"]["gap_merge_seconds"],
+                "candidate_budget": config["decoder"]["maximum_candidates_per_hour"],
+            })
+            artifacts.append(search_path)
+        calibrated_parts.append(calibrated)
         calibration_lineage.append(
             {
                 "prediction_fold": fold,
@@ -7404,6 +7727,7 @@ def _fit_pooled_deep_crossfit(
             "selected_epoch_by_seed": fold_selected_epochs,
             "parent_artifact_sha256": fold_parent_sha256,
             "upstream_lineage": data.upstream_lineage,
+            "locked_operating_point": locked_point,
         }
         write_json_atomic(lineage_path, lineage)
         artifacts.append(lineage_path)
@@ -7423,8 +7747,8 @@ def _fit_pooled_deep_crossfit(
     }
     report = {
         "protocol": POOLED_HEAD_PROTOCOL,
-        "joint_tuning": True,
-        "evidence_class": "development_stress_only",
+        "joint_tuning": not is_v49(config),
+        "evidence_class": "fully_excluded_outer_oof" if is_v49(config) else "development_stress_only",
         "lineage": lineages,
         "calibration_lineage": calibration_lineage,
         "selected_epochs": {str(key): value for key, value in selected_epochs.items()},
@@ -7540,7 +7864,7 @@ def _fit_pooled_boundary_crossfit(
         independent_events = len(
             train[["subject_key", "session_id", "matched_event_id"]].drop_duplicates()
         )
-        if independent_events < 2:
+        if independent_events < (int(config["boundary"]["minimum_independent_events"]) if is_v49(config) else 2):
             raise RuntimeError(f"Pooled Boundary fold {fold} has insufficient training events")
         start_residual = (
             train["truth_start_ms"].to_numpy(dtype=float)
@@ -7750,6 +8074,12 @@ def _fit_pooled_boundary_crossfit(
             "globally_excluded_subjects": sorted(prediction_subjects),
             "selected_epoch_by_seed": fold_selected_epochs,
             "range_source": "other_outer_folds_only",
+            "residual_clipping_fraction": boundary_range.clipped_fraction,
+            "selector_residual_clipping_fraction": selection_range.clipped_fraction,
+            "prediction_valid_bins": {
+                "start": bool(holdout_features.start_mask.any(axis=1).all()),
+                "end": bool(holdout_features.end_mask.any(axis=1).all()),
+            },
             "parent_artifact_sha256": fold_parent_sha256,
             "upstream_lineage": upstream_lineage,
         }
@@ -7826,10 +8156,23 @@ def train_hierarchical_final_v4(
     elif final_root.exists() and any(final_root.iterdir()):
         raise RuntimeError("V4 final directory exists without a valid final manifest")
     identity = current_v4_identity(config, input_root)
+    if is_v49(config):
+        config["_v49_checkpoint_identity"] = {
+            **identity, "trainer_sha256": sha256_file(Path(__file__)),
+            "runtime_sha256": runtime_source_identity(Path(__file__).resolve().parents[1])["sha256"],
+            "input_file_signatures": {
+                str(path): [path.stat().st_size, path.stat().st_mtime_ns]
+                for path in _tracked_inputs(config, input_root).values()
+            },
+        }
     experiment_root = output_root / "experiments" / run_name
+    if is_v49(config):
+        validate_v49_gate_manifest(output_root, run_name, identity)
     fold_roots = [experiment_root / f"fold_{fold}" for fold in range(5)]
     manifests = []
     parent_artifact_hashes: dict[str, str] = {}
+    if is_v49(config):
+        parent_artifact_hashes["v49_gate_manifest.json"] = sha256_file(experiment_root / "v49_gate_manifest.json")
     expected_state_seeds = [int(value) for value in config["final_training"]["state_seeds"]]
     downstream_mode = str(config.get("hierarchical", {}).get("downstream_mode", "full"))
     state_only_downstream = downstream_mode == "state_only"
@@ -7859,7 +8202,7 @@ def train_hierarchical_final_v4(
             raise RuntimeError(f"V4 fold {fold} must be EVALUATED before final training")
         if manifest.get("protocol_version") != PROTOCOL_VERSION:
             raise RuntimeError(f"V4 fold {fold} was not produced by {PROTOCOL_VERSION}")
-        if manifest.get("code_version") != CODE_VERSION:
+        if manifest.get("code_version") not in {CODE_VERSION, "v4.9"}:
             raise RuntimeError(f"V4 fold {fold} is a frozen predecessor code generation")
         if _saved_resume_config_hash(root, manifest) != identity["resolved_config_sha256"]:
             raise RuntimeError(f"V4 fold {fold} configuration differs from final training")
@@ -7960,7 +8303,7 @@ def train_hierarchical_final_v4(
     if existing_manifest is not None:
         if existing_manifest.get("protocol_version") != PROTOCOL_VERSION:
             raise RuntimeError("Legacy or blocked v4 final runs cannot be resumed")
-        if existing_manifest.get("code_version") != CODE_VERSION:
+        if existing_manifest.get("code_version") not in {CODE_VERSION, "v4.9"}:
             raise RuntimeError("Frozen v4.7.1 final runs cannot be resumed with v4.8 code")
         saved_resume_identity = existing_manifest.get("resume_identity", {})
         if _final_resume_comparison_identity(
@@ -7998,7 +8341,7 @@ def train_hierarchical_final_v4(
             manifest_path,
             {
                 "version": 5,
-                "code_version": CODE_VERSION,
+                "code_version": "v4.9" if is_v49(config) else CODE_VERSION,
                 "stage": "IN_PROGRESS",
                 "run_name": run_name,
                 "protocol_version": PROTOCOL_VERSION,
@@ -8153,6 +8496,7 @@ def train_hierarchical_final_v4(
                 {
                     "model": model.state_dict(),
                     "model_config": config["model"],
+                    **_state_promotion_evidence(model, config),
                     "epochs": fixed_epochs[seed],
                     "training_subject_count": int(inputs.anchors["subject_key"].nunique()),
                     "training_subjects": sorted(final_training_subjects),
@@ -8230,6 +8574,8 @@ def train_hierarchical_final_v4(
             scored_parts.append(scored)
             positive = scored[scored["max_iou"] > 0.25]
             boundary_positive_parts.append(_attach_truth_boundaries(positive, evaluable))
+        if is_v49(config):
+            windows["outer_fold"] = int(fold)
         window_parts.append(windows)
         truth_parts.append(evaluable)
         ignore_parts.append(ignored)
@@ -8294,14 +8640,24 @@ def train_hierarchical_final_v4(
         pd.concat(window_parts, ignore_index=True), state_calibration
     )
     pooled_windows = globally_calibrated_windows
-    selected_decoder, pooled_decoder_search = _select_decoder_configuration(
-        pooled_windows,
-        pooled_truth,
-        pooled_ignore,
-        prior,
-        config,
-        split_role="pooled_outer_oof_decoder_search",
-    )
+    if is_v49(config):
+        selected_decoder = dict(config["decoder"])
+        pooled_decoder_search = pd.DataFrame([{
+            "selection_protocol": "registered_fixed_decoder_without_holdout_search_v1",
+            "gap_merge_seconds": selected_decoder["gap_merge_seconds"],
+            "maximum_candidates_per_hour": selected_decoder["maximum_candidates_per_hour"],
+            "high_threshold": selected_decoder["high_threshold"],
+            "low_threshold": selected_decoder["low_threshold"],
+        }])
+    else:
+        selected_decoder, pooled_decoder_search = _select_decoder_configuration(
+            pooled_windows,
+            pooled_truth,
+            pooled_ignore,
+            prior,
+            config,
+            split_role="pooled_outer_oof_decoder_search",
+        )
     decoder_search_path = final_root / "decoder_search.parquet"
     selected_decoder_path = final_root / "selected_decoder.json"
     write_parquet_atomic(decoder_search_path, pooled_decoder_search)
@@ -8439,7 +8795,7 @@ def train_hierarchical_final_v4(
         raise RuntimeError("Pooled outer OOF produced no proposals")
     if calibration_frame["proposal_id"].astype(str).duplicated().any():
         raise RuntimeError("Pooled outer OOF proposal IDs are not globally unique")
-    if config["decoder"].get("candidate_protocol") == "v4.8":
+    if config["decoder"].get("candidate_protocol") in {"v4.8", "v4.9"}:
         v48_candidate_report = _v48_candidate_gate(
             calibration_frame, pooled_truth, config
         )
@@ -8591,6 +8947,13 @@ def train_hierarchical_final_v4(
         write_json_atomic(deep_report_path, pooled_deep_report)
         write_parquet_atomic(deep_scores_path, deep_scores)
         artifacts.extend((deep_report_path, deep_scores_path))
+        if is_v49(config):
+            deep_promotion["evidence_sha256"] = {
+                "deep_crossfit.json": sha256_file(deep_report_path),
+                "deep_crossfit_scores.parquet": sha256_file(deep_scores_path),
+                "resolved_config.yaml": sha256_file(final_root / "resolved_config.yaml"),
+            }
+            write_json_atomic(final_root / "v49_deep_gate.json", deep_promotion)
         if bool(deep_promotion["passed"]):
             if deployment_features is None or deployment_frame.empty:
                 raise RuntimeError("Pooled Deep deployment features are missing")
@@ -8637,14 +9000,17 @@ def train_hierarchical_final_v4(
         baseline_scores = calibration_frame.copy()
         baseline_scores["state_score"] = baseline_scores["generator_score"]
         baseline_scores["final_score"] = baseline_scores["generator_score"]
-        current_diagnostics, _ = _pooled_head_diagnostics(
-            baseline_scores,
-            "final_score",
-            pooled_truth,
-            pooled_windows,
-            pooled_ignore,
-            config,
-        )
+        if is_v49(config):
+            current_diagnostics = {}
+        else:
+            current_diagnostics, _ = _pooled_head_diagnostics(
+                baseline_scores,
+                "final_score",
+                pooled_truth,
+                pooled_windows,
+                pooled_ignore,
+                config,
+            )
         pooled_verifier_parent_sha256 = {
             "state_calibration": sha256_file(state_calibration_path),
             "duration_prior": sha256_file(prior_path),
@@ -8676,20 +9042,31 @@ def train_hierarchical_final_v4(
         )
         artifacts.extend(deep_artifacts)
         verifier_epoch_by_seed.update(fixed_deep_epochs)
-        deep_diagnostics, _ = _pooled_head_diagnostics(
-            deep_scores,
-            "final_score",
-            pooled_truth,
-            pooled_windows,
-            pooled_ignore,
-            config,
-        )
-        deep_promotion = _pooled_head_promotion(
-            current_diagnostics,
-            deep_diagnostics,
-            minimum_f1_gain=float(config["promotion_gate"]["minimum_verifier_f1_improvement"]),
-            config=config,
-        )
+        if is_v49(config):
+            deep_diagnostics, locked_accepted = _v49_locked_deep_diagnostics(
+                deep_scores, pooled_truth, pooled_ignore, pooled_windows, pooled_deep_report,
+            )
+            deep_promotion = _v49_deep_gate(
+                deep_scores, locked_accepted, deep_diagnostics, pooled_truth, pooled_ignore,
+                pooled_windows, config, output_root,
+            )
+            current_diagnostics = {
+                "point": deep_promotion["reference_metrics"],
+                "reference_run": config["v49"]["frozen_reference_run"],
+                "evaluation_protocol": "frozen_reference_predictions_on_identical_cohort_v1",
+            }
+            gate_path = final_root / "v49_deep_gate.json"
+            write_json_atomic(gate_path, deep_promotion)
+            artifacts.append(gate_path)
+        else:
+            deep_diagnostics, _ = _pooled_head_diagnostics(
+                deep_scores, "final_score", pooled_truth, pooled_windows, pooled_ignore, config,
+            )
+            deep_promotion = _pooled_head_promotion(
+                current_diagnostics, deep_diagnostics,
+                minimum_f1_gain=float(config["promotion_gate"]["minimum_verifier_f1_improvement"]),
+                config=config,
+            )
         if config["decoder"].get("candidate_protocol") == "v4.8":
             v48_absolute_gate = _v48_deep_gate(deep_diagnostics, config)
             v48_absolute_gate["subject_bootstrap"] = _v48_subject_bootstrap(
@@ -8701,7 +9078,7 @@ def train_hierarchical_final_v4(
             pooled_deep_report["v48_frozen_baseline_gate"] = v48_absolute_gate
         pooled_deep_report.update(
             {
-                "baseline_kind": "state_only_diagnostic",
+                "baseline_kind": "frozen_deep_reference" if is_v49(config) else "state_only_diagnostic",
                 "baseline": current_diagnostics,
                 "deep": deep_diagnostics,
                 "promotion": deep_promotion,
@@ -8713,9 +9090,23 @@ def train_hierarchical_final_v4(
         write_parquet_atomic(deep_scores_path, deep_scores)
         artifacts.extend((deep_report_path, deep_scores_path))
         if not bool(deep_promotion["passed"]):
+            if is_v49(config):
+                deep_promotion["evidence_sha256"] = {
+                    "deep_crossfit.json": sha256_file(deep_report_path),
+                    "deep_crossfit_scores.parquet": sha256_file(deep_scores_path),
+                    "resolved_config.yaml": sha256_file(final_root / "resolved_config.yaml"),
+                }
+                write_json_atomic(final_root / "v49_deep_gate.json", deep_promotion)
             raise RuntimeError(
                 "Deep-only promotion gate failed; no Logistic or state-only fallback is allowed"
             )
+        if is_v49(config):
+            deep_promotion["evidence_sha256"] = {
+                "deep_crossfit.json": sha256_file(deep_report_path),
+                "deep_crossfit_scores.parquet": sha256_file(deep_scores_path),
+                "resolved_config.yaml": sha256_file(final_root / "resolved_config.yaml"),
+            }
+            write_json_atomic(final_root / "v49_deep_gate.json", deep_promotion)
         if config["decoder"].get("candidate_protocol") == "v4.8" and not bool(
             pooled_deep_report["v48_frozen_baseline_gate"]["passed"]
         ):
@@ -8831,7 +9222,7 @@ def train_hierarchical_final_v4(
         )
     selection: dict[str, Any] = {
         "schema_version": 5,
-        "code_version": CODE_VERSION,
+        "code_version": "v4.9" if is_v49(config) else CODE_VERSION,
         "protocol_version": PROTOCOL_VERSION,
         "blocked_predecessors": list(BLOCKED_PREDECESSORS),
         "selection_source": "pooled_outer_oof",
@@ -8926,7 +9317,10 @@ def train_hierarchical_final_v4(
     pooled_boundary_fixed_epochs: dict[int, int] = {}
     pooled_boundary_positive: pd.DataFrame | None = None
     if pooled_learned_heads_downstream:
-        accepted = _accepted_from_point(pooled_scores, point, "final_score")
+        accepted = (
+            pooled_scores.loc[pooled_scores["locked_acceptance"].astype(bool)].copy()
+            if is_v49(config) else _accepted_from_point(pooled_scores, point, "final_score")
+        )
         pooled_boundary_positive = _attach_truth_boundaries(
             pooled_scores[pooled_scores["max_iou"] > 0.25], pooled_truth
         )
@@ -8942,7 +9336,7 @@ def train_hierarchical_final_v4(
             "minimum_independent_events": int(config["boundary"]["minimum_independent_events"]),
             "enabled": False,
         }
-        v48_boundary = config["decoder"].get("candidate_protocol") == "v4.8"
+        v48_boundary = config["decoder"].get("candidate_protocol") in {"v4.8", "v4.9"}
         if v48_boundary:
             boundary_report["geometric_feasibility"] = boundary_geometric_feasibility(
                 pooled_boundary_positive,
@@ -9093,6 +9487,21 @@ def train_hierarchical_final_v4(
                             "passed": relation_passed,
                         }
                     matched_enough = len(paired) >= minimum_boundary_events
+                    coarse_tp_ids = set(coarse_matches.get("prediction_event_id", pd.Series(dtype=str)).astype(str))
+                    refined_tp_ids = set(matches.get("prediction_event_id", pd.Series(dtype=str)).astype(str))
+                    tp_to_fp_rate = len(coarse_tp_ids - refined_tp_ids) / max(len(coarse_tp_ids), 1)
+                    boundary_safety = True
+                    if is_v49(config):
+                        boundary_limits = config["promotion_gate"]["boundary"]
+                        boundary_safety = bool(
+                            tp_to_fp_rate <= float(boundary_limits["maximum_tp_to_fp_rate"])
+                            and all(
+                                max(row["residual_clipping_fraction"], row["selector_residual_clipping_fraction"])
+                                <= float(boundary_limits["maximum_residual_clipping_rate"])
+                                and all(row["prediction_valid_bins"].values())
+                                for row in crossfit_report["lineage"]
+                            )
+                        )
                     passed = bool(
                         identity_preserved
                         and matched_enough
@@ -9102,6 +9511,7 @@ def train_hierarchical_final_v4(
                         >= coarse_metrics["f1"]
                         - float(config["promotion_gate"]["maximum_boundary_f1_drop"])
                         and hand_passed
+                        and boundary_safety
                     )
                     diagnostics = {
                         "threshold": float(threshold),
@@ -9116,6 +9526,9 @@ def train_hierarchical_final_v4(
                         "start_mae_seconds": float(metrics["start_mae_seconds"]),
                         "end_mae_seconds": float(metrics["end_mae_seconds"]),
                         "hand_gate": hand_gate,
+                        "tp_to_fp_rate": tp_to_fp_rate,
+                        "boundary_safety_passed": boundary_safety,
+                        "conflict_fallback_count": int(refined.get("boundary_conflict_fallback", pd.Series(False, index=refined.index)).sum()),
                     }
                     if passed:
                         winners.append(
@@ -9156,6 +9569,12 @@ def train_hierarchical_final_v4(
         write_json_atomic(boundary_report_path, boundary_report)
         artifacts.append(boundary_report_path)
         selection["boundary_selection_diagnostics"] = boundary_report
+        if is_v49(config) and not boundary_report["enabled"]:
+            write_json_atomic(final_root / "boundary_failure_report.json", {
+                "stage": "optional_endpoint_refiner_qualification", "passed": False,
+                "fallback": "coarse_boundary", "diagnostics": boundary_report,
+            })
+            artifacts.append(final_root / "boundary_failure_report.json")
 
     all_fold_boundary_enabled = all(
         bool(value.get("boundary_enabled", False)) for value in fold_selections
@@ -9299,6 +9718,8 @@ def train_hierarchical_final_v4(
             minimum_seconds=int(config["boundary"]["minimum_range_seconds"]),
             maximum_seconds=int(config["boundary"]["maximum_range_seconds"]),
         )
+        if is_v49(config) and final_range.clipped_fraction > float(config["boundary"]["maximum_clipped_fraction"]):
+            raise RuntimeError("v4.9 deployment Boundary residual clipping exceeds its qualification gate")
         augmented = augment_boundary_training_proposals(
             positive,
             maximum_jitters_per_event=int(config["boundary"]["maximum_jitters_per_event"]),
@@ -9463,7 +9884,7 @@ def train_hierarchical_final_v4(
     artifacts.append(snapshot_path)
     manifest = {
         "version": 5,
-        "code_version": CODE_VERSION,
+        "code_version": "v4.9" if is_v49(config) else CODE_VERSION,
         "stage": "COMPLETE",
         "run_name": run_name,
         "protocol_version": PROTOCOL_VERSION,

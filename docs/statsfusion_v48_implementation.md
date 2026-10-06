@@ -24,4 +24,6 @@ Boundary 仅在 Deep 晋级后尝试。新增几何可修正比例和计数诊�
 
 ## 后续执行
 
+单折后端诊断按完整 `oof/window_predictions.parquet` 时间轴确定评估受试者，而不是按候选表确定。没有候选的受试者仍保留 truth、ignore 和观测时长，其有效事件计为漏检；Verifier 与 Boundary 报告均记录 `evaluation_cohort`。旧版单折诊断使用原命令 `--resume` 时自动归档到 `single_fold_heads_before_cohort_fix_*`，复用兼容的 verifier checkpoint，重新计算校准、阈值、模型晋级与 Boundary。旧报告不覆盖，state 和候选无需重训；这些单折结果仍是开发集诊断，不是五折 pooled 结果。
+
 先对候选修复版和提名头版分别筛查 fold 1、3。只对通过候选及分层门禁的配置开全新 run 跑五折：每 fold 顺序为 `train_hierarchical_v4_state.py --fresh`、`build_event_candidates_v4.py --resume`、`select_hierarchical_v4_pipeline.py --resume`、`evaluate_hierarchical_v4.py --resume`。五折完成后运行 `train_hierarchical_v4_final.py --fresh`，通过绝对门禁后再 `export_hierarchical_v4_bundle.py --fresh`。IMU 实验先跑无 IMU 的完全相同候选配置，再用 `compare_v48_raw_imu.py --reference-final-root ... --candidate-final-root ...` 生成比较证据。不要将候选回放的 128/161 误认为最终 Deep 命中数；五折新训练、GPU smoke、真实 raw-session 与无 XGBoost bundle replay 尚待执行。

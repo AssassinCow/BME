@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -32,6 +34,7 @@ from bme_eating.training import hierarchical_v4_trainer as core
 from bme_eating.v4_protocol import CODE_VERSION, PROTOCOL_VERSION
 
 DIAGNOSTIC_PROTOCOL = "single_outer_fold_subject_crossfit_heads_v1"
+EVALUATION_COHORT_PROTOCOL = "complete_state_oof_timeline_v1"
 DIAGNOSTIC_SOURCE_PATHS = (
     "scripts/train_hierarchical_v4_single_fold_heads.py",
     "src/bme_eating/training/hierarchical_v4_single_fold_heads.py",
@@ -39,6 +42,7 @@ DIAGNOSTIC_SOURCE_PATHS = (
     "src/bme_eating/training/hierarchical_v4_trainer.py",
     "tests/test_statsfusion_v4.py",
 )
+
 def _project_root() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -120,6 +124,7 @@ def _parent_identity(run: Any, config: dict[str, Any]) -> dict[str, Any]:
         raise FileNotFoundError(f"Single-fold heads are missing parent artifacts: {missing}")
     return {
         "protocol": DIAGNOSTIC_PROTOCOL,
+        "evaluation_cohort_protocol": EVALUATION_COHORT_PROTOCOL,
         "code_version": CODE_VERSION,
         "protocol_version": PROTOCOL_VERSION,
         "run_name": str(run.payload["run_name"]),
@@ -182,10 +187,22 @@ def _load_or_initialize(
             raise FileExistsError(root)
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         semantic_keys = set(identity) - {"diagnostic_worktree"}
+        legacy_cohort = "evaluation_cohort_protocol" not in manifest
+        if legacy_cohort:
+            semantic_keys.discard("evaluation_cohort_protocol")
         saved_identity = {key: manifest.get(key) for key in semantic_keys}
         current_identity = {key: identity.get(key) for key in semantic_keys}
         if saved_identity != current_identity:
             raise RuntimeError("Single-fold diagnostic resume identity changed")
+        for relative, expected in manifest.get("artifact_sha256", {}).items():
+            path = root / relative
+            if not path.is_file() or sha256_file(path) != expected:
+                raise RuntimeError(f"Single-fold diagnostic artifact changed: {relative}")
+        if legacy_cohort:
+            identity["evaluation_cohort_repair"] = _archive_legacy_cohort_diagnostics(
+                root, identity
+            )
+            return root, manifest_path, identity, "CREATED"
         previous_source = manifest.get("diagnostic_worktree")
         active_source = identity.get("diagnostic_worktree")
         history = list(manifest.get("source_identity_history", []))
@@ -195,6 +212,8 @@ def _load_or_initialize(
                 history.append(transition)
         if history:
             identity["source_identity_history"] = history
+        if "evaluation_cohort_repair" in manifest:
+            identity["evaluation_cohort_repair"] = manifest["evaluation_cohort_repair"]
         if previous_source != active_source:
             manifest.update(identity)
             write_json_atomic(manifest_path, manifest)
@@ -206,6 +225,74 @@ def _load_or_initialize(
     root.mkdir(parents=True, exist_ok=True)
     _write_manifest(manifest_path, identity, "CREATED", [], root)
     return root, manifest_path, identity, "CREATED"
+
+
+def _archive_legacy_cohort_diagnostics(root: Path, identity: dict[str, Any]) -> dict[str, Any]:
+    """Preserve old evidence and reuse only cohort-independent verifier checkpoints."""
+    token = uuid4().hex[:12]
+    archive = root.with_name(f"{root.name}_before_cohort_fix_{token}")
+    staging = root.with_name(f"{root.name}_cohort_repair_{token}")
+    repair = {
+        "legacy_manifest_sha256": sha256_file(root / "manifest.json"),
+        "archive_path": archive.relative_to(root.parent.parent).as_posix(),
+        "verifier_checkpoints_reused": (root / "verifier").is_dir(),
+        "state_retraining_required": False,
+    }
+    staging.mkdir()
+    if (root / "verifier").is_dir():
+        shutil.copytree(root / "verifier", staging / "verifier")
+    repair["reused_verifier_sha256"] = {
+        path.relative_to(staging).as_posix(): sha256_file(path)
+        for path in staging.rglob("*")
+        if path.is_file()
+    }
+    _write_manifest(
+        staging / "manifest.json",
+        {**identity, "evaluation_cohort_repair": repair},
+        "CREATED",
+        [path for path in staging.rglob("*") if path.is_file()],
+        staging,
+    )
+    root.rename(archive)
+    try:
+        staging.rename(root)
+    except OSError:
+        archive.rename(root)
+        raise
+    print(f"[single-fold heads] archived legacy diagnostics: {archive}", flush=True)
+    print("[single-fold heads] recomputing selection on the complete state-OOF cohort", flush=True)
+    return repair
+
+
+def _evaluation_cohort(
+    run: Any,
+    windows: pd.DataFrame,
+    proposals: pd.DataFrame,
+    events: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+    subjects = set(windows["subject_key"].astype(str))
+    expected = set(run.payload.get("state_oof_prediction_subjects", subjects))
+    if not subjects or subjects != expected:
+        raise RuntimeError("Single-fold evaluation timeline does not cover the state-OOF cohort")
+    if subjects & set(run.payload.get("outer_test_subjects", [])):
+        raise RuntimeError("Single-fold development evaluation includes outer-test subjects")
+    proposal_subjects = set(proposals["subject_key"].astype(str))
+    if not proposal_subjects.issubset(subjects):
+        raise RuntimeError("Single-fold proposals include subjects outside the evaluation timeline")
+    truth, ignore = core.partition_evaluation_events(events, subjects)
+    without_candidates = subjects - proposal_subjects
+    return truth, ignore, {
+        "protocol": EVALUATION_COHORT_PROTOCOL,
+        "source": "oof/window_predictions.parquet",
+        "subjects": sorted(subjects),
+        "subject_count": len(subjects),
+        "subjects_without_candidates": sorted(without_candidates),
+        "truth_count": len(truth),
+        "ignore_count": len(ignore),
+        "truth_without_candidates_count": int(
+            truth["subject_key"].astype(str).isin(without_candidates).sum()
+        ),
+    }
 
 
 def _subject_partitions(proposals: pd.DataFrame, config: dict[str, Any]) -> dict[str, int]:
@@ -230,6 +317,7 @@ def _fit_verifiers(
         drop=True
     )
     windows = pd.read_parquet(run.root / "oof" / "window_predictions.parquet")
+    truth, ignore, evaluation_cohort = _evaluation_cohort(run, windows, proposals, inputs.events)
     if proposals.empty:
         raise RuntimeError("Single-fold verifier has no OOF proposals")
     features = build_proposal_features_v4(
@@ -383,7 +471,6 @@ def _fit_verifiers(
     if any(not np.isfinite(values).all() for values in logistic_scores.values()):
         raise RuntimeError("Single-fold Logistic crossfit left unscored proposals")
     subjects = set(proposals["subject_key"].astype(str))
-    truth, ignore = core.partition_evaluation_events(inputs.events, subjects)
     logistic_reports: list[dict[str, Any]] = []
     logistic_frames: dict[float, pd.DataFrame] = {}
     for regularization_c, values in logistic_scores.items():
@@ -553,6 +640,7 @@ def _fit_verifiers(
     write_json_atomic(calibration_path, final_calibration.to_json())
     report = {
         "protocol": DIAGNOSTIC_PROTOCOL,
+        "evaluation_cohort": evaluation_cohort,
         "winner": winner,
         "score_column": "final_score",
         "selected_point": selected_diagnostics["point"],
@@ -583,6 +671,7 @@ def _fit_boundary(
 ) -> tuple[list[Path], dict[str, Any]]:
     scores = pd.read_parquet(root / "oof_proposal_scores.parquet")
     windows = pd.read_parquet(run.root / "oof" / "window_predictions.parquet")
+    truth, ignore, evaluation_cohort = _evaluation_cohort(run, windows, scores, inputs.events)
     point = verifier_report["selected_point"]
     accepted = core._accepted_from_point(scores, point, "final_score")
     positive = core._attach_truth_boundaries(scores[scores["max_iou"] > 0.25], inputs.events)
@@ -591,6 +680,7 @@ def _fit_boundary(
     )
     report: dict[str, Any] = {
         "protocol": DIAGNOSTIC_PROTOCOL,
+        "evaluation_cohort": evaluation_cohort,
         "independent_positive_events": independent_events,
         "formal_minimum_events": int(config["boundary"]["minimum_independent_events"]),
         "formal_promotion_eligible": False,
@@ -774,8 +864,6 @@ def _fit_boundary(
     boundary_scores = pd.concat(score_parts, ignore_index=True)
     if set(boundary_scores["proposal_id"].astype(str)) != set(accepted["proposal_id"].astype(str)):
         raise RuntimeError("Single-fold Boundary did not score every accepted proposal")
-    subjects = set(scores["subject_key"].astype(str))
-    truth, ignore = core.partition_evaluation_events(inputs.events, subjects)
     coarse_metrics, _ = evaluate_events(
         truth, core._prediction_events(accepted), method="max_cardinality_iou", ignore=ignore
     )

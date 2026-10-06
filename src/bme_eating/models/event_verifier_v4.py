@@ -28,6 +28,7 @@ class ProposalFeatureBatchV4:
     iou_target: np.ndarray | None = None
     sample_weight: np.ndarray | None = None
     raw_imu: np.ndarray | None = None
+    sampling_metadata: dict[str, np.ndarray] | None = None
 
 
 def pooled_logistic_features(features: ProposalFeatureBatchV4) -> np.ndarray:
@@ -94,12 +95,14 @@ class HardNegativeBatchSampler(Sampler[list[int]]):
         steps_per_epoch: int,
         seed: int,
         target_weights: np.ndarray | None = None,
+        sampling_metadata: dict[str, np.ndarray] | None = None,
     ) -> None:
         self.categories = np.asarray(categories, dtype=str)
         self.batch_size = int(batch_size)
         self.steps_per_epoch = int(steps_per_epoch)
         self.seed = int(seed)
         self.epoch = 0
+        self.sampling_metadata = self._validate_metadata(sampling_metadata)
         if set(ratios) != set(CATEGORY_ORDER):
             raise ValueError("Verifier ratios must define all four categories")
         weights = np.asarray([ratios[name] for name in CATEGORY_ORDER], dtype=np.float64)
@@ -146,6 +149,54 @@ class HardNegativeBatchSampler(Sampler[list[int]]):
                 selected / total if total > 0 else np.full(len(pool), 1.0 / len(pool))
             )
 
+        self._strata = self._build_strata()
+
+    def _validate_metadata(
+        self, metadata: dict[str, np.ndarray] | None
+    ) -> dict[str, np.ndarray] | None:
+        if metadata is None:
+            return None
+        normalized: dict[str, np.ndarray] = {}
+        for name, values in metadata.items():
+            array = np.asarray(values)
+            if array.shape != self.categories.shape:
+                raise ValueError(f"Verifier sampling metadata {name!r} is not aligned")
+            normalized[name] = array.astype(str)
+        required = {"subject_key", "hand_relation", "iou_bin", "gyro_missingness_bin",
+                    "duration_bin", "source_mask", "proposal_family_id", "event_group"}
+        missing = required - set(normalized)
+        if missing:
+            raise ValueError(f"Verifier sampling metadata is missing: {sorted(missing)}")
+        normalized.setdefault("wear_hand", np.full(len(self.categories), "unknown", dtype=str))
+        ownership = pd.DataFrame({"family": normalized["proposal_family_id"], "subject": normalized["subject_key"]})
+        if ownership.groupby("family")["subject"].nunique().gt(1).any():
+            raise ValueError("Verifier proposal family crosses subject boundaries")
+        return normalized
+
+    def _build_strata(self) -> dict[str, list[tuple[str, str, np.ndarray]]]:
+        if self.sampling_metadata is None:
+            return {name: [("all", str(index), np.asarray([index])) for index in pool] for name, pool in self.pools.items()}
+        metadata = self.sampling_metadata
+        key_columns = ("subject_key", "wear_hand", "hand_relation", "iou_bin", "gyro_missingness_bin",
+                       "duration_bin", "source_mask")
+        strata: dict[str, list[tuple[str, str, np.ndarray]]] = {}
+        for name, pool in self.pools.items():
+            if not len(pool):
+                strata[name] = []
+                continue
+            frame = pd.DataFrame({column: metadata[column][pool] for column in key_columns})
+            groups: list[tuple[str, str, np.ndarray]] = []
+            grouping_column = "event_group" if name == "positive" else "proposal_family_id"
+            frame["group"] = metadata[grouping_column][pool]
+            for group_key, grouped in frame.groupby(["subject_key", "group"], sort=True):
+                representative = grouped.sort_values(list(key_columns), kind="stable").iloc[0]
+                groups.append((
+                    "|".join(str(representative[column]) for column in key_columns),
+                    "|".join(map(str, group_key)), pool[grouped.index.to_numpy()],
+                ))
+            strata[name] = groups
+        return strata
+
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
@@ -155,29 +206,50 @@ class HardNegativeBatchSampler(Sampler[list[int]]):
     def __iter__(self) -> Iterator[list[int]]:
         rng = np.random.default_rng(np.random.SeedSequence([self.seed, self.epoch]))
         for _ in range(self.steps_per_epoch):
-            parts = [
-                np.column_stack(
-                    (
-                        selected := rng.choice(
-                            self.pools[name],
-                            size=count,
-                            replace=True,
-                            p=self.within_category_probability[name],
-                        ),
-                        np.asarray(
-                            [
-                                (count / self.batch_size)
-                                * self.within_category_probability[name][
-                                    np.searchsorted(self.pools[name], value)
-                                ]
-                                for value in selected
-                            ]
-                        ),
+            parts = []
+            used_groups: set[str] = set()
+            for name, count in self.counts.items():
+                if not count:
+                    continue
+                strata = self._strata[name]
+                if not strata:
+                    continue
+                selected_rows: list[int] = []
+                selected_probabilities: list[float] = []
+                for _position in range(count):
+                    if self.sampling_metadata is None:
+                        pool = self.pools[name]
+                        row = int(rng.choice(pool, p=self.within_category_probability[name]))
+                        probability = self.within_category_probability[name][int(np.searchsorted(pool, row))]
+                        selected_rows.append(row)
+                        selected_probabilities.append((count / self.batch_size) * probability)
+                        continue
+                    candidates = [
+                        index for index, group in enumerate(strata) if group[1] not in used_groups
+                    ]
+                    if not candidates:
+                        candidates = list(range(len(strata)))
+                    stratum_counts: dict[str, int] = {}
+                    for index in candidates:
+                        key = strata[index][0]
+                        stratum_counts[key] = stratum_counts.get(key, 0) + 1
+                    probabilities = np.asarray([
+                        1.0 / stratum_counts[strata[index][0]] for index in candidates
+                    ])
+                    probabilities /= probabilities.sum()
+                    choice = int(rng.choice(len(candidates), p=probabilities))
+                    stratum_index = candidates[choice]
+                    _, group_name, stratum_rows = strata[stratum_index]
+                    row = int(rng.choice(stratum_rows))
+                    selected_rows.append(row)
+                    used_groups.add(group_name)
+                    selected_probabilities.append(
+                        (count / self.batch_size)
+                        * float(probabilities[choice]) / len(stratum_rows)
                     )
-                )
-                for name, count in self.counts.items()
-                if count
-            ]
+                parts.append(np.column_stack((selected_rows, selected_probabilities)))
+            if not parts:
+                continue
             batch = np.concatenate(parts)
             rng.shuffle(batch)
             yield [(int(row[0]), float(row[1])) for row in batch]
@@ -410,6 +482,11 @@ def build_proposal_features_v4(
 ) -> ProposalFeatureBatchV4:
     use_raw_imu = bool(config.get("use_raw_imu_branch", False))
     source_bits = 7 if bool(config.get("include_v48_source_flags", False)) else 4
+    include_v49_lineage = bool(config.get("include_v49_lineage", False))
+    if include_v49_lineage:
+        from bme_eating.proposals_v4 import validate_proposal_lineage
+
+        validate_proposal_lineage(proposals)
     if use_raw_imu and (raw_segments is None) == (raw_session is None):
         raise ValueError("Raw IMU verifier requires exactly one raw input source")
     reader = None
@@ -575,6 +652,18 @@ def build_proposal_features_v4(
                     state_mean,
                     *((source_mask & (1 << bit)) > 0 for bit in range(source_bits)),
                     float(np.mean(valid_bins)),
+                    *(
+                        [
+                            (float(proposal.coarse_start_ms) - float(proposal.parent_start_ms))
+                            / 600_000.0,
+                            (float(proposal.coarse_end_ms) - float(proposal.parent_end_ms))
+                            / 600_000.0,
+                            float(np.mean(np.isfinite(values[in_event, 0]))) if in_event.any() else 0.0,
+                            float(np.mean(np.isfinite(values[in_event, 1]))) if in_event.any() else 0.0,
+                        ]
+                        if include_v49_lineage
+                        else []
+                    ),
                 ],
                 dtype=np.float32,
             )
@@ -614,7 +703,7 @@ def build_proposal_features_v4(
     weights = normalized_proposal_weights(proposals) if "max_iou" in proposals else None
     bin_count = int(config["left_bins"]) + int(config["event_bins"]) + int(config["right_bins"])
     feature_dim = 5 * len(base_columns) + 6
-    scalar_values = np.stack(scalars) if scalars else np.empty((0, 4 + source_bits), np.float32)
+    scalar_values = np.stack(scalars) if scalars else np.empty((0, 4 + source_bits + (4 if include_v49_lineage else 0)), np.float32)
     if use_latent_bridge:
         latent_values = (
             np.stack(latent_summaries)
@@ -640,7 +729,67 @@ def build_proposal_features_v4(
         iou_target=iou_target,
         sample_weight=weights,
         raw_imu=np.stack(raw_imu_snippets) if use_raw_imu and raw_imu_snippets else None,
+        sampling_metadata=(
+            _proposal_sampling_metadata(proposals, windows) if include_v49_lineage else None
+        ),
     )
+
+
+def _proposal_sampling_metadata(proposals: pd.DataFrame, windows: pd.DataFrame | None = None) -> dict[str, np.ndarray] | None:
+    if proposals.empty:
+        return {name: np.empty(0, dtype=str) for name in (
+            "subject_key", "wear_hand", "hand_relation", "iou_bin", "gyro_missingness_bin",
+            "duration_bin", "source_mask", "proposal_family_id", "event_group")}
+    def values(name: str, default: str = "unknown") -> np.ndarray:
+        if name in proposals:
+            return proposals[name].fillna(default).astype(str).to_numpy()
+        return np.full(len(proposals), default, dtype=str)
+
+    iou = proposals.get("max_iou", pd.Series(0.0, index=proposals.index)).fillna(0.0).to_numpy(dtype=float)
+    gyro = proposals.get("gyro_valid_fraction", pd.Series(np.nan, index=proposals.index)).to_numpy(dtype=float)
+    hand = values("hand_relation").astype(object)
+    if windows is not None:
+        groups = {
+            (str(subject), str(session)): group.sort_values("timestamp_ms")
+            for (subject, session), group in windows.groupby(["subject_key", "session_id"], sort=False)
+        }
+        for proposal_index, proposal in enumerate(proposals.itertuples(index=False)):
+            group = groups.get((str(proposal.subject_key), str(proposal.session_id)))
+            if group is None:
+                continue
+            timestamps = group["timestamp_ms"].to_numpy()
+            left = np.searchsorted(timestamps, int(proposal.coarse_start_ms), side="right")
+            right = np.searchsorted(timestamps, int(proposal.coarse_end_ms), side="right")
+            event_windows = group.iloc[left:right]
+            if "gyro_valid_fraction" in event_windows and len(event_windows):
+                gyro[proposal_index] = event_windows["gyro_valid_fraction"].mean()
+            if "hand_relation" in event_windows and len(event_windows):
+                modes = event_windows["hand_relation"].dropna().astype(str).mode()
+                if len(modes):
+                    hand[proposal_index] = modes.iloc[0]
+    if "duration_seconds" in proposals:
+        duration = proposals["duration_seconds"].fillna(0.0).to_numpy(dtype=float)
+    elif {"coarse_start_ms", "coarse_end_ms"}.issubset(proposals.columns):
+        duration = (proposals["coarse_end_ms"].to_numpy(dtype=float) - proposals["coarse_start_ms"].to_numpy(dtype=float)) / 1000.0
+    elif {"start_ms", "end_ms"}.issubset(proposals.columns):
+        duration = (proposals["end_ms"].to_numpy(dtype=float) - proposals["start_ms"].to_numpy(dtype=float)) / 1000.0
+    else:
+        duration = np.zeros(len(proposals), dtype=float)
+    return {
+        "subject_key": values("subject_key"),
+        "wear_hand": values("wear_hand"),
+        "hand_relation": hand,
+        "iou_bin": pd.cut(iou, bins=[-np.inf, 0.0, 0.10, 0.25, np.inf], labels=False).astype(str),
+        "gyro_missingness_bin": np.where(~np.isfinite(gyro) | (gyro < 0.5), "missing", "observed"),
+        "duration_bin": pd.cut(duration, bins=[-np.inf, 5.0, 15.0, 30.0, 60.0, np.inf], labels=False).astype(str),
+        "source_mask": values("source_mask", "0"),
+        "proposal_family_id": values("proposal_family_id", "unknown"),
+        "event_group": (
+            proposals.get("session_id", pd.Series("", index=proposals.index)).fillna("").astype(str)
+            + ":"
+            + proposals.get("matched_event_id", pd.Series("", index=proposals.index)).fillna("").astype(str)
+        ).to_numpy(),
+    }
 
 
 def _raw_imu_proposal_snippets(

@@ -5,6 +5,7 @@ import argparse
 import _bootstrap  # noqa: F401
 
 from bme_eating.config import load_config, resolve_artifact_roots
+from bme_eating.integrated_v49 import run_cli_with_failure_report
 from bme_eating.reproducibility import require_git_worktree
 from bme_eating.training.hierarchical_v4_trainer import train_hierarchical_final_v4
 
@@ -34,4 +35,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_cli_with_failure_report(main, "final_training")

@@ -441,7 +441,53 @@ def _evaluation_metrics(
         "different_sensitivity": float(
             hand.get("different_sensitivity", primary.get("different_sensitivity", np.nan))
         ),
+        "same_sensitivity": float(
+            hand.get("same_sensitivity", primary.get("same_sensitivity", np.nan))
+        ),
+        "greedy_f1": float(
+            payload.get("greedy", {}).get("f1", primary.get("greedy_f1", primary["f1"]))
+        ),
     }
+
+
+def _candidate_coverage_metrics(root: Path, run_name: str, fold: int) -> dict[str, float]:
+    evaluation_path = root / "experiments" / run_name / f"fold_{fold}" / "evaluation" / "metrics.json"
+    path = root / "experiments" / run_name / f"fold_{fold}" / "decoder" / "candidate_metrics.json"
+    if evaluation_path.is_file():
+        payload = _read_json(evaluation_path)
+        candidate = payload.get("candidate", {})
+        if candidate:
+            return {
+                "covered": float(candidate.get("covered", candidate.get("candidate_covered", np.nan))),
+                "same_covered": float(candidate.get("same_covered", np.nan)),
+                "different_covered": float(candidate.get("different_covered", np.nan)),
+                "matching_ranking_reversal": bool(candidate.get("matching_ranking_reversal", False)),
+                "available": bool(candidate.get("formal_outer_holdout", True)),
+                "evidence": str(evaluation_path),
+            }
+    if not path.is_file():
+        return {
+            "covered": float("nan"),
+            "same_covered": float("nan"),
+            "different_covered": float("nan"),
+            "matching_ranking_reversal": False,
+            "available": False,
+        }
+    payload = _read_json(path)
+    event_count = int(payload.get("evaluable_event_count", 0))
+    return {
+        "covered": float(payload.get("covered", round(float(payload.get("candidate_recall", 0.0)) * event_count))),
+        "same_covered": float(payload.get("same_covered", 0)),
+        "different_covered": float(payload.get("different_covered", 0)),
+        "matching_ranking_reversal": bool(payload.get("matching_ranking_reversal", False)),
+        "available": True,
+    }
+
+
+def _matching_ranking_reversal(f1_delta: float, greedy_delta: float, *, tolerance: float) -> bool:
+    return (f1_delta > tolerance and greedy_delta < -tolerance) or (
+        f1_delta < -tolerance and greedy_delta > tolerance
+    )
 
 
 def _per_subject(root: Path, run_name: str, fold: int, *, state_only: bool = False) -> pd.DataFrame:
@@ -474,14 +520,15 @@ def _bootstrap_probability(
     replicates: int = 2000,
     seed: int = 2026,
 ) -> float:
+    keys = sorted(set(candidate["subject_key"]) | set(baseline["subject_key"]))
+    candidate = candidate.set_index("subject_key").reindex(keys).fillna(0).reset_index()
+    baseline = baseline.set_index("subject_key").reindex(keys).fillna(0).reset_index()
     merged = candidate.merge(
         baseline,
         on="subject_key",
         suffixes=("_candidate", "_baseline"),
         validate="one_to_one",
     )
-    if len(merged) != len(candidate) or len(merged) != len(baseline):
-        raise ValueError("Candidate and baseline bootstrap subjects differ")
     rng = np.random.default_rng(seed)
     wins = 0
 
@@ -541,13 +588,14 @@ def evaluate_crossfold_gate(
     v3_root: Path | None = None,
     v3_run: str | None = None,
 ) -> dict[str, Any]:
-    if mode not in {"development", "stress"}:
-        raise ValueError("Crossfold gate mode must be development or stress")
+    if mode not in {"development", "stress", "full"}:
+        raise ValueError("Crossfold gate mode must be development, stress, or full")
     fold_rows: list[dict[str, Any]] = []
     candidate_subjects: list[pd.DataFrame] = []
     baseline_subjects: list[pd.DataFrame] = []
     for fold in folds:
         candidate = _evaluation_metrics(output_root, candidate_run, fold)
+        candidate_coverage = _candidate_coverage_metrics(output_root, candidate_run, fold)
         candidate_per_subject = _per_subject(output_root, candidate_run, fold)
         baseline_name, baseline, baseline_per_subject = _stronger_baseline(
             output_root,
@@ -579,6 +627,10 @@ def evaluate_crossfold_gate(
                 "fp_ratio": candidate["fp_per_hour"] / max(baseline["fp_per_hour"], 1e-9),
                 "different_sensitivity_delta": candidate["different_sensitivity"]
                 - baseline["different_sensitivity"],
+                "same_sensitivity_delta": candidate["same_sensitivity"]
+                - baseline["same_sensitivity"],
+                "greedy_f1_delta": candidate["greedy_f1"] - baseline["greedy_f1"],
+                "candidate_coverage": candidate_coverage,
                 "evidence_sha256": {
                     "candidate_metrics": _evidence_file(
                         candidate_directory / "metrics.json", output_root.parent
@@ -619,7 +671,7 @@ def evaluate_crossfold_gate(
             "paired_bootstrap": probability
             >= float(gate["minimum_positive_bootstrap_probability"]),
         }
-    else:
+    elif mode == "stress":
         probability = None
         checks = {
             "two_of_three_non_degrading": sum(row["delta_f1"] >= 0 for row in fold_rows) >= 2,
@@ -634,6 +686,47 @@ def evaluate_crossfold_gate(
                 for row in fold_rows
             ),
         }
+    else:
+        probability = _bootstrap_probability(candidate_frame, baseline_frame)
+        coverage_available = all(row["candidate_coverage"].get("available", False) for row in fold_rows)
+        coverage_total = sum(
+            row["candidate_coverage"]["covered"]
+            for row in fold_rows
+            if np.isfinite(row["candidate_coverage"].get("covered", np.nan))
+        )
+        same_delta_ok = all(
+            row["same_sensitivity_delta"] >= -float(gate.get("maximum_same_hand_recall_drop", 0.02))
+            for row in fold_rows
+        )
+        different_delta_ok = all(
+            row["different_sensitivity_delta"] >= -float(gate.get("maximum_different_hand_recall_drop", 0.02))
+            for row in fold_rows
+        )
+        matching_reversal = any(
+            row["candidate_coverage"].get("matching_ranking_reversal", False)
+            or _matching_ranking_reversal(
+                row["delta_f1"], row["greedy_f1_delta"], tolerance=0.005
+            )
+            for row in fold_rows
+        )
+        minimum_f1 = float(gate.get("minimum_final_f1", 0.0))
+        maximum_fp_per_hour = float(gate.get("maximum_fp_per_hour", float("inf")))
+        maximum_stress_drop = float(gate.get("maximum_stress_fold_f1_drop", 0.03))
+        checks = {
+            "all_folds_present": len(fold_rows) == 5,
+            "candidate_coverage": coverage_available
+            and coverage_total >= float(gate.get("candidate_coverage_minimum", 125)),
+            "final_f1": candidate_pooled["f1"] >= minimum_f1,
+            "fp_per_hour": candidate_pooled["fp_per_hour"] <= maximum_fp_per_hour,
+            "paired_bootstrap": probability
+            >= float(gate.get("minimum_positive_bootstrap_probability", 0.80)),
+            "same_hand_recall": same_delta_ok,
+            "different_hand_recall": different_delta_ok,
+            "matching_ranking_stable": not matching_reversal,
+            "stress_fold_f1_drop": min(row["delta_f1"] for row in fold_rows)
+            >= -maximum_stress_drop,
+            "outer_evidence": all(bool(row["candidate_coverage"].get("available", False)) for row in fold_rows),
+        }
     report = {
         "mode": mode,
         "candidate_run": candidate_run,
@@ -646,6 +739,10 @@ def evaluate_crossfold_gate(
         "checks": checks,
         "passed": all(checks.values()),
     }
-    filename = "development_gate.json" if mode == "development" else "stress_gate.json"
+    filename = {
+        "development": "development_gate.json",
+        "stress": "stress_gate.json",
+        "full": "v49_crossfold_gate.json",
+    }[mode]
     write_json_atomic(output_root / "experiments" / candidate_run / filename, report)
     return report

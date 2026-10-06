@@ -125,6 +125,7 @@ from bme_eating.training.hierarchical_v4_trainer import (
     _matching_ranking_reversal,
     _nested_cache_artifacts,
     _nested_cache_key,
+    _per_subject_metrics_v4,
     _prepare_nested_meta_cache,
     _prepare_pooled_nested_state_oof,
     _selector_early_stopping_improved,
@@ -154,6 +155,45 @@ def test_inference_endpoints_tile_tail_without_overlapping_supervision() -> None
     for endpoint in endpoints:
         owned.extend(range(max(0, endpoint - 255), endpoint + 1))
     assert owned == list(range(1921))
+
+
+def test_per_subject_metrics_include_window_and_ignore_only_subjects() -> None:
+    events = pd.DataFrame(
+        {
+            "subject_key": ["truth"],
+            "start_ms": [0],
+            "end_ms": [1_000],
+            "hand_relation": ["same"],
+        }
+    )
+    predictions = pd.DataFrame(
+        {
+            "subject_key": ["fp-only"],
+            "start_ms": [2_000],
+            "end_ms": [3_000],
+            "hand_relation": ["same"],
+        }
+    )
+    ignore = pd.DataFrame(
+        {
+            "subject_key": ["ignored-only"],
+            "start_ms": [4_000],
+            "end_ms": [5_000],
+            "hand_relation": ["same"],
+        }
+    )
+    windows = pd.DataFrame(
+        {
+            "subject_key": ["window-only", "window-only"],
+            "session_id": ["session", "session"],
+            "timestamp_ms": [0, 1_000],
+        }
+    )
+    result = _per_subject_metrics_v4(events, predictions, windows, ignore)
+    assert set(result["subject_key"]) == {
+        "truth", "fp-only", "ignored-only", "window-only"
+    }
+    assert result.loc[result["subject_key"] == "window-only", "observed_hours"].iat[0] > 0
 
 
 @pytest.mark.parametrize("total_rows", [0, 1, 2, 255, 256, 257, 1921])
@@ -1655,6 +1695,35 @@ def test_verifier_missing_category_redistributes_in_declared_order() -> None:
         "hard_false_positive": 6,
         "random_background": 3,
     }
+
+
+def test_verifier_stratified_sampler_rotates_proposal_families() -> None:
+    categories = np.asarray(["hard_false_positive"] * 4)
+    metadata = {
+        "subject_key": np.asarray(["s1", "s1", "s2", "s2"]),
+        "hand_relation": np.asarray(["same", "same", "different", "different"]),
+        "iou_bin": np.asarray(["0", "0", "1", "1"]),
+        "gyro_missingness_bin": np.asarray(["observed"] * 4),
+        "duration_bin": np.asarray(["1"] * 4),
+        "source_mask": np.asarray(["1"] * 4),
+        "proposal_family_id": np.asarray(["f1", "f1", "f2", "f2"]),
+        "event_group": np.asarray(["", "", "", ""]),
+    }
+    sampler = HardNegativeBatchSampler(
+        categories,
+        batch_size=4,
+        ratios={
+            "positive": 0.0,
+            "near_miss": 0.0,
+            "hard_false_positive": 1.0,
+            "random_background": 0.0,
+        },
+        steps_per_epoch=1,
+        seed=3,
+        sampling_metadata=metadata,
+    )
+    sampled = [index for index, _ in next(iter(sampler))]
+    assert {metadata["proposal_family_id"][index] for index in sampled} == {"f1", "f2"}
 
 
 def test_masked_boundary_loss_and_valid_entropy_are_finite() -> None:

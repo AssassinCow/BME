@@ -594,6 +594,7 @@ def apply_boundary_refinement(
     output["start_fallback"] = ~start_use
     output["end_fallback"] = ~end_use
     output["boundary_fallback"] = output["start_fallback"] | output["end_fallback"]
+    output["boundary_conflict_fallback"] = False
     safety_gap_ms = int(safety_gap_seconds) * 1000
     for indices in output.groupby(["subject_key", "session_id"], sort=False).groups.values():
         ordered = sorted(
@@ -610,6 +611,7 @@ def apply_boundary_refinement(
             start = int(output.at[index, "refined_start_ms"])
             end = int(output.at[index, "refined_end_ms"])
             if start >= end:
+                output.at[index, "boundary_conflict_fallback"] = True
                 start, end = coarse_start, coarse_end
                 output.at[index, "start_fallback"] = True
                 output.at[index, "end_fallback"] = True
@@ -634,6 +636,7 @@ def apply_boundary_refinement(
                     (previous_index, "end"),
                     (index, "start"),
                 ):
+                    output.at[affected, "boundary_conflict_fallback"] = True
                     column = f"refined_{endpoint}_ms"
                     coarse = int(output.at[affected, f"coarse_{endpoint}_ms"])
                     if int(output.at[affected, column]) != coarse:
