@@ -60,6 +60,7 @@ from bme_eating.integrated_v49 import (
     candidate_coverage,
     is_v49,
     validate_v49_gate_manifest,
+    write_v49_raw_imu_gate,
 )
 from bme_eating.metrics import (
     evaluate_events,
@@ -84,6 +85,7 @@ from bme_eating.models.event_verifier_v4 import (
     ProposalFeatureBatchV4,
     build_proposal_features_v4,
     classify_proposals,
+    fit_raw_imu_normalization,
     pooled_logistic_features,
     verifier_loss_v4,
 )
@@ -122,6 +124,8 @@ from bme_eating.v4_protocol import (
     RUNTIME_SOURCE_BINDING,
     TARGET_SEMANTICS,
     configured_state_seeds,
+    execution_source_identity,
+    protocol_git_identity,
     runtime_source_identity,
 )
 
@@ -731,6 +735,7 @@ def _make_dataset(
             if training
             else 0.0
         ),
+        reader_cache_size=int(config["training"].get("session_reader_cache_size", 8)),
         seed=seed,
     )
 
@@ -814,13 +819,18 @@ def _train_state_epochs(
         supervised_steps=dataset.geometry.supervised_steps,
         balance_subjects=bool(config["training"].get("subject_balanced_sampling", False)),
     )
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        sampler=sampler,
-        num_workers=int(config["training"].get("num_workers", 0)),
-        pin_memory=device.type == "cuda",
-    )
+    worker_count = int(config["training"].get("num_workers", 0))
+    loader_options: dict[str, Any] = {
+        "batch_size": batch_size,
+        "sampler": sampler,
+        "num_workers": worker_count,
+        "pin_memory": device.type == "cuda",
+    }
+    if worker_count > 0:
+        loader_options["prefetch_factor"] = max(
+            1, int(config["training"].get("loader_prefetch_factor", 1))
+        )
+    loader = DataLoader(dataset, **loader_options)
     criterion = _state_loss(config)
     if optimizer is None:
         optimizer = torch.optim.AdamW(
@@ -829,11 +839,11 @@ def _train_state_epochs(
             weight_decay=float(config["training"]["weight_decay"]),
         )
     accumulation = int(config["training"]["gradient_accumulation"])
+    updates_per_epoch = math.ceil(len(loader) / accumulation)
     display_total = total_epochs or epoch_offset + int(epochs)
     schedule_total = scheduler_total_epochs or display_total
     scheduler = getattr(optimizer, "_bme_scheduler", None)
     if scheduler is None:
-        updates_per_epoch = math.ceil(len(loader) / accumulation)
         total_updates = max(1, updates_per_epoch * int(schedule_total))
         warmup_updates = max(1, round(total_updates * float(config["training"]["warmup_fraction"])))
 
@@ -1004,7 +1014,7 @@ def _train_state_epochs(
                 if (
                     is_v49(config)
                     and epoch + 1 > max(1, math.ceil(schedule_total * float(config["training"]["warmup_fraction"])))
-                    and clipping_count / len(gradient_norms) > _gradient_clipping_abort_fraction(config)
+                    and clipping_count / max(updates_per_epoch, 1) > _gradient_clipping_abort_fraction(config)
                 ):
                     raise RuntimeError("v4.9 State clipping abort fraction exceeded after warmup")
                 learning_rate_last = float(optimizer.param_groups[0]["lr"])
@@ -1175,12 +1185,17 @@ def _load_state_epoch(
     maximum_epochs: int,
 ) -> tuple[int, torch.optim.Optimizer, dict[str, Any], dict[str, Any]]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    config_matches = checkpoint.get("resume_config_sha256") == resume_config_hash(config)
+    if not config_matches and is_v49(config):
+        from bme_eating.v49_resume import legacy_state_checkpoint_matches
+
+        config_matches = legacy_state_checkpoint_matches(path, checkpoint, config)
     expected_subjects = {name: sorted(group) for name, group in subjects.items()}
     if (
         checkpoint.get("kind") != kind
         or checkpoint.get("seed") != seed
         or checkpoint.get("subjects") != expected_subjects
-        or checkpoint.get("resume_config_sha256") != resume_config_hash(config)
+        or not config_matches
     ):
         raise RuntimeError(f"State epoch checkpoint identity mismatch: {path.name}")
     epoch = int(checkpoint["epoch"])
@@ -1427,6 +1442,7 @@ def _selector_early_stopping_improved(
     *,
     minimum_recall: float,
     minimum_delta: float,
+    downstream_proxy: bool = False,
 ) -> bool:
     if best is None:
         return True
@@ -1440,6 +1456,15 @@ def _selector_early_stopping_improved(
     if current_qualified != best_qualified:
         return current_qualified
     if current_qualified:
+        if downstream_proxy:
+            if not current.get("promotion_eligible", False):
+                return False
+            if not best.get("promotion_eligible", False):
+                return True
+            if current["robust_event_f1"] > best["robust_event_f1"] + minimum_delta:
+                return True
+            if current["robust_event_f1"] < best["robust_event_f1"] - minimum_delta:
+                return False
         current_bce = float(current["robust_subject_macro_soft_bce"])
         best_bce = float(best["robust_subject_macro_soft_bce"])
         if current_bce < best_bce - minimum_delta:
@@ -1462,6 +1487,7 @@ def _choose_conservative_state_epoch(
     minimum_delta: float,
     minimum_epoch: int = 1,
     require_qualified: bool = False,
+    downstream_proxy: bool = False,
 ) -> tuple[dict[str, Any], bool]:
     eligible_metrics = [
         value for value in epoch_metrics
@@ -1492,6 +1518,15 @@ def _choose_conservative_state_epoch(
             if float(value["robust_candidate_recall"]) >= best_recall - minimum_delta
         ]
         promotion_eligible = False
+    if downstream_proxy:
+        if not all(np.isfinite(float(value.get("robust_event_f1", float("nan")))) for value in eligible):
+            raise RuntimeError("State downstream proxy is missing or non-finite")
+        for key, maximize in (("robust_event_f1", True), ("robust_candidate_recall", True),
+                              ("robust_ece", False), ("robust_state_fragment_count", False),
+                              ("robust_subject_macro_soft_bce", False)):
+            optimum = (max if maximize else min)(float(value[key]) for value in eligible)
+            eligible = [value for value in eligible if abs(float(value[key]) - optimum) <= minimum_delta]
+        return min(eligible, key=lambda value: int(value["epoch"])), promotion_eligible
     minimum_bce = min(eligible, key=lambda value: value["robust_subject_macro_soft_bce"])
     one_standard_error = float(minimum_bce["robust_soft_bce_standard_error"])
     within_one_standard_error = [
@@ -1605,11 +1640,19 @@ def _select_epoch(
         epoch_metrics.append({"epoch": epoch, **score})
         _add_robust_epoch_metrics(epoch_metrics, rolling_epochs)
         current = epoch_metrics[-1]
+        current["promotion_eligible"] = bool(
+            training_metrics and training_metrics[-1].get("finite_gate_passed", False)
+            and training_metrics[-1].get("clipping_gate_passed", False)
+            and current["robust_calibration_passed"] and current["robust_candidate_recall"] >= minimum_recall
+            and epoch >= checkpoint_selection_minimum_epoch
+            and all(torch.isfinite(value).all() for value in model.state_dict().values())
+        )
         if _selector_early_stopping_improved(
             current,
             best_progress,
             minimum_recall=minimum_recall,
             minimum_delta=minimum_delta,
+            downstream_proxy=config["training"].get("selector_downstream_proxy") == "event_f1_then_recall",
         ):
             best_progress = dict(current)
             checks_without_improvement = 0
@@ -1702,6 +1745,7 @@ def _select_epoch(
         minimum_delta=minimum_delta,
         minimum_epoch=checkpoint_selection_minimum_epoch,
         require_qualified=bool(config.get("training", {}).get("selector_requires_promotion_qualification", False)),
+        downstream_proxy=config["training"].get("selector_downstream_proxy") == "event_f1_then_recall",
     )
     if bool(config.get("training", {}).get("selector_requires_promotion_qualification", False)) and not promotion_eligible:
         raise RuntimeError("No v4.9 state epoch satisfies promotion qualification and clipping gates")
@@ -1712,7 +1756,7 @@ def _select_epoch(
         "gradient_clipping_gate": "selected_epoch_clipping_fraction_lte_configured_threshold",
         "selected_epoch_clipping_gate_passed": clipping_by_epoch.get(int(best["epoch"]), False),
         "selector_calibration_protocol": "subject_crossfit_soft_platt_v1",
-        "selection_rule": "best_recall_then_earliest_epoch_within_one_standard_error_soft_bce",
+        "selection_rule": config["training"].get("selector_downstream_proxy", "best_recall_then_earliest_epoch_within_one_standard_error_soft_bce"),
         "selector_rolling_epochs": rolling_epochs,
         "validation_every_epochs": validation_interval,
         "early_stopping_min_epochs": minimum_training_epochs,
@@ -1765,12 +1809,16 @@ def infer_state_windows(
         raise ValueError("inference batch size must be positive")
     if effective_num_workers < 0:
         raise ValueError("inference worker count cannot be negative")
-    loader = DataLoader(
-        dataset,
-        batch_size=effective_batch_size,
-        sampler=_inference_endpoints(dataset),
-        num_workers=effective_num_workers,
-    )
+    loader_options: dict[str, Any] = {
+        "batch_size": effective_batch_size,
+        "sampler": _inference_endpoints(dataset),
+        "num_workers": effective_num_workers,
+    }
+    if effective_num_workers > 0:
+        loader_options["prefetch_factor"] = max(
+            1, int(config["training"].get("loader_prefetch_factor", 1))
+        )
+    loader = DataLoader(dataset, **loader_options)
     amp_enabled = device.type == "cuda"
     amp_dtype = (
         torch.bfloat16 if config["training"].get("amp_dtype") == "bfloat16" else torch.float16
@@ -1953,12 +2001,12 @@ def _validate_state_checkpoint_binding(config: dict[str, Any], subjects: dict[st
         raise RuntimeError("v4.9 checkpoint config hash changed")
     if binding.get("trainer_sha256") != sha256_file(Path(__file__)):
         raise RuntimeError("v4.9 checkpoint trainer source changed")
-    from bme_eating.reproducibility import git_worktree_identity
-
-    if binding.get("git") != git_worktree_identity(Path(__file__).resolve().parents[3]):
+    if binding.get("git") != protocol_git_identity(Path(__file__).resolve().parents[3], config):
         raise RuntimeError("v4.9 checkpoint worktree source changed")
     if binding.get("runtime_sha256") != runtime_source_identity(Path(__file__).resolve().parents[1])["sha256"]:
         raise RuntimeError("v4.9 checkpoint runtime source changed")
+    if config.get("v49", {}).get("protocol") == "integrated_repair_v2" and binding.get("execution_source_identity") != execution_source_identity(Path(__file__).resolve().parents[3]):
+        raise RuntimeError("v4.9 checkpoint execution source changed")
     for file_name, expected in binding.get("input_file_signatures", {}).items():
         path = Path(file_name)
         if not path.is_file() or [path.stat().st_size, path.stat().st_mtime_ns] != expected:
@@ -2094,6 +2142,7 @@ def train_state_crossfit_v4(
             "input_file_signatures": config.get("_v49_input_files", {}),
             "trainer_sha256": sha256_file(Path(__file__)),
             "runtime_sha256": runtime_source_identity(Path(__file__).resolve().parents[1])["sha256"],
+            "execution_source_identity": run.payload.get("execution_source_identity"),
         }
     outer_train, outer_test = outer_subject_sets(inputs, int(run.payload["outer_fold"]))
     crossfit_mode = _state_crossfit_mode(config)
@@ -3534,6 +3583,7 @@ def _train_verifier_model_v4(
     model = EventVerifierV4(
         features.sequence.shape[-1], features.scalar.shape[-1], config["verifier"]
     ).to(device)
+    fit_raw_imu_normalization(model, features)
     dataset = ProposalDatasetV4(features)
     batch_size = int(config["verifier"]["batch_size"])
     steps = max(1, math.ceil(len(dataset) / batch_size))
@@ -3629,6 +3679,7 @@ def _select_verifier_epoch(
     model = EventVerifierV4(
         fit_features.sequence.shape[-1], fit_features.scalar.shape[-1], config["verifier"]
     ).to(device)
+    fit_raw_imu_normalization(model, fit_features)
     dataset = ProposalDatasetV4(fit_features)
     batch_size = int(config["verifier"]["batch_size"])
     sampler = HardNegativeBatchSampler(
@@ -5573,6 +5624,40 @@ def _refine_from_scores(
     )
 
 
+def _refine_locked_boundary(accepted: pd.DataFrame, scores: pd.DataFrame, safety_gap_seconds: int) -> pd.DataFrame:
+    if "locked_entropy_threshold" not in scores or scores["locked_entropy_threshold"].isna().any():
+        raise RuntimeError("Boundary lacks training-fold entropy locks")
+    parts = []
+    for threshold, group in scores.groupby("locked_entropy_threshold", sort=True):
+        selected = accepted[accepted["proposal_id"].isin(group["proposal_id"])]
+        score_columns = [name for name in group if name not in {"outer_fold", "locked_entropy_threshold"}]
+        parts.append(_refine_from_scores(selected, group[score_columns], float(threshold), safety_gap_seconds))
+    refined = pd.concat(parts, ignore_index=True).set_index("proposal_id")
+    return refined.loc[accepted["proposal_id"].tolist()].reset_index()
+
+
+def _select_boundary_entropy(positive: pd.DataFrame, outputs: tuple[np.ndarray, ...], config: dict[str, Any]) -> tuple[float, list[dict[str, Any]]]:
+    search = []
+    start_offset, end_offset, start_entropy, end_entropy = outputs
+    for threshold in config["boundary"]["entropy_thresholds"]:
+        starts = positive["coarse_start_ms"].to_numpy() + np.where(start_entropy <= threshold, start_offset * 1000, 0)
+        ends = positive["coarse_end_ms"].to_numpy() + np.where(end_entropy <= threshold, end_offset * 1000, 0)
+        conflict = starts >= ends
+        starts = np.where(conflict, positive["coarse_start_ms"], starts)
+        ends = np.where(conflict, positive["coarse_end_ms"], ends)
+        ious = np.asarray([interval_iou(int(left), int(right), int(truth_start), int(truth_end))
+                           for left, right, truth_start, truth_end in zip(starts, ends, positive["truth_start_ms"], positive["truth_end_ms"])])
+        loss = float((ious <= 0.25).mean())
+        mae = float((np.abs(starts - positive["truth_start_ms"].to_numpy()).mean()
+                     + np.abs(ends - positive["truth_end_ms"].to_numpy()).mean()) / 2000)
+        search.append({"threshold": float(threshold), "endpoint_mae_seconds": mae,
+                       "tp_to_fp_rate": loss, "passed": bool(np.isfinite(mae) and loss <= config["promotion_gate"]["boundary"]["maximum_tp_to_fp_rate"])})
+    eligible = [row for row in search if row["passed"]]
+    if not eligible:
+        raise RuntimeError("Boundary training-fold entropy search failed; retain coarse boundary")
+    return min(eligible, key=lambda row: (row["endpoint_mae_seconds"], row["threshold"]))["threshold"], search
+
+
 def _seeded_boundary_scores(frame: pd.DataFrame, seed: int) -> pd.DataFrame:
     output = frame.copy()
     for name in (
@@ -5881,7 +5966,7 @@ def select_v4_pipeline(
             * (1.0 - float(config["promotion_gate"]["minimum_boundary_mae_improvement"]))
             and refined_metrics["f1"]
             >= coarse_metrics["f1"] - float(config["promotion_gate"]["maximum_boundary_f1_drop"])
-            and lost_fraction <= float(config["promotion_gate"]["maximum_tp_to_fp_fraction"])
+            and lost_fraction <= float(config["promotion_gate"]["maximum_tp_to_fp_rate"] if is_v49(config) else config["promotion_gate"].get("maximum_tp_to_fp_fraction", 0.01))
             and seed_consistency_passed
             and hand_gate_passed
         )
@@ -6921,11 +7006,11 @@ def _v48_candidate_gate(
     same_total = int(relation.eq("same").sum())
     different_total = int(relation.eq("different").sum())
     counts = {
-        "covered": round(recall["candidate_recall"] * len(truth)),
-        "same_covered": round(recall["same_candidate_recall"] * same_total),
+        "covered": round(recall["candidate_recall"] * len(truth)) if len(truth) else 0,
+        "same_covered": round(recall["same_candidate_recall"] * same_total) if same_total else 0,
         "different_covered": round(
             recall["different_candidate_recall"] * different_total
-        ),
+        ) if different_total else 0,
     }
     checks = {
         "overall_gain": counts["covered"] >= int(baseline["candidate_covered"]) + 5,
@@ -6940,10 +7025,24 @@ def _v48_candidate_gate(
             "same_retained": counts["same_covered"] >= int(baseline["same_candidate_covered"]),
             "different_retained": counts["different_covered"] >= int(baseline["different_candidate_covered"]),
         }
+    fold_coverage = []
+    if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+        if "outer_fold" not in proposals or "outer_fold" not in truth:
+            raise RuntimeError("v4.9 candidate coverage requires outer fold identity")
+        for fold in range(5):
+            group = proposals[proposals["outer_fold"].eq(fold)]
+            coverage = candidate_coverage(group, truth[truth["outer_fold"].eq(fold)])
+            fold_coverage.append({"fold": fold, **coverage})
+        checks["fold_candidate_recall_floor"] = len(fold_coverage) == 5 and all(
+            row["candidate_recall"] >= float(config["promotion_gate"]["fold_candidate_recall_minimum"])
+            for row in fold_coverage
+        )
     if bool(config["model"].get("use_proposal_head", False)) and not is_v49(config):
         checks["proposal_head_overall_target"] = counts["covered"] >= 126
         checks["proposal_head_different_target"] = counts["different_covered"] >= 63
     return {
+        "protocol": "v49_candidate_coverage_v2" if is_v49(config) else "v48_candidate_coverage_v1",
+        "fold_coverage": fold_coverage,
         "evidence_class": "development_stress_only",
         "counts": counts,
         "checks": checks,
@@ -7468,7 +7567,7 @@ def _fit_pooled_deep_crossfit(
             sampling_frame["category"] = classify_proposals(train_proposals)
             sampling_path = head_root / f"fold_{fold}_hard_negative_statistics.json"
             strata_columns = ["subject_key", "wear_hand", "hand_relation", "iou_bin", "gyro_missingness_bin",
-                              "duration_bin", "source_mask", "category"]
+                              "duration_bin", "source_family", "category"]
             statistics = sampling_frame.groupby(strata_columns, dropna=False).agg(
                 candidate_count=("proposal_family_id", "size"),
                 independent_family_count=("proposal_family_id", "nunique"),
@@ -7477,6 +7576,12 @@ def _fit_pooled_deep_crossfit(
                 "protocol": config["training"]["hard_negative_sampling_protocol"],
                 "training_subjects": sorted(training_subjects),
                 "globally_excluded_subjects": sorted(prediction_subjects),
+                "sampling_order": ["subject_key", "wear_hand", "hand_relation", "iou_bin", "gyro_missingness_bin", "duration_bin", "source_family", "category"],
+                "candidate_count": len(sampling_frame),
+                "positive_candidate_count": int(sampling_frame["category"].eq("positive").sum()),
+                "negative_candidate_count": int(sampling_frame["category"].ne("positive").sum()),
+                "independent_positive_event_count": sampling_frame.loc[sampling_frame["category"].eq("positive"), "event_group"].nunique(),
+                "independent_negative_family_count": sampling_frame.loc[sampling_frame["category"].ne("positive"), "proposal_family_id"].nunique(),
                 "strata": statistics.to_dict("records"),
             })
             artifacts.append(sampling_path)
@@ -7728,6 +7833,17 @@ def _fit_pooled_deep_crossfit(
             "parent_artifact_sha256": fold_parent_sha256,
             "upstream_lineage": data.upstream_lineage,
             "locked_operating_point": locked_point,
+            "raw_imu": {
+                "protocol": config["verifier"].get("raw_imu_protocol"),
+                "shape": list(train_features.raw_imu.shape) if train_features.raw_imu is not None else None,
+                "channels": ["acc_x", "acc_y", "acc_z", "gyro_x", "gyro_y", "gyro_z",
+                             "acc_x_valid", "acc_y_valid", "acc_z_valid", "gyro_x_valid", "gyro_y_valid", "gyro_z_valid"],
+                "window_protocol": "start_midpoint_end_centered_30s_10hz",
+                "maximum_future_seconds": 15,
+                "normalization": config["verifier"].get("raw_imu_normalization", "snippet_local_robust_v1"),
+                "normalization_training_subjects": sorted(training_subjects),
+                "missing_fraction": float(1 - train_features.raw_imu[:, :, 6:, :].mean()) if train_features.raw_imu is not None else None,
+            },
         }
         write_json_atomic(lineage_path, lineage)
         artifacts.append(lineage_path)
@@ -7982,6 +8098,13 @@ def _fit_pooled_boundary_crossfit(
             ),
         }
         seed_outputs: dict[int, tuple[np.ndarray, ...]] = {}
+        entropy_outputs: dict[int, tuple[np.ndarray, ...]] = {}
+        entropy_positive = selector_positive.sort_values("max_iou", ascending=False, kind="stable").drop_duplicates(
+            ["subject_key", "session_id", "matched_event_id"]
+        ).reset_index(drop=True)
+        entropy_features = build_endpoint_features(
+            entropy_positive, fold_windows, [f"stat_{name}" for name in STATS_FEATURE_COLUMNS], selection_range, config["boundary"],
+        ) if config.get("v49", {}).get("protocol") == "integrated_repair_v2" else None
         fold_selected_epochs: dict[str, int] = {}
         for configured_seed in config["boundary"]["seeds"]:
             seed = int(configured_seed)
@@ -8004,6 +8127,14 @@ def _fit_pooled_boundary_crossfit(
                 resume=resume,
                 identity=selector_identity,
             )
+            if entropy_features is not None:
+                entropy_model = _train_endpoint_model(
+                    fit_features, config, seed=seed + fold * 100, epochs=selected_epoch,
+                    checkpoint_path=checkpoint.with_name(checkpoint.stem + "_entropy_last.pt"),
+                    resume=resume, identity=selector_identity,
+                )
+                entropy_outputs[seed] = _infer_endpoint_model(entropy_model, entropy_features, config)
+                del entropy_model
             retrain_identity = {
                 "training_subjects": sorted(training_subjects),
                 "prediction_subjects": sorted(prediction_subjects),
@@ -8054,6 +8185,13 @@ def _fit_pooled_boundary_crossfit(
             fold_selected_epochs[str(seed)] = selected_epoch
             seed_outputs[seed] = _infer_endpoint_model(model, holdout_features, config)
         output = holdout[["proposal_id", "outer_fold"]].copy().reset_index(drop=True)
+        entropy_lock = None
+        entropy_search = []
+        if entropy_outputs:
+            entropy_lock, entropy_search = _select_boundary_entropy(
+                entropy_positive, tuple(np.mean([value[index] for value in entropy_outputs.values()], axis=0) for index in range(4)), config,
+            )
+            output["locked_entropy_threshold"] = entropy_lock
         for index, name in enumerate(
             ("start_offset_seconds", "end_offset_seconds", "start_entropy", "end_entropy")
         ):
@@ -8073,6 +8211,9 @@ def _fit_pooled_boundary_crossfit(
             "prediction_subjects": sorted(prediction_subjects),
             "globally_excluded_subjects": sorted(prediction_subjects),
             "selected_epoch_by_seed": fold_selected_epochs,
+            "locked_entropy_threshold": entropy_lock,
+            "entropy_search": entropy_search,
+            "entropy_source": "selector_subjects_excluding_outer_fold",
             "range_source": "other_outer_folds_only",
             "residual_clipping_fraction": boundary_range.clipped_fraction,
             "selector_residual_clipping_fraction": selection_range.clipped_fraction,
@@ -8098,8 +8239,8 @@ def _fit_pooled_boundary_crossfit(
     }
     report = {
         "protocol": POOLED_HEAD_PROTOCOL,
-        "joint_tuning": True,
-        "evidence_class": "development_stress_only",
+        "joint_tuning": config.get("v49", {}).get("protocol") != "integrated_repair_v2",
+        "evidence_class": "fully_excluded_outer_oof" if config.get("v49", {}).get("protocol") == "integrated_repair_v2" else "development_stress_only",
         "lineage": lineages,
         "selected_epochs": {str(key): value for key, value in selected_epochs.items()},
         "deployment_epoch_by_seed": {str(key): value for key, value in fixed_epochs.items()},
@@ -8143,7 +8284,7 @@ def train_hierarchical_final_v4(
         if fresh:
             raise FileExistsError(f"V4 final run already exists: {final_root}")
         existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if existing_manifest.get("stage") not in {"IN_PROGRESS", "COMPLETE"}:
+        if existing_manifest.get("stage") not in {"IN_PROGRESS", "COMPLETE", "EXPORTED"}:
             raise RuntimeError("V4 final manifest has an invalid stage")
         for relative, expected in existing_manifest.get("artifact_hashes", {}).items():
             if (
@@ -8166,13 +8307,16 @@ def train_hierarchical_final_v4(
             },
         }
     experiment_root = output_root / "experiments" / run_name
+    v49_protocol_lock = None
     if is_v49(config):
-        validate_v49_gate_manifest(output_root, run_name, identity)
+        v49_protocol_lock = validate_v49_gate_manifest(output_root, run_name, identity)
     fold_roots = [experiment_root / f"fold_{fold}" for fold in range(5)]
     manifests = []
     parent_artifact_hashes: dict[str, str] = {}
     if is_v49(config):
-        parent_artifact_hashes["v49_gate_manifest.json"] = sha256_file(experiment_root / "v49_gate_manifest.json")
+        gate_name = str(config.get("v49", {}).get("gate_manifest", "v49_gate_manifest.json"))
+        gate_path = experiment_root / gate_name
+        parent_artifact_hashes[gate_name] = sha256_file(gate_path)
     expected_state_seeds = [int(value) for value in config["final_training"]["state_seeds"]]
     downstream_mode = str(config.get("hierarchical", {}).get("downstream_mode", "full"))
     state_only_downstream = downstream_mode == "state_only"
@@ -8325,7 +8469,7 @@ def train_hierarchical_final_v4(
             )
             existing_manifest["resume_identity"] = resume_identity
             write_json_atomic(manifest_path, existing_manifest)
-        if existing_manifest["stage"] == "COMPLETE":
+        if existing_manifest["stage"] in {"COMPLETE", "EXPORTED"}:
             if (
                 pooled_logistic_downstream or pooled_learned_heads_downstream
             ) and existing_manifest.get("pooled_head_training_protocol") != (
@@ -8796,14 +8940,15 @@ def train_hierarchical_final_v4(
     if calibration_frame["proposal_id"].astype(str).duplicated().any():
         raise RuntimeError("Pooled outer OOF proposal IDs are not globally unique")
     if config["decoder"].get("candidate_protocol") in {"v4.8", "v4.9"}:
+        candidate_truth = pd.concat([frame.assign(outer_fold=fold) for fold, frame in enumerate(truth_parts)], ignore_index=True)
         v48_candidate_report = _v48_candidate_gate(
-            calibration_frame, pooled_truth, config
+            calibration_frame, candidate_truth, config
         )
-        v48_candidate_path = final_root / "v48_candidate_gate.json"
+        v48_candidate_path = final_root / ("v49_candidate_gate.json" if is_v49(config) else "v48_candidate_gate.json")
         write_json_atomic(v48_candidate_path, v48_candidate_report)
         artifacts.append(v48_candidate_path)
         if not v48_candidate_report["passed"]:
-            raise RuntimeError("v4.8 candidate gate failed; Deep training is not eligible")
+            raise RuntimeError(f"{config['decoder']['candidate_protocol']} candidate gate failed; Deep training is not eligible")
     verifier_epoch_by_seed: dict[int, int] = {}
     pooled_logistic_report: dict[str, Any] | None = None
     pooled_deep_report: dict[str, Any] | None = None
@@ -9089,17 +9234,6 @@ def train_hierarchical_final_v4(
         write_json_atomic(deep_report_path, pooled_deep_report)
         write_parquet_atomic(deep_scores_path, deep_scores)
         artifacts.extend((deep_report_path, deep_scores_path))
-        if not bool(deep_promotion["passed"]):
-            if is_v49(config):
-                deep_promotion["evidence_sha256"] = {
-                    "deep_crossfit.json": sha256_file(deep_report_path),
-                    "deep_crossfit_scores.parquet": sha256_file(deep_scores_path),
-                    "resolved_config.yaml": sha256_file(final_root / "resolved_config.yaml"),
-                }
-                write_json_atomic(final_root / "v49_deep_gate.json", deep_promotion)
-            raise RuntimeError(
-                "Deep-only promotion gate failed; no Logistic or state-only fallback is allowed"
-            )
         if is_v49(config):
             deep_promotion["evidence_sha256"] = {
                 "deep_crossfit.json": sha256_file(deep_report_path),
@@ -9107,6 +9241,13 @@ def train_hierarchical_final_v4(
                 "resolved_config.yaml": sha256_file(final_root / "resolved_config.yaml"),
             }
             write_json_atomic(final_root / "v49_deep_gate.json", deep_promotion)
+            if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+                raw_gate_path = write_v49_raw_imu_gate(final_root, config, bool(deep_promotion["passed"]))
+                artifacts.append(raw_gate_path)
+                if not json.loads(raw_gate_path.read_text(encoding="utf-8"))["passed"]:
+                    raise RuntimeError("v4.9 raw IMU nested-crossfit gate failed")
+        if not bool(deep_promotion["passed"]):
+            raise RuntimeError("Deep-only promotion gate failed; no Logistic or state-only fallback is allowed")
         if config["decoder"].get("candidate_protocol") == "v4.8" and not bool(
             pooled_deep_report["v48_frozen_baseline_gate"]["passed"]
         ):
@@ -9290,6 +9431,9 @@ def train_hierarchical_final_v4(
             else "pooled_outer_oof_calibration"
         ),
         "bundle_state_calibration_source": "pooled_outer_oof",
+        "sensor_only_reference": (
+            v49_protocol_lock["sensor_only_reference"] if v49_protocol_lock is not None else None
+        ),
         "ignore_protocol_version": IGNORE_PROTOCOL,
         "observation_gap_protocol": OBSERVATION_GAP_PROTOCOL,
         "runtime_source_binding": RUNTIME_SOURCE_BINDING,
@@ -9400,8 +9544,10 @@ def train_hierarchical_final_v4(
                 winners: list[
                     tuple[float, float, dict[str, Any], pd.DataFrame, dict[str, Any]]
                 ] = []
-                for threshold in config["boundary"]["entropy_thresholds"]:
-                    refined = _refine_from_scores(
+                registered_entropy = config.get("v49", {}).get("protocol") == "integrated_repair_v2"
+                evaluation_thresholds = [float(np.median([row["locked_entropy_threshold"] for row in crossfit_report["lineage"]]))] if registered_entropy else config["boundary"]["entropy_thresholds"]
+                for threshold in evaluation_thresholds:
+                    refined = _refine_locked_boundary(accepted, boundary_scores, int(config["boundary"]["safety_gap_seconds"])) if registered_entropy else _refine_from_scores(
                         accepted,
                         boundary_scores,
                         float(threshold),
@@ -9519,6 +9665,10 @@ def train_hierarchical_final_v4(
                         "identity_preserved": identity_preserved,
                         "matched_events": len(matches),
                         "paired_matched_events": len(paired),
+                        "coarse_tp": len(coarse_matches),
+                        "refined_tp": len(matches),
+                        "endpoint_changed_count": int(((refined["refined_start_ms"] != refined["coarse_start_ms"]) | (refined["refined_end_ms"] != refined["coarse_end_ms"])).sum()),
+                        "entropy_source": "training_fold_locked_oof" if registered_entropy else "pooled_outer_oof",
                         "paired_mae_ms": paired_mae,
                         "start_mae_improved_10pct": start_improved,
                         "end_mae_improved_10pct": end_improved,
@@ -9680,7 +9830,7 @@ def train_hierarchical_final_v4(
                         and metrics["f1"]
                         >= coarse_metrics["f1"]
                         - float(config["promotion_gate"]["maximum_boundary_f1_drop"])
-                        and lost <= float(config["promotion_gate"]["maximum_tp_to_fp_fraction"])
+                        and lost <= float(config["promotion_gate"]["maximum_tp_to_fp_rate"] if is_v49(config) else config["promotion_gate"].get("maximum_tp_to_fp_fraction", 0.01))
                         and hand_safe
                     )
                     if passed:
@@ -9885,6 +10035,7 @@ def train_hierarchical_final_v4(
     manifest = {
         "version": 5,
         "code_version": "v4.9" if is_v49(config) else CODE_VERSION,
+        "sensor_only_reference": selection["sensor_only_reference"],
         "stage": "COMPLETE",
         "run_name": run_name,
         "protocol_version": PROTOCOL_VERSION,

@@ -23,11 +23,16 @@ def load_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
+    declared_legacy_tp_key = "maximum_tp_to_fp_fraction" in payload.get("promotion_gate", {})
     parent_name = payload.pop("extends", None)
     if parent_name:
         parent_path = (config_path.parent / parent_name).resolve()
         parent = load_config(parent_path)
         payload = _deep_merge(parent, payload)
+    if payload.get("v49", {}).get("protocol") == "integrated_repair_v2":
+        if declared_legacy_tp_key:
+            raise ValueError("v4.9 uses maximum_tp_to_fp_rate; legacy fraction key is forbidden")
+        payload.get("promotion_gate", {}).pop("maximum_tp_to_fp_fraction", None)
     payload["_config_path"] = str(config_path)
     return payload
 

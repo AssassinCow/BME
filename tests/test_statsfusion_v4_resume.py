@@ -92,6 +92,34 @@ def _weights(path):
     return checkpoint, {key: value.clone() for key, value in checkpoint["model"].items()}
 
 
+@pytest.mark.parametrize("steps,norms,aborts", [
+    (8, [101.0, 0.0, 0.0, 0.0], False),
+    (7, [101.0, 101.0, 0.0, 0.0], False),
+    (8, [101.0, 101.0, 101.0], True),
+])
+def test_v49_clipping_abort_uses_full_epoch_updates(monkeypatch, steps, norms, aborts):
+    _patch_toy_training(monkeypatch)
+    config = _config()
+    config["decoder"] = {"candidate_protocol": "v4.9"}
+    config["training"]["steps_per_epoch"] = steps
+    seen = []
+
+    def gradient_norm(*_args, **_kwargs):
+        value = norms[len(seen)]
+        seen.append(value)
+        return torch.tensor(value)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", gradient_norm)
+    model = ToyModel()
+    if aborts:
+        with pytest.raises(RuntimeError, match="clipping abort fraction"):
+            trainer._train_state_epochs(model, ToyDataset(), config, epochs=1, seed=45, epoch_offset=1)
+    else:
+        trainer._train_state_epochs(model, ToyDataset(), config, epochs=1, seed=45, epoch_offset=1)
+        assert model._bme_training_monitor["clipping_fraction"] == sum(value > 100 for value in norms) / 4
+    assert len(seen) == len(norms)
+
+
 def test_retraining_resume_matches_uninterrupted_and_checks_identity(tmp_path, monkeypatch):
     _patch_toy_training(monkeypatch)
     config = _config()

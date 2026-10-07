@@ -27,7 +27,9 @@ def main() -> None:
     )
     parser.add_argument("--mode", choices=("ablation", "development", "stress", "full"), required=True)
     parser.add_argument("--run-name", required=True, help="Selected r3 candidate run name")
-    parser.add_argument("--s0-run", required=True)
+    reference = parser.add_mutually_exclusive_group(required=True)
+    reference.add_argument("--s0-run")
+    reference.add_argument("--skip-s0", action="store_true")
     parser.add_argument(
         "--compare",
         action="append",
@@ -39,6 +41,8 @@ def main() -> None:
     args = parser.parse_args()
     require_git_worktree()
     config = load_config(args.config)
+    if args.skip_s0 and (args.mode != "full" or not is_v49(config)):
+        parser.error("--skip-s0 is only supported by the full v4.9 integrated gate")
     _, _, output_root = resolve_artifact_roots(config)
     if args.mode == "ablation":
         comparisons = []
@@ -62,7 +66,9 @@ def main() -> None:
         run_root.mkdir(parents=True, exist_ok=True)
         try:
             if args.mode == "full" and is_v49(config):
-                report = evaluate_v49_outer_preflight(output_root, args.run_name, args.s0_run, config)
+                report = evaluate_v49_outer_preflight(
+                    output_root, args.run_name, args.s0_run, config, skip_s0=args.skip_s0,
+                )
             else:
                 report = evaluate_crossfold_gate(
                     output_root,
@@ -86,8 +92,10 @@ def main() -> None:
                 "error": str(exc),
             }
         if args.mode == "full":
+            gate_protocol = "v49_gate_manifest_v2" if config.get("v49", {}).get("protocol") == "integrated_repair_v2" else "v49_gate_manifest_v1"
+            gate_name = str(config.get("v49", {}).get("gate_manifest", "v49_gate_manifest.json"))
             manifest = {
-                "protocol": "v49_gate_manifest_v1",
+                "protocol": gate_protocol,
                 "candidate_run": args.run_name,
                 "s0_run": args.s0_run,
                 "config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
@@ -96,6 +104,7 @@ def main() -> None:
                 "identity": report.get("identity", {}),
                 "evidence_sha256": report.get("evidence_sha256", {}),
                 "reference_evidence_sha256": report.get("reference_evidence_sha256", {}),
+                "sensor_only_reference": report.get("sensor_only_reference", {}),
                 "passed": bool(report.get("passed")),
                 "folds": list(range(5)),
                 "protocol_lock": {
@@ -103,7 +112,7 @@ def main() -> None:
                     "final_deep_thresholds_deferred": True,
                 },
             }
-            write_json_atomic(run_root / "v49_gate_manifest.json", manifest)
+            write_json_atomic(run_root / gate_name, manifest)
             if not manifest["passed"]:
                 write_failure_report(
                     run_root, "crossfold_gate", RuntimeError(report.get("error", str(report.get("checks")))),

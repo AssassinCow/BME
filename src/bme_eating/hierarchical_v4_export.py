@@ -10,8 +10,7 @@ import torch
 import yaml
 
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
-from bme_eating.integrated_v49 import validate_v49_gate_manifest
-from bme_eating.reproducibility import git_worktree_identity
+from bme_eating.integrated_v49 import validate_v49_gate_manifest, validate_v49_raw_imu_gate
 from bme_eating.stats_features import FoldRobustScaler
 from bme_eating.v4_protocol import (
     BLOCKED_PREDECESSORS,
@@ -24,6 +23,9 @@ from bme_eating.v4_protocol import (
     RUNTIME_SOURCE_BINDING,
     RUNTIME_SOURCE_FILES,
     V49_CODE_VERSION,
+    execution_environment_identity,
+    execution_source_identity,
+    protocol_git_identity,
     runtime_source_identity,
     validate_serialized_state_seeds,
     validate_serialized_verifier_seeds,
@@ -165,13 +167,14 @@ def export_hierarchical_v4_bundle(
         )
     config = yaml.safe_load((final_root / "resolved_config.yaml").read_text(encoding="utf-8"))
     if config.get("decoder", {}).get("candidate_protocol") == "v4.9":
-        gate_path = final_root.parent.parent / "experiments" / final_root.name / "v49_gate_manifest.json"
+        gate_name = str(config.get("v49", {}).get("gate_manifest", "v49_gate_manifest.json"))
+        gate_path = final_root.parent.parent / "experiments" / final_root.name / gate_name
         if not gate_path.is_file():
             raise RuntimeError("v4.9 export requires v49_gate_manifest.json")
         gate_manifest = json.loads(gate_path.read_text(encoding="utf-8"))
-        if gate_manifest.get("protocol") != "v49_gate_manifest_v1" or not gate_manifest.get("passed"):
+        if gate_manifest.get("protocol") not in {"v49_gate_manifest_v1", "v49_gate_manifest_v2"} or not gate_manifest.get("passed"):
             raise RuntimeError("v4.9 promotion gate failed; bundle export is disabled")
-        if gate_manifest.get("config_sha256") and gate_manifest["config_sha256"] != sha256_file(final_root / "resolved_config.yaml"):
+        if config.get("v49", {}).get("protocol") != "integrated_repair_v2" and gate_manifest.get("config_sha256") and gate_manifest["config_sha256"] != sha256_file(final_root / "resolved_config.yaml"):
             raise RuntimeError("v4.9 gate manifest does not match resolved config")
     if config.get("decoder", {}).get("candidate_protocol") in {"v4.8", "v4.9"}:
         if selection.get("code_version") not in {CODE_VERSION, V49_CODE_VERSION}:
@@ -186,8 +189,10 @@ def export_hierarchical_v4_bundle(
             selection.get("raw_imu_verifier_protocol") == "three_causal_30s_snippets_v1"
         ):
             raise RuntimeError("v4.8 bundle raw IMU binding differs from its verifier")
-        if bool(config.get("verifier", {}).get("use_raw_imu_branch", False)):
-            gate_path = final_root / "v48_raw_imu_gate.json"
+        if bool(config.get("verifier", {}).get("use_raw_imu_branch", False)) and config.get("v49", {}).get("protocol") != "integrated_repair_v2":
+            gate_path = final_root / (
+                "v48_raw_imu_gate.json"
+            )
             if not gate_path.is_file():
                 raise RuntimeError("Raw IMU verifier requires identical-pool promotion evidence")
             gate = json.loads(gate_path.read_text(encoding="utf-8"))
@@ -213,7 +218,12 @@ def export_hierarchical_v4_bundle(
         raise RuntimeError("V4 pooled heads lack fully excluded nested state OOF evidence")
     resume_identity = manifest.get("resume_identity", {})
     if config.get("decoder", {}).get("candidate_protocol") == "v4.9":
-        validate_v49_gate_manifest(final_root.parent.parent, final_root.name, resume_identity)
+        protocol_lock = validate_v49_gate_manifest(final_root.parent.parent, final_root.name, resume_identity)
+        if (
+            selection.get("sensor_only_reference") != protocol_lock["sensor_only_reference"]
+            or manifest.get("sensor_only_reference") != protocol_lock["sensor_only_reference"]
+        ):
+            raise RuntimeError("v4.9 export sensor-only comparison status differs from the protocol lock")
         deep_gate_path = final_root / "v49_deep_gate.json"
         if not deep_gate_path.is_file():
             raise RuntimeError("v4.9 export lacks mandatory Deep promotion evidence")
@@ -225,9 +235,15 @@ def export_hierarchical_v4_bundle(
         for relative, digest in deep_gate["evidence_sha256"].items():
             if sha256_file(final_root / relative) != digest:
                 raise RuntimeError("v4.9 Deep promotion evidence changed")
+        if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+            validate_v49_raw_imu_gate(final_root)
+            if resume_identity.get("execution_source_identity") != execution_source_identity(project_root):
+                raise RuntimeError("v4.9 export execution source differs from training")
+            if resume_identity.get("execution_environment") != execution_environment_identity():
+                raise RuntimeError("v4.9 export execution environment differs from training")
         if selection.get("boundary_enabled") and not selection.get("boundary_selection_diagnostics", {}).get("selected", {}).get("passed"):
             raise RuntimeError("v4.9 enabled Boundary has failed its qualification gate")
-    active_git = git_worktree_identity(project_root)
+    active_git = protocol_git_identity(project_root, config)
     active_runtime_source = runtime_source_identity(project_root / "src" / "bme_eating")
     project_config = config.get("project", {})
     if bool(project_config.get("enforce_git_identity_on_resume", False)) and (
@@ -369,6 +385,26 @@ def export_hierarchical_v4_bundle(
     if temporary.exists():
         raise RuntimeError("Stale V4 model_bundle.tmp exists")
     temporary.mkdir(parents=True)
+    if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+        for name in ("v49_deep_gate.json", "v49_raw_imu_gate.json"):
+            report = json.loads((final_root / name).read_text(encoding="utf-8"))
+            write_json_atomic(temporary / name, {key: report[key] for key in (
+                "protocol", "passed", "checks", "evidence_sha256",
+            )})
+        write_json_atomic(temporary / "v49_deployment_protocol.json", {
+            "protocol": "v49_deployment_lock_v2",
+            "outer_gate_sha256": sha256_file(gate_path),
+            "execution_source_identity": resume_identity["execution_source_identity"],
+            "execution_environment": resume_identity["execution_environment"],
+            "config_sha256": sha256_file(final_root / "resolved_config.yaml"),
+            "nested_state_protocol": manifest["pooled_head_training_protocol"],
+            "sensor_only_reference": {key: protocol_lock["sensor_only_reference"].get(key) for key in (
+                "status", "comparison_performed", "reason", "run_name",
+            )},
+            "state_seeds": state_seeds,
+            "verifier_seeds": verifier_seeds,
+            "boundary_passed": not selection.get("boundary_enabled") or bool(selection.get("boundary_selection_diagnostics", {}).get("selected", {}).get("passed")),
+        })
     selected_optional_files = _selected_optional_model_files(selection, promotion_protocol)
     unexpected_optional_files = set(OPTIONAL_MODEL_FILES) - set(selected_optional_files)
     for name in (*REQUIRED_MODEL_FILES, *selected_state_files, *selected_optional_files):

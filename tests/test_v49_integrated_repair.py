@@ -19,6 +19,7 @@ from bme_eating.hierarchical_v4_artifacts import resume_config_hash
 from bme_eating.integrated_v49 import (
     _evaluation_cohort_identity,
     candidate_coverage,
+    evaluate_v49_outer_preflight,
     validate_proposal_lineage,
     validate_sensor_only_reference,
     validate_v49_gate_manifest,
@@ -29,8 +30,9 @@ from bme_eating.models.event_verifier_v4 import (
     HardNegativeBatchSampler,
     _proposal_sampling_metadata,
     build_proposal_features_v4,
+    fit_raw_imu_normalization,
 )
-from bme_eating.proposals_v4 import generate_event_candidates_v4
+from bme_eating.proposals_v4 import budget_v49_candidates, generate_event_candidates_v4
 from bme_eating.reproducibility import git_worktree_identity
 from bme_eating.structured_decoder import FixedLagSemiMarkovDecoder, TruncatedLogNormalDurationPrior
 from bme_eating.training import hierarchical_v4_trainer as trainer
@@ -55,6 +57,28 @@ def _epoch(epoch=3, **changes):
             "robust_state_fragment_count": 1.0, "robust_ece": 0.01, **changes}
 
 
+def test_v49_source_family_budget_normalizes_scores_and_records_shortfalls():
+    frame = pd.DataFrame({
+        "proposal_id": [f"p{i}" for i in range(8)],
+        "proposal_family_id": [f"f{i}" for i in range(8)],
+        "source_mask": [64, 64, 32, 32, 1, 1, 1, 1],
+        "generator_score": [100, 90, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4],
+        "coarse_start_ms": np.arange(8) * 1000,
+        "coarse_end_ms": np.arange(8) * 1000 + np.array([10, 10, 20, 20, 100, 100, 100, 100]) * 1000,
+    })
+    result = budget_v49_candidates(frame, 4, {
+        "proposal_head_minimum_fraction": 0.25,
+        "short_candidate_minimum_fraction": 0.25,
+        "expansion_minimum_fraction": 0.25,
+        "short_candidate_maximum_seconds": 30,
+    })
+    assert len(result) == 4
+    assert result["proposal_family_id"].is_unique
+    assert result["source_family"].isin({"proposal_head", "expansion", "state"}).all()
+    diagnostics = json.loads(result["budget_diagnostics"].iloc[0])
+    assert diagnostics["selected_families"] == 4
+
+
 @pytest.mark.parametrize("epochs,qualified", [
     ([_epoch(1)], [_epoch(1)]),
     ([_epoch()], []),
@@ -72,6 +96,11 @@ def test_v49_resume_hash_binds_runtime_settings():
     config = _config()
     expected = resume_config_hash(config)
     config["training"]["num_workers"] += 1
+    config["training"]["inference_num_workers"] += 1
+    config["training"]["loader_prefetch_factor"] += 1
+    config["training"]["session_reader_cache_size"] += 1
+    assert resume_config_hash(config) == expected
+    config["training"]["learning_rate"] += 1e-6
     assert resume_config_hash(config) != expected
 
 
@@ -191,8 +220,10 @@ def _locked_manifest(tmp_path):
         evidence[path.relative_to(root).as_posix()] = sha256_file(path)
     reference = tmp_path / "final" / "reference" / "deep_crossfit.json"
     write_json_atomic(reference, {"f1": 0.5375})
+    sensor_only = {"status": "not_available", "comparison_performed": False, "reason": "explicit_skip_s0"}
     manifest = {"protocol": "v49_gate_manifest_v1", "candidate_run": "run", "folds": list(range(5)),
-                "passed": True, "crossfold_gate": {"passed": True}, "identity": identity,
+                "s0_run": None, "sensor_only_reference": sensor_only,
+                "passed": True, "crossfold_gate": {"passed": True, "sensor_only_reference": dict(sensor_only)}, "identity": identity,
                 "evidence_sha256": evidence,
                 "reference_evidence_sha256": {reference.relative_to(tmp_path).as_posix(): sha256_file(reference)}}
     write_json_atomic(root / "v49_gate_manifest.json", manifest)
@@ -237,12 +268,16 @@ def test_v49_failed_formal_gate_blocks_export(monkeypatch, tmp_path, failed_gate
 
     final_root = tmp_path / "final" / "run"
     config = {"decoder": {"candidate_protocol": "v4.9"}, "model": {}, "verifier": {}}
-    write_json_atomic(final_root / "final_manifest.json", {"stage": "COMPLETE", "protocol_version": PROTOCOL_VERSION})
+    sensor_only = {"status": "not_available", "comparison_performed": False, "reason": "explicit_skip_s0"}
+    write_json_atomic(final_root / "final_manifest.json", {
+        "stage": "COMPLETE", "protocol_version": PROTOCOL_VERSION, "sensor_only_reference": sensor_only,
+    })
     selection = {
         "protocol_version": PROTOCOL_VERSION, "code_version": "v4.9", "candidate_protocol": "v4.9",
         "blocked_predecessors": list(BLOCKED_PREDECESSORS), "selection_source": "pooled_outer_oof",
         "ignore_protocol_version": IGNORE_PROTOCOL, "observation_gap_protocol": OBSERVATION_GAP_PROTOCOL,
         "runtime_source_binding": RUNTIME_SOURCE_BINDING,
+        "sensor_only_reference": sensor_only,
     }
     if failed_gate == "boundary":
         selection.update({"boundary_enabled": True, "boundary_selection_diagnostics": {"selected": {"passed": False}}})
@@ -256,7 +291,7 @@ def test_v49_failed_formal_gate_blocks_export(monkeypatch, tmp_path, failed_gate
         "evidence_sha256": {"resolved_config.yaml": sha256_file(final_root / "resolved_config.yaml")},
     })
     monkeypatch.setattr(export, "REQUIRED_MODEL_FILES", ())
-    monkeypatch.setattr(export, "validate_v49_gate_manifest", lambda *_args: {})
+    monkeypatch.setattr(export, "validate_v49_gate_manifest", lambda *_args: {"sensor_only_reference": sensor_only})
     with pytest.raises(RuntimeError, match="Deep promotion failed" if failed_gate == "deep" else "Boundary"):
         export.export_hierarchical_v4_bundle(tmp_path, final_root, fresh=True, resume=False)
     assert not (final_root / "model_bundle").exists()
@@ -267,12 +302,12 @@ def test_v49_lineage_requires_parent_evidence():
         validate_proposal_lineage(pd.DataFrame({"proposal_id": ["legacy"]}))
 
 
-def _synthetic_v49_candidates():
+def _synthetic_v49_candidates(subject="subject"):
     config = _config()
     timestamps = np.arange(3_000, 1_803_000, 3_000)
     active = (timestamps >= 900_000) & (timestamps <= 990_000)
     windows = pd.DataFrame({
-        "subject_key": "subject", "session_id": "session", "timestamp_ms": timestamps,
+        "subject_key": subject, "session_id": "session", "timestamp_ms": timestamps,
         "state_probability": np.where(active, 0.12, 0.01),
         "onset_probability": 0.0, "offset_probability": 0.0,
         "proposal_logit": np.where(timestamps == 930_000, 8.0, -8.0),
@@ -312,12 +347,29 @@ def test_v49_generated_lineage_is_verified(tampering):
             validate_proposal_lineage(proposals)
 
 
-def test_v49_verifier_runtime_works_without_training_package_or_xgboost(tmp_path):
+@pytest.mark.parametrize("raw_imu", [False, True])
+def test_v49_verifier_runtime_works_without_training_package_or_xgboost(tmp_path, raw_imu):
+    from bme_eating.data.stats_fusion_preprocess import RawSessionInput
+
     config, proposals, windows = _synthetic_v49_candidates()
-    features = build_proposal_features_v4(proposals, windows, ["stat_example"], config["verifier"])
+    raw_session = None
+    if raw_imu:
+        config = load_config(Path(__file__).parents[1] / "configs/hierarchical_v4_v49_integrated_optimized.yaml")
+        timestamps = np.arange(0, 1_900_000, 100, dtype=np.int64)
+        values = np.zeros((len(timestamps), 6), dtype=np.float32)
+        mask = np.ones_like(values, dtype=bool)
+        mask[:, 3:] = False
+        np.savez(tmp_path / "raw.npz", timestamps=timestamps, values=values, mask=mask)
+        raw_session = RawSessionInput(subject_key="subject", session_id="session", motion_timestamp_ms=timestamps,
+                                      motion_values=values, motion_mask=mask, ppg_timestamp_ms=np.empty(0, dtype=np.int64),
+                                      ppg_values=np.empty((0, 1), dtype=np.float32), ppg_mask=np.empty((0, 1), dtype=bool))
+    features = build_proposal_features_v4(proposals, windows, ["stat_example"], config["verifier"], raw_session=raw_session)
     torch.manual_seed(2026)
     model = EventVerifierV4(features.sequence.shape[-1], features.scalar.shape[-1], config["verifier"]).eval()
+    fit_raw_imu_normalization(model, features)
     batch = {name: torch.from_numpy(getattr(features, name)) for name in ("sequence", "sequence_mask", "scalar")}
+    if features.raw_imu is not None:
+        batch["raw_imu"] = torch.from_numpy(features.raw_imu.astype(np.float32))
     with torch.no_grad():
         expected = model(batch)["event_logit"].numpy()
     package = tmp_path / "runtime" / "bme_eating"
@@ -336,6 +388,7 @@ import json
 from pathlib import Path
 import sys
 import pandas as pd
+import numpy as np
 import torch
 root = Path(sys.argv[1])
 sys.path.insert(0, str(root / 'runtime'))
@@ -346,13 +399,22 @@ class BlockTrainingImports(importlib.abc.MetaPathFinder):
             raise ImportError('Training dependency entered the inference runtime: ' + fullname)
 sys.meta_path.insert(0, BlockTrainingImports())
 from bme_eating.models.event_verifier_v4 import EventVerifierV4, build_proposal_features_v4
+from bme_eating.data.stats_fusion_preprocess import RawSessionInput
 config = json.loads((root / 'config.json').read_text(encoding='utf-8'))
 proposals = pd.read_parquet(root / 'proposals.parquet')
 windows = pd.read_parquet(root / 'windows.parquet')
-features = build_proposal_features_v4(proposals, windows, ['stat_example'], config['verifier'])
+raw_session = None
+if config['verifier'].get('use_raw_imu_branch'):
+    payload = np.load(root / 'raw.npz')
+    raw_session = RawSessionInput(subject_key='subject', session_id='session', motion_timestamp_ms=payload['timestamps'],
+        motion_values=payload['values'], motion_mask=payload['mask'], ppg_timestamp_ms=np.empty(0, dtype=np.int64),
+        ppg_values=np.empty((0, 1), dtype=np.float32), ppg_mask=np.empty((0, 1), dtype=bool))
+features = build_proposal_features_v4(proposals, windows, ['stat_example'], config['verifier'], raw_session=raw_session)
 model = EventVerifierV4(features.sequence.shape[-1], features.scalar.shape[-1], config['verifier']).eval()
 model.load_state_dict(torch.load(root / 'model.pt', weights_only=True))
 batch = {name: torch.from_numpy(getattr(features, name)) for name in ('sequence', 'sequence_mask', 'scalar')}
+if features.raw_imu is not None:
+    batch['raw_imu'] = torch.from_numpy(features.raw_imu.astype(np.float32))
 with torch.no_grad():
     first = model(batch)['event_logit']
     second = model(batch)['event_logit']
@@ -487,3 +549,122 @@ def test_v49_replay_checks_intermediate_predictions_even_with_no_events(monkeypa
             repeat_error(first, second, ["proposal_id"])
     else:
         assert repeat_error(first, second, ["proposal_id"]) == pytest.approx(0.01 if issue else 0.0)
+
+
+def _outer_preflight_fixture(tmp_path):
+    config = _config()
+    config["promotion_gate"]["candidate_coverage_minimum"] = 5
+    config["promotion_gate"]["v48_frozen_baseline"]["same_candidate_covered"] = 5
+    config["promotion_gate"]["v48_frozen_baseline"]["different_candidate_covered"] = 0
+    inputs = {"events": "data", "subject_folds": "split"}
+    reference_run = config["v49"]["frozen_reference_run"]
+    frozen_root = tmp_path / "final" / reference_run
+    write_json_atomic(frozen_root / "final_manifest.json", {"stage": "EXPORTED", "resume_identity": {"input_hashes": inputs}})
+    write_json_atomic(frozen_root / "deep_crossfit.json", {"deep": {"point": {"f1": 0.5375}}})
+    write_json_atomic(frozen_root / "selected_pipeline.json", {})
+    pd.DataFrame({"final_score": [0.5]}).to_parquet(frozen_root / "deep_crossfit_scores.parquet", index=False)
+    for fold in range(5):
+        _, proposals, windows = _synthetic_v49_candidates(f"subject-{fold}")
+        positive = proposals.iloc[0]
+        truth = pd.DataFrame([{
+            "subject_key": positive.subject_key, "session_id": positive.session_id,
+            "event_id": f"event-{fold}", "start_ms": positive.coarse_start_ms,
+            "end_ms": positive.coarse_end_ms, "hand_relation": "same",
+        }])
+        root = tmp_path / "experiments" / "repair" / f"fold_{fold}"
+        frames = {"outer/proposals.parquet": proposals, "outer/window_predictions.parquet": windows,
+                  "evaluation/truth_events.parquet": truth, "evaluation/ignore_events.parquet": truth.iloc[:0]}
+        for relative, frame in frames.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(path, index=False)
+            if relative != "outer/proposals.parquet":
+                reference = tmp_path / "experiments" / reference_run / f"fold_{fold}" / relative
+                reference.parent.mkdir(parents=True, exist_ok=True)
+                frame.to_parquet(reference, index=False)
+        (root / "resolved_config.yaml").write_text(
+            yaml.safe_dump({key: value for key, value in config.items() if not key.startswith("_")}), encoding="utf-8",
+        )
+        write_json_atomic(root / "selection/state_epochs.json", {"2026": 3})
+        write_json_atomic(root / "crossfit/partition_0/selector_seed_2026.json", {
+            "selected_epoch": 3, "promotion_eligible": True,
+        })
+        paths = [*frames, "resolved_config.yaml", "selection/state_epochs.json",
+                 "crossfit/partition_0/selector_seed_2026.json"]
+        write_json_atomic(root / "run_manifest.json", {
+            "outer_fold": fold, "code_version": "v4.9", "stage": "EVALUATED", "git": {"commit": "source"},
+            "input_hashes": inputs, "artifact_hashes": {relative: sha256_file(root / relative) for relative in paths},
+        })
+    return config
+
+
+def test_v49_explicit_skip_s0_retains_verified_frozen_reference(tmp_path):
+    config = _outer_preflight_fixture(tmp_path)
+    report = evaluate_v49_outer_preflight(tmp_path, "repair", None, config, skip_s0=True)
+    assert report["passed"] is True
+    assert report["sensor_only_reference"]["comparison_performed"] is False
+    assert "sensor_only_coverage_retained" not in report["checks"]
+    assert all(row["sensor_only_coverage"] is None for row in report["folds"])
+    assert report["reference_evidence_sha256"]
+    manifest = {
+        "protocol": "v49_gate_manifest_v1", "candidate_run": "repair", "s0_run": None,
+        "folds": list(range(5)), "passed": True, "crossfold_gate": report,
+        **{name: report[name] for name in (
+            "identity", "evidence_sha256", "reference_evidence_sha256", "sensor_only_reference",
+        )},
+    }
+    write_json_atomic(tmp_path / "experiments/repair/v49_gate_manifest.json", manifest)
+    assert validate_v49_gate_manifest(tmp_path, "repair", report["identity"])["passed"] is True
+
+
+@pytest.mark.parametrize("skip_s0,s0_run", [(False, None), (True, "sensor-only")])
+def test_v49_skip_s0_requires_exclusive_explicit_policy(tmp_path, skip_s0, s0_run):
+    with pytest.raises(ValueError, match="explicit"):
+        evaluate_v49_outer_preflight(tmp_path, "repair", s0_run, _config(), skip_s0=skip_s0)
+
+
+def test_v49_skip_s0_cannot_bypass_candidate_coverage(tmp_path):
+    config = _outer_preflight_fixture(tmp_path)
+    config["promotion_gate"]["candidate_coverage_minimum"] = 6
+    for fold in range(5):
+        root = tmp_path / "experiments" / "repair" / f"fold_{fold}"
+        path = root / "resolved_config.yaml"
+        path.write_text(yaml.safe_dump({key: value for key, value in config.items() if not key.startswith("_")}), encoding="utf-8")
+        manifest = json.loads((root / "run_manifest.json").read_text(encoding="utf-8"))
+        manifest["artifact_hashes"]["resolved_config.yaml"] = sha256_file(path)
+        write_json_atomic(root / "run_manifest.json", manifest)
+    report = evaluate_v49_outer_preflight(tmp_path, "repair", None, config, skip_s0=True)
+    assert report["checks"]["candidate_coverage"] is False
+    assert report["passed"] is False
+
+
+@pytest.mark.parametrize("issue", ["cohort", "missing_reference"])
+def test_v49_skip_s0_cannot_bypass_frozen_reference(tmp_path, issue):
+    config = _outer_preflight_fixture(tmp_path)
+    reference_run = config["v49"]["frozen_reference_run"]
+    if issue == "cohort":
+        path = tmp_path / "experiments" / reference_run / "fold_4/evaluation/truth_events.parquet"
+        truth = pd.read_parquet(path).assign(end_ms=lambda frame: frame.end_ms + 3_000)
+        truth.to_parquet(path, index=False)
+    else:
+        (tmp_path / "final" / reference_run / "deep_crossfit.json").unlink()
+    with pytest.raises((RuntimeError, FileNotFoundError)):
+        evaluate_v49_outer_preflight(tmp_path, "repair", None, config, skip_s0=True)
+
+
+@pytest.mark.parametrize("issue", ["missing_policy", "pretend_passed", "claimed_comparison", "named_reference"])
+def test_v49_missing_s0_comparison_cannot_be_presented_as_passed(tmp_path, issue):
+    root, identity, manifest = _locked_manifest(tmp_path)
+    if issue == "missing_policy":
+        manifest.pop("sensor_only_reference")
+        manifest["crossfold_gate"].pop("sensor_only_reference")
+    elif issue == "pretend_passed":
+        manifest["crossfold_gate"]["checks"] = {"sensor_only_coverage_retained": True}
+    elif issue == "claimed_comparison":
+        manifest["sensor_only_reference"]["comparison_performed"] = True
+        manifest["crossfold_gate"]["sensor_only_reference"]["comparison_performed"] = True
+    else:
+        manifest["s0_run"] = "made-up-reference"
+    write_json_atomic(root / "v49_gate_manifest.json", manifest)
+    with pytest.raises(RuntimeError):
+        validate_v49_gate_manifest(tmp_path, "run", identity)

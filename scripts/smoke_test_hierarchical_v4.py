@@ -10,6 +10,7 @@ import torch
 from bme_eating.config import load_config
 from bme_eating.data.stats_fusion_preprocess import causal_completed_block_layout
 from bme_eating.data.stats_fusion_sequence import sequence_geometry_from_config
+from bme_eating.models.event_verifier_v4 import EventVerifierV4, verifier_loss_v4
 from bme_eating.models.factory import build_state_model
 from bme_eating.models.stats_fusion_loss import StatsFusionStateLoss
 
@@ -96,6 +97,37 @@ def main() -> None:
     maximum_error = float(torch.max(torch.abs(first - second)).cpu())
     if maximum_error > 1e-6:
         raise RuntimeError(f"Repeated inference differs by {maximum_error:.3e}")
+    del output, loss, first, second, model, batch, motion_blocks, invariant_blocks, ppg_blocks, statistics
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(device)
+    verifier_batch = {
+        "sequence": torch.randn(batch_size, 32, 160, device=device),
+        "sequence_mask": torch.ones(batch_size, 32, dtype=torch.bool, device=device),
+        "scalar": torch.randn(batch_size, 128, device=device),
+        "event_target": torch.ones(batch_size, device=device),
+        "iou_target": torch.full((batch_size,), 0.5, device=device),
+    }
+    if config["verifier"].get("use_raw_imu_branch"):
+        raw = torch.randn(batch_size, 3, 12, 300, device=device)
+        raw[:, :, 6:] = 1
+        raw[:, :, 9:] = 0
+        raw[:, :, 3:6] = 0
+        verifier_batch["raw_imu"] = raw
+    verifier = EventVerifierV4(160, 128, config["verifier"]).to(device).train()
+    verifier_output = verifier(verifier_batch)
+    verifier_loss, _ = verifier_loss_v4(verifier_output, verifier_batch)
+    verifier_loss.backward()
+    if not torch.isfinite(verifier_loss) or any(parameter.grad is not None and not torch.isfinite(parameter.grad).all() for parameter in verifier.parameters()):
+        raise RuntimeError("Deep verifier smoke has non-finite loss or gradients")
+    verifier.eval()
+    with torch.no_grad():
+        first_deep = verifier(verifier_batch)["event_logit"]
+        second_deep = verifier(verifier_batch)["event_logit"]
+    deep_error = float((first_deep - second_deep).abs().max().cpu())
+    deep_peak = torch.cuda.max_memory_allocated(device) / 1024**3 if device.type == "cuda" else 0.0
+    if deep_error > 1e-6 or deep_peak >= 10.5:
+        raise RuntimeError("Deep verifier smoke fails determinism or memory qualification")
     print(
         json.dumps(
             {
@@ -107,6 +139,9 @@ def main() -> None:
                 "steps": steps,
                 "peak_memory_gb": peak_gb,
                 "repeat_probability_max_error": maximum_error,
+                "deep_repeat_logit_max_error": deep_error,
+                "deep_peak_memory_gb": deep_peak,
+                "raw_imu_branch": bool(config["verifier"].get("use_raw_imu_branch")),
             },
             indent=2,
         )

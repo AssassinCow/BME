@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import platform
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,7 @@ OBSERVATION_GAP_PROTOCOL = "active_sensor_valid_runs_v1"
 RUNTIME_SOURCE_BINDING = "exact_runtime_sha_v1"
 FULL_STATE_SEEDS = (2026, 2027, 2028)
 DIRECT_STATE_SEEDS = (2026,)
+V49_VERIFIER_SEEDS = (2026, 2027, 2028)
 RUNTIME_SOURCE_FILES = (
     "__init__.py",
     "calibration_v4.py",
@@ -55,6 +58,21 @@ RUNTIME_SOURCE_FILES = (
     "models/factory.py",
     "models/hierarchical_state.py",
     "models/stats_fusion_state.py",
+)
+V49_EXECUTION_SOURCE_FILES = (
+    "scripts/_bootstrap.py",
+    "scripts/prepare_statsfusion_v4_inputs.py",
+    "scripts/audit_statsfusion_feature_provenance.py",
+    "scripts/train_hierarchical_v4_state.py",
+    "scripts/build_event_candidates_v4.py",
+    "scripts/select_hierarchical_v4_pipeline.py",
+    "scripts/evaluate_hierarchical_v4.py",
+    "scripts/smoke_test_hierarchical_v4.py",
+    "scripts/run_hierarchical_v49_integrated.py",
+    "scripts/check_hierarchical_v4_gates.py",
+    "scripts/train_hierarchical_v4_final.py",
+    "scripts/export_hierarchical_v4_bundle.py",
+    "scripts/replay_hierarchical_v4_raw_session.py",
 )
 R3_ABLATION_IDS = frozenset(
     {
@@ -137,6 +155,43 @@ def runtime_source_identity(package_root: Path) -> dict[str, Any]:
     return {"files": files, "sha256": hashlib.sha256(payload).hexdigest()}
 
 
+def execution_source_identity(project_root: Path) -> dict[str, Any]:
+    files: dict[str, str] = {}
+    relative_paths = set(V49_EXECUTION_SOURCE_FILES)
+    relative_paths.update(path.relative_to(project_root).as_posix() for path in (project_root / "src/bme_eating").rglob("*.py"))
+    for relative in sorted(relative_paths):
+        path = Path(project_root) / relative
+        if not path.is_file():
+            raise FileNotFoundError(f"v4.9 execution source is missing: {relative}")
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        files[relative] = digest.hexdigest()
+    payload = json.dumps(files, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return {"files": files, "sha256": hashlib.sha256(payload).hexdigest()}
+
+
+def execution_environment_identity() -> dict[str, Any]:
+    import torch
+
+    return {
+        "python": platform.python_version(), "torch": str(torch.__version__),
+        "cuda_runtime": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "conda_environment": os.environ.get("CONDA_DEFAULT_ENV"),
+    }
+
+
+def protocol_git_identity(project_root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    from bme_eating.reproducibility import git_worktree_identity
+
+    git = git_worktree_identity(project_root)
+    if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+        return {"commit": git["commit"], "execution_source_sha256": execution_source_identity(project_root)["sha256"]}
+    return git
+
+
 def validate_r3_config(config: dict[str, Any]) -> None:
     experiment = config.get("experiment", {})
     protocol = experiment.get("protocol_version")
@@ -159,23 +214,23 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         if not bool(config.get("verifier", {}).get("include_v48_source_flags", False)):
             raise ValueError(f"{candidate_protocol} verifier requires all candidate-source flags")
         if int(config.get("decoder", {}).get("maximum_variants_per_event", 0)) != 17:
-            raise ValueError("v4.8 requires the 17-way symmetric jitter set")
+            raise ValueError(f"{candidate_protocol} requires the 17-way symmetric jitter set")
         if float(config["decoder"].get("low_threshold", -1)) != 0.04:
-            raise ValueError("v4.8 requires low_threshold: 0.04")
+            raise ValueError(f"{candidate_protocol} requires low_threshold: 0.04")
         if float(config["decoder"].get("high_threshold", -1)) not in {0.06, 0.08}:
-            raise ValueError("v4.8 high threshold must be 0.06 or 0.08")
+            raise ValueError(f"{candidate_protocol} high threshold must be 0.06 or 0.08")
         if bool(config.get("verifier", {}).get("use_raw_imu_branch", False)) and (
             config.get("hierarchical", {}).get("downstream_mode") != "pooled_deep_only"
         ):
-            raise ValueError("v4.8 raw IMU verifier requires pooled Deep mode")
+            raise ValueError(f"{candidate_protocol} raw IMU verifier requires pooled Deep mode")
         if bool(config.get("model", {}).get("use_proposal_head", False)) != bool(
             config.get("decoder", {}).get("use_proposal_head", False)
         ):
-            raise ValueError("v4.8 proposal head model and decoder flags must agree")
+            raise ValueError(f"{candidate_protocol} proposal head model and decoder flags must agree")
         if bool(config.get("model", {}).get("use_proposal_head", False)) != (
             float(config.get("loss", {}).get("proposal_weight", 0.0)) == 0.1
         ):
-            raise ValueError("v4.8 enabled proposal head requires loss weight 0.1")
+            raise ValueError(f"{candidate_protocol} enabled proposal head requires loss weight 0.1")
     ablation_id = str(experiment.get("ablation_id", ""))
     if ablation_id not in R3_ABLATION_IDS:
         raise ValueError(f"StatsFusion-r3 uses an unsupported ablation_id: {ablation_id!r}")
@@ -341,11 +396,34 @@ def validate_r3_config(config: dict[str, Any]) -> None:
         raise ValueError("training.selector_decoder_search must be 'full' or 'fixed'")
     configured_state_seeds(config)
     verifier_seeds = [int(value) for value in config.get("verifier", {}).get("seeds", [])]
-    expected_verifier_seeds = [2026] if ablation_id == "R3-DIRECT" else [2026, 2027, 2028]
+    expected_verifier_seeds = (
+        list(V49_VERIFIER_SEEDS)
+        if config.get("v49", {}).get("protocol") == "integrated_repair_v2"
+        else ([2026] if ablation_id == "R3-DIRECT" else [2026, 2027, 2028])
+    )
     if verifier_seeds != expected_verifier_seeds:
         raise ValueError(
             f"{ablation_id or 'StatsFusion-r3'} requires verifier seeds {expected_verifier_seeds}"
         )
+    if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+        if not bool(verifier_config.get("use_raw_imu_branch", False)):
+            raise ValueError("v4.9 requires the raw IMU verifier branch")
+        if (
+            str(config.get("v49", {}).get("protocol", "")).startswith("integrated_repair")
+            and not bool(config.get("project", {}).get("enforce_runtime_source_identity_on_resume", False))
+        ):
+            raise ValueError("v4.9 requires runtime source identity enforcement")
+        if "maximum_tp_to_fp_fraction" in config.get("promotion_gate", {}):
+            raise ValueError("v4.9 uses maximum_tp_to_fp_rate; legacy fraction key is forbidden")
+        if verifier_config.get("raw_imu_normalization") != "training_fold_robust_v1":
+            raise ValueError("v4.9 requires training-fold raw IMU normalization")
+        if list(boundary_config.get("entropy_thresholds", [])) != [0.55, 0.65, 0.75]:
+            raise ValueError("v4.9 requires the registered Boundary entropy search")
+        if decoder.get("source_score_normalization") != "session_source_percentile_v1":
+            raise ValueError("v4.9 requires session-local source normalization")
+        for name in ("preprocess_num_workers", "num_workers", "inference_num_workers"):
+            if int(config["training"].get(name, 0)) < 1:
+                raise ValueError(f"v4.9 requires positive training.{name}")
     if str(config.get("hierarchical", {}).get("downstream_mode", "full")) in {
         "pooled_heads",
         "pooled_deep_only",

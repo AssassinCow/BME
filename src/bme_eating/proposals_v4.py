@@ -41,6 +41,82 @@ def interval_iou(start_a: int, end_a: int, start_b: int, end_b: int) -> float:
     return intersection / union if union > 0 else 0.0
 
 
+def proposal_source_family(source_mask: int) -> str:
+    if source_mask & int(ProposalSource.PROPOSAL_HEAD):
+        return "proposal_head"
+    if source_mask & int(ProposalSource.BACKTRACK | ProposalSource.START_EXPANSION):
+        return "expansion"
+    return "state"
+
+
+def budget_v49_candidates(group: pd.DataFrame, budget: int, config: dict[str, Any]) -> pd.DataFrame:
+    if budget < 1:
+        raise ValueError("Candidate budget must be positive")
+    ranked = group.copy()
+    if not np.isfinite(ranked["generator_score"].to_numpy(dtype=float)).all():
+        raise ValueError("Candidate generator scores must be finite")
+    ranked["source_family"] = ranked["source_mask"].astype(int).map(proposal_source_family)
+    ranked["normalized_generator_score"] = ranked.groupby("source_family")["generator_score"].rank(method="average", pct=True)
+    ranked = ranked.sort_values(
+        ["normalized_generator_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"],
+        ascending=[False, True, True, True], kind="stable",
+    )
+    duration = (ranked["coarse_end_ms"] - ranked["coarse_start_ms"]) / 1000.0
+    eligibility = {
+        "proposal_head": (ranked["source_mask"].astype(int) & int(ProposalSource.PROPOSAL_HEAD)).ne(0),
+        "short": duration <= float(config.get("short_candidate_maximum_seconds", 30)),
+        "expansion": (ranked["source_mask"].astype(int) & int(ProposalSource.BACKTRACK | ProposalSource.START_EXPANSION)).ne(0),
+    }
+    fractions = {
+        "proposal_head": float(config.get("proposal_head_minimum_fraction", 0.20)),
+        "short": float(config.get("short_candidate_minimum_fraction", 0.15)),
+        "expansion": float(config.get("expansion_minimum_fraction", 0.15)),
+    }
+    if any(not 0 <= value <= 1 for value in fractions.values()) or sum(fractions.values()) > 1:
+        raise ValueError("Candidate quota fractions must be non-negative and sum to at most one")
+    targets = {name: int(np.ceil(budget * fraction)) for name, fraction in fractions.items()}
+    selected: list[int] = []
+    families: set[str] = set()
+    for unique_families in (True, False):
+        for name, mask in eligibility.items():
+            for index in ranked.index[mask]:
+                if len(selected) >= budget or int(mask.reindex(selected).sum()) >= targets[name]:
+                    break
+                family = str(ranked.at[index, "proposal_family_id"])
+                if index in selected or (unique_families and family in families):
+                    continue
+                selected.append(index)
+                families.add(family)
+        for index in ranked.index:
+            if len(selected) >= budget:
+                break
+            if unique_families:
+                reserved = sum(min(
+                    max(0, targets[name] - int(mask.reindex(selected).sum())),
+                    int(mask.loc[~mask.index.isin(selected)].sum()),
+                ) for name, mask in eligibility.items())
+                if len(selected) >= budget - reserved:
+                    break
+            family = str(ranked.at[index, "proposal_family_id"])
+            if index not in selected and (not unique_families or family not in families):
+                selected.append(index)
+                families.add(family)
+    output = ranked.loc[selected].copy()
+    diagnostics = {
+        "budget": budget, "available_candidates": len(group), "selected_candidates": len(output),
+        "available_families": group["proposal_family_id"].nunique(), "selected_families": len(families),
+        "quotas": {name: {
+            "target": targets[name], "available": int(mask.sum()),
+            "selected": int(mask.reindex(selected).sum()),
+            "shortfall": max(0, targets[name] - int(mask.reindex(selected).sum())),
+            "reason": ("insufficient_candidates" if int(mask.sum()) < targets[name] else "budget_or_family_constraint")
+            if int(mask.reindex(selected).sum()) < targets[name] else None,
+        } for name, mask in eligibility.items()},
+    }
+    output["budget_diagnostics"] = json.dumps(diagnostics, sort_keys=True)
+    return output
+
+
 def causal_ema(
     probabilities: np.ndarray, half_life_seconds: float, step_seconds: float
 ) -> np.ndarray:
@@ -651,6 +727,9 @@ def generate_event_candidates_v4(
     for (subject, session), group in unbudgeted.groupby(["subject_key", "session_id"], sort=False):
         session_key = (str(subject), str(session))
         budget = max(1, int(np.ceil(observed_hours[session_key] * maximum_per_hour)))
+        if config.get("source_budget_protocol") == "normalized_source_family_quota_v1":
+            selected_frames.append(budget_v49_candidates(group, budget, config))
+            continue
         ordering = ["generator_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"]
         ascending = [False, True, True, True]
         ranked_group = group.sort_values(ordering, ascending=ascending, kind="stable")
@@ -712,9 +791,10 @@ def generate_event_candidates_v4(
                 break
         selected_frames.append(unbudgeted.loc[selected].copy())
     output = pd.concat(selected_frames, ignore_index=True)
+    ranking_score = "normalized_generator_score" if "normalized_generator_score" in output else "generator_score"
     output["rank_within_session"] = (
         output.sort_values(
-            ["generator_score", "coarse_start_ms", "coarse_end_ms", "proposal_id"],
+            [ranking_score, "coarse_start_ms", "coarse_end_ms", "proposal_id"],
             ascending=[False, True, True, True],
             kind="stable",
         )
@@ -725,7 +805,7 @@ def generate_event_candidates_v4(
         .astype(int)
     )
     return (
-        output[columns]
+        output[columns + [name for name in ("source_family", "normalized_generator_score", "budget_diagnostics") if name in output]]
         .sort_values(["subject_key", "session_id", "rank_within_session"], kind="stable")
         .reset_index(drop=True)
     )

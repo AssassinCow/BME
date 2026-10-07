@@ -69,6 +69,17 @@ def test_final_resume_ignores_only_source_identity_metadata() -> None:
     )
 
 
+def test_v49_optimized_config_registers_raw_imu_and_mixed_seed_profile() -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = load_config(root / "configs" / "hierarchical_v4_v49_integrated_optimized.yaml")
+    validate_r3_config(config)
+    assert config["verifier"]["use_raw_imu_branch"] is True
+    assert config["verifier"]["seeds"] == [2026, 2027, 2028]
+    assert config["final_training"]["state_seeds"] == [2026]
+    assert config["training"]["preprocess_num_workers"] == 10
+    assert "maximum_tp_to_fp_fraction" not in config["promotion_gate"]
+
+
 def test_r3_config_rejects_blocked_s4_ablation_name() -> None:
     root = Path(__file__).resolve().parents[1]
     config = load_config(root / "configs" / "hierarchical_v4_statsfusion_r3.yaml")
@@ -363,5 +374,6 @@ def test_repository_keeps_only_current_config_chain() -> None:
         "hierarchical_v4_v48_proposal_head_no_mixstyle.yaml",
         "hierarchical_v4_v48_proposal_head_no_contrastive.yaml",
         "hierarchical_v4_v49_integrated_repair.yaml",
+        "hierarchical_v4_v49_integrated_optimized.yaml",
     }
     assert {path.name for path in root.glob("*.yaml")} == expected

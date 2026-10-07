@@ -78,6 +78,27 @@ def _verify_bundle_runtime_source(root: Path) -> None:
         raise RuntimeError("V4 bundle runtime differs from the imported bme_eating source")
 
 
+def _verify_v49_deployment_lock(root: Path, config: dict[str, Any], selection: dict[str, Any]) -> None:
+    if config.get("v49", {}).get("protocol") != "integrated_repair_v2":
+        return
+    lock_path = root / "v49_deployment_protocol.json"
+    if not lock_path.is_file():
+        raise RuntimeError("v4.9 bundle lacks its deployment protocol lock")
+    lock = json.loads(lock_path.read_text(encoding="utf-8"))
+    if (lock.get("protocol") != "v49_deployment_lock_v2"
+            or lock.get("config_sha256") != _sha256_file(root / "resolved_config.yaml")
+            or lock.get("nested_state_protocol") != POOLED_HEAD_TRAINING_PROTOCOL
+            or lock.get("boundary_passed") is not True
+            or lock.get("state_seeds") != [2026] or lock.get("verifier_seeds") != [2026, 2027, 2028]
+            or selection.get("state_seeds") != [2026] or selection.get("verifier_seeds") != [2026, 2027, 2028]):
+        raise RuntimeError("v4.9 bundle has an incompatible deployment lock")
+    for name, protocol in (("v49_deep_gate.json", "v49_deep_promotion_v1"),
+                           ("v49_raw_imu_gate.json", "v49_raw_imu_nested_crossfit_gate_v2")):
+        gate = json.loads((root / name).read_text(encoding="utf-8"))
+        if gate.get("protocol") != protocol or gate.get("passed") is not True:
+            raise RuntimeError("v4.9 bundle lacks qualified Deep and raw IMU evidence")
+
+
 def _iter_tail_aligned_raw_state_batches(
     preprocessor: StatsFusionRawSessionPreprocessor,
     raw_session: RawSessionInput,
@@ -517,6 +538,7 @@ def load_hierarchical_v4_bundle(
     _verify_bundle_runtime_source(root)
     config = yaml.safe_load((root / "resolved_config.yaml").read_text(encoding="utf-8"))
     selection = json.loads((root / "selected_pipeline.json").read_text(encoding="utf-8"))
+    _verify_v49_deployment_lock(root, config, selection)
     if selection.get("protocol_version") != PROTOCOL_VERSION:
         raise RuntimeError(f"Only {PROTOCOL_VERSION} bundles are supported")
     if selection.get("raw_input_schema") != RAW_INPUT_SCHEMA:
@@ -528,11 +550,11 @@ def load_hierarchical_v4_bundle(
         if bool(config.get("model", {}).get("use_proposal_head", False)) != (
             selection.get("proposal_head_protocol") == "causal_event_nomination_v1"
         ):
-            raise RuntimeError("v4.8 bundle proposal-head binding is incompatible")
+            raise RuntimeError(f"{candidate_protocol} bundle proposal-head binding is incompatible")
         if bool(config.get("verifier", {}).get("use_raw_imu_branch", False)) != (
             selection.get("raw_imu_verifier_protocol") == "three_causal_30s_snippets_v1"
         ):
-            raise RuntimeError("v4.8 bundle raw IMU binding is incompatible")
+            raise RuntimeError(f"{candidate_protocol} bundle raw IMU binding is incompatible")
     selected_decoder = selection.get("decoder_config")
     if not isinstance(selected_decoder, dict):
         raise TypeError("V4 bundle selection has no hash-locked decoder configuration")

@@ -37,6 +37,9 @@ from bme_eating.v4_protocol import (
     RAW_INPUT_SCHEMA,
     TARGET_SEMANTICS,
     V49_CODE_VERSION,
+    execution_environment_identity,
+    execution_source_identity,
+    protocol_git_identity,
     validate_r3_config,
 )
 
@@ -46,6 +49,9 @@ RESUME_RUNTIME_CONFIG_PATHS = frozenset(
         "training.inference_num_workers",
         "training.inference_batch_size",
         "training.inference_resume_chunk_rows",
+        "training.loader_prefetch_factor",
+        "training.session_reader_cache_size",
+        "training.preprocess_num_workers",
     }
 )
 RESUME_POLICY_CONFIG_KEYS = frozenset(
@@ -67,6 +73,12 @@ def _public_config(config: dict[str, Any]) -> dict[str, Any]:
 def _resume_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = deepcopy(_public_config(config))
     if config.get("decoder", {}).get("candidate_protocol") == "v4.9":
+        training = normalized.get("training")
+        if isinstance(training, dict):
+            for path in RESUME_RUNTIME_CONFIG_PATHS:
+                section, key = path.split(".", 1)
+                if section == "training":
+                    training.pop(key, None)
         return normalized
     project = normalized.get("project")
     if isinstance(project, dict):
@@ -253,7 +265,7 @@ def current_v4_identity(config: dict[str, Any], input_root: Path) -> dict[str, A
     missing = [name for name, path in tracked.items() if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"Required StatsFusion inputs are missing: {missing}")
-    return {
+    identity = {
         "protocol_version": PROTOCOL_VERSION,
         "pooled_head_protocol": (
             POOLED_HEAD_PROTOCOL
@@ -262,9 +274,19 @@ def current_v4_identity(config: dict[str, Any], input_root: Path) -> dict[str, A
             else None
         ),
         "resolved_config_sha256": resume_config_hash(config),
-        "git": git_worktree_identity(Path(__file__).resolve().parents[2]),
+        "git": protocol_git_identity(Path(__file__).resolve().parents[2], config),
         "input_hashes": {name: sha256_file(path) for name, path in tracked.items()},
     }
+    if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+        identity["v49_gate_manifest"] = str(
+            config.get("v49", {}).get("gate_manifest", "v49_gate_manifest.json")
+        )
+    if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+        identity["execution_source_identity"] = execution_source_identity(
+            Path(__file__).resolve().parents[2]
+        )
+        identity["execution_environment"] = execution_environment_identity()
+    return identity
 
 
 def validate_v4_freeze_manifest(
@@ -326,7 +348,9 @@ def initialize_v4_run(
     public_config = _public_config(config)
     config_hash = resume_config_hash(config)
     project_root = Path(__file__).resolve().parents[2]
-    git_identity = git_worktree_identity(project_root)
+    git_identity = (protocol_git_identity(project_root, config)
+                    if config.get("v49", {}).get("protocol") == "integrated_repair_v2"
+                    else git_worktree_identity(project_root))
     experiment_root = output_root / "experiments" / run_name
     time_constrained_single_holdout = bool(
         config.get("experiment", {}).get("time_constrained_single_holdout", False)
@@ -353,6 +377,9 @@ def initialize_v4_run(
         raise FileNotFoundError(f"Required StatsFusion inputs are missing: {missing}")
     input_hashes = {name: sha256_file(path) for name, path in tracked.items()}
     if config.get("decoder", {}).get("candidate_protocol") == "v4.9":
+        from bme_eating.v49_resume import validate_resume_migration
+
+        validate_resume_migration(experiment_root, config, input_hashes)
         config["_v49_input_files"] = {
             str(path): [path.stat().st_size, path.stat().st_mtime_ns] for path in tracked.values()
         }
@@ -369,6 +396,11 @@ def initialize_v4_run(
             raise RuntimeError("Active v4 configuration differs from the run manifest")
         if payload.get("input_hashes") != input_hashes:
             raise RuntimeError("V2 inputs changed after the v4 run was initialized")
+        if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+            if payload.get("execution_source_identity") != execution_source_identity(Path(__file__).resolve().parents[2]):
+                raise RuntimeError("v4.9 execution source changed; choose a new run")
+            if payload.get("execution_environment") != execution_environment_identity():
+                raise RuntimeError("v4.9 execution environment changed; choose a new run")
         if (
             fold >= 2
             and not time_constrained_single_holdout
@@ -531,6 +563,10 @@ def initialize_v4_run(
             "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         },
     }
+    if config.get("v49", {}).get("protocol") == "integrated_repair_v2":
+        payload["worktree_identity"] = git_worktree_identity(project_root)
+        payload["execution_source_identity"] = execution_source_identity(Path(__file__).resolve().parents[2])
+        payload["execution_environment"] = execution_environment_identity()
     if fold >= 2 and not time_constrained_single_holdout:
         payload["freeze_manifest_sha256"] = sha256_file(freeze_path)
     write_json_atomic(manifest_path, payload)

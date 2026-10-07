@@ -27,11 +27,38 @@ from bme_eating.data.stats_fusion_sequence import (
     StatsFusionSequenceDataset,
     sequence_geometry_from_config,
 )
-from bme_eating.hierarchical_artifacts import write_json_atomic
+from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
 from bme_eating.hierarchical_v4_pipeline import load_hierarchical_v4_bundle
 from bme_eating.models.factory import build_state_model
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
-from bme_eating.v4_protocol import PROTOCOL_VERSION
+from bme_eating.v4_protocol import (
+    PROTOCOL_VERSION,
+    execution_environment_identity,
+    execution_source_identity,
+)
+
+
+def validate_replay_lock(bundle: Path, config: dict) -> dict:
+    if config.get("v49", {}).get("protocol") != "integrated_repair_v2":
+        return {}
+    path = bundle / "v49_deployment_protocol.json"
+    if not path.is_file():
+        raise RuntimeError("v4.9 replay requires the deployment protocol lock")
+    lock = json.loads(path.read_text(encoding="utf-8"))
+    if (lock.get("protocol") != "v49_deployment_lock_v2"
+            or lock.get("execution_source_identity") != execution_source_identity(Path(__file__).resolve().parents[1])
+            or lock.get("execution_environment") != execution_environment_identity()
+            or lock.get("config_sha256") != sha256_file(bundle / "resolved_config.yaml")
+            or lock.get("nested_state_protocol") != "fully_excluded_nested_state_oof_v1"
+            or lock.get("boundary_passed") is not True
+            or lock.get("state_seeds") != [2026] or lock.get("verifier_seeds") != [2026, 2027, 2028]):
+        raise RuntimeError("v4.9 replay protocol/runtime identity changed")
+    for name, protocol in (("v49_deep_gate.json", "v49_deep_promotion_v1"),
+                           ("v49_raw_imu_gate.json", "v49_raw_imu_nested_crossfit_gate_v2")):
+        gate = json.loads((bundle / name).read_text(encoding="utf-8"))
+        if gate.get("protocol") != protocol or gate.get("passed") is not True:
+            raise RuntimeError("v4.9 replay requires qualified Deep and raw IMU gates")
+    return lock
 
 
 def _repeat_frame_error(first: pd.DataFrame, second: pd.DataFrame, identity: list[str]) -> float:
@@ -142,6 +169,7 @@ def main() -> None:
         ppg_mask=payload["ppg_mask"],
     )
     if args.bundle:
+        replay_lock = validate_replay_lock(Path(args.bundle), config)
         if args.forbid_xgboost:
             class BlockXGBoost:
                 def find_spec(self, fullname, path=None, target=None):
@@ -204,6 +232,7 @@ def main() -> None:
             "repeat_state_max_error": state_error, "repeat_proposal_max_error": score_error,
             "xgboost_import_forbidden": bool(args.forbid_xgboost),
             "checkpoint_manifest": json.loads((Path(args.bundle) / "SHA256SUMS.json").read_text(encoding="utf-8")),
+            "protocol_lock": replay_lock,
         }
         report_path = Path(args.output).resolve() if args.output else Path(args.bundle).parent / "bundle_replay.json"
         write_json_atomic(report_path, report)

@@ -282,6 +282,7 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         ppg_modality_dropout: float = 0.0,
         gyro_modality_dropout: float = 0.0,
         rotation_augmentation_probability: float = 0.0,
+        reader_cache_size: int = 8,
         seed: int = 2026,
     ) -> None:
         required = {
@@ -361,7 +362,9 @@ class StatsFusionSequenceDataset(Dataset[dict[str, torch.Tensor | str | int]]):
         if not 0.0 <= self.rotation_augmentation_probability <= 1.0:
             raise ValueError("Rotation augmentation probability must be in [0, 1]")
         self.seed = int(seed)
-        self.reader = SessionWindowReader(segments, cache_size=8)
+        if int(reader_cache_size) <= 0:
+            raise ValueError("Reader cache size must be positive")
+        self.reader = SessionWindowReader(segments, cache_size=int(reader_cache_size))
         self.session_groups = {
             (str(subject), str(session)): group.sort_values("timestamp_ms").reset_index(drop=True)
             for (subject, session), group in self.anchors.groupby(

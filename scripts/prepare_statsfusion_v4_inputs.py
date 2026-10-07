@@ -17,7 +17,7 @@ def main() -> None:
     parser.add_argument(
         "--config", default="configs/hierarchical_v4_r32_pooled_heads_early_select.yaml"
     )
-    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--workers", type=int)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--fresh", action="store_true")
     mode.add_argument("--resume", action="store_true")
@@ -28,11 +28,12 @@ def main() -> None:
         raise RuntimeError(
             f"Canonical StatsFusion preparation requires {PROTOCOL_VERSION}"
         )
+    workers = args.workers or int(config.get("training", {}).get("preprocess_num_workers", 8))
     _, input_root, output_root = resolve_artifact_roots(config)
     manifest = prepare_canonical_statsfusion_inputs(
         input_root,
         output_root,
-        workers=args.workers,
+        workers=workers,
         fresh=args.fresh,
         resume=args.resume,
     )

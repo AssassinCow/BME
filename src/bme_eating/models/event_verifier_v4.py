@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter, defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +10,8 @@ import pandas as pd
 import torch
 from torch import nn
 from torch.utils.data import Dataset, Sampler
+
+from bme_eating.proposals_v4 import proposal_source_family
 
 CATEGORY_ORDER = (
     "positive",
@@ -168,8 +171,12 @@ class HardNegativeBatchSampler(Sampler[list[int]]):
         if missing:
             raise ValueError(f"Verifier sampling metadata is missing: {sorted(missing)}")
         normalized.setdefault("wear_hand", np.full(len(self.categories), "unknown", dtype=str))
-        ownership = pd.DataFrame({"family": normalized["proposal_family_id"], "subject": normalized["subject_key"]})
-        if ownership.groupby("family")["subject"].nunique().gt(1).any():
+        normalized.setdefault("source_family", np.asarray([
+            proposal_source_family(int(value)) for value in normalized["source_mask"]
+        ]))
+        ownership = pd.DataFrame({"family": normalized["proposal_family_id"], "subject": normalized["subject_key"],
+                                  "session": normalized.get("session_id", normalized["subject_key"])})
+        if ownership.groupby("family")[["subject", "session"]].nunique().gt(1).any().any():
             raise ValueError("Verifier proposal family crosses subject boundaries")
         return normalized
 
@@ -178,7 +185,7 @@ class HardNegativeBatchSampler(Sampler[list[int]]):
             return {name: [("all", str(index), np.asarray([index])) for index in pool] for name, pool in self.pools.items()}
         metadata = self.sampling_metadata
         key_columns = ("subject_key", "wear_hand", "hand_relation", "iou_bin", "gyro_missingness_bin",
-                       "duration_bin", "source_mask")
+                       "duration_bin", "source_family")
         strata: dict[str, list[tuple[str, str, np.ndarray]]] = {}
         for name, pool in self.pools.items():
             if not len(pool):
@@ -229,13 +236,18 @@ class HardNegativeBatchSampler(Sampler[list[int]]):
                     ]
                     if not candidates:
                         candidates = list(range(len(strata)))
-                    stratum_counts: dict[str, int] = {}
-                    for index in candidates:
-                        key = strata[index][0]
-                        stratum_counts[key] = stratum_counts.get(key, 0) + 1
-                    probabilities = np.asarray([
-                        1.0 / stratum_counts[strata[index][0]] for index in candidates
-                    ])
+                    probabilities = np.ones(len(candidates), dtype=float)
+                    paths = [strata[index][0].split("|") for index in candidates]
+                    branching: dict[tuple[str, ...], set[str]] = defaultdict(set)
+                    for path in paths:
+                        for depth in range(len(path)):
+                            branching[tuple(path[:depth])].add(path[depth])
+                    for depth in range(len(paths[0])):
+                        for candidate_index, path in enumerate(paths):
+                            probabilities[candidate_index] /= len(branching[tuple(path[:depth])])
+                    leaves = Counter(tuple(path) for path in paths)
+                    for candidate_index, path in enumerate(paths):
+                        probabilities[candidate_index] /= leaves[tuple(path)]
                     probabilities /= probabilities.sum()
                     choice = int(rng.choice(len(candidates), p=probabilities))
                     stratum_index = candidates[choice]
@@ -312,6 +324,10 @@ class EventVerifierV4(nn.Module):
         self.iou_head = nn.Linear(64, 1)
         self.use_raw_imu_branch = bool(config.get("use_raw_imu_branch", False))
         if self.use_raw_imu_branch:
+            self.use_fold_raw_normalization = config.get("raw_imu_normalization") == "training_fold_robust_v1"
+            if self.use_fold_raw_normalization:
+                self.register_buffer("raw_imu_center", torch.zeros(6))
+                self.register_buffer("raw_imu_scale", torch.ones(6))
             self.raw_imu_encoder = nn.Sequential(
                 nn.Conv1d(12, 16, kernel_size=7, stride=2, padding=3),
                 nn.SiLU(),
@@ -359,6 +375,12 @@ class EventVerifierV4(nn.Module):
             if raw_imu is None or raw_imu.ndim != 4 or raw_imu.shape[1:3] != (3, 12):
                 raise ValueError("Raw IMU verifier requires three aligned 12-channel snippets")
             raw_imu = torch.nan_to_num(raw_imu)
+            raw_mask = raw_imu[:, :, 6:, :].clamp(0, 1)
+            raw_values = raw_imu[:, :, :6, :]
+            if self.use_fold_raw_normalization:
+                raw_values = (raw_values - self.raw_imu_center[None, None, :, None]) / self.raw_imu_scale[None, None, :, None]
+                raw_values = raw_values.clamp(-10, 10)
+            raw_imu = torch.cat((torch.where(raw_mask.bool(), raw_values, 0.0), raw_mask), dim=2)
             raw_validity = raw_imu[:, :, 6:, :].mean(dim=(1, 2, 3)).clamp(0, 1)
             encoded = self.raw_imu_encoder(
                 raw_imu.reshape(-1, 12, raw_imu.shape[-1])
@@ -559,6 +581,7 @@ def build_proposal_features_v4(
                     payload["motion_mask"],
                     int(candidate.coarse_start_ms),
                     int(candidate.coarse_end_ms),
+                    normalize_locally=config.get("raw_imu_normalization") != "training_fold_robust_v1",
                 )
     for proposal_index, proposal in enumerate(proposals.itertuples(index=False)):
         if use_raw_imu:
@@ -574,6 +597,7 @@ def build_proposal_features_v4(
                     raw_session.motion_values,
                     raw_session.motion_mask,
                     int(proposal.coarse_start_ms), int(proposal.coarse_end_ms),
+                    normalize_locally=config.get("raw_imu_normalization") != "training_fold_robust_v1",
                 ))
         group = groups.get((str(proposal.subject_key), str(proposal.session_id)))
         if group is None:
@@ -739,7 +763,7 @@ def _proposal_sampling_metadata(proposals: pd.DataFrame, windows: pd.DataFrame |
     if proposals.empty:
         return {name: np.empty(0, dtype=str) for name in (
             "subject_key", "wear_hand", "hand_relation", "iou_bin", "gyro_missingness_bin",
-            "duration_bin", "source_mask", "proposal_family_id", "event_group")}
+            "duration_bin", "source_mask", "source_family", "session_id", "proposal_family_id", "event_group")}
     def values(name: str, default: str = "unknown") -> np.ndarray:
         if name in proposals:
             return proposals[name].fillna(default).astype(str).to_numpy()
@@ -763,7 +787,7 @@ def _proposal_sampling_metadata(proposals: pd.DataFrame, windows: pd.DataFrame |
             event_windows = group.iloc[left:right]
             if "gyro_valid_fraction" in event_windows and len(event_windows):
                 gyro[proposal_index] = event_windows["gyro_valid_fraction"].mean()
-            if "hand_relation" in event_windows and len(event_windows):
+            if hand[proposal_index] not in {"same", "different"} and "hand_relation" in event_windows and len(event_windows):
                 modes = event_windows["hand_relation"].dropna().astype(str).mode()
                 if len(modes):
                     hand[proposal_index] = modes.iloc[0]
@@ -783,6 +807,8 @@ def _proposal_sampling_metadata(proposals: pd.DataFrame, windows: pd.DataFrame |
         "gyro_missingness_bin": np.where(~np.isfinite(gyro) | (gyro < 0.5), "missing", "observed"),
         "duration_bin": pd.cut(duration, bins=[-np.inf, 5.0, 15.0, 30.0, 60.0, np.inf], labels=False).astype(str),
         "source_mask": values("source_mask", "0"),
+        "source_family": np.asarray([proposal_source_family(int(value)) for value in values("source_mask", "0")]),
+        "session_id": values("session_id"),
         "proposal_family_id": values("proposal_family_id", "unknown"),
         "event_group": (
             proposals.get("session_id", pd.Series("", index=proposals.index)).fillna("").astype(str)
@@ -798,6 +824,8 @@ def _raw_imu_proposal_snippets(
     mask: np.ndarray,
     start_ms: int,
     end_ms: int,
+    *,
+    normalize_locally: bool = True,
 ) -> np.ndarray:
     from bme_eating.data.deep_dataset import _sample_grid
 
@@ -818,6 +846,9 @@ def _raw_imu_proposal_snippets(
             valid = sampled_mask[:, channel]
             if not valid.any():
                 continue
+            if not normalize_locally:
+                normalized[valid, channel] = sampled[valid, channel]
+                continue
             median = np.median(sampled[valid, channel])
             spread = max(float(np.percentile(sampled[valid, channel], 75)
                                - np.percentile(sampled[valid, channel], 25)), 1e-3)
@@ -826,3 +857,23 @@ def _raw_imu_proposal_snippets(
             )
         snippets.append(np.concatenate((normalized, sampled_mask.astype(np.float32)), axis=1).T)
     return np.stack(snippets).astype(np.float16)
+
+
+def fit_raw_imu_normalization(model: EventVerifierV4, features: ProposalFeatureBatchV4) -> None:
+    if not model.use_raw_imu_branch or not model.use_fold_raw_normalization:
+        return
+    raw = features.raw_imu
+    if raw is None or raw.shape[1:] != (3, 12, 300):
+        raise ValueError("v4.9 raw IMU normalization requires training snippets")
+    centers, scales = [], []
+    sample_stride = max(1, int(np.ceil(len(raw) * 900 / 1_000_000)))
+    for channel in range(6):
+        values = raw[::sample_stride, :, channel, :].reshape(-1)
+        valid = raw[::sample_stride, :, channel + 6, :].reshape(-1).astype(bool) & np.isfinite(values)
+        selected = values[valid].astype(np.float32)
+        selected = selected[::max(1, int(np.ceil(len(selected) / 1_000_000)))]
+        centers.append(float(np.median(selected)) if len(selected) else 0.0)
+        scales.append(max(float(np.percentile(selected, 75) - np.percentile(selected, 25)), 1e-3) if len(selected) else 1.0)
+    with torch.no_grad():
+        model.raw_imu_center.copy_(torch.tensor(centers, device=model.raw_imu_center.device))
+        model.raw_imu_scale.copy_(torch.tensor(scales, device=model.raw_imu_scale.device))

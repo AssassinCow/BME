@@ -42,7 +42,13 @@ NON_CANONICAL_SOURCE_MIGRATIONS = {
             "773e6f413f696295423ad6f2e10746011c98a19fcc9df0473c46b6f95ec5fd8d",
             "bef22313c1801b35e0b7860a365de9e796b2e2e1f7cde9a2e00f48fa46288579",
         )
-    }
+    },
+    "data/stats_fusion_sequence.py": {
+        (
+            "f5975246563aa1ba9238a1f0f8bc3590a7f251f4c33bfbbddc241c6be57ffb89",
+            "4d116977c45692527157eae73f670d8653b937f1357dcaea785b23e8e2f1ff94",
+        )
+    },
 }
 
 

@@ -1,0 +1,48 @@
+extends: hierarchical_v4_v49_integrated_repair.yaml
+
+experiment:
+  name: hierarchical_v4_v49_integrated_optimized
+  variant: time_constrained_outer_single_holdout_deep_only_v49
+
+project:
+  enforce_git_identity_on_resume: true
+  enforce_runtime_source_identity_on_resume: true
+
+training:
+  preprocess_num_workers: 10
+  num_workers: 10
+  inference_num_workers: 10
+  loader_prefetch_factor: 1
+  session_reader_cache_size: 1
+  selector_requires_promotion_qualification: true
+  selector_downstream_proxy: event_f1_then_recall
+  hard_negative_sampling_protocol: subject_hand_iou_missingness_duration_source_family_category_v2
+
+verifier:
+  use_raw_imu_branch: true
+  seeds: [2026, 2027, 2028]
+  raw_imu_protocol: three_causal_30s_snippets_v1
+  raw_imu_normalization: training_fold_robust_v1
+
+boundary:
+  entropy_thresholds: [0.55, 0.65, 0.75]
+
+promotion_gate:
+  maximum_tp_to_fp_rate: 0.01
+  candidate_coverage_minimum: 125
+  candidate_coverage_target: 126
+  fold_candidate_recall_minimum: 0.70
+
+decoder:
+  source_budget_protocol: normalized_source_family_quota_v1
+  source_score_normalization: session_source_percentile_v1
+  proposal_head_minimum_fraction: 0.20
+  short_candidate_maximum_seconds: 30
+  short_candidate_minimum_fraction: 0.15
+  expansion_minimum_fraction: 0.15
+
+v49:
+  protocol: integrated_repair_v2
+  run_name_prefix: hierarchical_v4_v49_integrated_optimized
+  gate_manifest: v49_gate_manifest_v2.json
+  runtime_identity_protocol: execution_and_package_sha256_v1
