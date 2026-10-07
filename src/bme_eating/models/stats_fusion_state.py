@@ -398,6 +398,14 @@ class StatsFusionStateModel(nn.Module):
         return self.long_tcn.receptive_field_steps * self.ppg_block_seconds
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return self._forward_features(batch, expose_features=False)
+
+    def forward_features(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        return self._forward_features(batch, expose_features=True)
+
+    def _forward_features(
+        self, batch: dict[str, torch.Tensor], *, expose_features: bool
+    ) -> dict[str, torch.Tensor]:
         motion_blocks = batch["motion_blocks"]
         motion_valid = batch["motion_valid"].to(motion_blocks.dtype)
         steps = motion_blocks.shape[1]
@@ -528,6 +536,12 @@ class StatsFusionStateModel(nn.Module):
             statistics * statistics_gate_scalar * statistics_reliability.unsqueeze(-1)
         )
         combined = torch.cat((short, gated_statistics), dim=-1)
+        local = self.final_norm(
+            short
+            + statistics_gate
+            * statistics_reliability.unsqueeze(-1)
+            * self.statistics_to_hidden(statistics)
+        )
         combined_valid = torch.maximum(
             torch.maximum(motion_fusion_valid, ppg_fusion_valid), statistics_reliability
         )
@@ -618,4 +632,7 @@ class StatsFusionStateModel(nn.Module):
         }
         if self.proposal_head is not None:
             result["proposal_logit"] = self.proposal_head(final).squeeze(-1)
+        if expose_features:
+            result["semantic_features"] = final
+            result["local_features"] = local
         return result

@@ -375,5 +375,6 @@ def test_repository_keeps_only_current_config_chain() -> None:
         "hierarchical_v4_v48_proposal_head_no_contrastive.yaml",
         "hierarchical_v4_v49_integrated_repair.yaml",
         "hierarchical_v4_v49_integrated_optimized.yaml",
+        "statsfusion_v410_joint_event.yaml",
     }
     assert {path.name for path in root.glob("*.yaml")} == expected
