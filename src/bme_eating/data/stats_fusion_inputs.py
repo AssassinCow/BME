@@ -50,6 +50,20 @@ NON_CANONICAL_SOURCE_MIGRATIONS = {
         )
     },
 }
+LEGACY_MIXED_NEWLINE_SOURCE_HASHES = {
+    "data/deep_dataset.py": {
+        "bf2c70d85f1c2c0f857a7b2a1a5a1ad074811461572f8f6a492706973f577806":
+            "9fb31b215860e42ebe658a180208a591f79c230b9c1e9e239fd40c401a9f5cdb",
+    },
+    "data/labels.py": {
+        "5e390274c4316506cdccd7bcfbd8e4dca1dd6803eb83a606c052a29d22292bd9":
+            "259ac00e3a90228f88ac932932992d4ffc8b80864c4553635415076cf876948c",
+    },
+    "data/session.py": {
+        "58bfdb8f04ecd2a88f6d5cf81072374c96350a5b0810f8504ef3e8c9225e8a58":
+            "4556ae521cf446b624ac6e9558a4ab2e34bc6cfbddc4349add6122dac600921b",
+    },
+}
 
 
 def canonical_input_paths(output_root: Path) -> dict[str, Path]:
@@ -204,17 +218,33 @@ def _require_matching_preparation_identity(
     }
     compatible = bool(changed_files)
     for name in changed_files:
-        transition = (stored_files.get(name), current_files.get(name))
-        compatible &= transition in NON_CANONICAL_SOURCE_MIGRATIONS.get(name, set())
-        if compatible:
-            current_files[name] = stored_files[name]
+        compatible &= _canonical_source_compatible(name, stored_files.get(name), current_files.get(name))
     if compatible:
+        for name in changed_files:
+            current_files[name] = stored_files[name]
         current_implementation["sha256"] = stored_implementation.get("sha256")
     if not compatible or stored_copy != current_copy:
         raise RuntimeError(
             "StatsFusion canonical source identity changed; refuse resume of stale partial inputs"
         )
     return stored
+
+
+def _canonical_source_compatible(name: str, stored_hash: str | None, current_hash: str | None) -> bool:
+    if name not in FEATURE_IMPLEMENTATION_FILES:
+        return False
+    source = (Path(__file__).resolve().parents[1] / name).read_bytes()
+    if hashlib.sha256(source).hexdigest() != current_hash:
+        return False
+    normalized = source.replace(b"\r\n", b"\n")
+    normalized_hash = hashlib.sha256(normalized).hexdigest()
+    variants = {current_hash, normalized_hash,
+                hashlib.sha256(normalized.replace(b"\n", b"\r\n")).hexdigest()}
+    variants.update(old for old, normalized_identity in LEGACY_MIXED_NEWLINE_SOURCE_HASHES.get(name, {}).items()
+                    if normalized_identity == normalized_hash)
+    return stored_hash in variants or any(
+        stored_hash == old and compatible_hash in variants
+        for old, compatible_hash in NON_CANONICAL_SOURCE_MIGRATIONS.get(name, set()))
 
 
 def _verify_anchor_identity(paths: dict[str, Path]) -> None:

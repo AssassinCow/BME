@@ -63,10 +63,14 @@ def main():
     parser.add_argument("--fold", type=int, choices=range(5))
     parser.add_argument("--skip-s0", action="store_true")
     parser.add_argument("--historical-reference")
+    parser.add_argument("--migrate-clipping-gate", action="store_true",
+                        help="Apply the registered clipping-only migration to the existing failed run")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--fresh", action="store_true")
     mode.add_argument("--resume", action="store_true")
     arguments = parser.parse_args()
+    if arguments.migrate_clipping_gate and not arguments.resume:
+        parser.error("--migrate-clipping-gate requires --resume")
     if arguments.fold is not None and arguments.stage not in {"outer", "all"}:
         parser.error("--fold is only valid with --stage outer or all")
     config = load_config(arguments.config)
@@ -78,7 +82,8 @@ def main():
     root = PROJECT_ROOT
     run = initialize_run(config, root, output_base / "v410", arguments.run_name, inputs.identity,
                          fresh=arguments.fresh, skip_s0=arguments.skip_s0,
-                         historical_reference=arguments.historical_reference)
+                         historical_reference=arguments.historical_reference,
+                         migrate_clipping_gate=arguments.migrate_clipping_gate)
     reference = output_base / "v4" / "experiments" / arguments.historical_reference if arguments.historical_reference else None
     with run_lock(run), run_logging(run):
         write_json_atomic(run / "resolved_config.json", config)

@@ -195,8 +195,10 @@ def assert_excluded(training: set[str], prediction: set[str], outer: set[str]) -
 
 def initialize_run(config: dict[str, Any], root: Path, output: Path, run_name: str,
                    data_identity: dict[str, Any], *, fresh: bool, skip_s0: bool,
-                   historical_reference: str | None) -> Path:
+                   historical_reference: str | None, migrate_clipping_gate: bool = False) -> Path:
     validate_config(config)
+    if fresh and migrate_clipping_gate:
+        raise ValueError("Clipping migration requires --resume")
     if run_name in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", run_name):
         raise ValueError("Unsafe run name")
     if historical_reference and (historical_reference in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", historical_reference)):
@@ -218,7 +220,10 @@ def initialize_run(config: dict[str, Any], root: Path, output: Path, run_name: s
     else:
         if not (run / "identity.json").is_file():
             raise FileNotFoundError("Resume requires an existing joint run")
-        stored = json.loads((run / "identity.json").read_text(encoding="utf-8"))
+        from bme_eating.joint_resume_migration import active_resume_identity, migrate_clipping_run
+        if migrate_clipping_gate:
+            migrate_clipping_run(run, identity, root)
+        stored = active_resume_identity(run)
         if stored != identity:
             raise RuntimeError("Resume source/config/data/runtime/protocol identity changed; create a new run")
     if fresh:

@@ -12,6 +12,9 @@
 数据审计验证 canonical preparation、原始 archive、特征文件和 subject split 的身份。
 本地事件表已核对：161 个可评估 truth，140 个 ignore，truth 的 `source_event_key` 唯一。
 
+canonical 身份审计保留原始 SHA-256，不改写已冻结的 preparation/manifest/sidecar。Git `core.autocrlf=true` 创建隔离 checkout 时可能改变 LF/CRLF；只有经逐字节换行归一化核实的等价版本、已注册的历史混合换行哈希以及既有非 canonical 迁移可以复用。实际实现或数据变化仍拒绝通过。
+2026-10-07 启动问题已用真实 JointInputs.audit 复核：39 名受试者、五折、161 个 truth、140 个 ignore；所有 canonical 文件哈希前后相同，未创建训练 run。
+
 ## 模型与训练
 
 `StatsFusionStateModel.forward_features()` 公开 semantic/local 两种特征；旧 `forward()` 的键及权重格式保留。
@@ -79,7 +82,13 @@ selector 为内部训练 subject 的 35%，采用已有事件分层算法。
 
 操作点搜索使用批准的 high/budget/NMS/gap/acceptance 网格，校准用自然候选而非训练采样分布。
 最早选模 epoch 8，每两 epoch 验证，patience=3，F1 min delta=0.003。
-clipping 在 epoch>=6 超过 0.50 立即失败；晋级 checkpoint 上限 0.20，另外校验 finite、完成状态、配置、data/source 与 subject lineage。
+clipping 按完整 epoch 的 optimizer 更新数统计，包含末尾不足四个 session 的更新。epoch>=6 时，只有已裁剪次数除以本轮计划更新数超过 0.50（即后续更新全部不裁剪也不能通过）才提前失败；epoch 完成时该比例等于实际整轮裁剪率。晋级 checkpoint 上限仍为实际整轮裁剪率 0.20，另外校验 finite、完成状态、配置、data/source 与 subject lineage。
+每轮保存 clipping_gate、计划/实际更新数和最大裁剪前梯度范数；裁剪失败另存 clipping_failure_report.json，不把未完成 epoch 作为晋级权重。
+
+2026-10-08 修复：旧统计在每轮第一次更新被裁剪时会用 1/1=100% 直接终止。`statsfusion_v410_joint_event_20261007a` 第八轮因此失败；第六、七轮完整裁剪率分别为 1/87 和 5/87，失败前权重与梯度 finite。修复不提高裁剪范数或放宽整轮 50%/晋级 20% 阈值。
+
+用户随后明确授权旧 run 恢复，因此增加一次性 `--resume --migrate-clipping-gate` 迁移。登记文件 `configs/statsfusion_v410_clipping_resume_migration.json` 锁定旧身份、修复源码集合及该断点 SHA-256；仅支持此 run 的第八轮、已提交 29 个 chunk 的断点。其它源码、模型、配置、数据、划分或环境改变仍拒绝恢复。
+迁移保留原 `identity.json` 和断点，备份放入 `resume_migrations/clipping_epoch_gate_v1/`，另外生成 `active_identity.json` 与 `resume_migration.json`。模型、optimizer、累计梯度、RNG、session/cache 游标原样加载；未提交的第 30 个 chunk 重新执行。原验证记录备份后重验，五折/最终 manifest 与 bundle 保留迁移证据。迁移准备完成后普通 `--resume` 即可继续，无需重跑前七轮；一般源码修改仍要求新 run。
 无可行操作点时保留诊断最优的训练合格 epoch，标记不可晋级，不把诊断选择变成正式资格。
 
 Boundary 须覆盖>=0.70 且至少 60 独立正事件才训练。内部 cross-fit 决定是否启用；启用时使用实际 refined 标签重新校准。
@@ -139,6 +148,7 @@ conda run --no-capture-output -n bme-model python scripts/run_statsfusion_joint.
 ```
 
 只做身份审计可使用 stage=audit。先 audit 创建 run 后，outer/其他 stage 使用 resume。
+如果在 JointInputs.audit 报错且 run 尚未创建，修复后应继续使用 fresh；不要手工修改 preparation_identity、manifest 或 checksum 来跳过检查。
 单折执行：`--stage outer --fold 0`；之后 `--stage outer --resume` 自动补其余折。
 不要把五折单 seed 理解成只训练五次。
 

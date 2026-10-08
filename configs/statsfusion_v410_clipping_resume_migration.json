@@ -1,0 +1,38 @@
+{
+  "migration": "clipping_epoch_gate_v1",
+  "run_name": "statsfusion_v410_joint_event_20261007a",
+  "original_identity_sha256": "e01ecad572d700991e535b3d52856dd4f982e5dfb23f55d1b9952b5a35ea8319",
+  "previous_source_sha256": "72d1db7e31e69ad24ad13e3a964ff5e237d2a7de962c945e0ee15f8ebde48cbc",
+  "current_source_sha256": "096131f0923fd6d3c70e13104f552e24087e280de8cb436dfbe636abb48cc0d1",
+  "checkpoint": "fold_0/internal/partition_0/selection/resume.pt",
+  "checkpoint_sha256": "5f969b91bf411db76671435ad485a1311b923c1cb1b6df4f11d887fd27b7a111",
+  "resume_cursor": {
+    "epoch": 8,
+    "next_chunk": 29,
+    "session_count": 3,
+    "optimizer_steps": 0,
+    "clipped_steps": 0
+  },
+  "source_changes": {
+    "scripts/run_statsfusion_joint.py": {
+      "before": "5cbed91a1f839fee13f19badbffbbb236528779df75d10fbde65dd3fd573f205",
+      "after": "c812fe03937ffe09312e588b1c2649e1ab535ec948952655884e75e4023c886f"
+    },
+    "src/bme_eating/joint_protocol.py": {
+      "before": "aab0450930f685fd20d96466b5105995a83add59155cfa7b789d7d062cf21762",
+      "after": "dbf77ea7aa70f0df78f1693a0044c0d09e10b871ce7b1092d3fd2af3f05a4b51"
+    },
+    "src/bme_eating/joint_resume_migration.py": {
+      "before": null,
+      "after": "304e8bd1bb5adddce2608817a904d7e9053cfa6c84bcda73ccb873532f821623"
+    },
+    "src/bme_eating/joint_workflow.py": {
+      "before": "4f794544c0b817ce40816784f3315d9dd746f754224130a1268f036e69482562",
+      "after": "b572e8cfe9981838839d281412a289a038e66476bece61ee98c2f1650b8c7fb4"
+    },
+    "src/bme_eating/training/statsfusion_joint_trainer.py": {
+      "before": "a67de2db87e77f8b92eab7732777e163d5dbdb58cdfe46070b8fde58f8e97de4",
+      "after": "4dfe9fc00ddff22999761cb4eb9af0974336029455221a5d0108e579c2842ba2"
+    }
+  }
+}

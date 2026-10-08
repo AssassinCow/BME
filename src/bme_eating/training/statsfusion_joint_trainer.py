@@ -67,6 +67,21 @@ from bme_eating.training.hierarchical_v4_trainer import _selector_split, stackin
 FEATURE_WIDTH = 137
 
 
+def epoch_clipping_report(epoch, clipped_steps, optimizer_steps, expected_optimizer_steps,
+                          maximum_fraction):
+    if (expected_optimizer_steps < 1 or not 0 <= clipped_steps <= optimizer_steps
+            <= expected_optimizer_steps or not 0 <= maximum_fraction <= 1):
+        raise RuntimeError("Invalid joint epoch clipping counters or threshold")
+    minimum_fraction = clipped_steps / expected_optimizer_steps
+    return {"protocol": "full_epoch_optimizer_updates_v1", "epoch": epoch,
+            "clipped_steps": clipped_steps, "optimizer_steps": optimizer_steps,
+            "expected_optimizer_steps": expected_optimizer_steps,
+            "clipping_fraction": clipped_steps / max(optimizer_steps, 1),
+            "minimum_epoch_clipping_fraction": minimum_fraction,
+            "maximum_clipping_fraction": maximum_fraction,
+            "abort_failed": epoch >= 6 and minimum_fraction > maximum_fraction}
+
+
 def seed_model(config):
     random.seed(2026)
     np.random.seed(2026)
@@ -325,15 +340,20 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                 or set(payload.get("excluded_subjects", [])) != (outer_excluded or set()) | (selector or set())):
             raise RuntimeError("Training resume epoch/selector/exclusion protocol changed")
         if (payload.get("config_sha256") != bound_config
-                or payload.get("source_sha256") != digest(bound_source)
                 or payload.get("data_sha256") != digest(inputs.identity)):
             raise RuntimeError("Training checkpoint config/source/data identity mismatch")
+        migration = None
+        if payload.get("source_sha256") != digest(bound_source):
+            from bme_eating.joint_resume_migration import authorize_checkpoint_migration
+            migration = authorize_checkpoint_migration(directory, checkpoint_path, payload, bound_source)
         model.load_state_dict(payload["model"])
         optimizer.load_state_dict(payload["optimizer"])
         for name, parameter in model.named_parameters():
             gradient = payload["gradients"].get(name)
             parameter.grad = gradient.to(device) if gradient is not None else None
         state = payload["state"]
+        if migration:
+            state["resume_migration"] = migration
         random.setstate(payload["python_rng"])
         np.random.set_state(payload["numpy_rng"])
         torch.set_rng_state(payload["torch_rng"].cpu())
@@ -377,6 +397,10 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         if state.get("sampler_identity") and state["sampler_identity"] != sampler.identity:
             raise RuntimeError("Resume session order changed")
         state["sampler_identity"] = sampler.identity
+        expected_optimizer_steps = math.ceil(
+            sum(chunk[4] for chunk in sampler.chunks) / training["accumulate_sessions"])
+        epoch_clipping_report(epoch, state["clipped_steps"], state["optimizer_steps"],
+                              expected_optimizer_steps, training["clipping_abort_fraction"])
         model.train()
         loader = session_loader(dataset, sampler, config)
         for chunk_index, batch in enumerate(loader, start=sampler.start_chunk):
@@ -560,9 +584,26 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                                                          error_if_nonfinite=True)
                     state["clipped_steps"] += int(float(norm) > training["gradient_clip_norm"])
                     state["optimizer_steps"] += 1
-                    fraction = state["clipped_steps"] / state["optimizer_steps"]
-                    if epoch >= 6 and fraction > training["clipping_abort_fraction"]:
-                        raise RuntimeError(f"Joint clipping abort gate failed: {fraction:.4f}")
+                    state["maximum_gradient_norm"] = max(
+                        state.get("maximum_gradient_norm", 0), float(norm))
+                    clipping_report = epoch_clipping_report(
+                        epoch, state["clipped_steps"], state["optimizer_steps"],
+                        expected_optimizer_steps, training["clipping_abort_fraction"])
+                    if clipping_report["abort_failed"]:
+                        write_json_atomic(directory / "clipping_failure_report.json", {
+                            **clipping_report, "epoch_complete": False, "promotion_eligible": False,
+                            "pre_clip_gradient_norm": float(norm), "failed_chunk": chunk_index,
+                            "committed_next_chunk": chunk_index, "identity": identity,
+                            "training_subjects": sorted(subjects),
+                            "excluded_subjects": sorted((outer_excluded or set()) | (selector or set())),
+                            "config_sha256": bound_config, "source_sha256": digest(bound_source),
+                            "data_sha256": digest(inputs.identity)})
+                        raise RuntimeError(
+                            "Joint clipping abort gate failed: "
+                            f"{state['clipped_steps']}/{expected_optimizer_steps} planned updates clipped; "
+                            "minimum full-epoch fraction "
+                            f"{clipping_report['minimum_epoch_clipping_fraction']:.4f} "
+                            f"> {training['clipping_abort_fraction']:.4f}")
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                     state["update_count"] += 1
@@ -573,7 +614,12 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             checkpoint()
             print(f"[joint epoch={epoch}/{epochs} chunk={chunk_index + 1}/{len(sampler.chunks)}] "
                   f"subject={key[0]} loss={float(loss.detach()):.5f}", flush=True)
-        fraction = state["clipped_steps"] / max(state["optimizer_steps"], 1)
+        if state["optimizer_steps"] != expected_optimizer_steps:
+            raise RuntimeError("Completed joint epoch optimizer count differs from session traversal")
+        clipping_report = epoch_clipping_report(
+            epoch, state["clipped_steps"], state["optimizer_steps"], expected_optimizer_steps,
+            training["clipping_abort_fraction"])
+        fraction = clipping_report["clipping_fraction"]
         coverage = candidate_coverage(state["epoch_candidates"], truth)
         residuals = []
         independent = set()
@@ -600,6 +646,8 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             "preprocessing": preprocessing, "boundary": state["boundary"],
             "config_sha256": bound_config, "source_sha256": digest(bound_source),
             "data_sha256": digest(inputs.identity)}
+        if state.get("resume_migration"):
+            epoch_payload["resume_migration"] = state["resume_migration"]
         checkpoint()
         if not all(torch.isfinite(value).all() for value in epoch_payload["model"].values()):
             raise RuntimeError("Epoch checkpoint finite gate failed")
@@ -607,6 +655,8 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         record = {"epoch": epoch, "clipping_fraction": fraction, "promotion_eligible": qualification,
                   "chunks": len(sampler.chunks), "sessions": len(session_lengths),
                   "optimizer_steps": state["optimizer_steps"], "candidate_coverage": coverage,
+                  "clipping_gate": clipping_report,
+                  "maximum_gradient_norm": state.get("maximum_gradient_norm", 0),
                   "elapsed_seconds": time.monotonic() - started, **enforce_resources(config, device)}
         stop = False
         if selector and epoch >= training["checkpoint_min_epoch"] and epoch % training["validation_every_epochs"] == 0:
@@ -643,6 +693,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         state["sampler_identity"] = None
         state["epoch_complete"] = False
         state["clipped_steps"], state["optimizer_steps"] = 0, 0
+        state["maximum_gradient_norm"] = 0
         state["event_contributions"], state["family_contributions"] = set(), set()
         state["epoch_candidates"] = []
         checkpoint()

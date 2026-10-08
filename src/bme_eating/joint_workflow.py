@@ -240,6 +240,7 @@ def _audit_reference(reference_root: Path, inputs):
 
 
 def execute_gates(inputs, config, run, reference_root):
+    from bme_eating.joint_resume_migration import migration_evidence
     reports, prediction, candidates, windows, truth, ignore, evidence = [], [], [], [], [], [], {}
     for fold in range(5):
         directory = run / f"fold_{fold}"
@@ -327,6 +328,8 @@ def execute_gates(inputs, config, run, reference_root):
                 "metrics": metrics, "coverage": coverage, "folds": reports, "fold4": reports[4],
                 "reference": reference, "paired_bootstrap": paired, "evidence_sha256": evidence,
                 "s0": read_json(run / "identity.json")["s0"]}
+    manifest["resume_migration_evidence"] = migration_evidence(run)
+    manifest["evidence_sha256"].update(manifest["resume_migration_evidence"])
     write_json_atomic(run / "joint_gate_manifest.json", manifest)
     write_json_atomic(run / "reference_audit.json", reference)
     event_frame(prediction).to_parquet(run / "pooled_outer_predictions.parquet", index=False)
@@ -337,6 +340,7 @@ def execute_gates(inputs, config, run, reference_root):
 
 
 def execute_final(inputs, config, run, resume):
+    from bme_eating.joint_resume_migration import migration_evidence
     require_gate(run)
     subjects, directory = set(inputs.subject_folds), run / "final"
     run_identity = sha256_file(run / "identity.json")
@@ -363,6 +367,7 @@ def execute_final(inputs, config, run, resume):
                 "internal_manifest_sha256": sha256_file(directory / "internal" / "internal_manifest.json"),
                 "training_subjects": sorted(subjects),
                 "lineage": point["lineage"], "boundary_enabled": point["boundary_enabled"]}
+    manifest["resume_migration_evidence"] = migration_evidence(run)
     write_json_atomic(directory / "final_manifest.json", manifest)
     return manifest
 
@@ -436,6 +441,8 @@ def export_joint_bundle(config, run, source_root, *, resume=False):
              (run / "resolved_config.json", "resolved_config.json"),
              (run / "joint_gate_manifest.json", "joint_gate_manifest.json"),
              (run / "identity.json", "identity.json")]
+    for name in manifest.get("resume_migration_evidence", {}):
+        pairs.append((run / name, name))
     for source, name in pairs:
         shutil.copyfile(source, staging / name)
     for source in (source_root / "src" / "bme_eating").rglob("*.py"):
