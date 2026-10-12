@@ -1,0 +1,41 @@
+{
+  "kind": "repository_cleanup",
+  "version": "v4.14",
+  "baseline_commit": "613df35622d53bbbdf3655e3ccd4390d799cd359",
+  "original_isolation": {
+    "source_version": "v4.13",
+    "source_head": "e0ec880f25412d0683261068c3dc7955b0f6d9d3",
+    "source_sha256": "b9aef5f11a600b07e97c7a71e49477e5d9df42ccd4f1affa3d257500ad86612a",
+    "git_object_store_shared": false
+  },
+  "historical_provenance": {
+    "git_path": "manifests/v414_source_provenance.json",
+    "sha256": "16929b7552bd999ae71fa7505e20006d0b26e41472824475f9942d3c88c95e70",
+    "read_command": "git show 613df35622d53bbbdf3655e3ccd4390d799cd359:manifests/v414_source_provenance.json"
+  },
+  "historical_reports": "Original versioned reports and diffs are preserved in the baseline Git commit.",
+  "current_snapshot": "Each fresh run stores all current source files with SHA256SUMS.json.",
+  "protected_v413": {
+    "checked_source_files": 247,
+    "source_hashes_unchanged": true,
+    "git_hashes": {
+      "HEAD": "14914d420acfe60cfdbaf18e5501a320d3b31784e08ec3fcf455c2f1615d23d0",
+      "config": "f6d03ecf7db243448ba74f4939844518a14e003421f4d7520f708e67e5f4f767",
+      "index": "03c1fcad6dec06a1d9eea64a73ae85a38f125b5f2b29f82a257f818e889a2f4a"
+    },
+    "writes_performed": false
+  },
+  "canonical_recipe_sha256": {
+    "src/bme_eating/data/deep_dataset.py": "3fe15ed5d64c67d9ebb6996d77f1c33fc00b02d5794f53492777d35f5269dda6",
+    "src/bme_eating/data/labels.py": "a432f95df767b0e6d44ecea32673ccb624bc3245b5e2abdebaac0f8a44f4e778",
+    "src/bme_eating/data/session.py": "09b09ae5a75d0566a0779ebf39b9b6d793573ca2784a7089e656105bb6e05be9",
+    "src/bme_eating/data/stats_fusion_preprocess.py": "d46c1d49c01564e235a5cb5fca8a45837c4dc335c7a4fa2b21faf22727deb3bb",
+    "src/bme_eating/data/stats_fusion_sequence.py": "3f28f48ce2c15cfba7e2f67f1274b76cf78b71b7ec35d9f041a3d445a0872cc0",
+    "src/bme_eating/features/baseline.py": "d7996bcc5f9da5290f8b0db249863d149a916ca37eb21465350cd3a4f5e39b83",
+    "src/bme_eating/features/signal.py": "080029c1b5776f0c0bbd04fb49a849e2e2b00725a9f5bee2003c2983adeb3218",
+    "src/bme_eating/stats_features.py": "77cd78bcb70547d022c000446e4d22cee8e499292c60bee3f9c8c6a4b4b8a239"
+  },
+  "split_sha256": "d5c3b2e6faa67bad587e57018dfcb24ddf070b626312a3bd5a61030cfd162e0f",
+  "model_math_changed": false,
+  "fresh_run_required": true
+}

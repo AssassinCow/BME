@@ -1,18 +1,21 @@
 from __future__ import annotations
 
-import argparse
+import json
+import platform
+import sys
 
-import _bootstrap  # noqa: F401
+import _bootstrap as _bootstrap
+import torch
 
-from bme_eating.cli import command_environment
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Check Python, CUDA, and RTX 4080 availability.")
-    arguments = parser.parse_args()
-    command_environment(arguments)
+def main():
+    print(json.dumps({"python": sys.version, "executable": sys.executable,
+        "platform": platform.platform(), "torch": torch.__version__,
+        "cuda_available": torch.cuda.is_available(), "cuda_runtime": torch.version.cuda,
+        "devices": [{"name": torch.cuda.get_device_name(index),
+                     "total_memory_gb": torch.cuda.get_device_properties(index).total_memory / 1024 ** 3}
+                    for index in range(torch.cuda.device_count())]}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
     main()
-

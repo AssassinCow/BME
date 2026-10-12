@@ -1,4 +1,4 @@
 """2026 BME eating-detection modeling package."""
 
-__version__ = "0.1.0"
+__version__ = "4.14.0"
 

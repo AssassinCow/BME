@@ -11,6 +11,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Sampler
 
+from bme_eating.artifacts import sha256_file
 from bme_eating.data.deep_dataset import Normalization, compute_normalization
 from bme_eating.data.stats_fusion_inputs import (
     canonical_input_paths,
@@ -20,10 +21,8 @@ from bme_eating.data.stats_fusion_sequence import (
     StatsFusionSequenceDataset,
     sequence_geometry_from_config,
 )
-from bme_eating.hierarchical_artifacts import sha256_file
-from bme_eating.joint_capabilities import supported
-from bme_eating.joint_protocol import digest
 from bme_eating.models.statsfusion_joint_event import CompletedScale
+from bme_eating.protocol import digest
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
 
 
@@ -130,7 +129,7 @@ def make_joint_dataset(inputs: JointInputs, subjects: set[str], config: dict[str
                        preprocessing: dict[str, Any] | None = None, *, training: bool,
                        development_calibration: dict[str, Any] | None = None):
     if development_calibration is not None:
-        from bme_eating.joint_v414_split import validate_development_calibration
+        from bme_eating.development_split import validate_development_calibration
         validate_development_calibration(inputs, subjects, config, preprocessing, development_calibration,
                                          training=training)
     anchors, statistics, events, segments = inputs.frames(subjects, labels=training)
@@ -154,9 +153,8 @@ def make_joint_dataset(inputs: JointInputs, subjects: set[str], config: dict[str
     if anchors[columns].isna().any().any():
         raise RuntimeError("Canonical statistics have missing anchor alignment rows")
     dataset_type = JointSessionDataset
-    if supported(config, "consistent_inputs"):
-        from bme_eating.data.joint_v412_augmentation import JointSessionDatasetV412
-        dataset_type = JointSessionDatasetV412
+    from bme_eating.data.augmentation import AugmentedSessionDataset
+    dataset_type = AugmentedSessionDataset
     dataset = dataset_type(
         anchors, segments, events, normal, statistics_columns=columns,
         geometry=joint_geometry(config), training=training, seed=2026,

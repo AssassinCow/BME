@@ -2,37 +2,18 @@ from __future__ import annotations
 
 import os
 import re
-from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = deepcopy(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = deepcopy(value)
-    return merged
-
-
 def load_config(path: str | Path) -> dict[str, Any]:
     config_path = Path(path).expanduser().resolve()
     with config_path.open("r", encoding="utf-8") as handle:
         payload = yaml.safe_load(handle) or {}
-    declared_legacy_tp_key = "maximum_tp_to_fp_fraction" in payload.get("promotion_gate", {})
-    parent_name = payload.pop("extends", None)
-    if parent_name:
-        parent_path = (config_path.parent / parent_name).resolve()
-        parent = load_config(parent_path)
-        payload = _deep_merge(parent, payload)
-    if payload.get("v49", {}).get("protocol") == "integrated_repair_v2":
-        if declared_legacy_tp_key:
-            raise ValueError("v4.9 uses maximum_tp_to_fp_rate; legacy fraction key is forbidden")
-        payload.get("promotion_gate", {}).pop("maximum_tp_to_fp_fraction", None)
+    if "extends" in payload:
+        raise ValueError("Use one complete v4.14 configuration; inheritance is unsupported")
     payload["_config_path"] = str(config_path)
     return payload
 

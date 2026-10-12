@@ -6,15 +6,15 @@ import os
 
 from _bootstrap import PROJECT_ROOT
 
+from bme_eating.artifacts import write_json_atomic
 from bme_eating.config import load_config
-from bme_eating.hierarchical_artifacts import write_json_atomic
-from bme_eating.joint_protocol import require_idle_gpu
-from bme_eating.joint_validation import replay_joint_bundle, validate_joint_implementation
+from bme_eating.protocol import require_idle_gpu
+from bme_eating.validation import replay_joint_bundle, validate_joint_implementation
 
 
 def main():
     parser = argparse.ArgumentParser(description="Joint model CPU/GPU smoke and native raw replay")
-    parser.add_argument("--config", default="configs/statsfusion_v411_learned_boundary.yaml")
+    parser.add_argument("--config", default="configs/statsfusion_v414_full_data.yaml")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--bundle")
     parser.add_argument("--output")

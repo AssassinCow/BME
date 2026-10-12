@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import copy
-import json
 import math
 import pickle
 import random
@@ -15,6 +14,14 @@ import pandas as pd
 import torch
 from torch.nn import functional as F
 
+from bme_eating.artifacts import write_json_atomic
+from bme_eating.candidates import (
+    JointCandidate,
+    StreamingProposals,
+    TimelineCache,
+    candidate_targets,
+    stable_id,
+)
 from bme_eating.data.joint_sessions import (
     JointInputs,
     SessionChunkSampler,
@@ -23,54 +30,30 @@ from bme_eating.data.joint_sessions import (
     reuse_session_loader,
     session_loader,
 )
-from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
-from bme_eating.joint_capabilities import capabilities, supported
-from bme_eating.joint_evaluation import (
-    NonnegativePlatt,
-    apply_online_budget,
-    calibration_ece,
+from bme_eating.evaluation import (
     candidate_coverage,
     choose_operating_point,
-    commit_candidates,
     metrics_with_exposure,
-)
-from bme_eating.joint_progress import print_metrics, progress
-from bme_eating.joint_protocol import (
-    assert_excluded,
-    calibration_scope,
-    checkpoint_qualified,
-    config_identity,
-    configure_numerics,
-    digest,
-    internal_partitions,
-    protocol_for,
-    protocol_identities,
-    save_torch_atomic,
-    source_identity,
-    verify_calibration_lineage,
-    verify_internal_manifest,
-)
-from bme_eating.joint_stream import (
-    FrozenSourceCDF,
-    JointCandidate,
-    StreamingProposals,
-    TimelineCache,
-    candidate_targets,
-    sample_candidates,
-    stable_id,
 )
 from bme_eating.metrics import partition_evaluation_events, prediction_ignore_mask
 from bme_eating.models.statsfusion_joint_event import (
-    candidate_roi,
-    distribution_endpoint,
     event_contrastive_loss,
     gaussian_distribution,
     loss_schedule,
     quality_focal_loss,
 )
-from bme_eating.training.hierarchical_v4_trainer import _selector_split, stacking_partitions
-
-FEATURE_WIDTH = 137
+from bme_eating.progress import print_metrics, progress
+from bme_eating.protocol import (
+    assert_excluded,
+    capabilities,
+    checkpoint_qualified,
+    config_identity,
+    configure_numerics,
+    digest,
+    save_torch_atomic,
+    source_identity,
+    supported,
+)
 
 
 class PackedCheckpointState:
@@ -188,7 +171,7 @@ def seed_model(config):
     np.random.seed(2026)
     torch.manual_seed(2026)
     configure_numerics(config)
-    from bme_eating.models.statsfusion_joint_event_v411 import build_joint_model
+    from bme_eating.models.statsfusion_joint_event import build_joint_model
     return build_joint_model(config)
 
 
@@ -219,11 +202,10 @@ def resource_usage(device):
 
 def enforce_resources(config, device):
     usage = resource_usage(device)
-    if supported(config, "grouped"):
-        from bme_eating.joint_v411_resources import private_process_tree
-        usage.update(private_process_tree())
-        if usage["process_tree_private_ram_gb"] >= config["resources"]["maximum_private_ram_gb"]:
-            raise RuntimeError("Process tree private RAM exceeds registered 26 GB limit")
+    from bme_eating.resources import private_process_tree
+    usage.update(private_process_tree())
+    if usage["process_tree_private_ram_gb"] >= config["resources"]["maximum_private_ram_gb"]:
+        raise RuntimeError("Process tree private RAM exceeds registered 26 GB limit")
     if max(usage["peak_gpu_gb"], usage["peak_gpu_reserved_gb"]) >= config["resources"]["maximum_gpu_gb"]:
         raise RuntimeError("GPU memory gate failed; protocol cannot silently shrink batches")
     return usage
@@ -255,63 +237,13 @@ def generate_chunk(stream: StreamingProposals, times: torch.Tensor, features: to
 
 
 def score_candidate(model, candidate, times, features, device):
-    if supported(model, "grouped"):
-        from bme_eating.joint_v411_scoring import score_candidates
-        return score_candidates(model, [candidate], times, features, device)[0]
-    causal = times <= candidate.decision_time_ms
-    selected_times, selected_features = times[causal], features[causal]
-    needed = (selected_times > candidate.start_ms - 60_000) & (
-        selected_times <= min(candidate.end_ms + 30_000, candidate.decision_time_ms))
-    selected_times, selected_features = selected_times[needed], selected_features[needed]
-    if len(selected_features):
-        candidate.missing_fraction = float(selected_features[:, 136].mean().detach())
-        candidate.gyro_missing = bool((selected_features[:, 135] <= 0).all())
-    roi = candidate_roi(selected_features[:, :64], selected_features[:, 64:128], selected_times,
-                         selected_features[:, 128], candidate.start_ms, candidate.end_ms,
-                         candidate.decision_time_ms)
-    outputs = model.candidate_head(roi[None].to(device), candidate.metadata(device)[None])
-    candidate.event_logit = float(outputs["event_logit"].detach())
-    candidate.predicted_quality = float(outputs["quality_logit"].sigmoid().detach())
-    return outputs
+    from bme_eating.candidate_scoring import score_candidates
+    return score_candidates(model, [candidate], times, features, device)[0]
 
 
 def refine_candidate(model, candidate, times, features, device, boundary, entropy):
-    if supported(model, "grouped"):
-        from bme_eating.joint_v411_scoring import refine
-        return refine(model, candidate, times, features, device, boundary, entropy)
-    refined = copy.deepcopy(candidate)
-    refined.unrefined_start_ms, refined.unrefined_end_ms = candidate.start_ms, candidate.end_ms
-    refined.coarse_event_logit, refined.coarse_quality = candidate.event_logit, candidate.predicted_quality
-    def fallback(reason):
-        refined.start_ms, refined.end_ms = candidate.start_ms, candidate.end_ms
-        refined.refined = False
-        refined.boundary_fallback_reason = reason
-        refined.boundary_conflict = reason in {"conflict_or_latency", "insufficient_valid_bins"}
-        return refined
-    if not boundary.get("qualified") or candidate.source == "truth_jitter":
-        return fallback("training_qualification_failed")
-    for endpoint, range_seconds, head_index in (("start_ms", boundary["start_range_seconds"], 0),
-                                               ("end_ms", boundary.get("end_range_seconds", 30), 1)):
-        center = getattr(candidate, endpoint)
-        selected = ((times - center).abs() <= range_seconds * 1000) & (times <= candidate.decision_time_ms)
-        selected &= features[:, 128] > 0
-        setattr(refined, "boundary_valid_" + ("start" if head_index == 0 else "end") + "_bins", int(selected.sum()))
-        if int(selected.sum()) < 3:
-            return fallback("insufficient_valid_bins")
-        local, support = features[selected, 64:128].to(device), times[selected].to(device)
-        logits = model.boundary_head(local, (support - center).float() / 1000)[:, head_index]
-        proposal, uncertainty = distribution_endpoint(logits, support)
-        setattr(refined, "boundary_" + ("start" if head_index == 0 else "end") + "_entropy", uncertainty)
-        if uncertainty > entropy:
-            return fallback("entropy")
-        refined.boundary_clipped |= abs(proposal - center) >= range_seconds * 1000 - 3000
-        setattr(refined, endpoint, proposal)
-    if (refined.start_ms >= refined.end_ms or refined.end_ms > candidate.decision_time_ms
-            or candidate.decision_time_ms - refined.end_ms > 60_000):
-        return fallback("conflict_or_latency")
-    refined.refined = (refined.start_ms != candidate.start_ms or refined.end_ms != candidate.end_ms)
-    score_candidate(model, refined, times, features, device)
-    return refined
+    from bme_eating.candidate_scoring import refine
+    return refine(model, candidate, times, features, device, boundary, entropy)
 
 
 def boundary_distribution_loss(model, candidate, target, times, features, device, qualification):
@@ -382,7 +314,7 @@ def random_background_candidates(truth, ignore, subject, session, times, feature
         if candidate_targets(candidate, truth)[1] > 0:
             continue
         if len(ignore):
-            from bme_eating.joint_evaluation import event_frame
+            from bme_eating.evaluation import event_frame
             if prediction_ignore_mask(event_frame([candidate]), ignore).any():
                 continue
         candidate.validate()
@@ -439,28 +371,17 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             raise RuntimeError("CUDA required by protocol")
         torch.cuda.reset_peak_memory_stats(device)
     model = seed_model(config).to(device)
-    v411 = supported(model, "grouped")
-    v412 = supported(model, "consistent_inputs")
-    v413 = supported(model, "stabilized")
-    from bme_eating.joint_v411_features import FeatureBlocks
-    from bme_eating.joint_v411_journal import CheckedJournal
-    from bme_eating.joint_v411_stream import make_stream
-    from bme_eating.joint_v411_training import PositiveGradientBuffer
-    if v412:
-        from bme_eating.joint_v412_training import (
-            ReplaceablePositiveGradientBuffer,
-            apply_learning_rate,
-            heatmap_focal_loss,
-            subject_weights,
-        )
-        PositiveGradientBuffer = ReplaceablePositiveGradientBuffer
-    if v413:
-        from bme_eating.joint_v413_training import (
-            ContributionBank,
-            PositiveGradientBuffer,
-            heatmap_focal_loss,
-            selection_update,
-        )
+    from bme_eating.feature_cache import FeatureBlocks
+    from bme_eating.journal import CheckedJournal
+    from bme_eating.proposal_stream import make_stream
+    from bme_eating.training.candidate_supervision import (
+        ContributionBank,
+        PositiveGradientBuffer,
+        apply_learning_rate,
+        heatmap_focal_loss,
+        selection_update,
+        subject_weights,
+    )
     source_root = Path(config["_config_path"]).resolve().parents[1]
     bound_source = source_identity(source_root)
     bound_config = config_identity(config)
@@ -487,12 +408,10 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
              "event_contributions": set(), "family_contributions": set(),
              "epoch_candidates": [], "gradient_diagnostics": [], "sample_audit": [],
              "training_complete": False}
-    if v411:
-        state.update({"positive_gradients": {}, "positive_group_counts": {},
-                      "journal_offsets": {}, "contrastive_history": None})
-    if v413:
-        ContributionBank(state)
-        state.update({"natural_replay": None, "unqualified_checks": 0, "lost_qualification_checks": 0})
+    state.update({"positive_gradients": {}, "positive_group_counts": {},
+                  "journal_offsets": {}, "contrastive_history": None})
+    ContributionBank(state)
+    state.update({"natural_replay": None, "unqualified_checks": 0, "lost_qualification_checks": 0})
     if resume and checkpoint_path.exists():
         payload = torch.load(checkpoint_path, map_location=device, weights_only=False)
         if payload["identity"] != identity or set(payload["training_subjects"]) != subjects:
@@ -505,50 +424,41 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         if (payload.get("config_sha256") != bound_config
                 or payload.get("data_sha256") != digest(inputs.identity)):
             raise RuntimeError("Training checkpoint config/source/data identity mismatch")
-        migration = None
-        if v411 and payload.get("source_sha256") != digest(bound_source):
-            raise RuntimeError("v411 resume source changed; create a new run")
         if payload.get("source_sha256") != digest(bound_source):
-            from bme_eating.joint_resume_migration import authorize_checkpoint_migration
-            migration = authorize_checkpoint_migration(directory, checkpoint_path, payload, bound_source)
+            raise RuntimeError("Resume source changed; create a new run")
         model.load_state_dict(payload["model"])
         optimizer.load_state_dict(payload["optimizer"])
         for name, parameter in model.named_parameters():
             gradient = payload["gradients"].get(name)
             parameter.grad = gradient.to(device) if gradient is not None else None
         state = payload["state"]
-        if v412:
-            PositiveGradientBuffer(state["positive_gradients"])
-        if migration:
-            state["resume_migration"] = migration
+        PositiveGradientBuffer(state["positive_gradients"])
         random.setstate(payload["python_rng"])
         np.random.set_state(payload["numpy_rng"])
         torch.set_rng_state(payload["torch_rng"].cpu())
         if device.type == "cuda":
             torch.cuda.set_rng_state_all([value.cpu() for value in payload["cuda_rng"]])
         if state.get("training_complete"):
-            if selector and ((not state["best_epoch"] or state.get("selection_failure")) if v413 else not (state["best_epoch"] or state["diagnostic_epoch"])):
+            if selector and (not state["best_epoch"] or state.get("selection_failure")):
                 raise RuntimeError("No finite/clipping-qualified joint epoch; diagnostic checkpoints preserved")
             return (state["best_epoch"] or state["diagnostic_epoch"]) if selector else epochs
     natural_dataset = None
     replay_payload = None
-    if v413:
-        ContributionBank(state)
-        natural_dataset, _ = make_joint_dataset(inputs, subjects, config, preprocessing, training=True)
-        natural_dataset.training = False
+    ContributionBank(state)
+    natural_dataset, _ = make_joint_dataset(inputs, subjects, config, preprocessing, training=True)
+    natural_dataset.training = False
     truth, _ = partition_evaluation_events(dataset.events, subjects)
     session_lengths = {key: len(group) for key, group in dataset.session_groups.items()}
-    contribution_weights = subject_weights(session_lengths) if v412 else {subject: 1.0 for subject in subjects}
-    if v412:
-        write_json_atomic(directory / "subject_weights.json", {
-            "weights": contribution_weights,
-            "session_counts": {subject: sum(key[0] == subject for key in session_lengths) for subject in sorted(subjects)},
-            "natural_calibration_weights": True})
+    contribution_weights = subject_weights(session_lengths)
+    write_json_atomic(directory / "subject_weights.json", {
+        "weights": contribution_weights,
+        "session_counts": {subject: sum(key[0] == subject for key in session_lengths) for subject in sorted(subjects)},
+        "natural_calibration_weights": True})
     session_events = {key: max(1, int(((truth.subject_key.astype(str) == key[0])
                         & (truth.session_id.astype(str) == key[1])).sum())) for key in session_lengths}
     started = time.monotonic()
     journals = {name: CheckedJournal(directory / (name + ".jsonl"), state["journal_offsets"].get(name, 0))
-                for name in ("sampling", "gradients", "candidate_history", "training_history")} if v411 else {}
+                for name in ("sampling", "gradients", "candidate_history", "training_history")}
 
     def checkpoint():
         checkpoint_started = time.monotonic()
@@ -562,27 +472,23 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         if not finite or not tensors_finite(parameter.grad for parameter in model.parameters()
                                             if parameter.grad is not None):
             raise RuntimeError("Finite gate failed before chunk checkpoint")
-        if v411:
-            positive_values = (PositiveGradientBuffer(state["positive_gradients"]).tensors() if v412 else
-                               (value for event in state["positive_gradients"].values()
-                                for value in event["gradients"].values()))
-            if v413 and not tensors_finite(ContributionBank(state).tensors()):
-                raise RuntimeError("Contribution bank finite gate failed")
-            if not tensors_finite(positive_values):
-                raise RuntimeError("Positive event gradient buffer finite gate failed")
-            if not tensors_finite(value for moment in optimizer.state.values()
-                                  for value in moment.values() if isinstance(value, torch.Tensor)):
-                raise RuntimeError("Optimizer state finite gate failed")
-            for name, key in (("sampling", "sample_audit"), ("gradients", "gradient_diagnostics"),
-                              ("candidate_history", "epoch_candidates")):
-                records = state[key]
-                payloads = ([{"epoch": state["epoch"], "candidate": candidate.to_dict()}
-                             for candidate in records] if name == "candidate_history" else records)
-                journals[name].append(payloads)
-                state["journal_offsets"][name] = journals[name].offset
-                state[key] = []
-        if v413:
-            state["checkpoint_precommit_seconds"] = time.monotonic() - checkpoint_started
+        positive_values = (PositiveGradientBuffer(state["positive_gradients"]).tensors())
+        if not tensors_finite(ContributionBank(state).tensors()):
+            raise RuntimeError("Contribution bank finite gate failed")
+        if not tensors_finite(positive_values):
+            raise RuntimeError("Positive event gradient buffer finite gate failed")
+        if not tensors_finite(value for moment in optimizer.state.values()
+                              for value in moment.values() if isinstance(value, torch.Tensor)):
+            raise RuntimeError("Optimizer state finite gate failed")
+        for name, key in (("sampling", "sample_audit"), ("gradients", "gradient_diagnostics"),
+                          ("candidate_history", "epoch_candidates")):
+            records = state[key]
+            payloads = ([{"epoch": state["epoch"], "candidate": candidate.to_dict()}
+                         for candidate in records] if name == "candidate_history" else records)
+            journals[name].append(payloads)
+            state["journal_offsets"][name] = journals[name].offset
+            state[key] = []
+        state["checkpoint_precommit_seconds"] = time.monotonic() - checkpoint_started
         save_torch_atomic(checkpoint_path, training_checkpoint_snapshot({"identity": identity, "training_subjects": sorted(subjects),
             "requested_epochs": epochs, "deployment_epoch": deployment_epoch, "selector_subjects": sorted(selector or set()),
             "excluded_subjects": sorted((outer_excluded or set()) | (selector or set())),
@@ -593,8 +499,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             "config_sha256": bound_config, "source_sha256": digest(bound_source),
             "data_sha256": digest(inputs.identity), "torch_rng": torch.get_rng_state(),
             "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else []}))
-        if v413:
-            state["previous_checkpoint_total_seconds"] = time.monotonic() - checkpoint_started
+        state["previous_checkpoint_total_seconds"] = time.monotonic() - checkpoint_started
 
     loader = None
     while state["epoch"] <= epochs:
@@ -628,14 +533,13 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                 state["cache_rows"] = 0
                 state["cache_sha256"] = None
                 state["stream"] = make_stream(*key, identity, config["decoder"])
-                if v412:
-                    state["augmentation_identity"] = batch["augmentation_identity"]
-                    state["augmentation_description"] = batch["augmentation_description"]
-            if v412 and state.get("augmentation_identity") != batch["augmentation_identity"]:
+                state["augmentation_identity"] = batch["augmentation_identity"]
+                state["augmentation_description"] = batch["augmentation_description"]
+            if state.get("augmentation_identity") != batch["augmentation_identity"]:
                 raise RuntimeError("Session augmentation changed across chunks or resume")
-            if v413 and epoch >= training["natural_replay_from_epoch"] and (replay_payload is None or
+            if epoch >= training["natural_replay_from_epoch"] and (replay_payload is None or
                     replay_payload["binding"]["session"] != key[1] or replay_payload["binding"]["subject"] != key[0]):
-                from bme_eating.joint_v413_replay import replay_session
+                from bme_eating.training.natural_replay import replay_session
                 stage = time.monotonic()
                 replay_payload, state["natural_replay"] = replay_session(model, inputs, config, preprocessing,
                     natural_dataset, sampler, key, directory / "natural_replay", identity, epoch,
@@ -659,8 +563,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             mask[:, -new_steps:] = True
             current_times = batch["timestamp_ms"][0, mask[0]]
             schedule = loss_schedule(epoch)
-            if v411:
-                schedule["quality_ranking"] = schedule["quality"]
+            schedule["quality_ranking"] = schedule["quality"]
             rng = np.random.default_rng(2026 + epoch * 1_000_000 + chunk_index)
             with torch.autocast(device_type=device.type, dtype=torch.bfloat16,
                                 enabled=device.type == "cuda"):
@@ -668,12 +571,11 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                 outputs = model(batch)
                 features = pack_features(outputs, mask[0])
                 times = torch.cat((history_times, current_times.cpu()))
-                full_features = (FeatureBlocks([history_features, features.cpu()]) if v411 else
-                                 torch.cat((history_features, features.cpu())))
+                full_features = (FeatureBlocks([history_features, features.cpu()]))
                 chunk_timing["encoder_seconds"] = time.monotonic() - stage
                 stage = time.monotonic()
-                if v413 and replay_payload is not None:
-                    from bme_eating.joint_v413_replay import release_candidates
+                if replay_payload is not None:
+                    from bme_eating.training.natural_replay import release_candidates
                     candidates = copy.deepcopy(release_candidates(replay_payload, state["natural_replay"], int(current_times[-1])))
                 else:
                     candidates = generate_chunk(state["stream"], current_times, features)
@@ -683,16 +585,15 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                 previous = int(history_times[-1]) if len(history_times) else int(current_times[0]) - 3000
                 candidates.extend(truth_jitter_candidates(truth, *key, int(current_times[-1]),
                     previous, schedule["truth_jitter"], identity, rng))
-                sampling_features = (replay_payload["features"][:len(times)] if v413 and replay_payload is not None else full_features)
+                sampling_features = (replay_payload["features"][:len(times)] if replay_payload is not None else full_features)
                 background_options = ({"maximum": training["random_background_families"],
-                    "durations": training["random_background_seconds"]} if v413 else {})
+                    "durations": training["random_background_seconds"]})
                 candidates.extend(random_background_candidates(truth, dataset.ignore_events, *key,
                     times, sampling_features, identity, rng, **background_options))
-                if v413:
-                    from bme_eating.joint_v413_replay import naturalize_jitter
-                    natural = (replay_payload["candidates"][:state["natural_replay"]["cursor"]]
-                               if replay_payload is not None else [])
-                    naturalize_jitter(candidates, times, sampling_features, natural)
+                from bme_eating.training.natural_replay import naturalize_jitter
+                natural = (replay_payload["candidates"][:state["natural_replay"]["cursor"]]
+                           if replay_payload is not None else [])
+                naturalize_jitter(candidates, times, sampling_features, natural)
                 session_segments = dataset.segments[
                     (dataset.segments.subject_key.astype(str) == key[0])
                     & (dataset.segments.session_id.astype(str) == key[1])] if hasattr(dataset, "segments") else pd.DataFrame()
@@ -710,67 +611,54 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                         candidate.hand_relation = next(iter(relations)) if len(relations) == 1 else "unknown"
                 ignore = dataset.ignore_events
                 if len(candidates) and len(ignore):
-                    from bme_eating.joint_evaluation import event_frame
+                    from bme_eating.evaluation import event_frame
                     ignored = prediction_ignore_mask(event_frame(candidates), ignore)
                     candidates = [candidate for candidate, drop in zip(candidates, ignored)
                                   if not drop or candidate_targets(candidate, truth)[0] > 0]
-                if v411:
-                    chunk_timing["proposal_seconds"] = time.monotonic() - stage
-                    stage = time.monotonic()
-                    if v412:
-                        from bme_eating.joint_v412_training import sample_groups
-                        sampling_options = {"performance": chunk_timing} if v413 else {}
-                        candidate_groups, sample_report = sample_groups(model, candidates, truth, config, rng,
-                            state["positive_gradients"], state["family_contributions"], times,
-                            full_features, device, schedule["truth_jitter"], **sampling_options)
-                    else:
-                        from bme_eating.joint_v411_training import sample_groups
-                        candidate_groups, sample_report = sample_groups(candidates, truth, config, rng,
-                            state["positive_group_counts"], schedule["truth_jitter"])
-                    chunk_timing["sampling_seconds"] = time.monotonic() - stage
-                    candidates = [candidate for group in candidate_groups for candidate in group["versions"]]
-                else:
-                    candidates, sample_report = sample_candidates(candidates, truth,
-                        training["candidates_per_chunk"], training["sample_composition"], rng,
-                        truth_jitter_fraction=schedule["truth_jitter"])
+                chunk_timing["proposal_seconds"] = time.monotonic() - stage
+                stage = time.monotonic()
+                from bme_eating.training.candidate_supervision import sample_groups
+                sampling_options = {"performance": chunk_timing}
+                candidate_groups, sample_report = sample_groups(model, candidates, truth, config, rng,
+                    state["positive_gradients"], state["family_contributions"], times,
+                    full_features, device, schedule["truth_jitter"], **sampling_options)
+                chunk_timing["sampling_seconds"] = time.monotonic() - stage
+                candidates = [candidate for group in candidate_groups for candidate in group["versions"]]
                 state["sample_audit"].append({"epoch": epoch, "chunk": chunk_index,
                     "subject": key[0], "session": key[1], **sample_report})
-                if v412:
-                    state["sample_audit"][-1]["augmentation"] = batch["augmentation_description"]
+                state["sample_audit"][-1]["augmentation"] = batch["augmentation_description"]
                 target = batch["state_target"].float()
                 valid = mask.float() * batch["state_loss_mask"] * (outputs["sensor_valid"] > 0)
                 def masked_bce(logit, label, weight, count=None):
                     return (F.binary_cross_entropy_with_logits(logit.float(), label, reduction="none")
                             * weight).sum() / (weight.sum() if count is None else count.sum()).clamp_min(1e-8)
                 tasks = {"state": masked_bce(outputs["state_logit"], target, valid,
-                    batch["state_session_count"] if v413 else None)}
+                    batch["state_session_count"])}
                 proposals = []
                 for scale, (logits, scale_valid) in outputs["proposal_scales"].items():
                     factor = int(scale) // 3
-                    proposal_options = {"fractional": True} if v413 else {}
+                    proposal_options = {"fractional": True}
                     scale_target, scale_mask = proposal_supervision(batch, cpu_batch, valid, scale_valid, factor,
                                                                      **proposal_options)
                     proposals.append(masked_bce(logits, scale_target, scale_mask,
-                        batch["proposal_" + scale + "_session_count"] if v413 else None))
+                        batch["proposal_" + scale + "_session_count"]))
                 tasks["proposal"] = torch.stack(proposals).mean()
                 tasks["transitions"] = sum(masked_bce(outputs[name + "_logit"],
                     batch[name + "_target"], mask.float() * batch[name + "_loss_mask"])
                     for name in ("onset", "offset"))
-                if v412:
-                    tasks["transitions"] = sum(heatmap_focal_loss(outputs[name + "_logit"],
-                        batch[name + "_target"], mask.float() * batch[name + "_loss_mask"]
-                        * batch["supervision_mask"] * (outputs["sensor_valid"] > 0),
-                        batch[name + "_positive_count"], batch[name + "_background_count"])
-                        for name in ("onset", "offset")) / (2 if v413 else 1)
+                tasks["transitions"] = sum(heatmap_focal_loss(outputs[name + "_logit"],
+                    batch[name + "_target"], mask.float() * batch[name + "_loss_mask"]
+                    * batch["supervision_mask"] * (outputs["sensor_valid"] > 0),
+                    batch[name + "_positive_count"], batch[name + "_background_count"])
+                    for name in ("onset", "offset")) / (2)
                 smooth_mask = valid[:, 1:] * valid[:, :-1] * batch["smooth_mask"][:, 1:] * batch["smooth_loss_mask"][:, 1:]
-                if v413:
-                    previous_valid = batch["state_loss_mask"] * (outputs["sensor_valid"] > 0)
-                    smooth_mask = mask[:, 1:] * previous_valid[:, 1:] * previous_valid[:, :-1] * batch["smooth_mask"][:, 1:] * batch["smooth_loss_mask"][:, 1:]
+                previous_valid = batch["state_loss_mask"] * (outputs["sensor_valid"] > 0)
+                smooth_mask = mask[:, 1:] * previous_valid[:, 1:] * previous_valid[:, :-1] * batch["smooth_mask"][:, 1:] * batch["smooth_loss_mask"][:, 1:]
                 tasks["smooth"] = ((outputs["state_logit"][:, 1:].sigmoid()
-                    - outputs["state_logit"][:, :-1].sigmoid()).square() * smooth_mask).sum() / (batch["smooth_session_count"].sum() if v413 else smooth_mask.sum()).clamp_min(1e-8)
+                    - outputs["state_logit"][:, :-1].sigmoid()).square() * smooth_mask).sum() / (batch["smooth_session_count"].sum()).clamp_min(1e-8)
                 event_losses, quality_losses, boundary_losses = [], [], []
                 negative_event_losses, negative_quality_losses = [], []
-                for candidate in ([] if v411 else candidates):
+                for candidate in ([]):
                     target_data = candidate_targets(candidate, truth)
                     positive, quality, event_id, *_ = target_data
                     contribution = (key, event_id) if positive else (key, candidate.proposal_family_id)
@@ -811,77 +699,71 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                 tasks["boundary"] = torch.stack(boundary_losses).sum() / session_events[key] if boundary_losses else zero
                 positive_group_losses = []
                 gradient_strata = {}
-                if v411:
-                    from bme_eating.joint_v411_training import group_losses
-                    scoring_options = {"performance": chunk_timing} if v413 else {}
-                    grouped, label_changes = group_losses(model, candidate_groups, truth, times,
-                        full_features, device, state["boundary"], config, schedule, **scoring_options)
-                    negative_tasks = {name: [] for name in ("event", "quality", "boundary", "quality_ranking")}
-                    used_groups = []
-                    bank_groups = []
-                    for group, group_tasks in grouped:
-                        if v413:
-                            if group["category"] != "positive":
-                                if (key, group["family"]) in state["family_contributions"]:
-                                    continue
-                                state["family_contributions"].add((key, group["family"]))
-                            bank_tasks = {"classification": group_tasks["event"] * config["loss"]["event"] * schedule["event"]
-                                + group_tasks["quality"] * config["loss"]["quality"] * schedule["quality"]}
-                            for name in ("boundary", "quality_ranking"):
-                                if float(group_tasks[name].detach()) > 0:
-                                    bank_tasks[name] = group_tasks[name] * config["loss"][name] * schedule.get(name, schedule["event"])
-                            bank_tasks = {name: value * contribution_weights[key[0]] for name, value in bank_tasks.items()}
-                            bank_groups.append((group, bank_tasks))
-                            if group["category"] == "positive":
-                                positive_group_losses.append((group, sum(bank_tasks.values())))
-                            else:
-                                negative_tasks["event"].append(group_tasks["event"])
-                            used_groups.append(group)
+                from bme_eating.training.candidate_supervision import group_losses
+                scoring_options = {"performance": chunk_timing}
+                grouped, label_changes = group_losses(model, candidate_groups, truth, times,
+                    full_features, device, state["boundary"], config, schedule, **scoring_options)
+                negative_tasks = {name: [] for name in ("event", "quality", "boundary", "quality_ranking")}
+                used_groups = []
+                bank_groups = []
+                for group, group_tasks in grouped:
+                    if group["category"] != "positive":
+                        if (key, group["family"]) in state["family_contributions"]:
                             continue
-                        if group["category"] == "positive":
-                            positive_group_losses.append((group if v412 else group["event_key"], sum(
-                                value * config["loss"][name] * schedule.get(name, schedule["event"])
-                                for name, value in group_tasks.items()) * contribution_weights[key[0]]))
-                        elif (key, group["family"]) not in state["family_contributions"]:
-                            state["family_contributions"].add((key, group["family"]))
-                            for name, value in group_tasks.items():
-                                negative_tasks[name].append(value)
-                        else:
-                            continue
-                        used_groups.append(group)
-                        category = group["category"]
-                        stratum_loss = sum(value * config["loss"][name] * schedule.get(name, schedule["event"])
-                                           for name, value in group_tasks.items()) * contribution_weights[key[0]] / training["accumulate_sessions"]
-                        gradient_strata[category] = gradient_strata.get(category, zero) + stratum_loss
-                    for name, values in negative_tasks.items():
-                        tasks[name] = (torch.stack(values).mean() * new_steps / session_lengths[key]
-                                       if values and not v413 else zero)
-                    state["sample_audit"][-1].update({"refined_label_changes": label_changes,
-                        "positive_loss_groups": len(positive_group_losses),
-                        "negative_loss_groups": len(negative_tasks["event"]),
-                        "actual_loss_versions": sum(len(group["versions"]) for group in used_groups),
-                        "actual_loss_proposal_ids": [item.proposal_id for group in used_groups for item in group["versions"]],
-                        "positive_group_version_mean": True,
-                        "positive_session_event_mean_at_commit": True})
+                        state["family_contributions"].add((key, group["family"]))
+                    bank_tasks = {"classification": group_tasks["event"] * config["loss"]["event"] * schedule["event"]
+                        + group_tasks["quality"] * config["loss"]["quality"] * schedule["quality"]}
+                    for name in ("boundary", "quality_ranking"):
+                        if float(group_tasks[name].detach()) > 0:
+                            bank_tasks[name] = group_tasks[name] * config["loss"][name] * schedule.get(name, schedule["event"])
+                    bank_tasks = {name: value * contribution_weights[key[0]] for name, value in bank_tasks.items()}
+                    bank_groups.append((group, bank_tasks))
+                    if group["category"] == "positive":
+                        positive_group_losses.append((group, sum(bank_tasks.values())))
+                    else:
+                        negative_tasks["event"].append(group_tasks["event"])
+                    used_groups.append(group)
+                    continue
+                    if group["category"] == "positive":
+                        positive_group_losses.append((group, sum(
+                            value * config["loss"][name] * schedule.get(name, schedule["event"])
+                            for name, value in group_tasks.items()) * contribution_weights[key[0]]))
+                    elif (key, group["family"]) not in state["family_contributions"]:
+                        state["family_contributions"].add((key, group["family"]))
+                        for name, value in group_tasks.items():
+                            negative_tasks[name].append(value)
+                    else:
+                        continue
+                    used_groups.append(group)
+                    category = group["category"]
+                    stratum_loss = sum(value * config["loss"][name] * schedule.get(name, schedule["event"])
+                                       for name, value in group_tasks.items()) * contribution_weights[key[0]] / training["accumulate_sessions"]
+                    gradient_strata[category] = gradient_strata.get(category, zero) + stratum_loss
+                for name in negative_tasks:
+                    tasks[name] = (zero)
+                state["sample_audit"][-1].update({"refined_label_changes": label_changes,
+                    "positive_loss_groups": len(positive_group_losses),
+                    "negative_loss_groups": len(negative_tasks["event"]),
+                    "actual_loss_versions": sum(len(group["versions"]) for group in used_groups),
+                    "actual_loss_proposal_ids": [item.proposal_id for group in used_groups for item in group["versions"]],
+                    "positive_group_version_mean": True,
+                    "positive_session_event_mean_at_commit": True})
                 state["sample_audit"][-1]["training_weights"] = {
                     "subject": contribution_weights[key[0]],
                     "valid_timeline": new_steps / session_lengths[key], "positive_event": 1 / session_events[key],
                     "negative_family": new_steps / session_lengths[key] / max(len(negative_event_losses), 1),
                     "natural_calibration": 1.0}
-                if v411:
-                    state["sample_audit"][-1]["training_weights"].update({
-                        "positive_event": "1 / actual_supervised_session_events",
-                        "positive_group": "1 / actual_supervised_groups_for_event",
-                        "version": "1 / actual_unique_versions_for_group",
-                        "accumulate_sessions": training["accumulate_sessions"], "schedule": schedule})
-                if v412:
-                    state["sample_audit"][-1]["training_weights"]["negative_family"] = (
-                        new_steps / session_lengths[key] / max(len(negative_tasks["event"]), 1))
+                state["sample_audit"][-1]["training_weights"].update({
+                    "positive_event": "1 / actual_supervised_session_events",
+                    "positive_group": "1 / actual_supervised_groups_for_event",
+                    "version": "1 / actual_unique_versions_for_group",
+                    "accumulate_sessions": training["accumulate_sessions"], "schedule": schedule})
+                state["sample_audit"][-1]["training_weights"]["negative_family"] = (
+                    new_steps / session_lengths[key] / max(len(negative_tasks["event"]), 1))
                 event_ids = torch.full((new_steps,), -2, dtype=torch.long, device=device)
                 phases = torch.zeros_like(event_ids)
                 invalid = batch["state_loss_mask"][0, mask[0]] <= 0
-                if v411:
-                    invalid |= outputs["sensor_valid"][0, mask[0]] <= 0
+                invalid |= outputs["sensor_valid"][0, mask[0]] <= 0
                 event_ids[invalid], phases[invalid] = -1, -1
                 for event_index, event in enumerate(session_truth.itertuples(index=False)):
                     boundary_near = ((current_times - int(event.start_ms)).abs() <= 30_000) | (
@@ -896,8 +778,8 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                     model.contrastive_projection(outputs["semantic_features"][0, mask[0]]), event_ids,
                     phases, temperature=config["loss"]["contrastive_temperature"],
                     maximum_pairs=config["loss"]["contrastive_max_pairs"])
-                if v411 and schedule["contrastive"]:
-                    from bme_eating.joint_v411_training import historical_contrastive
+                if schedule["contrastive"]:
+                    from bme_eating.training.candidate_supervision import historical_contrastive
                     tasks["contrastive"], contrastive_pairs = historical_contrastive(model,
                         outputs["semantic_features"][0, mask[0]], event_ids, phases, history_times,
                         history_features, truth, *key, config, ignore=dataset.ignore_events)
@@ -905,50 +787,40 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                 state["sample_audit"][-1]["contrastive_no_negative_or_positive_pairs"] = contrastive_pairs == 0
                 weighted = {name: loss * config["loss"][name] * schedule.get(name, 1)
                             * (new_steps / session_lengths[key] if name not in {"event", "quality", "boundary", "quality_ranking"}
-                               and not (v412 and name == "transitions") and not (v413 and name in {"state", "proposal", "smooth"}) else 1)
+                               and not (name == "transitions") and name not in {"state", "proposal", "smooth"} else 1)
                             * contribution_weights[key[0]]
                             / training["accumulate_sessions"] for name, loss in tasks.items()}
                 loss = sum(weighted.values())
-                if v413:
-                    state["sample_audit"][-1]["task_bank_normalization"] = {
-                        "pure_negative": "session_actual_family_mean",
-                        "classification": "contributing_session_mean_then_class_mean",
-                        "boundary_and_ranking": "legal_groups_events_sessions"}
-                    state["sample_audit"][-1]["training_weights"].update({
-                        "valid_timeline": "1 / actual_valid_session_supervision",
-                        "negative_family": "1 / actual_supervised_session_negative_families",
-                        "classification_sessions": "contributing_sessions_then_present_classes_mean"})
+                state["sample_audit"][-1]["task_bank_normalization"] = {
+                    "pure_negative": "session_actual_family_mean",
+                    "classification": "contributing_session_mean_then_class_mean",
+                    "boundary_and_ranking": "legal_groups_events_sessions"}
+                state["sample_audit"][-1]["training_weights"].update({
+                    "valid_timeline": "1 / actual_valid_session_supervision",
+                    "negative_family": "1 / actual_supervised_session_negative_families",
+                    "classification_sessions": "contributing_sessions_then_present_classes_mean"})
             if not torch.isfinite(loss):
                 raise RuntimeError("Nonfinite joint loss")
             if chunk_index % training["gradient_diagnostics_every_chunks"] == 0:
                 diagnostic_tasks = dict(weighted)
-                if v411 and positive_group_losses:
+                if positive_group_losses:
                     diagnostic_tasks["positive_event"] = sum(value for _, value in positive_group_losses) / training["accumulate_sessions"]
-                if v411:
-                    diagnostic_tasks.update({"stratum_" + name: value for name, value in gradient_strata.items()})
-                if v413:
-                    for group, bank_tasks in bank_groups:
-                        category = group["category"]
-                        diagnostic_tasks["stratum_" + category] = diagnostic_tasks.get(
-                            "stratum_" + category, features.sum() * 0) + sum(bank_tasks.values())
+                diagnostic_tasks.update({"stratum_" + name: value for name, value in gradient_strata.items()})
+                for group, bank_tasks in bank_groups:
+                    category = group["category"]
+                    diagnostic_tasks["stratum_" + category] = diagnostic_tasks.get(
+                        "stratum_" + category, features.sum() * 0) + sum(bank_tasks.values())
                 report = gradient_diagnostics(diagnostic_tasks, model)
                 state["gradient_diagnostics"].append({"epoch": epoch, "chunk": chunk_index,
                     "contrastive_pairs": contrastive_pairs, **report})
-            if v413:
-                buffer = PositiveGradientBuffer(state["positive_gradients"])
-                bank = ContributionBank(state)
-                for group, bank_tasks in bank_groups:
-                    if group["category"] == "positive":
-                        change = buffer.add(group, bank_tasks, model)
-                        state["sample_audit"][-1].setdefault("positive_retention", []).append(change)
-                    else:
-                        bank.negative(bank_tasks["classification"], model)
-            if v411 and not v413:
-                buffer = PositiveGradientBuffer(state["positive_gradients"])
-                for event_key, positive_loss in positive_group_losses:
-                    change = buffer.add(event_key, positive_loss, model)
-                    if v412:
-                        state["sample_audit"][-1].setdefault("positive_retention", []).append(change)
+            buffer = PositiveGradientBuffer(state["positive_gradients"])
+            bank = ContributionBank(state)
+            for group, bank_tasks in bank_groups:
+                if group["category"] == "positive":
+                    change = buffer.add(group, bank_tasks, model)
+                    state["sample_audit"][-1].setdefault("positive_retention", []).append(change)
+                else:
+                    bank.negative(bank_tasks["classification"], model)
             loss.backward()
             stage = time.monotonic()
             cache.append(current_times.detach().cpu().numpy(), features.detach().cpu().numpy())
@@ -957,19 +829,14 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             state["cache_sha256"] = cache.checksum
             state["next_chunk"] = chunk_index + 1
             if last:
-                if v411:
-                    state["sample_audit"][-1]["positive_committed_events"] = len(state["positive_gradients"])
-                    if v412:
-                        state["sample_audit"][-1]["positive_committed_groups"] = {
-                            str(event): [item["descriptor"] for item in groups.values()]
-                            for event, groups in state["positive_gradients"].items()}
-                    if v413:
-                        ContributionBank(state).finish_session(state["positive_gradients"])
-                        state["sample_audit"][-1]["actual_session_contributions"] = state["last_session_contributions"]
-                        state["natural_replay"] = None
-                        replay_payload = None
-                    else:
-                        PositiveGradientBuffer(state["positive_gradients"]).finish(model, training["accumulate_sessions"])
+                state["sample_audit"][-1]["positive_committed_events"] = len(state["positive_gradients"])
+                state["sample_audit"][-1]["positive_committed_groups"] = {
+                    str(event): [item["descriptor"] for item in groups.values()]
+                    for event, groups in state["positive_gradients"].items()}
+                ContributionBank(state).finish_session(state["positive_gradients"])
+                state["sample_audit"][-1]["actual_session_contributions"] = state["last_session_contributions"]
+                state["natural_replay"] = None
+                replay_payload = None
                 state["session_count"] += 1
                 state["session_key"], state["stream"] = None, None
                 state["cache_rows"] = 0
@@ -981,9 +848,8 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                         for parameter in model.parameters():
                             if parameter.grad is not None:
                                 parameter.grad.mul_(factor)
-                    if v413:
-                        ContributionBank(state).commit(model)
-                        state["sample_audit"][-1]["actual_update_contributions"] = state["last_update_contributions"]
+                    ContributionBank(state).commit(model)
+                    state["sample_audit"][-1]["actual_update_contributions"] = state["last_update_contributions"]
                     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), training["gradient_clip_norm"],
                                                          error_if_nonfinite=True)
                     state["clipped_steps"] += int(float(norm) > training["gradient_clip_norm"])
@@ -1008,29 +874,25 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                             "minimum full-epoch fraction "
                             f"{clipping_report['minimum_epoch_clipping_fraction']:.4f} "
                             f"> {training['clipping_abort_fraction']:.4f}")
-                    if v412:
-                        apply_learning_rate(optimizer, state, training,
-                            epoch - 1 + (state["optimizer_steps"] - 1) / expected_optimizer_steps)
+                    apply_learning_rate(optimizer, state, training,
+                        epoch - 1 + (state["optimizer_steps"] - 1) / expected_optimizer_steps)
                     optimizer.step()
                     optimizer.zero_grad(set_to_none=True)
                     state["update_count"] += 1
                     state["session_count"] = 0
             usage = enforce_resources(config, device)
-            if v411:
-                state["sample_audit"][-1].update({"elapsed_seconds": time.monotonic() - chunk_started,
-                    "cache_write_bytes": len(current_times) * (8 + capabilities(config).feature_width * 4),
-                    "positive_buffer_events": len(state["positive_gradients"]), "resources": usage,
-                    "workers": training["num_workers"], "prefetch": training["loader_prefetch_factor"],
-                    "reader_cache": training["session_reader_cache_size"]})
-                if v413:
-                    chunk_timing["previous_checkpoint_total_seconds"] = state.get("previous_checkpoint_total_seconds", 0.0)
-                    state["sample_audit"][-1]["stage_timing"] = chunk_timing
+            state["sample_audit"][-1].update({"elapsed_seconds": time.monotonic() - chunk_started,
+                "cache_write_bytes": len(current_times) * (8 + capabilities(config).feature_width * 4),
+                "positive_buffer_events": len(state["positive_gradients"]), "resources": usage,
+                "workers": training["num_workers"], "prefetch": training["loader_prefetch_factor"],
+                "reader_cache": training["session_reader_cache_size"]})
+            chunk_timing["previous_checkpoint_total_seconds"] = state.get("previous_checkpoint_total_seconds", 0.0)
+            state["sample_audit"][-1]["stage_timing"] = chunk_timing
             if hasattr(inputs, "assert_session_unchanged"):
                 inputs.assert_session_unchanged(key)
             checkpoint()
             displayed_loss = float(loss.detach())
-            if v413:
-                displayed_loss += sum(float(value.detach()) for _, tasks in bank_groups for value in tasks.values())
+            displayed_loss += sum(float(value.detach()) for _, tasks in bank_groups for value in tasks.values())
             chunk_progress.set_postfix(loss=f"{displayed_loss:.5f}", subject=key[0],
                                        refresh=False)
         chunk_progress.close()
@@ -1040,13 +902,12 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             epoch, state["clipped_steps"], state["optimizer_steps"], expected_optimizer_steps,
             training["clipping_abort_fraction"])
         fraction = clipping_report["clipping_fraction"]
-        if v411:
-            def restore_candidate(payload):
-                payload = dict(payload)
-                payload.pop("source_flags", None)
-                return JointCandidate(**payload)
-            state["epoch_candidates"] = [restore_candidate(record["candidate"]) for record in
-                journals["candidate_history"].records() if record["epoch"] == epoch]
+        def restore_candidate(payload):
+            payload = dict(payload)
+            payload.pop("source_flags", None)
+            return JointCandidate(**payload)
+        state["epoch_candidates"] = [restore_candidate(record["candidate"]) for record in
+            journals["candidate_history"].records() if record["epoch"] == epoch]
         coverage = candidate_coverage(state["epoch_candidates"], truth)
         residuals = []
         independent = set()
@@ -1064,11 +925,10 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                              "start_range_seconds": start_range,
                              "end_range_seconds": settings["maximum_end_range_seconds"],
                              "sigma_seconds": settings["sigma_seconds"]}
-        if v411:
-            state["boundary"].update({"qualified": epoch >= settings["train_from_epoch"]
-                and config.get("ablation", {}).get("name") != "no_boundary", "mode": "both",
-                "training_qualification_separate_from_oof_enablement": True})
-            state["epoch_candidates"] = []
+        state["boundary"].update({"qualified": epoch >= settings["train_from_epoch"]
+            and config.get("ablation", {}).get("name") != "no_boundary", "mode": "both",
+            "training_qualification_separate_from_oof_enablement": True})
+        state["epoch_candidates"] = []
         state["epoch_complete"] = True
         qualification = epoch >= training["checkpoint_min_epoch"] and fraction <= training["clipping_promotion_fraction"]
         epoch_payload = {"model": model.state_dict(), "identity": identity, "epoch": epoch,
@@ -1078,9 +938,8 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             "preprocessing": preprocessing, "boundary": state["boundary"],
             "config_sha256": bound_config, "source_sha256": digest(bound_source),
             "data_sha256": digest(inputs.identity)}
-        if v412:
-            epoch_payload.update({"lr_position": state.get("lr_position", 0),
-                                  "learning_rates": state.get("learning_rates", [])})
+        epoch_payload.update({"lr_position": state.get("lr_position", 0),
+                              "learning_rates": state.get("learning_rates", [])})
         if state.get("resume_migration"):
             epoch_payload["resume_migration"] = state["resume_migration"]
         checkpoint()
@@ -1098,21 +957,19 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                   "clipping_gate": clipping_report,
                   "maximum_gradient_norm": state.get("maximum_gradient_norm", 0),
                   "elapsed_seconds": time.monotonic() - started, **enforce_resources(config, device)}
-        if v412:
-            record.update({"lr_position": state.get("lr_position", 0),
-                           "learning_rates": state.get("learning_rates", [])})
+        record.update({"lr_position": state.get("lr_position", 0),
+                       "learning_rates": state.get("learning_rates", [])})
         stop = False
         if selector and epoch >= training["checkpoint_min_epoch"] and epoch % training["validation_every_epochs"] == 0:
-            if v411:
-                from bme_eating.data.joint_sessions import release_session_loader
-                release_session_loader(loader)
-                loader = None
+            from bme_eating.data.joint_sessions import release_session_loader
+            release_session_loader(loader)
+            loader = None
             assert_excluded(subjects, selector, outer_excluded or set())
             fitted_mapping = fit_source_mapping(model, inputs, subjects, config, preprocessing,
                                                 directory / "source_fit" / str(epoch), identity)
             predictions = predict_joint_model(model, inputs, selector, config, preprocessing,
                                                directory / "selector" / str(epoch), identity,
-                                               {**state["boundary"], **({"search_eligible": False} if v412 else {})},
+                                               {**state["boundary"], "search_eligible": False},
                                                mapping=fitted_mapping)
             _, _, selector_events, _ = inputs.frames(selector, labels=True)
             selector_truth, selector_ignore = partition_evaluation_events(selector_events, selector)
@@ -1127,30 +984,21 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                 state["diagnostic_epoch"], state["diagnostic_f1"] = epoch, f1
                 save_torch_atomic(directory / "diagnostic_selected.pt", {
                     **epoch_payload, "promotion_eligible": False, "diagnostic_only": True})
-            if v413:
-                improved, stop = selection_update(state, epoch, eligible, f1, training)
-                if improved:
-                    save_torch_atomic(directory / "selected.pt", epoch_payload)
-                record["selection_state"] = {name: state.get(name) for name in (
-                    "best_epoch", "stale_checks", "unqualified_checks", "lost_qualification_checks", "selection_failure")}
-            else:
-                if eligible and (state["best_epoch"] is None or f1 > state["best_f1"] + training["f1_min_delta"]):
-                    state["best_epoch"], state["best_f1"], state["stale_checks"] = epoch, f1, 0
-                    save_torch_atomic(directory / "selected.pt", epoch_payload)
-                else:
-                    state["stale_checks"] += 1
-                stop = state["stale_checks"] >= training["patience_checks"]
+            improved, stop = selection_update(state, epoch, eligible, f1, training)
+            if improved:
+                save_torch_atomic(directory / "selected.pt", epoch_payload)
+            record["selection_state"] = {name: state.get(name) for name in (
+                "best_epoch", "stale_checks", "unqualified_checks", "lost_qualification_checks", "selection_failure")}
             print(f"[selection] best_epoch={state['best_epoch']} best_F1={state['best_f1']:.4f} "
                   f"stale_checks={state['stale_checks']}/{training['patience_checks']} "
                   f"clipping={fraction:.4f} early_stop={stop} "
                   f"unqualified_checks={state.get('unqualified_checks', 0)} "
                   f"lost_qualification_checks={state.get('lost_qualification_checks', 0)}", flush=True)
-        if v411:
-            journals["training_history"].append([record])
-            state["journal_offsets"]["training_history"] = journals["training_history"].offset
-            if "selector" in record:
-                record = {**record, "selector": {name: value for name, value in record["selector"].items()
-                           if name != "budget_audit"}}
+        journals["training_history"].append([record])
+        state["journal_offsets"]["training_history"] = journals["training_history"].offset
+        if "selector" in record:
+            record = {**record, "selector": {name: value for name, value in record["selector"].items()
+                       if name != "budget_audit"}}
         state["history"].append(record)
         write_json_atomic(directory / "training_history.json", state["history"])
         write_json_atomic(directory / "sampling.json", state["sample_audit"])
@@ -1162,27 +1010,25 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         state["clipped_steps"], state["optimizer_steps"] = 0, 0
         state["maximum_gradient_norm"] = 0
         state["event_contributions"], state["family_contributions"] = set(), set()
-        if v411:
-            state["positive_group_counts"] = {}
-            if state["positive_gradients"]:
-                raise RuntimeError("Positive gradients remain uncommitted after epoch completion")
+        state["positive_group_counts"] = {}
+        if state["positive_gradients"]:
+            raise RuntimeError("Positive gradients remain uncommitted after epoch completion")
         state["epoch_candidates"] = []
         checkpoint()
         if stop:
             break
     state["training_complete"] = True
-    if v411:
-        from bme_eating.data.joint_sessions import release_session_loader
-        release_session_loader(loader)
+    from bme_eating.data.joint_sessions import release_session_loader
+    release_session_loader(loader)
     checkpoint()
     if selector:
         if state["best_epoch"] is None and state["diagnostic_epoch"] is None:
             raise RuntimeError("No finite/clipping-qualified joint epoch; diagnostic checkpoints preserved")
-        if v413 and (state["best_epoch"] is None or state.get("selection_failure")):
+        if (state["best_epoch"] is None or state.get("selection_failure")):
             write_json_atomic(directory / "selector_failure_report.json", {
                 "promotion_eligible": False, "diagnostic_epoch": state["diagnostic_epoch"],
                 "reason": state.get("selection_failure") or "No qualified checkpoint at maximum epoch"})
-            raise RuntimeError("v413 selection failed; diagnostic weights cannot enter retraining")
+            raise RuntimeError("Joint selection failed; diagnostic weights cannot enter retraining")
         if state["best_epoch"] is None:
             write_json_atomic(directory / "selector_failure_report.json", {
                 "promotion_eligible": False, "diagnostic_epoch": state["diagnostic_epoch"],
@@ -1192,87 +1038,26 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
 
 
 def decoder_settings(config):
-    if supported(config, "stabilized"):
-        return {f"high_{high:g}_low_{ratio:g}_gap_{gap}":
-                {**config["decoder"], "high_threshold": high, "low_ratio": ratio,
-                 "gap_merge_seconds": gap}
-                for high, ratio, gap in product(config["search"]["high_thresholds"],
-                    config["search"]["low_ratios"], config["search"]["gap_seconds"])}
-    return {f"high_{high:g}_gap_{gap}": {**config["decoder"], "high_threshold": high,
-                                         "gap_merge_seconds": gap}
-            for high, gap in product(config["search"]["high_thresholds"], config["search"]["gap_seconds"])}
+    return {f"high_{high:g}_low_{ratio:g}_gap_{gap}":
+            {**config["decoder"], "high_threshold": high, "low_ratio": ratio,
+             "gap_merge_seconds": gap}
+            for high, ratio, gap in product(config["search"]["high_thresholds"],
+                config["search"]["low_ratios"], config["search"]["gap_seconds"])}
 
 
 @torch.no_grad()
 def predict_joint_model(model, inputs, subjects, config, preprocessing, directory, identity,
                         boundary, *, training_source: bool = False, mapping=None, operating_point=None,
                         development_calibration=None):
-    if supported(model, "grouped"):
-        from bme_eating.joint_v411_prediction import predict
-        return predict(model, inputs, subjects, config, preprocessing, directory, identity, boundary,
-                       source_only=training_source, mapping=mapping, operating_point=operating_point,
-                       development_calibration=development_calibration)
-    device = next(model.parameters()).device
-    dataset, _ = make_joint_dataset(inputs, subjects, config, preprocessing, training=training_source)
-    dataset.training = False
-    sampler = SessionChunkSampler(dataset, 0, training=False)
-    loader = session_loader(dataset, sampler, config)
-    model.eval()
-    coarse = {name: [] for name in decoder_settings(config)}
-    refined = {str(entropy): {name: [] for name in coarse} for entropy in config["boundary"]["entropy_thresholds"]}
-    windows, streams, current_key, cache = [], {}, None, None
-    for chunk_index, batch in enumerate(loader):
-        _, _, _, key, last, count = sampler.chunks[chunk_index]
-        if hasattr(inputs, "assert_session_unchanged"):
-            inputs.assert_session_unchanged(key)
-        if key != current_key:
-            current_key = key
-            streams = {name: StreamingProposals(*key, identity, decoder)
-                       for name, decoder in decoder_settings(config).items()}
-            cache = TimelineCache(directory / "cache" / stable_id(*key),
-                {"identity": identity, "epoch": "prediction", "subject": key[0], "session": key[1]},
-                FEATURE_WIDTH)
-        batch = {name: value.to(device) if isinstance(value, torch.Tensor) else value
-                 for name, value in batch.items()}
-        outputs = model(batch)
-        mask = torch.zeros(batch["timestamp_ms"].shape[1], dtype=torch.bool, device=device)
-        mask[-count:] = True
-        times = batch["timestamp_ms"][0, mask]
-        features = pack_features(outputs, mask)
-        cache.append(times.cpu().numpy(), features.cpu().numpy())
-        all_times, all_features = cache.tensors()
-        for timestamp, values in zip(times.tolist(), features.cpu().numpy()):
-            windows.append({"subject_key": key[0], "session_id": key[1], "timestamp_ms": timestamp,
-                            "valid": float(values[128]), "gyro_valid": float(values[135]),
-                            "model_identity": identity})
-        for setting, stream in streams.items():
-            candidates = generate_chunk(stream, times, features)
-            if last:
-                candidates.extend(stream.finish())
-            for candidate in candidates:
-                score_candidate(model, candidate, all_times, all_features, device)
-                coarse[setting].append(candidate)
-                for entropy in config["boundary"]["entropy_thresholds"]:
-                    refined[str(entropy)][setting].append(refine_candidate(model, candidate,
-                        all_times, all_features, device, boundary, entropy))
-        enforce_resources(config, device)
-        if hasattr(inputs, "assert_session_unchanged"):
-            inputs.assert_session_unchanged(key)
-        if hasattr(inputs, "file_signature") and inputs.file_signature() != inputs.bound_files:
-            raise RuntimeError("Runtime canonical input changed during prediction")
-    return {"coarse": coarse, "refined": refined, "windows": pd.DataFrame(windows)}
+    from bme_eating.prediction import predict
+    return predict(model, inputs, subjects, config, preprocessing, directory, identity, boundary,
+                   source_only=training_source, mapping=mapping, operating_point=operating_point,
+                   development_calibration=development_calibration)
 
 
 def fit_source_mapping(model, inputs, subjects, config, preprocessing, directory, identity):
-    if supported(model, "grouped"):
-        from bme_eating.joint_v411_prediction import fit_mapping
-        return fit_mapping(model, inputs, subjects, config, preprocessing, directory, identity)
-    outputs = predict_joint_model(model, inputs, subjects, config, preprocessing, directory, identity,
-                                   {"qualified": False}, training_source=True)
-    candidates = [candidate for pool in outputs["coarse"].values() for candidate in pool]
-    mapping = FrozenSourceCDF.fit(candidates, subjects)
-    write_json_atomic(directory / "source_mapping.json", mapping.to_json())
-    return mapping
+    from bme_eating.prediction import fit_mapping
+    return fit_mapping(model, inputs, subjects, config, preprocessing, directory, identity)
 
 
 def load_trained(directory, config, identity, subjects, data_identity, *, checkpoint_name="latest.pt"):
@@ -1296,12 +1081,10 @@ def boundary_pair_gate(coarse, refined, truth, ignore, windows, config, *, requi
     coarse_metrics, coarse_match = metrics_with_exposure(truth, coarse, ignore, windows)
     refined_metrics, refined_match = metrics_with_exposure(truth, refined, ignore, windows)
     event_keys = ["subject_key", "session_id", "event_id"]
-    keys = [*event_keys, "prediction_event_id"]
     proposal_keys = ["subject_key", "session_id", "prediction_event_id"]
     before = set(map(tuple, coarse_match[proposal_keys].values)) if len(coarse_match) else set()
     after = set(map(tuple, refined_match[proposal_keys].values)) if len(refined_match) else set()
-    v411 = supported(config, "grouped")
-    paired = coarse_match.merge(refined_match, on=event_keys if v411 else keys,
+    paired = coarse_match.merge(refined_match, on=event_keys,
                                 suffixes=("_coarse", "_refined")) if before and after else pd.DataFrame()
     improvements = {}
     for endpoint in ("start", "end"):
@@ -1310,13 +1093,13 @@ def boundary_pair_gate(coarse, refined, truth, ignore, windows, config, *, requi
         improvements[endpoint] = (old - new) / old if old > 0 else 0
     truth_before = set(map(tuple, coarse_match[event_keys].values)) if len(coarse_match) else set()
     truth_after = set(map(tuple, refined_match[event_keys].values)) if len(refined_match) else set()
-    from bme_eating.joint_evaluation import event_frame
+    from bme_eating.evaluation import event_frame
     refined_frame = event_frame(refined)
     refined_keys = ["subject_key", "session_id", "proposal_id"]
     emitted = set(map(tuple, refined_frame[refined_keys].values))
     ignored = prediction_ignore_mask(refined_frame, ignore)
     false_positive_ids = set(map(tuple, refined_frame.loc[~ignored, refined_keys].values)) - after
-    conversions = before & false_positive_ids if v411 else before - after
+    conversions = before & false_positive_ids
     tp_to_fp = len(conversions) / max(len(before), 1)
     population = {candidate.proposal_id: candidate for candidate in
                   (refined_candidates if refined_candidates is not None else refined)}
@@ -1344,8 +1127,7 @@ def boundary_pair_gate(coarse, refined, truth, ignore, windows, config, *, requi
             "paired_positive_events": positive_events, "improvements": improvements,
             "tp_to_fp_count": failures, "tp_to_fp_denominator": denominator,
             "tp_to_fp_exact_95_interval": interval,
-            "tp_to_fp_basis": ("coarse_matched_prediction_id_to_refined_false_positive" if v411
-                               else "coarse_matched_prediction_id_not_refined_matched"),
+            "tp_to_fp_basis": ("coarse_matched_prediction_id_to_refined_false_positive"),
             "tp_prediction_loss_count": len(before - after),
             "dropped_tp_prediction_count": len(before - emitted),
             "ignored_tp_prediction_count": len((before & emitted) - after - false_positive_ids),
@@ -1362,148 +1144,3 @@ def boundary_pair_gate(coarse, refined, truth, ignore, windows, config, *, requi
             "valid_end_bins": [candidate.boundary_valid_end_bins for candidate in population],
             "fallback_reasons": {reason: sum(candidate.boundary_fallback_reason == reason for candidate in population)
                                  for reason in {candidate.boundary_fallback_reason for candidate in population}}}
-
-
-def train_partition_protocol(inputs, subjects, outer, config, directory, run_identity, resume):
-    if resume and (directory / "internal_manifest.json").exists():
-        point = verify_internal_manifest(directory, config, inputs.identity, subjects, outer, run_identity)
-        return int(np.median([lineage["epoch"] for lineage in point["lineage"]])), point
-    partitions = stacking_partitions(subjects, 3, 2026)
-    epochs, outputs, mappings, lineages = [], [], {}, []
-    executed = internal_partitions(config)
-    boundary_search_eligible = True
-    if supported(config, "consistent_inputs"):
-        calibration_subjects = {subject for subject, partition in partitions.items() if partition in executed}
-        _, _, calibration_events, _ = inputs.frames(calibration_subjects, labels=True)
-        calibration_truth, _ = partition_evaluation_events(calibration_events, calibration_subjects)
-        boundary_search_eligible = len(calibration_truth) >= config["boundary"]["minimum_positive_events"]
-    for partition in executed:
-        print(f"[internal] {directory.parent.name} partition {partition + 1}/{len(executed)} "
-              f"({calibration_scope(config)['calibration_kind']})", flush=True)
-        prediction = {subject for subject, group in partitions.items() if group == partition}
-        train = subjects - prediction
-        assert_excluded(train, prediction, outer)
-        anchors, _, events, _ = inputs.frames(train, labels=True)
-        fit, selector, split_report = _selector_split(train, config["training"]["selector_fraction"],
-                                                     2026, events=events, anchors=anchors)
-        partition_root = directory / f"partition_{partition}"
-        identity = digest({"run": run_identity, "training": sorted(train), "prediction": sorted(prediction),
-                           "outer": sorted(outer), "partition": partition})
-        write_json_atomic(partition_root / "selector_split.json", split_report)
-        selected_epoch = train_joint_model(inputs, fit, config, partition_root / "selection", identity,
-            epochs=config["training"]["max_epochs"], resume=resume, selector=selector,
-            outer_excluded=outer | prediction)
-        epochs.append(selected_epoch)
-        train_joint_model(inputs, train, config, partition_root / "retrain", identity,
-                          epochs=selected_epoch, resume=resume, outer_excluded=outer | prediction)
-        model, payload = load_trained(partition_root / "retrain", config, identity, train, inputs.identity)
-        mapping = fit_source_mapping(model, inputs, train, config, payload["preprocessing"],
-                                      partition_root / "source_fit", identity)
-        mappings[identity] = mapping
-        output = predict_joint_model(model, inputs, prediction, config, payload["preprocessing"],
-            partition_root / "prediction", identity,
-            {**payload["boundary"], "search_eligible": boundary_search_eligible}, mapping=mapping)
-        outputs.append(output)
-        history = json.loads((partition_root / "selection" / "training_history.json").read_text(encoding="utf-8"))
-        selected_record = next(record for record in history if record["epoch"] == selected_epoch)
-        lineages.append({"partition": partition, "model_identity": identity,
-                         "training_subjects": sorted(train), "prediction_subjects": sorted(prediction),
-                         "outer_excluded_subjects": sorted(outer), "epoch": selected_epoch,
-                         "source_training_subjects": mapping.training_subjects,
-                         "normalization_subjects": payload["preprocessing"]["training_subjects"],
-                         "selector_fit_subjects": sorted(fit), "selector_subjects": sorted(selector),
-                         "config_sha256": payload["config_sha256"], "source_sha256": payload["source_sha256"],
-                         "data_sha256": payload["data_sha256"], "checkpoint_qualified": True})
-        lineages[-1]["selector_promotion_eligible"] = bool(selected_record.get("selector", {}).get("promotion_eligible"))
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    windows = pd.concat([output["windows"] for output in outputs], ignore_index=True)
-    coarse = {name: [candidate for output in outputs for candidate in output["coarse"][name]]
-              for name in outputs[0]["coarse"]}
-    calibration_subjects = {subject for lineage in lineages for subject in lineage["prediction_subjects"]}
-    _, _, events, _ = inputs.frames(calibration_subjects, labels=True)
-    truth, ignore = partition_evaluation_events(events, calibration_subjects)
-    point, search = choose_operating_point(coarse, windows, truth, ignore, mappings, config)
-    coarse_point = copy.deepcopy(point)
-    natural, _ = apply_online_budget(coarse[point["setting"]], windows, mappings, point["budget"],
-                                     config["decoder"]["quotas"])
-    calibrator = NonnegativePlatt(**point["calibration"])
-    coarse_predictions = commit_candidates(natural, calibrator, point["acceptance"], point["nms"])
-    boundary_reports, enabled, best_boundary_f1, best_entropy, winning_point = [], False, -1.0, None, None
-    v411 = supported(config, "grouped")
-    if v411:
-        from bme_eating.joint_v411_boundary import lock_boundary_modes
-        point, boundary_reports, search_boundary = lock_boundary_modes(
-            point, natural, coarse_predictions, outputs, truth, ignore, windows, config)
-        search.extend(search_boundary)
-        enabled, best_entropy = point["boundary_enabled"], point["boundary_entropy"]
-    for entropy in ([] if v411 else config["boundary"]["entropy_thresholds"]):
-        candidates = [candidate for output in outputs for candidate in output["refined"][str(entropy)][point["setting"]]]
-        natural_refined = {candidate.proposal_id: candidate for candidate in candidates}
-        refined_candidates = [natural_refined[candidate.proposal_id] for candidate in natural]
-        from bme_eating.joint_evaluation import event_frame
-        ignored = prediction_ignore_mask(event_frame(refined_candidates), ignore)
-        targets = np.asarray([candidate_targets(candidate, truth)[0] for candidate in refined_candidates])
-        keep = ~ignored | (targets > 0)
-        logits = np.asarray([candidate.event_logit for candidate in refined_candidates])
-        refined_calibrator = NonnegativePlatt.fit(logits[keep], targets[keep])
-        ece = calibration_ece(refined_calibrator.transform(logits[keep]), targets[keep], config["calibration"]["bins"])
-        refined_point, refined_best = None, None
-        report = boundary_pair_gate(coarse_predictions, coarse_predictions, truth, ignore, windows, config)
-        if any(candidate.refined for candidate in refined_candidates) and refined_calibrator.qualified and ece <= config["calibration"]["maximum_ece"]:
-            acceptances = np.arange(config["search"]["acceptance_min"], config["search"]["acceptance_max"] + 1e-8,
-                                    config["search"]["acceptance_step"])
-            for nms, acceptance in product(config["search"]["nms_ious"], acceptances):
-                refined_predictions, refined_diagnostics = commit_candidates(refined_candidates, refined_calibrator,
-                    float(acceptance), nms, return_diagnostics=True)
-                paired_coarse = commit_candidates(natural, refined_calibrator, float(acceptance), nms)
-                trial = boundary_pair_gate(paired_coarse, refined_predictions, truth, ignore, windows, config,
-                                           refined_candidates=refined_diagnostics)
-                trial["locked_coarse"] = coarse_point
-                metrics = trial["refined"]
-                eligible = (trial["passed"] and point["candidate_recall"] >= 0.70
-                            and metrics["fp_per_hour"] <= config["gates"]["maximum_fp_per_hour"]
-                            and coarse_point["f1"] - metrics["f1"] <= config["gates"]["boundary_maximum_f1_drop"])
-                search.append({"boundary_entropy": entropy, "nms": nms, "acceptance": float(acceptance),
-                               "calibration_ece": ece, "promotion_eligible": eligible, **metrics})
-                key = (int(eligible), metrics["f1"], -metrics["fp_per_hour"])
-                if refined_best is None or key > refined_best:
-                    refined_best, report = key, trial
-                    refined_point = {**point, **metrics, "calibration": refined_calibrator.to_json(),
-                                     "calibration_ece": ece, "acceptance": float(acceptance), "nms": nms,
-                                     "promotion_eligible": eligible}
-        report["entropy"] = entropy
-        boundary_reports.append(report)
-        if refined_point and refined_point["promotion_eligible"] and report["passed"] and report["refined"]["f1"] > best_boundary_f1:
-            enabled, best_boundary_f1, best_entropy = True, report["refined"]["f1"], entropy
-            winning_point = refined_point
-    if winning_point is not None:
-        point = winning_point
-    point["coarse_operating_point"] = coarse_point
-    point["boundary_enabled"], point["boundary_entropy"] = enabled, best_entropy
-    point["promotion_eligible"] &= all(lineage["selector_promotion_eligible"] for lineage in lineages)
-    point["lineage"] = lineages
-    point.update({**calibration_scope(config), "calibration_subjects": sorted(calibration_subjects)})
-    verify_calibration_lineage(lineages, subjects, outer, config,
-                               identities=protocol_identities(config, inputs.identity))
-    write_json_atomic(directory / "operating_point.json", point)
-    write_json_atomic(directory / "search.json", search)
-    write_json_atomic(directory / "boundary_crossfit.json", boundary_reports)
-    if not enabled:
-        write_json_atomic(directory / "boundary_failure_report.json", {
-            "boundary_enabled": False, "coarse_retained": True,
-            "reason": "No internal cross-fit entropy passed all Boundary gates", "diagnostics": boundary_reports})
-    windows.to_parquet(directory / "internal_oof_windows.parquet", index=False)
-    save_torch_atomic(directory / "internal_oof.pt", {"outputs": outputs, "lineages": lineages,
-                                                      "mappings": mappings})
-    evidence = {path.relative_to(directory).as_posix(): sha256_file(path) for path in directory.rglob("*")
-                if path.is_file() and "cache" not in path.relative_to(directory).parts
-                and path.suffix in {".json", ".pt", ".parquet"}
-                and path.name not in {"internal_manifest.json", "resume.pt"}}
-    write_json_atomic(directory / "internal_manifest.json", {"protocol": protocol_for(config),
-        "run_identity": run_identity, "training_subjects": sorted(subjects),
-        "outer_excluded_subjects": sorted(outer), **protocol_identities(config, inputs.identity),
-        **calibration_scope(config), "calibration_subjects": sorted(calibration_subjects),
-        "evidence_sha256": evidence})
-    return int(np.median(epochs)), point

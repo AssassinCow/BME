@@ -1,26 +1,17 @@
-# 2026 生医工进食检测：StatsFusion v4.14
+# StatsFusion：可穿戴进食事件检测
 
-本仓库的开发主线为 **v4.14**：28名受试者训练、11名开发验证选择epoch，再用全部39名有效受试者从头重训。模型沿用v4.13共享编码器与联合检测训练，增加独立的全量数据工作流、冻结划分、阶段核验和最终开发校准。
+用于2026生医工竞赛的 **v4.14** 联合检测实现。共享传感器编码器同时学习时间线、候选事件、质量和边界；训练按受试者划分，推理按已观测数据因果提交。
 
-| 项目 | 当前主线 |
-|---|---|
-| 版本 / schema | `v4.14` / `v414` |
-| 模型 | `statsfusion_joint_event_v414` |
-| 协议 | `statsfusion-joint-event-v5` |
-| 配置 | `configs/statsfusion_v414_full_data.yaml` |
-| 默认run | `statsfusion_v414_28_11_then_39_20261012a` |
+| 身份 | 值 |
+| --- | --- |
+| 模型 / 协议 | `statsfusion_joint_event_v414` / `statsfusion-joint-event-v5` |
+| 唯一配置 | [`configs/statsfusion_v414_full_data.yaml`](configs/statsfusion_v414_full_data.yaml) |
 | Seed | `2026` |
-| Runner | `scripts/run_statsfusion_joint.py` |
-| 最终bundle接口 | `StatsFusionJointFinalDataDetector.predict_session()` |
+| 流程 | `audit → dev → final39 → export → replay` |
 
-完整流程、产物及推理示例见[v4.14运行说明](docs/statsfusion_v414_full_data.md)。旧版源码、配置和测试作为历史实现及兼容依赖保留；v4.14运行必须使用自己的配置和全新run。相邻v4.13项目独立运行，不受本仓库提交和推送影响。
+## 快速开始
 
-## 环境与输入
-
-- Python `3.11`或`3.12`；训练使用CUDA与BF16，CPU可运行相应验收。
-- 原始输入根目录由`BME_DATA_ROOT`提供，产物根目录由`BME_OUTPUT_ROOT`提供。
-- 只读复用已核验的原始输入、canonical features及subject split；冻结开发划分位于`splits/v414_dev28_11.json`。
-- `.env`、凭据、subject salt、原始数据、模型权重和运行输出保存在仓库外或Git忽略目录。
+Python 3.11或3.12。先安装适合本机的[PyTorch CUDA版本](https://pytorch.org/get-started/locally/)，再安装项目；CPU环境可运行单元测试和合成验收。
 
 ```powershell
 conda activate bme-model
@@ -28,45 +19,62 @@ python -m pip install -e ".[dev]"
 python scripts/check_environment.py
 ```
 
-## 训练与恢复
+复制`.env.example`为`.env`并设置`BME_DATA_ROOT`与`BME_OUTPUT_ROOT`。训练前必须已有核验通过的输入：`$BME_OUTPUT_ROOT/v2`数据索引与原始session缓存、`$BME_OUTPUT_ROOT/v4` canonical特征。输入准备协议为`statsfusion-r3.2`；这是数据身份，与模型版本分开。输入及冻结划分保持只读，审计失败时停止。
 
-GPU资源空闲后，在v4.14仓库根目录执行：
+GPU空闲后，在仓库根目录运行：
 
 ```powershell
 conda run --no-capture-output -n bme-model python scripts/run_statsfusion_joint.py `
   --config configs/statsfusion_v414_full_data.yaml `
   --run-name statsfusion_v414_28_11_then_39_20261012a `
-  --evaluation-mode dev28_11 --stage all --skip-s0 --fresh
+  --evaluation-mode dev28_11 --stage all --fresh
 ```
 
-执行顺序为`audit → dev → final39 → export → replay`。开发训练上限64轮，保留资格检查与早停。最终39人训练采用开发阶段冻结的E轮，不再次选epoch；实际训练到E+4，保存`E−4、E−2、E、E+2、E+4`五档checkpoint，默认校准和导出仍使用E轮。学习率沿用64轮时间轴，额外轮次保持既有最低学习率。
+中断后使用相同命令，将`--fresh`改为`--resume`。只需开发模型时使用`--stage dev`；开发完成后以`--evaluation-mode final39 --stage all --resume`继续。可用阶段为`audit/dev/final39/export/replay/all`，详细产物和失败处理见[运行说明](docs/training.md)。
 
-中断后保持相同命令，将`--fresh`改为`--resume`。恢复仅允许worker、prefetch和既有缓存运行参数调整；模型、loss、源码、seed、数据或成员名单变化必须新建run。v4.14拒绝旧版本run及checkpoint身份。未完成阶段按恢复游标继续，损坏或不完整证据不能标记为完成或用于导出。
-
-若先仅执行开发训练，将`--stage all`改为`--stage dev`；完成后在同一run用`--evaluation-mode final39 --stage all --resume`继续最终训练、导出和replay。
-
-## 数据与结论范围
+## 数据与结果边界
 
 | 集合 | 受试者 | Session | 有效事件 | 自然GYRO全缺失事件 |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | 开发训练 | 28 | 799 | 116 | 6 |
 | 开发验证 | 11 | 354 | 45 | 4 |
-| 最终训练 | 39 | 1153 | 161 | 10 |
+| 最终重训 | 39 | 1153 | 161 | 10 |
 
-训练与开发按受试者互斥，两名自然GYRO全缺失受试者各分配一组。开发成绩用于选epoch、校准和完整16038操作点搜索，属于开发证据。最终39人模型在原11人上重新校准；这些标签已参与最终训练，因此该结果明确登记为`development_on_final_model`、`independent_calibration=false`。
+划分冻结于[`splits/v414_dev28_11.json`](splits/v414_dev28_11.json)。开发阶段选择epoch `E`；最终39人模型从头训练至`E+4`，保存`E−4/E−2/E/E+2/E+4`，默认校准与导出仍使用`E`。训练数学和完整16038个操作点保持既有协议。
 
-主线身份不表示效果已通过正式晋级。最终bundle标记`official_test_candidate=true`、`promotable=false`；Boundary部署固定为`off`。官方测试仅使用锁定配置推理，不能据其标签重新选epoch、拟合校准器或搜索操作点。
+最终校准使用已参与39人训练的11名开发受试者，标记为`development_on_final_model`和`independent_calibration=false`。所有产物`promotable=false`；合格最终bundle为`official_test_candidate=true`。开发F1、bootstrap和邻近checkpoint结果均不能作为独立测试证明。Boundary继续学习，部署固定`off`。
 
-## 验收与记录
+## 仓库结构
+
+```text
+configs/                  唯一完整训练配置，无继承链
+splits/                   冻结受试者划分
+src/bme_eating/
+  models/                 共享编码器、定位表示和联合候选头
+  training/               自然回放、采样、贡献归一化与恢复
+  data/                   session读取、派生特征与一致增强
+  workflow.py             开发选模与最终39人工作流
+  protocol.py             身份、资格、资源与恢复约束
+  streaming.py, bundle.py  因果推理与部署bundle
+scripts/                  训练、验收、审计和环境入口
+tests/                    当前主线及输入语义回归测试
+docs/                     架构、运行和验收说明
+manifests/                源码来源及本次整理验收
+```
+
+候选、评分、缓存、搜索和诊断按功能组织，旧模型、迁移和五折入口已退役。历史实现与旧验收报告可从Git历史查阅，当前入口仅支持v4.14。相邻v4.13项目独立运行。
+
+## 验证与推理
 
 ```powershell
 python -m pytest -k "not cuda and not gpu"
-python -m ruff check src scripts tests --no-cache
+python -m ruff check src scripts tests
 python -m compileall -q src scripts tests
-git diff --check
-python scripts/validate_statsfusion_joint.py --config configs/statsfusion_v414_full_data.yaml --device cpu
+python scripts/validate_statsfusion_joint.py --device cpu
 ```
 
-GPU验收必须等待已有训练释放资源。实施检查、GPU/真实数据验收、开发与最终训练完成、正式晋级分别记录，不能相互替代。已执行检查与待验项见[实施验收记录](docs/v414_implementation_acceptance_20261012.md)及[完整性修复验收](docs/v414_integrity_repairs_20261012.md)。
+GPU验收需要资源空闲：`python scripts/validate_statsfusion_joint.py --device cuda`。真实短训练审计使用`python scripts/audit_statsfusion_v414_training.py --device cuda`，其权重不进入正式run。真实资源测试需显式设置`BME_RESOURCE_TESTS=1`，见[验收说明](docs/validation.md)。CI只执行CPU检查。
 
-每run保存源码、配置/data/runtime身份、冻结划分、训练贡献、候选漏斗、搜索、资源、失败报告和逐文件hash。仓库通过`.gitattributes`固定源码checkout的换行，并保留冻结划分及验收证据的原始字节，以便核验已有hash。历史r3.2运行说明见[历史runbook](docs/hierarchical_v4_statsfusion_runbook.md)，不作为当前v4.14入口。
+部署入口：`bme_eating.bundle.StatsFusionJointFinalDataDetector`。加载导出的bundle后调用`predict_session(raw)`，其中`raw`为`bme_eating.data.stats_fusion_preprocess.RawSessionInput`；接口、因果约束见[架构说明](docs/architecture.md)。
+
+本次整理改变源码身份：正式训练使用全新run；旧源码身份的run不能resume。原始数据、权重、输出、`.env`和subject salt均不提交Git。AI使用及最终提交须遵守赛事规则。

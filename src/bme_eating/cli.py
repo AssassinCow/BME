@@ -2,16 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import platform
-import sys
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
-import torch
 from tqdm import tqdm
 
 from bme_eating.config import load_config, resolve_roots
@@ -214,29 +210,6 @@ def _inspect_selected_layouts(
     finally:
         progress.close()
     return [completed[str(fingerprint["zip_path"])] for fingerprint in selected_fingerprints]
-
-
-def command_environment(_: argparse.Namespace) -> None:
-    try:
-        import xgboost
-    except ImportError as error:
-        raise SystemExit("XGBoost is unavailable in the active environment.") from error
-    payload = {
-        "python": sys.version,
-        "platform": platform.platform(),
-        "numpy": np.__version__,
-        "torch": torch.__version__,
-        "xgboost": xgboost.__version__,
-        "cuda_available": torch.cuda.is_available(),
-        "cuda_runtime": torch.version.cuda,
-        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
-        "gpu_memory_bytes": torch.cuda.get_device_properties(0).total_memory
-        if torch.cuda.is_available()
-        else 0,
-    }
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
-    if not torch.cuda.is_available():
-        raise SystemExit("CUDA is unavailable. Run this project on the RTX 4080 computer.")
 
 
 def command_audit(args: argparse.Namespace) -> None:

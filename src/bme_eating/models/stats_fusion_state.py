@@ -7,7 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from bme_eating.models.dtp_sqf import LocalEncoder
+from bme_eating.models.local_encoder import LocalEncoder
 
 
 def temporal_receptive_field(dilations: Sequence[int], kernel_size: int = 3) -> int:

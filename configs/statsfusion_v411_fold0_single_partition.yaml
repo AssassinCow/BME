@@ -1,4 +1,0 @@
-extends: statsfusion_v411_fold0_continue64.yaml
-execution:
-  mode: fold0
-  internal_mode: single

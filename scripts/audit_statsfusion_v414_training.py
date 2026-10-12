@@ -2,22 +2,19 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import tempfile
 from pathlib import Path
 
 import torch
+from _bootstrap import PROJECT_ROOT
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(PROJECT_ROOT / "src"))
-
+from bme_eating.artifacts import write_json_atomic
 from bme_eating.config import _load_project_dotenv, load_config, require_environment_path
 from bme_eating.data.joint_sessions import JointInputs
-from bme_eating.hierarchical_artifacts import write_json_atomic
-from bme_eating.joint_protocol import configure_numerics, digest, require_idle_gpu, source_identity
-from bme_eating.joint_v413_training import ContributionBank
-from bme_eating.joint_v414_split import load_split
+from bme_eating.development_split import load_split
 from bme_eating.metrics import partition_evaluation_events
+from bme_eating.protocol import configure_numerics, digest, require_idle_gpu, source_identity
+from bme_eating.training.candidate_supervision import ContributionBank
 from bme_eating.training.statsfusion_joint_trainer import seed_model, train_joint_model
 
 
