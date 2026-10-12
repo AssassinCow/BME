@@ -1,0 +1,66 @@
+{
+  "version": "v4.14",
+  "kind": "full_member_header_scan_repair",
+  "baseline_commit": "5fafdb247b3d67601f70626a4bf02a66ebfaf82f",
+  "passed": true,
+  "audit_version": "v2-full-member-header-scan",
+  "header_scan_scope": "full_member",
+  "ppg_sample_maximum_rows": 100000,
+  "legacy_sampled_schema_checkpoints_reused": false,
+  "preparation_source_sha256": "0cd181775aceb48ddded56ae46ec84bc63a341dfc0e152cfaeeb5027213530ab",
+  "modified_implementation_sha256": {
+    "src/bme_eating/cli.py": "756638049eacceeecab99594780aba577c7cfe9824ade9731c014ed0fa812c92",
+    "src/bme_eating/data/packet_reader.py": "0929472fe74166ddb9c12792fbfe51620e3f9fa311e24dde7ffeea664df6506a"
+  },
+  "preparation_recipe_sha256": "c9a5a11ce2c9388482079d38bd9aabf68efa7f0d3a60bed61240e3ff347c728d",
+  "preparation_recipe_and_quality_counts_unchanged": true,
+  "config_sha256": "744280fb8700ca7149877998f99e3e40793303ea478c024226de2e7be1be1206",
+  "config_unchanged_vs_HEAD": true,
+  "model_and_training_unchanged_vs_HEAD": true,
+  "split_sha256": "d5c3b2e6faa67bad587e57018dfcb24ddf070b626312a3bd5a61030cfd162e0f",
+  "split_unchanged_vs_HEAD": true,
+  "canonical_recipe_files_unchanged": 8,
+  "protected_v413_source_files_checked": 247,
+  "protected_v413_source_unchanged": true,
+  "v413_training_interrupted": false,
+  "real_attachment_validation": {
+    "source": "existing full schema audit and original local ZIP members",
+    "repeated_header_attachments_checked": 79,
+    "headers_beyond_100000_rows": 60,
+    "status_mismatches": 0,
+    "ppg_sample_maximum_rows": 1,
+    "seconds": 18.13,
+    "late_header_example_original_detection_row": 501183,
+    "writes_performed": false,
+    "multisection_classification_recomputed": false
+  },
+  "regression_coverage": [
+    "repeated headers after 100001 data rows with plain, BOM and binary-prefix members",
+    "terminal repeated header without a newline",
+    "PPG statistics retain their independent sample limit",
+    "actual preparation entry point detects late repeated headers",
+    "legacy or mismatched schema checkpoint rejected",
+    "preparation resume rejects old scan source identity"
+  ],
+  "targeted_pytest": {
+    "passed": 25,
+    "failures": 0,
+    "seconds": 29.99
+  },
+  "cpu_pytest": {
+    "command": "python -m pytest -k 'not cuda and not gpu'",
+    "passed": 215,
+    "skipped": 3,
+    "deselected": 15,
+    "failures": 0,
+    "seconds": 364.25
+  },
+  "ruff": true,
+  "compileall": true,
+  "git_diff_check": true,
+  "real_inputs_rebuilt": false,
+  "full_real_preparation_executed": false,
+  "gpu_test_performed": false,
+  "old_failed_preparation_requires_fresh_output_root": true,
+  "promotable": false
+}

@@ -152,6 +152,54 @@ def test_canonical_only_preserves_v2(config, raw_inputs):
     assert indices == {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in indices}
 
 
+def test_preparation_audits_headers_after_100000_rows(config, raw_inputs, monkeypatch):
+    data_root, output_root, sensor_zip = raw_inputs
+    duplicate_zip = sensor_zip.with_name("duplicate.zip")
+    header = "\t".join(SENSOR_COLUMNS) + "\n"
+    data_row = "\t".join(map(str, [1000] * 3 + [1] * 20 + [0] * 24 + [1] * 6)) + "\n"
+    with zipfile.ZipFile(duplicate_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("sensor.txt", header + data_row * 100_001 + header + data_row)
+    state_path = data_root / "manifests/download_state.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    for attachment in state["attachments"]:
+        if Path(attachment["relative_path"]).name == duplicate_zip.name:
+            attachment["sha256"] = hashlib.sha256(duplicate_zip.read_bytes()).hexdigest()
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    def stop_after_schema_audit(*args, **kwargs):
+        raise KeyboardInterrupt("inspect the schema audit before multisection preprocessing")
+
+    monkeypatch.setattr(input_preparation, "command_audit_multisection", stop_after_schema_audit)
+    with pytest.raises(KeyboardInterrupt):
+        input_preparation.prepare_inputs(config, stage="v2", workers=1, fresh=True)
+
+    report = json.loads((output_root / "v2/indices/schema_audit.json").read_text(encoding="utf-8"))
+    assert report["header_scan_scope"] == "full_member"
+    assert report["ppg_sample_maximum_rows"] == 100_000
+    assert report["layout_status_counts"] == {"documented_text": 1, "repeated_header": 2}
+    late_layout = next(layout for layout in report["layouts"]
+                       if layout["zip_name"] == duplicate_zip.name)
+    assert late_layout["status"] == "repeated_header"
+
+
+def test_preparation_refuses_resume_with_old_scan_source(config, raw_inputs, monkeypatch):
+    _, output_root, _ = raw_inputs
+
+    def stop_after_schema_audit(*args, **kwargs):
+        raise KeyboardInterrupt("injected interruption")
+
+    monkeypatch.setattr(input_preparation, "command_audit_multisection", stop_after_schema_audit)
+    with pytest.raises(KeyboardInterrupt):
+        input_preparation.prepare_inputs(config, stage="v2", workers=1, fresh=True)
+    manifest_path = output_root / "v2/preparation_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["identity"]["source"]["data/packet_reader.py"] = "0" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="recipe/source changed; resume refused"):
+        input_preparation.prepare_inputs(config, stage="v2", workers=1, resume=True)
+
+
 def test_preparation_cli_help():
     root = Path(__file__).resolve().parents[1]
     result = subprocess.run([sys.executable, str(root / "scripts/prepare_statsfusion_inputs.py"),

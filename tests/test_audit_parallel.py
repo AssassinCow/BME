@@ -95,3 +95,21 @@ def test_parallel_schema_audit_rejects_nonpositive_workers(tmp_path):
             schema_zips="all",
             completed={},
         )
+
+
+def test_schema_audit_discards_legacy_or_mismatched_scan_checkpoint(tmp_path):
+    path = tmp_path / "sample.zip"
+    _write_sensor_zip(path, 1000)
+    fingerprints = [{"zip_path": str(path), "zip_sha256": "a" * 64,
+                     "zip_size_bytes": path.stat().st_size}]
+    checkpoint = tmp_path / "checkpoint.json"
+    _inspect_selected_layouts(fingerprints, maximum_rows=100, workers=1,
+                              checkpoint_path=checkpoint, schema_zips="all", completed={})
+    current = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert _load_audit_checkpoint(checkpoint, "all", 100, fingerprints)
+
+    legacy = dict(current, version=1)
+    legacy.pop("audit_version")
+    for payload in (legacy, dict(current, audit_version="sampled-header-scan")):
+        checkpoint.write_text(json.dumps(payload), encoding="utf-8")
+        assert _load_audit_checkpoint(checkpoint, "all", 100, fingerprints) == {}

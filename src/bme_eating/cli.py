@@ -43,6 +43,7 @@ _RECOVERABLE_INPUT_ERRORS = (
 )
 
 _FEATURE_CACHE_SCHEMA_VERSION = "v2.1-nonoverlap-terminal-validity"
+_SCHEMA_AUDIT_VERSION = "v2-full-member-header-scan"
 
 
 def _invalid_subjects(config: dict[str, Any]) -> set[str]:
@@ -99,7 +100,9 @@ def _load_audit_checkpoint(
     except (TypeError, ValueError):
         return {}
     if (
-        checkpoint.get("schema_zips") != schema_zips
+        checkpoint.get("version") != 2
+        or checkpoint.get("audit_version") != _SCHEMA_AUDIT_VERSION
+        or checkpoint.get("schema_zips") != schema_zips
         or checkpoint_rows != maximum_rows
         or checkpoint.get("selected_fingerprints") != selected_fingerprints
     ):
@@ -117,7 +120,8 @@ def _write_audit_checkpoint(
 ) -> None:
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "version": 1,
+        "version": 2,
+        "audit_version": _SCHEMA_AUDIT_VERSION,
         "schema_zips": schema_zips,
         "maximum_rows": maximum_rows,
         "selected_fingerprints": selected_fingerprints,
@@ -264,6 +268,9 @@ def command_audit(args: argparse.Namespace, *, config: dict[str, Any] | None = N
         status = str(layout.get("status", "ok"))
         layout_status_counts[status] = layout_status_counts.get(status, 0) + 1
     audit = {
+        "audit_version": _SCHEMA_AUDIT_VERSION,
+        "header_scan_scope": "full_member",
+        "ppg_sample_maximum_rows": maximum_rows,
         "records": len(records),
         "subjects": int(records["subject_key"].nunique()),
         "events": len(events),

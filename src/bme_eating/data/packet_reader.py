@@ -162,6 +162,8 @@ def _find_sensor_header_offsets(
     while True:
         chunk = handle.read(1024 * 1024)
         if not chunk:
+            if tail.endswith(_SENSOR_HEADER_BYTES):
+                offsets.add(consumed - len(_SENSOR_HEADER_BYTES))
             break
         buffer = tail + chunk
         base = consumed - len(tail)
@@ -566,6 +568,13 @@ def inspect_ppg_layout(zip_path: str | Path, maximum_rows: int = 100_000) -> dic
                 | set(GYRO_COLUMNS)
                 | {f"PPG{number}" for number in range(1, 45)},
             )
+            if parser_status == "documented_text":
+                with archive.open(text_name) as handle:
+                    header_offsets = _find_sensor_header_offsets(handle)
+                if len(header_offsets) > 1:
+                    raise UnsupportedSensorFormatError(
+                        zip_path, text_name, "standard sensor header occurs more than once"
+                    )
         except UnsupportedSensorFormatError as error:
             status = (
                 "repeated_header"

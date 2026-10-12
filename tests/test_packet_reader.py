@@ -122,6 +122,46 @@ def test_sensor_parser_rejects_invalid_numeric_value(tmp_path):
         parse_sensor_zip(path)
 
 
+@pytest.mark.parametrize("prefix", [b"", b"\xef\xbb\xbf", b"\xffprefix"])
+def test_layout_detects_repeated_header_beyond_ppg_sampling_limit(tmp_path, prefix):
+    header = ("\t".join(SENSOR_COLUMNS) + "\n").encode("utf-8")
+    data_row = ("\t".join(map(str, [1000] * 3 + [1] * 50)) + "\n").encode("utf-8")
+    path = tmp_path / "late-repeated-header.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("sensor.txt", prefix + header + data_row * 100_001 + header + data_row)
+
+    for maximum_rows in (1, 100_000):
+        layout = inspect_ppg_layout(path, maximum_rows=maximum_rows)
+        assert layout["status"] == "repeated_header"
+        assert layout["error"] == "standard sensor header occurs more than once"
+
+
+def test_layout_detects_terminal_header_without_newline(tmp_path):
+    header = "\t".join(SENSOR_COLUMNS).encode("utf-8")
+    data_row = ("\t".join(map(str, [1000] * 3 + [1] * 50)) + "\n").encode("utf-8")
+    path = tmp_path / "terminal-repeated-header.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("sensor.txt", header + b"\n" + data_row * 2 + header)
+
+    assert inspect_ppg_layout(path, maximum_rows=1)["status"] == "repeated_header"
+
+
+def test_full_member_header_scan_preserves_ppg_sampling_limit(tmp_path):
+    header = "\t".join(SENSOR_COLUMNS) + "\n"
+    nonzero = "\t".join(map(str, [1000] * 3 + [1] * 50)) + "\n"
+    zero = "\t".join(map(str, [1000] * 3 + [0] * 50)) + "\n"
+    path = tmp_path / "sampled-ppg.zip"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("sensor.txt", header + nonzero * 2 + zero * 100_001)
+
+    layout = inspect_ppg_layout(path, maximum_rows=2)
+
+    assert layout["status"] == "documented_text"
+    assert layout["rows_scanned"] == 2
+    assert layout["ppg_rows"] == 2
+    assert layout["nonzero_fraction_by_slot"] == [1.0] * 44
+
+
 def test_sensor_parser_validates_unused_ppg_slots(tmp_path):
     row = [1000, 1000, 1000] + list(range(1, 45)) + [1, 2, 3, 4, 5, 6]
     row[3 + 43] = "not-a-number"

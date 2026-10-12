@@ -31,7 +31,11 @@ conda run --no-capture-output -n bme-model python scripts/prepare_statsfusion_in
 - `--stage all`：按上述顺序完成两步。
 - 中断后使用相同stage和输出目录，将`--fresh`替换为`--resume`。允许调整worker；原始数据、salt或预处理配方/源码变化会拒绝v2恢复。
 
+格式审计使用流式字节扫描检查整个TXT成员的标准表头；即使第二个表头出现在第10万行之后，也会进入多section审计。`maximum_rows=100_000`仅限制PPG槽统计抽样，不限制表头检测。审计报告分别记录`header_scan_scope=full_member`和`ppg_sample_maximum_rows`；旧版截断扫描checkpoint不再复用。
+
 `--fresh`不会覆盖已有输入；旧入口生成的v2没有新的恢复manifest，不能用`--stage v2 --resume`接管。已有合格v2缺少canonical时，使用`--stage canonical --fresh`。
+
+若准备任务在旧版截断扫描上失败，更新源码后会因源码身份变化拒绝`--resume`。请保留旧目录，在新的`BME_OUTPUT_ROOT`中沿用原私有salt并执行上述`--fresh`命令，重新生成v2及canonical；不要删除、覆盖或迁移正在被训练使用的输入。修复不修改冻结的质量计数：完整审计应识别79个重复表头附件，由多section审计区分45个完全重复、17个冲突和17个非单调附件。
 
 v2配方与整理前一致：ACC/GYRO 100 Hz、PPG 50 Hz、20个有效PPG槽、3秒网格和session连接间隔、5折及seed 2026。排除三名官方作废受试者；45个已审计的完全重复多section附件去重，34个冲突或非单调附件隔离。隔离数量和分类必须通过原质量规则，不能把全部异常视为可恢复数据。
 
