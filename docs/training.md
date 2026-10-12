@@ -4,6 +4,8 @@
 
 `.env`或环境变量提供输入及输出根目录。`JointInputs.audit()`核验v2索引、session缓存、v4 canonical特征及其来源；冻结28/11划分与当前数据hash必须一致。`scripts/generate_v414_split.py`仅打印确定性生成结果供核对，运行时不会重新划分。
 
+从原始下载材料生成输入使用`scripts/prepare_statsfusion_inputs.py`，完整命令、私有salt要求及恢复方式见[数据准备说明](data_preparation.md)。该入口使用冻结v2配方，不改变训练配置或模型。
+
 v4.14的训练、源码快照、缓存及诊断写入`$BME_OUTPUT_ROOT/v414/runs/<run>`。旧版输入只读复用；不写相邻v4.13源码或产物。GPU忙时返回PAUSED，保留状态并等待资源释放后resume。
 
 ## 两次训练

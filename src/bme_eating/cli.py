@@ -212,8 +212,8 @@ def _inspect_selected_layouts(
     return [completed[str(fingerprint["zip_path"])] for fingerprint in selected_fingerprints]
 
 
-def command_audit(args: argparse.Namespace) -> None:
-    config = load_config(args.config)
+def command_audit(args: argparse.Namespace, *, config: dict[str, Any] | None = None) -> None:
+    config = load_config(args.config) if config is None else config
     data_root, output_root = resolve_roots(config)
     records, events = _indices(config, data_root, output_root)
     if args.schema_zips == "all":
@@ -280,6 +280,8 @@ def command_audit(args: argparse.Namespace) -> None:
     checkpoint_path.unlink(missing_ok=True)
     print(audit_path)
     allowed_statuses = {"documented_text", "recovered_text_suffix", "repeated_header"}
+    if getattr(args, "allow_quarantine", False):
+        allowed_statuses.add("unsupported_binary")
     bad_statuses = {
         status: count
         for status, count in layout_status_counts.items()
@@ -298,8 +300,10 @@ def command_audit(args: argparse.Namespace) -> None:
         )
 
 
-def command_audit_multisection(args: argparse.Namespace) -> None:
-    config = load_config(args.config)
+def command_audit_multisection(
+    args: argparse.Namespace, *, config: dict[str, Any] | None = None
+) -> None:
+    config = load_config(args.config) if config is None else config
     _, output_root = resolve_roots(config)
     index_dir = output_root / "indices"
     records_path = index_dir / "records.parquet"
@@ -326,6 +330,16 @@ def command_audit_multisection(args: argparse.Namespace) -> None:
     }
     print(output_path)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if getattr(args, "allow_quarantine", False):
+        expectations = config["quality_gates"]
+        validate_multisection_preprocess_policy(
+            records, schema_audit, report,
+            expected_exact=expectations["expected_recovered_multisection_deduplicated"],
+            expected_quarantined=expectations["expected_quarantined_multisection"],
+            expected_documented=expectations["expected_documented_text"],
+            expected_text_suffix=expectations["expected_recovered_text_suffix"],
+        )
+        return
     blocking = {
         key: value
         for key, value in report["classification_counts"].items()
@@ -389,8 +403,10 @@ def _preprocess_job(
     return rows, None
 
 
-def command_preprocess(args: argparse.Namespace) -> None:
-    config = load_config(args.config)
+def command_preprocess(
+    args: argparse.Namespace, *, config: dict[str, Any] | None = None
+) -> None:
+    config = load_config(args.config) if config is None else config
     data_root, output_root = resolve_roots(config)
     records, events = _indices(config, data_root, output_root)
     index_dir = output_root / "indices"

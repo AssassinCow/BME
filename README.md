@@ -19,7 +19,14 @@ python -m pip install -e ".[dev]"
 python scripts/check_environment.py
 ```
 
-复制`.env.example`为`.env`并设置`BME_DATA_ROOT`与`BME_OUTPUT_ROOT`。训练前必须已有核验通过的输入：`$BME_OUTPUT_ROOT/v2`数据索引与原始session缓存、`$BME_OUTPUT_ROOT/v4` canonical特征。输入准备协议为`statsfusion-r3.2`；这是数据身份，与模型版本分开。输入及冻结划分保持只读，审计失败时停止。
+复制`.env.example`为`.env`并设置`BME_DATA_ROOT`与`BME_OUTPUT_ROOT`。训练使用核验通过的`$BME_OUTPUT_ROOT/v2`数据索引与原始session缓存、`$BME_OUTPUT_ROOT/v4` canonical特征。只有原始下载材料时，先在新输出目录生成输入，并沿用原私有subject salt：
+
+```powershell
+conda run --no-capture-output -n bme-model python scripts/prepare_statsfusion_inputs.py `
+  --config configs/statsfusion_v414_full_data.yaml --stage all --workers 8 --fresh
+```
+
+仅生成v2时使用`--stage v2`；已有合格v2时使用`--stage canonical`。恢复准备任务使用`--resume`，禁止覆盖已有共享输入。材料格式、salt、冻结配方及数据身份衔接见[数据准备说明](docs/data_preparation.md)。canonical协议为`statsfusion-r3.2`，与模型版本分开；训练期间输入及冻结划分保持只读，审计失败时停止。
 
 GPU空闲后，在仓库根目录运行：
 
@@ -56,7 +63,7 @@ src/bme_eating/
   workflow.py             开发选模与最终39人工作流
   protocol.py             身份、资格、资源与恢复约束
   streaming.py, bundle.py  因果推理与部署bundle
-scripts/                  训练、验收、审计和环境入口
+scripts/                  数据准备、训练、验收、审计和环境入口
 tests/                    当前主线及输入语义回归测试
 docs/                     架构、运行和验收说明
 manifests/                源码来源及本次整理验收
