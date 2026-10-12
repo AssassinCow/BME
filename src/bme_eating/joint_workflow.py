@@ -10,6 +10,7 @@ import pandas as pd
 import torch
 
 from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
+from bme_eating.joint_capabilities import supported
 from bme_eating.joint_evaluation import (
     NonnegativePlatt,
     apply_online_budget,
@@ -19,14 +20,19 @@ from bme_eating.joint_evaluation import (
     metrics_with_exposure,
     paired_subject_bootstrap,
 )
+from bme_eating.joint_progress import print_metrics
 from bme_eating.joint_protocol import (
-    PROTOCOL,
     checkpoint_qualified,
     digest,
+    event_score_formula,
+    grouped_protocol,
+    model_run_identity,
+    protocol_for,
     protocol_identities,
     require_gate,
     save_torch_atomic,
     verify_artifact_hashes,
+    verify_calibration_lineage,
     verify_internal_manifest,
     verify_oof_lineage,
     write_failure,
@@ -51,7 +57,7 @@ def verify_outer_completion(inputs, config, run, fold):
     if not path.is_file():
         raise RuntimeError(f"Outer fold {fold} completion evidence is missing")
     manifest = read_json(path)
-    expected_identity = {"protocol": PROTOCOL, "run_identity": sha256_file(run / "identity.json"),
+    expected_identity = {"protocol": protocol_for(config), "run_identity": model_run_identity(run),
                          "fold": fold, **protocol_identities(config, inputs.identity)}
     if any(manifest.get(name) != value for name, value in expected_identity.items()):
         raise RuntimeError("Outer completion config/source/data/run identity mismatch")
@@ -90,10 +96,11 @@ def execute_outer(inputs, config, run, fold, resume):
         return verify_outer_completion(inputs, config, run, fold)
     outer = {subject for subject, index in inputs.subject_folds.items() if index == fold}
     subjects = set(inputs.subject_folds) - outer
-    run_identity = sha256_file(run / "identity.json")
+    run_identity = model_run_identity(run)
     epoch, point = train_partition_protocol(inputs, subjects, outer, config,
                                            directory / "internal", run_identity, resume)
-    verify_oof_lineage(point["lineage"], subjects, outer, identities=protocol_identities(config, inputs.identity))
+    verify_calibration_lineage(point["lineage"], subjects, outer, config,
+                               identities=protocol_identities(config, inputs.identity))
     identity = digest({"run": run_identity, "fold": fold, "training": sorted(subjects), "epoch": epoch})
     train_joint_model(inputs, subjects, config, directory / "model", identity, epochs=epoch,
                       resume=resume, outer_excluded=outer)
@@ -101,11 +108,13 @@ def execute_outer(inputs, config, run, fold, resume):
     mapping = fit_source_mapping(model, inputs, subjects, config, payload["preprocessing"],
                                   directory / "source_fit", identity)
     output = predict_joint_model(model, inputs, outer, config, payload["preprocessing"],
-                                directory / "prediction", identity, payload["boundary"])
+                                directory / "prediction", identity, payload["boundary"], mapping=mapping,
+                                operating_point=point if supported(config, "consistent_inputs") else None)
     candidates, budget_audit = apply_online_budget(output["coarse"][point["setting"]], output["windows"],
         {identity: mapping}, point["budget"], config["decoder"]["quotas"])
+    from bme_eating.joint_v411_boundary import refined_key
     refined_by_id = ({candidate.proposal_id: candidate for candidate in
-                      output["refined"][str(point["boundary_entropy"])][point["setting"]]}
+                      output["refined"][refined_key(point)][point["setting"]]}
                      if point["boundary_enabled"] else {})
     final_candidates = [refined_by_id.get(candidate.proposal_id, candidate) for candidate in candidates]
     prediction, boundary_diagnostics = commit_candidates(final_candidates, NonnegativePlatt(**point["calibration"]),
@@ -114,21 +123,29 @@ def execute_outer(inputs, config, run, fold, resume):
     truth, ignore = partition_evaluation_events(events, outer)
     metrics, matches = metrics_with_exposure(truth, prediction, ignore, output["windows"])
     coverage = candidate_coverage(candidates, truth, output["windows"])
+    print_metrics(f"outer fold {fold} TEST (locked internal OOF)",
+                  {**point, **metrics, "candidate_recall": coverage["recall"]})
     coarse_by_id = {candidate.proposal_id: candidate for candidate in output["coarse"][point["setting"]]}
     coarse_candidates = [coarse_by_id[candidate.proposal_id] for candidate in candidates]
-    coarse_prediction = commit_candidates(coarse_candidates, NonnegativePlatt(**point["calibration"]),
-                                           point["acceptance"], point["nms"])
+    comparison_point = point["coarse_operating_point"] if grouped_protocol(config) else point
+    coarse_prediction = commit_candidates(coarse_candidates, NonnegativePlatt(**comparison_point["calibration"]),
+                                           comparison_point["acceptance"], comparison_point["nms"])
     from bme_eating.training.statsfusion_joint_trainer import boundary_pair_gate
     boundary = boundary_pair_gate(coarse_prediction, prediction, truth, ignore, output["windows"], config,
-                                  require_sixty=False, refined_candidates=boundary_diagnostics)
+                                  require_sixty=False, refined_candidates=boundary_diagnostics,
+                                  mode=point.get("boundary_mode", "both"))
     locked_coarse = point["coarse_operating_point"]
     locked_prediction = commit_candidates(coarse_candidates, NonnegativePlatt(**locked_coarse["calibration"]),
                                           locked_coarse["acceptance"], locked_coarse["nms"])
     locked_metrics, _ = metrics_with_exposure(truth, locked_prediction, ignore, output["windows"])
+    if grouped_protocol(config):
+        boundary = boundary_pair_gate(locked_prediction, prediction, truth, ignore, output["windows"],
+            config, require_sixty=False, refined_candidates=boundary_diagnostics,
+            mode=point.get("boundary_mode", "both"))
     boundary["locked_coarse"] = locked_metrics
     boundary["passed"] &= locked_metrics["f1"] - metrics["f1"] <= config["gates"]["boundary_maximum_f1_drop"]
     greedy_metrics, _ = evaluate_events(truth, event_frame(prediction), ignore=ignore, method="greedy")
-    report = {"protocol": PROTOCOL, "fold": fold, "identity": identity, "epoch": epoch,
+    report = {"protocol": protocol_for(config), "fold": fold, "identity": identity, "epoch": epoch,
               "training_subjects": sorted(subjects), "prediction_subjects": sorted(outer),
               "metrics": metrics, "coverage": coverage, "operating_point": point,
               "checkpoint_qualified": True, "boundary": boundary,
@@ -142,27 +159,35 @@ def execute_outer(inputs, config, run, fold, resume):
     truth.to_parquet(directory / "truth.parquet", index=False)
     ignore.to_parquet(directory / "ignore.parquet", index=False)
     write_json_atomic(directory / "budget_audit.json", budget_audit)
-    save_torch_atomic(directory / "outer_evidence.pt", {"prediction": prediction, "candidates": candidates})
+    save_torch_atomic(directory / "outer_evidence.pt", {"prediction": prediction, "candidates": candidates,
+                     "coarse_prediction": locked_prediction, "boundary_diagnostics": boundary_diagnostics})
     write_json_atomic(complete, report)
     paths = ["evaluation.json", "outer_evidence.pt", "outer_windows.parquet", "outer_predictions.parquet",
              "outer_candidates.parquet", "truth.parquet", "ignore.parquet", "model/latest.pt",
              "internal/internal_manifest.json", "budget_audit.json", "matches.csv"]
-    write_json_atomic(directory / "completion.json", {"protocol": PROTOCOL, "fold": fold,
+    write_json_atomic(directory / "completion.json", {"protocol": protocol_for(config), "fold": fold,
         "run_identity": run_identity, **protocol_identities(config, inputs.identity),
         "evidence_sha256": {relative: sha256_file(directory / relative) for relative in paths}})
     return report
 
 
-def audit_reference(reference_root: Path, inputs):
+def audit_reference(reference_root: Path, inputs, *, folds=None):
     try:
-        return _audit_reference(reference_root, inputs)
+        return _audit_reference(reference_root, inputs, folds=folds)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError, EOFError,
             pickle.UnpicklingError) as error:
         return {"qualified": False, "comparison_performed": False, "evidence_sha256": {},
                 "reasons": [f"Reference audit failed: {type(error).__name__}: {error}"]}
 
 
-def _audit_reference(reference_root: Path, inputs):
+def _audit_reference(reference_root: Path, inputs, *, folds=None):
+    if (reference_root / "identity.json").is_file() and read_json(reference_root / "identity.json").get("protocol") in {
+            "statsfusion-joint-event-v1", "statsfusion-joint-event-v2", "statsfusion-joint-event-v3", "statsfusion-joint-event-v4"}:
+        from bme_eating.joint_v411_reference import audit_completed_joint
+        return audit_completed_joint(reference_root, inputs, folds=folds)
+    if folds is not None:
+        return {"qualified": False, "comparison_performed": False,
+                "reasons": ["Single-fold comparison requires a completed joint outer checkpoint"]}
     reasons, files = [], {}
     path = reference_root / "joint_reference_evidence.json"
     legacy = list(reference_root.glob("**/final_manifest.json")) if reference_root.is_dir() else []
@@ -242,6 +267,7 @@ def _audit_reference(reference_root: Path, inputs):
 def execute_gates(inputs, config, run, reference_root):
     from bme_eating.joint_resume_migration import migration_evidence
     reports, prediction, candidates, windows, truth, ignore, evidence = [], [], [], [], [], [], {}
+    boundary_pools = {}
     for fold in range(5):
         directory = run / f"fold_{fold}"
         report = verify_outer_completion(inputs, config, run, fold)
@@ -254,6 +280,13 @@ def execute_gates(inputs, config, run, reference_root):
                            identities=protocol_identities(config, inputs.identity))
         payload = torch.load(directory / "outer_evidence.pt", map_location="cpu", weights_only=False)
         reports.append(report)
+        mode = report["operating_point"].get("boundary_mode", "off")
+        if grouped_protocol(config) and mode != "off":
+            bucket = boundary_pools.setdefault(mode, {"coarse": [], "refined": [], "diagnostics": [], "folds": []})
+            bucket["coarse"].extend(payload["coarse_prediction"])
+            bucket["refined"].extend(payload["prediction"])
+            bucket["diagnostics"].extend(payload["boundary_diagnostics"])
+            bucket["folds"].append(fold)
         prediction.extend(payload["prediction"])
         candidates.extend(payload["candidates"])
         _, _, canonical_events, _ = inputs.frames(expected, labels=True)
@@ -289,6 +322,16 @@ def execute_gates(inputs, config, run, reference_root):
     reference = audit_reference(reference_root, inputs) if reference_root else {
         "qualified": False, "comparison_performed": False, "reasons": ["Reference not provided"]}
     checks["reference"] = reference["qualified"]
+    boundary_summary = {}
+    if grouped_protocol(config):
+        from bme_eating.training.statsfusion_joint_trainer import boundary_pair_gate
+        for mode, bucket in boundary_pools.items():
+            selected_subjects = {subject for subject, fold in inputs.subject_folds.items() if fold in bucket["folds"]}
+            boundary_summary[mode] = boundary_pair_gate(bucket["coarse"], bucket["refined"],
+                truth[truth.subject_key.astype(str).isin(selected_subjects)], ignore,
+                windows[windows.subject_key.astype(str).isin(selected_subjects)], config,
+                refined_candidates=bucket["diagnostics"], mode=mode)
+        checks["boundary"] = all(report["passed"] for report in boundary_summary.values())
     paired = {"comparison_performed": False}
     if reference["qualified"]:
         payload = reference["payload"]
@@ -296,8 +339,14 @@ def execute_gates(inputs, config, run, reference_root):
             reference["qualified"] = checks["reference"] = False
             reference["reasons"].append("Truth/ignore cohort identity differs")
         else:
-            frame = pd.read_parquet(reference_root / payload["predictions_file"])
-            reference_windows = pd.read_parquet(reference_root / payload["exposure_file"])
+            if reference.get("derived_from_five_fold_completions"):
+                frame = pd.concat([pd.read_parquet(reference_root / f"fold_{fold}" /
+                    "outer_predictions.parquet") for fold in range(5)], ignore_index=True)
+                reference_windows = pd.concat([pd.read_parquet(reference_root / f"fold_{fold}" /
+                    "outer_windows.parquet") for fold in range(5)], ignore_index=True)
+            else:
+                frame = pd.read_parquet(reference_root / payload["predictions_file"])
+                reference_windows = pd.read_parquet(reference_root / payload["exposure_file"])
             exposure_keys = ["subject_key", "session_id", "timestamp_ms", "valid"]
             if digest(windows[exposure_keys].sort_values(exposure_keys[:3]).to_dict("records")) != digest(
                     reference_windows[exposure_keys].sort_values(exposure_keys[:3]).to_dict("records")):
@@ -323,10 +372,11 @@ def execute_gates(inputs, config, run, reference_root):
                 if len({report["operating_point"]["budget"] for report in reports}) == 1 and (
                         reports[0]["operating_point"]["budget"] == payload["candidate_budget"]):
                     checks["reference_coverage"] = coverage["covered"] >= payload.get("candidate_covered", float("inf"))
-    manifest = {"protocol": PROTOCOL, "identity_sha256": sha256_file(run / "identity.json"),
+    manifest = {"protocol": protocol_for(config), "identity_sha256": sha256_file(run / "identity.json"),
                 "diagnostic_complete": True, "promotable": all(checks.values()), "checks": checks,
                 "metrics": metrics, "coverage": coverage, "folds": reports, "fold4": reports[4],
                 "reference": reference, "paired_bootstrap": paired, "evidence_sha256": evidence,
+                "boundary_summary": boundary_summary,
                 "s0": read_json(run / "identity.json")["s0"]}
     manifest["resume_migration_evidence"] = migration_evidence(run)
     manifest["evidence_sha256"].update(manifest["resume_migration_evidence"])
@@ -358,7 +408,7 @@ def execute_final(inputs, config, run, resume):
                                   directory / "source_fit", identity)
     write_json_atomic(directory / "operating_point.json", point)
     write_json_atomic(directory / "source_mapping.json", mapping.to_json())
-    manifest = {"protocol": PROTOCOL, "promotable": True, "epoch": epoch, "model_identity": identity,
+    manifest = {"protocol": protocol_for(config), "promotable": True, "epoch": epoch, "model_identity": identity,
                 "identity_sha256": run_identity, "gate_sha256": sha256_file(run / "joint_gate_manifest.json"),
                 "checkpoint_sha256": sha256_file(directory / "model" / "latest.pt"),
                 "operating_point_sha256": sha256_file(directory / "operating_point.json"),
@@ -366,7 +416,11 @@ def execute_final(inputs, config, run, resume):
                 "internal_oof_sha256": sha256_file(directory / "internal" / "internal_oof.pt"),
                 "internal_manifest_sha256": sha256_file(directory / "internal" / "internal_manifest.json"),
                 "training_subjects": sorted(subjects),
-                "lineage": point["lineage"], "boundary_enabled": point["boundary_enabled"]}
+                "lineage": point["lineage"], "boundary_enabled": point["boundary_enabled"],
+                "boundary_mode": point.get("boundary_mode", "both" if point["boundary_enabled"] else "off"),
+                "score_formula": point.get(
+                    "score_formula",
+                    event_score_formula(config))}
     manifest["resume_migration_evidence"] = migration_evidence(run)
     write_json_atomic(directory / "final_manifest.json", manifest)
     return manifest
@@ -410,9 +464,16 @@ def export_joint_bundle(config, run, source_root, *, resume=False):
         raise RuntimeError("Final operating point differs from dedicated internal OOF")
     if not point["promotion_eligible"] or point["boundary_enabled"] != manifest["boundary_enabled"]:
         raise RuntimeError("Deployment operating point is unqualified or differs from manifest")
+    if grouped_protocol(config) and (
+            point.get("score_formula") != event_score_formula(config)
+            or point.get("boundary_mode") != manifest.get("boundary_mode")
+            or point["boundary_enabled"] != (point["boundary_mode"] != "off")):
+        raise RuntimeError("Deployment v411 scoring or Boundary mode lock differs")
     if point["boundary_enabled"]:
         boundary_reports = read_json(final / "internal" / "boundary_crossfit.json")
-        passed = any(report["passed"] and report["entropy"] == point["boundary_entropy"] for report in boundary_reports)
+        passed = any(report["passed"] and report["entropy"] == point["boundary_entropy"]
+                     and report.get("boundary_mode", "both") == point.get("boundary_mode", "both")
+                     for report in boundary_reports)
         if not payload["boundary"]["qualified"] or not passed:
             raise RuntimeError("Deployment Boundary gate failed")
     bundle = run / "bundle"
@@ -422,6 +483,15 @@ def export_joint_bundle(config, run, source_root, *, resume=False):
             detector = StatsFusionJointDetector(bundle, device="cpu")
             if detector.identity != manifest["model_identity"]:
                 raise RuntimeError("Existing bundle model differs from dedicated final checkpoint")
+            existing_manifest = read_json(bundle / "final_manifest.json")
+            if any(existing_manifest.get(name) != value for name, value in manifest.items()
+                   if name != "checkpoint_sha256"):
+                raise RuntimeError("Existing bundle deployment locks differ from current final manifest")
+            existing_payload = torch.load(bundle / "checkpoint.pt", map_location="cpu", weights_only=True)
+            if (existing_payload["model"].keys() != payload["model"].keys()
+                    or any(not torch.equal(existing_payload["model"][name], value)
+                           for name, value in payload["model"].items())):
+                raise RuntimeError("Existing bundle weights differ from dedicated final checkpoint")
             return {"bundle": str(bundle), "resumed": True}
         raise FileExistsError("A bundle already exists; export cannot overwrite it")
     staging = run / "bundle.partial"

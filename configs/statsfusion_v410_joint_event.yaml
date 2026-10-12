@@ -60,8 +60,8 @@ training:
   amp_dtype: bfloat16
   seeds: [2026]
   num_workers: 10
-  loader_prefetch_factor: 1
-  session_reader_cache_size: 1
+  loader_prefetch_factor: 4
+  session_reader_cache_size: 4
   accumulate_sessions: 4
   max_epochs: 32
   encoder_learning_rate: 0.0001

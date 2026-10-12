@@ -1,0 +1,60 @@
+{
+  "date": "2026-10-12",
+  "schema": "v414",
+  "protocol": "statsfusion-joint-event-v5",
+  "source_sha256": "04528d318b80e07f78523872f00915440be37ae85c9a258ca74895e65ffaab81",
+  "implementation_repairs_completed": true,
+  "formal_training_performed": false,
+  "gpu_validation_performed": false,
+  "gpu_validation_pending_reason": "Existing v413 training remains active",
+  "training_file_baseline": {
+    "src/bme_eating/training/statsfusion_joint_trainer.py": {
+      "sha256": "a9bda4ae54048c9057c6a98da565e7c2aa01077900e1d9bbdcf4366c749ea140",
+      "unchanged": true
+    },
+    "src/bme_eating/models/statsfusion_joint_event_v414.py": {
+      "sha256": "d8f64a2ebd53ea1c01dcfe63bcb6cac51c659163d270a01e6ddfa63640a8e101",
+      "unchanged": true
+    },
+    "src/bme_eating/models/statsfusion_joint_event_v413.py": {
+      "sha256": "b896c627d5043ec18a4595330698366c1c427498dfbd2d89e1efac887cc0040c",
+      "unchanged": true
+    },
+    "configs/statsfusion_v414_full_data.yaml": {
+      "sha256": "744280fb8700ca7149877998f99e3e40793303ea478c024226de2e7be1be1206",
+      "unchanged": true
+    },
+    "splits/v414_dev28_11.json": {
+      "sha256": "d5c3b2e6faa67bad587e57018dfcb24ddf070b626312a3bd5a61030cfd162e0f",
+      "unchanged": true
+    }
+  },
+  "v413_source_verified_files": 247,
+  "v413_changed_files": [],
+  "tests": {
+    "cpu": {
+      "tests": 81,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 0,
+      "passed": 81,
+      "xml_sha256": "d1369ea4977aa807759c546f0fd91cb87a83063d409e144e361cabcbf4fe9e51"
+    },
+    "compatibility": {
+      "tests": 133,
+      "errors": 0,
+      "failures": 0,
+      "skipped": 13,
+      "passed": 120,
+      "xml_sha256": "5b7209cb6b6b73c05786f537bd87fcb5ad5243e963c603cb0ab1b86a8fc792eb"
+    }
+  },
+  "ruff": "passed",
+  "compileall": "passed",
+  "diff_check": "passed",
+  "replay_report_sha256": "57119108f4cd6c986b653d0d94be4ddd4409a4aea3df765c9cce8dc0b8cbd052",
+  "repair_document_sha256": "24b33d9f6c41f8aa1725c9009b17d499e00867d7e25c1630a32fe42dcd1f4a44",
+  "default_deployment_epoch_unchanged": true,
+  "automatic_neighbor_selection_added": false,
+  "promotable": false
+}

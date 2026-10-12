@@ -1,0 +1,119 @@
+* text=auto eol=crlf whitespace=cr-at-eol
+/.gitattributes text eol=lf
+/manifests/** -text
+/manifests/skill-runs.jsonl text eol=crlf
+/splits/** -text
+/v412_source_snapshot.json -text
+*.patch -text -whitespace
+/manifests/*.xml -whitespace
+/src/bme_eating/joint_continuation.py whitespace=cr-at-eol,-blank-at-eof
+/src/bme_eating/joint_progress.py whitespace=cr-at-eol,-blank-at-eof
+/configs/statsfusion_v410_clipping_resume_migration.json text eol=lf
+/configs/statsfusion_v410_joint_event.yaml text eol=lf
+/configs/statsfusion_v410_performance_resume_migration.json text eol=lf
+/configs/statsfusion_v410_resume_identity_migration.json text eol=lf
+/configs/statsfusion_v411_fold0_continue64.yaml text eol=lf
+/configs/statsfusion_v411_fold0_single_partition.yaml text eol=lf
+/configs/statsfusion_v411_learned_boundary.yaml text eol=lf
+/configs/statsfusion_v412_integrated_repair.yaml text eol=lf
+/configs/statsfusion_v413_integrated_repair.yaml text eol=lf
+/configs/statsfusion_v414_full_data.yaml text eol=lf
+/docs/statsfusion_v410_deep_audit.md text eol=lf
+/docs/statsfusion_v410_io_acceleration.md text eol=lf
+/docs/statsfusion_v410_joint_event.md text eol=lf
+/docs/statsfusion_v410_optimization_audit_20261008.md text eol=lf
+/docs/statsfusion_v411_deep_audit_20261008.md text eol=lf
+/docs/statsfusion_v411_fold0_continuation.md text eol=lf
+/docs/statsfusion_v411_learned_boundary.md text eol=lf
+/docs/statsfusion_v411_single_partition.md text eol=lf
+/docs/statsfusion_v412_integrated_repair.md text eol=lf
+/docs/statsfusion_v414_full_data.md text eol=lf
+/docs/v413_deep_audit_20261011.md text eol=lf
+/docs/v413_implementation.md text eol=lf
+/docs/v414_implementation_acceptance_20261012.md text eol=lf
+/docs/v414_integrity_repairs_20261012.md text eol=lf
+/scripts/audit_statsfusion_v413_production.py text eol=lf
+/scripts/audit_statsfusion_v413_replay.py text eol=lf
+/scripts/audit_statsfusion_v413_training.py text eol=lf
+/scripts/audit_statsfusion_v414_training.py text eol=lf
+/scripts/benchmark_statsfusion_v411.py text eol=lf
+/scripts/benchmark_statsfusion_v412.py text eol=lf
+/scripts/benchmark_statsfusion_v413.py text eol=lf
+/scripts/enable_statsfusion_long_paths.ps1 text eol=lf
+/scripts/fork_statsfusion_joint_run.py text eol=lf
+/scripts/generate_v414_split.py text eol=lf
+/scripts/migrate_statsfusion_single_partition.py text eol=lf
+/scripts/record_statsfusion_v412_provenance.py text eol=lf
+/scripts/run_statsfusion_joint.py text eol=lf
+/scripts/snapshot_v414_source.py text eol=lf
+/scripts/validate_statsfusion_joint.py text eol=lf
+/scripts/validate_statsfusion_v412_real_inputs.py text eol=lf
+/src/bme_eating/data/joint_sessions.py text eol=lf
+/src/bme_eating/data/joint_v412_augmentation.py text eol=lf
+/src/bme_eating/joint_amp.py text eol=lf
+/src/bme_eating/joint_capabilities.py text eol=lf
+/src/bme_eating/joint_continuation.py text eol=lf
+/src/bme_eating/joint_evaluation.py text eol=lf
+/src/bme_eating/joint_partition_migration.py text eol=lf
+/src/bme_eating/joint_performance_migration.py text eol=lf
+/src/bme_eating/joint_pipeline.py text eol=lf
+/src/bme_eating/joint_progress.py text eol=lf
+/src/bme_eating/joint_protocol.py text eol=lf
+/src/bme_eating/joint_resume_migration.py text eol=lf
+/src/bme_eating/joint_single_fold.py text eol=lf
+/src/bme_eating/joint_stream.py text eol=lf
+/src/bme_eating/joint_v411_ablation.py text eol=lf
+/src/bme_eating/joint_v411_boundary.py text eol=lf
+/src/bme_eating/joint_v411_features.py text eol=lf
+/src/bme_eating/joint_v411_journal.py text eol=lf
+/src/bme_eating/joint_v411_prediction.py text eol=lf
+/src/bme_eating/joint_v411_reference.py text eol=lf
+/src/bme_eating/joint_v411_resources.py text eol=lf
+/src/bme_eating/joint_v411_scoring.py text eol=lf
+/src/bme_eating/joint_v411_search.py text eol=lf
+/src/bme_eating/joint_v411_stream.py text eol=lf
+/src/bme_eating/joint_v411_training.py text eol=lf
+/src/bme_eating/joint_v412_cache.py text eol=lf
+/src/bme_eating/joint_v412_diagnostics.py text eol=lf
+/src/bme_eating/joint_v412_training.py text eol=lf
+/src/bme_eating/joint_v413_diagnostics.py text eol=lf
+/src/bme_eating/joint_v413_replay.py text eol=lf
+/src/bme_eating/joint_v413_training.py text eol=lf
+/src/bme_eating/joint_v414_bundle.py text eol=lf
+/src/bme_eating/joint_v414_diagnostics.py text eol=lf
+/src/bme_eating/joint_v414_split.py text eol=lf
+/src/bme_eating/joint_v414_workflow.py text eol=lf
+/src/bme_eating/joint_validation.py text eol=lf
+/src/bme_eating/joint_workflow.py text eol=lf
+/src/bme_eating/models/statsfusion_joint_event.py text eol=lf
+/src/bme_eating/models/statsfusion_joint_event_v411.py text eol=lf
+/src/bme_eating/models/statsfusion_joint_event_v412.py text eol=lf
+/src/bme_eating/models/statsfusion_joint_event_v413.py text eol=lf
+/src/bme_eating/models/statsfusion_joint_event_v414.py text eol=lf
+/src/bme_eating/training/statsfusion_joint_trainer.py text eol=lf
+/tests/test_statsfusion_canonical_newlines.py text eol=lf
+/tests/test_statsfusion_joint_audit.py text eol=lf
+/tests/test_statsfusion_joint_bundle.py text eol=lf
+/tests/test_statsfusion_joint_clipping.py text eol=lf
+/tests/test_statsfusion_joint_continuation.py text eol=lf
+/tests/test_statsfusion_joint_event.py text eol=lf
+/tests/test_statsfusion_joint_gates.py text eol=lf
+/tests/test_statsfusion_joint_io_runtime.py text eol=lf
+/tests/test_statsfusion_joint_migration.py text eol=lf
+/tests/test_statsfusion_joint_performance.py text eol=lf
+/tests/test_statsfusion_joint_pipeline_repairs.py text eol=lf
+/tests/test_statsfusion_joint_progress.py text eol=lf
+/tests/test_statsfusion_joint_resources.py text eol=lf
+/tests/test_statsfusion_joint_resume.py text eol=lf
+/tests/test_statsfusion_joint_single_partition.py text eol=lf
+/tests/test_statsfusion_joint_windows_paths.py text eol=lf
+/tests/test_statsfusion_v411.py text eol=lf
+/tests/test_statsfusion_v411_reference.py text eol=lf
+/tests/test_statsfusion_v412.py text eol=lf
+/tests/test_statsfusion_v413.py text eol=lf
+/tests/test_statsfusion_v414.py text eol=lf
+/pyproject.toml -text
+/src/bme_eating/data/stats_fusion_inputs.py -text
+/src/bme_eating/models/event_verifier_v4.py -text
+/src/bme_eating/models/stats_fusion_state.py -text
+/tests/test_statsfusion_v4_config.py -text

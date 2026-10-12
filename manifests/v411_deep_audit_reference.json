@@ -1,0 +1,8 @@
+{
+  "qualified": false,
+  "comparison_performed": false,
+  "evidence_sha256": {},
+  "reasons": [
+    "Reference audit failed: FileNotFoundError: [Errno 2] No such file or directory: 'C:\\\\Users\\\\LZX\\\\Desktop\\\\University\\\\Competition\\\\生医工\\\\outputs\\\\v410\\\\runs\\\\statsfusion_v410_joint_event_20261007a\\\\fold_0\\\\completion.json'"
+  ]
+}

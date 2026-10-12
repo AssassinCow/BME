@@ -8,6 +8,8 @@ __pycache__/
 env/
 *.egg-info/
 /.vscode/
+/.v414-git-baseline/
+/.modeling/runtime-snapshots/
 
 /data/
 outputs/

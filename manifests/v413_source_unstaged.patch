@@ -1,0 +1,2398 @@
+diff --git a/docs/statsfusion_v411_learned_boundary.md b/docs/statsfusion_v411_learned_boundary.md
+index a8a28e8..834e52c 100644
+--- a/docs/statsfusion_v411_learned_boundary.md
++++ b/docs/statsfusion_v411_learned_boundary.md
+@@ -59,6 +59,8 @@ worker10、prefetch4、reader cache4；resume只允许这三个运行参数变
+ 
+ ## 执行
+ 
++单 fold0、64 轮上限与已完成 32 轮 selector 的新 run 接续见 [单折接续说明](statsfusion_v411_fold0_continuation.md)。模型、损失、优化器、划分、校准搜索及早停规则保持不变；单折产物不替代完整五折晋级。
++
+ 在本隔离目录中，等当前v410释放GPU后执行：
+ 
+ ```powershell
+diff --git a/scripts/run_statsfusion_joint.py b/scripts/run_statsfusion_joint.py
+index 4360da0..5ae2cf8 100644
+--- a/scripts/run_statsfusion_joint.py
++++ b/scripts/run_statsfusion_joint.py
+@@ -15,8 +15,11 @@ from bme_eating.hierarchical_artifacts import write_json_atomic
+ from bme_eating.joint_protocol import (
+     STAGES,
+     execution_failure_status,
++    execution_folds,
++    execution_mode,
+     initialize_run,
+     require_idle_gpu,
++    resolve_reference,
+     run_lock,
+     stages_for,
+     write_failure,
+@@ -34,6 +37,9 @@ class LogMirror:
+     def __init__(self, stream, log):
+         self.stream, self.log = stream, log
+ 
++    def __getattr__(self, name):
++        return getattr(self.stream, name)
++
+     def write(self, text):
+         self.stream.write(text)
+         self.log.write(text)
+@@ -44,6 +50,9 @@ class LogMirror:
+         self.stream.flush()
+         self.log.flush()
+ 
++    def isatty(self):
++        return self.stream.isatty()
++
+ 
+ @contextlib.contextmanager
+ def run_logging(run):
+@@ -57,11 +66,16 @@ def run_logging(run):
+ 
+ 
+ def main():
+-    parser = argparse.ArgumentParser(description="StatsFusion v4.11 learned localization protocol")
+-    parser.add_argument("--config", default="configs/statsfusion_v411_learned_boundary.yaml")
++    parser = argparse.ArgumentParser(description="StatsFusion v4.12 integrated repair protocol")
++    parser.add_argument("--config", default="configs/statsfusion_v412_integrated_repair.yaml")
+     parser.add_argument("--run-name", required=True)
+     parser.add_argument("--stage", choices=(*STAGES, "ablation", "all"), default="all")
+     parser.add_argument("--fold", type=int, choices=range(5))
++    parser.add_argument("--evaluation-mode", choices=("fold0", "fivefold"),
++                        help="fold0 saves an independent single-fold diagnostic model; fivefold uses formal gates")
++    parser.add_argument("--internal-mode", choices=("single", "oof"),
++                        help="single uses partition 0 for independent calibration in fold0 diagnostic mode")
++    parser.add_argument("--max-epochs", type=int, help="Epoch ceiling; must match the run's frozen configuration")
+     parser.add_argument("--skip-s0", action="store_true")
+     parser.add_argument("--historical-reference")
+     parser.add_argument("--reference-run")
+@@ -78,6 +92,14 @@ def main():
+     if arguments.fold is not None and arguments.stage not in {"outer", "all"}:
+         parser.error("--fold is only valid with --stage outer or all")
+     config = load_config(arguments.config)
++    if arguments.evaluation_mode:
++        config.setdefault("execution", {})["mode"] = arguments.evaluation_mode
++    if arguments.internal_mode:
++        config.setdefault("execution", {})["internal_mode"] = arguments.internal_mode
++    if arguments.max_epochs is not None:
++        config["training"]["max_epochs"] = arguments.max_epochs
++    if execution_mode(config) == "fold0" and arguments.fold not in (None, 0):
++        parser.error("fold0 mode can only run fold 0")
+     _load_project_dotenv(config)
+     output_base = require_environment_path(config, "output_root_env")
+     input_root = output_base / config["project"]["input_artifact_schema_version"]
+@@ -90,7 +112,7 @@ def main():
+                          migrate_clipping_gate=arguments.migrate_clipping_gate)
+     reference = output_base / "v4" / "experiments" / arguments.historical_reference if arguments.historical_reference else None
+     if arguments.reference_run:
+-        reference = output_base / "v410" / "runs" / arguments.reference_run
++        reference = resolve_reference(output_base, arguments.reference_run)
+     with run_lock(run), run_logging(run):
+         write_json_atomic(run / "resolved_config.json", config)
+         execute_stages(arguments, config, inputs, root, run, reference)
+@@ -103,10 +125,13 @@ def execute_stages(arguments, config, inputs, root, run, reference):
+         if arguments.resume and status["stages"].get(stage) == "COMPLETE" and stage in {"audit", "validate"}:
+             continue
+         status.update({"status": "RUNNING", "current_stage": stage, "command": sys.argv,
++                       "evaluation_mode": execution_mode(config),
++                       "internal_mode": config.get("execution", {}).get("internal_mode", "oof"),
+                        "workers": config["training"]["num_workers"],
+                        "prefetch": config["training"]["loader_prefetch_factor"],
+                        "cache": config["training"]["session_reader_cache_size"]})
+         status["stages"][stage] = "RUNNING"
++        status.pop("error", None)
+         write_json_atomic(run / "execution_status.json", status)
+         try:
+             if stage in {"validate", "outer", "ablation", "final", "replay"}:
+@@ -114,7 +139,9 @@ def execute_stages(arguments, config, inputs, root, run, reference):
+             if stage == "audit":
+                 write_json_atomic(run / "input_audit.json", inputs.identity)
+                 if reference is not None:
+-                    audit = audit_reference(reference, inputs)
++                    audit = audit_reference(reference, inputs, folds=[0] if
++                        config["experiment"]["code_version"] == "v4.12" and execution_mode(config) == "fold0" else None)
++                    audit["root"] = str(reference.resolve())
+                     audit.pop("prediction_frame", None)
+                     audit.pop("exposure_frame", None)
+                     write_json_atomic(run / "reference_audit.json", audit)
+@@ -125,7 +152,7 @@ def execute_stages(arguments, config, inputs, root, run, reference):
+                 from bme_eating.joint_v411_ablation import execute_ablations
+                 execute_ablations(inputs, config, run, arguments.resume)
+             elif stage == "outer":
+-                for fold in [arguments.fold] if arguments.fold is not None else range(5):
++                for fold in [arguments.fold] if arguments.fold is not None else execution_folds(config):
+                     status["current_fold"] = fold
+                     status.setdefault("outer_folds", {})[str(fold)] = "RUNNING"
+                     write_json_atomic(run / "execution_status.json", status)
+@@ -133,19 +160,32 @@ def execute_stages(arguments, config, inputs, root, run, reference):
+                     status["outer_folds"][str(fold)] = "COMPLETE"
+                     write_json_atomic(run / "execution_status.json", status)
+             elif stage == "gates":
+-                manifest = execute_gates(inputs, config, run, reference)
+-                if not manifest["promotable"]:
+-                    raise RuntimeError("Five-fold diagnostics complete; joint promotion gates closed")
++                if execution_mode(config) == "fold0":
++                    from bme_eating.joint_single_fold import execute_fold_gate
++                    execute_fold_gate(inputs, config, run)
++                else:
++                    manifest = execute_gates(inputs, config, run, reference)
++                    if not manifest["promotable"]:
++                        raise RuntimeError("Five-fold diagnostics complete; joint promotion gates closed")
+             elif stage == "final":
+-                execute_final(inputs, config, run, arguments.resume)
++                if execution_mode(config) == "fold0":
++                    from bme_eating.joint_single_fold import save_fold_final
++                    save_fold_final(inputs, config, run, resume=arguments.resume)
++                else:
++                    execute_final(inputs, config, run, arguments.resume)
+             elif stage == "export":
+-                export_joint_bundle(config, run, root, resume=arguments.resume)
++                if execution_mode(config) == "fold0":
++                    from bme_eating.joint_single_fold import export_fold_bundle
++                    export_fold_bundle(inputs, config, run, root, resume=arguments.resume)
++                else:
++                    export_joint_bundle(config, run, root, resume=arguments.resume)
+             elif stage == "replay":
+                 from bme_eating.joint_validation import replay_joint_bundle
+-                write_json_atomic(run / "bundle_replay.json", replay_joint_bundle(run / "bundle", config))
++                bundle_name = "fold0_bundle" if execution_mode(config) == "fold0" else "bundle"
++                write_json_atomic(run / "bundle_replay.json", replay_joint_bundle(run / bundle_name, config))
+             status["stages"][stage] = "COMPLETE"
+             if stage == "outer" and not all((run / f"fold_{fold}" / "completion.json").is_file()
+-                                             for fold in range(5)):
++                                             for fold in execution_folds(config)):
+                 status["stages"][stage] = "PAUSED"
+                 write_json_atomic(run / "execution_status.json", status)
+                 break
+diff --git a/src/bme_eating/data/joint_sessions.py b/src/bme_eating/data/joint_sessions.py
+index 913b50b..76e5b8f 100644
+--- a/src/bme_eating/data/joint_sessions.py
++++ b/src/bme_eating/data/joint_sessions.py
+@@ -147,7 +147,11 @@ def make_joint_dataset(inputs: JointInputs, subjects: set[str], config: dict[str
+     anchors = anchors.merge(transformed[[*keys, *columns]], on=keys, how="left", validate="one_to_one")
+     if anchors[columns].isna().any().any():
+         raise RuntimeError("Canonical statistics have missing anchor alignment rows")
+-    dataset = JointSessionDataset(
++    dataset_type = JointSessionDataset
++    if config["model"]["architecture"] == "statsfusion_joint_event_v412":
++        from bme_eating.data.joint_v412_augmentation import JointSessionDatasetV412
++        dataset_type = JointSessionDatasetV412
++    dataset = dataset_type(
+         anchors, segments, events, normal, statistics_columns=columns,
+         geometry=joint_geometry(config), training=training, seed=2026,
+         reader_cache_size=int(config["training"]["session_reader_cache_size"]),
+@@ -155,6 +159,8 @@ def make_joint_dataset(inputs: JointInputs, subjects: set[str], config: dict[str
+         gyro_modality_dropout=float(config["training"]["gyro_modality_dropout"]) if training else 0,
+         rotation_augmentation_probability=float(config["training"]["rotation_augmentation_probability"])
+         if training else 0)
++    if dataset_type is not JointSessionDataset:
++        dataset.configure(config, scaler, inputs.identity)
+     return dataset, preprocessing
+ 
+ 
+@@ -206,8 +212,8 @@ def session_loader(dataset: JointSessionDataset, sampler: SessionChunkSampler,
+                    config: dict[str, Any]):
+     workers = int(config["training"]["num_workers"])
+     loader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=workers,
+-                      prefetch_factor=int(config["training"]["loader_prefetch_factor"]),
+-                      persistent_workers=True, pin_memory=config["training"]["device"] == "cuda",
++                      prefetch_factor=int(config["training"]["loader_prefetch_factor"]) if workers else None,
++                      persistent_workers=bool(workers), pin_memory=config["training"]["device"] == "cuda",
+                       collate_fn=single_item_collate,
+                       generator=torch.Generator().manual_seed(2026 + sampler.epoch))
+     if _active_loader_scopes:
+diff --git a/src/bme_eating/joint_evaluation.py b/src/bme_eating/joint_evaluation.py
+index c1b3ee1..7211ca3 100644
+--- a/src/bme_eating/joint_evaluation.py
++++ b/src/bme_eating/joint_evaluation.py
+@@ -160,8 +160,9 @@ def commit_candidates(candidates: list[JointCandidate], calibrator: NonnegativeP
+     decisions: dict[tuple[str, str, int], list[JointCandidate]] = {}
+     for candidate in candidates:
+         candidate.event_probability = float(calibrator.transform(candidate.event_logit))
+-        candidate.rank_score = (candidate.event_probability if candidate.score_formula ==
+-            "calibrated_event_probability_v411" else candidate.event_probability * candidate.predicted_quality)
++        candidate.rank_score = (candidate.event_probability if candidate.score_formula
++            in {"calibrated_event_probability_v411", "calibrated_event_probability_v412"}
++            else candidate.event_probability * candidate.predicted_quality)
+         candidate.acceptance_score, candidate.quality_score = candidate.rank_score, candidate.predicted_quality
+         if candidate.coarse_event_logit is not None:
+             candidate.coarse_probability = float(calibrator.transform(candidate.coarse_event_logit))
+@@ -199,16 +200,20 @@ def calibration_ece(probabilities: np.ndarray, targets: np.ndarray, bins: int) -
+ 
+ def choose_operating_point(candidate_sets: dict[str, list[JointCandidate]], windows,
+                            truth, ignore, mappings, config):
+-    if config["model"]["architecture"] == "statsfusion_joint_event_v411" and not config.get("_reference_execution"):
++    if config["model"]["architecture"] in {"statsfusion_joint_event_v411", "statsfusion_joint_event_v412"} and not config.get("_reference_execution"):
+         from bme_eating.joint_v411_search import choose_point
+         return choose_point(candidate_sets, windows, truth, ignore, mappings, config)
+     search = config["search"]
++    from bme_eating.joint_v411_resources import SearchResourceMonitor
++    monitor = SearchResourceMonitor(config)
++    monitor.check(force=True)
+     records, best, best_key = [], None, None
+     observed_hours = float((windows.valid > 0).sum() * 3 / 3600)
+     thresholds = np.arange(search["acceptance_min"], search["acceptance_max"] + 1e-8,
+                            search["acceptance_step"])
+     for setting, candidates in candidate_sets.items():
+         for budget in search["budgets"]:
++            monitor.check(force=True)
+             natural, budget_audit = apply_online_budget(candidates, windows, mappings, budget,
+                                                          config["decoder"]["quotas"])
+             ignored = prediction_ignore_mask(event_frame(natural), ignore)
+@@ -222,6 +227,7 @@ def choose_operating_point(candidate_sets: dict[str, list[JointCandidate]], wind
+             qualified = (calibrator.qualified and ece <= config["calibration"]["maximum_ece"]
+                          and coverage["recall"] >= 0.70)
+             for nms, acceptance in product(search["nms_ious"], thresholds):
++                monitor.check()
+                 predictions = commit_candidates(natural, calibrator, float(acceptance), nms)
+                 metrics, _ = metrics_with_exposure(truth, predictions, ignore, windows,
+                                                    observed_hours=observed_hours)
+@@ -238,6 +244,7 @@ def choose_operating_point(candidate_sets: dict[str, list[JointCandidate]], wind
+                     best_key, best = key, {**record, "budget_audit": budget_audit}
+     if best is None:
+         raise RuntimeError("No diagnostic operating point could be evaluated")
++    best["search_resources"] = monitor.check(force=True)
+     return best, records
+ 
+ 
+diff --git a/src/bme_eating/joint_pipeline.py b/src/bme_eating/joint_pipeline.py
+index 5eaa210..601910b 100644
+--- a/src/bme_eating/joint_pipeline.py
++++ b/src/bme_eating/joint_pipeline.py
+@@ -19,10 +19,13 @@ from bme_eating.joint_evaluation import NonnegativePlatt
+ from bme_eating.joint_protocol import (
+     PROTOCOL,
+     V411_PROTOCOL,
++    V412_PROTOCOL,
+     checkpoint_qualified,
+     config_identity,
+     configure_numerics,
+     digest,
++    event_score_formula,
++    grouped_protocol,
+     protocol_for,
+     validate_config,
+     validate_gate_structure,
+@@ -220,7 +223,7 @@ class StatsFusionJointDetector:
+     def __init__(self, bundle: str | Path, *, device: str = "cpu") -> None:
+         root = Path(bundle)
+         manifest = json.loads((root / "final_manifest.json").read_text(encoding="utf-8"))
+-        if manifest.get("protocol") not in {PROTOCOL, V411_PROTOCOL} or not manifest.get("promotable"):
++        if manifest.get("protocol") not in {PROTOCOL, V411_PROTOCOL, V412_PROTOCOL} or not manifest.get("promotable"):
+             raise RuntimeError("Bundle has no qualified joint manifest")
+         checksums = json.loads((root / "SHA256SUMS.json").read_text(encoding="utf-8"))
+         verify_artifact_hashes(root, checksums)
+@@ -246,8 +249,8 @@ class StatsFusionJointDetector:
+         validate_config(self.config)
+         configure_numerics(self.config)
+         self.point = json.loads((root / "operating_point.json").read_text(encoding="utf-8"))
+-        if protocol_for(self.config) == V411_PROTOCOL and (
+-                self.point.get("score_formula") != "calibrated_event_probability_v411"
++        if grouped_protocol(self.config) and (
++                self.point.get("score_formula") != event_score_formula(self.config)
+                 or self.point.get("boundary_mode") not in {"off", "start_only", "both"}
+                 or self.point.get("boundary_mode") != manifest.get("boundary_mode")
+                 or self.point["boundary_enabled"] != (self.point["boundary_mode"] != "off")):
+diff --git a/src/bme_eating/joint_protocol.py b/src/bme_eating/joint_protocol.py
+index 42bfd16..d1da36a 100644
+--- a/src/bme_eating/joint_protocol.py
++++ b/src/bme_eating/joint_protocol.py
+@@ -20,9 +20,30 @@ import torch
+ from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
+ 
+ PROTOCOL = "statsfusion-joint-event-v1"
+-RUNTIME_KEYS = {"num_workers", "loader_prefetch_factor", "session_reader_cache_size"}
++RUNTIME_KEYS = {"num_workers", "loader_prefetch_factor", "session_reader_cache_size", "derived_cache_mib"}
+ STAGES = ("audit", "validate", "outer", "gates", "final", "export", "replay")
+ V411_PROTOCOL = "statsfusion-joint-event-v2"
++V412_PROTOCOL = "statsfusion-joint-event-v3"
++
++
++def grouped_protocol(config):
++    return protocol_for(config) in {V411_PROTOCOL, V412_PROTOCOL}
++
++
++def event_score_formula(config):
++    if protocol_for(config) == V412_PROTOCOL:
++        return "calibrated_event_probability_v412"
++    if grouped_protocol(config):
++        return "calibrated_event_probability_v411"
++    return "calibrated_event_probability_times_quality"
++
++
++def resolve_reference(output_base, name):
++    matches = [output_base / schema / "runs" / name for schema in ("v410", "v411", "v412")
++               if (output_base / schema / "runs" / name / "identity.json").is_file()]
++    if len({sha256_file(path / "identity.json") for path in matches}) > 1:
++        raise RuntimeError("Reference run name has conflicting identities across schemas")
++    return matches[0] if matches else output_base / "v411" / "runs" / name
+ 
+ 
+ def protocol_for(config):
+@@ -30,10 +51,46 @@ def protocol_for(config):
+ 
+ 
+ def stages_for(config):
++    if execution_mode(config) == "fold0":
++        return STAGES
+     return ("audit", "validate", "outer", "ablation", "gates", "final", "export", "replay") if (
+         protocol_for(config) == V411_PROTOCOL) else STAGES
+ 
+ 
++def execution_mode(config):
++    return config.get("execution", {}).get("mode", "fivefold")
++
++
++def execution_folds(config):
++    return [0] if execution_mode(config) == "fold0" else list(range(5))
++
++
++def internal_partitions(config):
++    mode = config.get("execution", {}).get("internal_mode", "oof")
++    if mode not in {"single", "oof"}:
++        raise ValueError("Internal mode must be single or oof")
++    if mode == "single":
++        if execution_mode(config) != "fold0" or not grouped_protocol(config):
++            raise ValueError("Single partition is restricted to grouped fold0 diagnostics")
++        return [0]
++    if protocol_for(config) == V412_PROTOCOL and execution_mode(config) != "fivefold":
++        raise ValueError("v412 requires fold0/single or fivefold/oof")
++    return list(range(3))
++
++
++def calibration_scope(config):
++    return {"calibration_kind": "single_partition_holdout" if internal_partitions(config) == [0]
++            else "three_partition_oof", "full_internal_oof": internal_partitions(config) != [0]}
++
++
++def model_run_identity(run):
++    path = run / "single_partition_migration.json"
++    if not path.exists():
++        return sha256_file(run / "identity.json")
++    from bme_eating.joint_partition_migration import verify_partition_migration
++    return verify_partition_migration(run)["original_identity_sha256"]
++
++
+ def configure_numerics(config: dict[str, Any]) -> None:
+     os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+     torch.set_num_threads(int(config["resources"]["cpu_threads"]))
+@@ -161,6 +218,9 @@ def record_resume_git(run: Path, stored: dict[str, Any], current: dict[str, Any]
+ 
+ 
+ def validate_config(config: dict[str, Any]) -> None:
++    if execution_mode(config) not in {"fold0", "fivefold"}:
++        raise ValueError("Execution mode must be fold0 or fivefold")
++    internal_partitions(config)
+     def finite_values(value):
+         if isinstance(value, dict):
+             return all(finite_values(item) for item in value.values())
+@@ -169,19 +229,20 @@ def validate_config(config: dict[str, Any]) -> None:
+         return not isinstance(value, (int, float)) or math.isfinite(value)
+     if not finite_values(config):
+         raise ValueError("Joint configuration contains nonfinite values")
+-    v411 = protocol_for(config) == V411_PROTOCOL
+-    if config["experiment"]["protocol_version"] not in {PROTOCOL, V411_PROTOCOL}:
++    v411 = grouped_protocol(config)
++    v412 = protocol_for(config) == V412_PROTOCOL
++    if config["experiment"]["protocol_version"] not in {PROTOCOL, V411_PROTOCOL, V412_PROTOCOL}:
+         raise ValueError("Unregistered joint protocol")
+-    expected_version = "v4.11" if v411 else "v4.10"
++    expected_version = "v4.12" if v412 else "v4.11" if v411 else "v4.10"
+     if config["experiment"]["code_version"] != expected_version:
+         raise ValueError(f"Joint version must be {expected_version}")
+-    if config["model"]["architecture"] != ("statsfusion_joint_event_v411" if v411 else "statsfusion_joint_event"):
++    if config["model"]["architecture"] != ("statsfusion_joint_event_v412" if v412 else "statsfusion_joint_event_v411" if v411 else "statsfusion_joint_event"):
+         raise ValueError("Joint architecture mismatch")
+     if config["training"]["seeds"] != [2026] or config["project"]["seed"] != 2026:
+         raise ValueError("Joint protocol uses one seed: 2026")
+     if config["model"]["hidden_dim"] != 64 or config["sequence"]["step_seconds"] != 3:
+         raise ValueError("Joint protocol requires hidden=64 and step=3 seconds")
+-    if (config["project"]["artifact_schema_version"] != ("v411" if v411 else "v410")
++    if (config["project"]["artifact_schema_version"] != ("v412" if v412 else "v411" if v411 else "v410")
+             or config["model"].get("future_context_seconds", 0) != 0
+             or config["model"]["long_pool_factor"] != config["sequence"]["long_pool_factor"]):
+         raise ValueError("Joint schema, causal context or pooling identity mismatch")
+@@ -213,7 +274,7 @@ def validate_config(config: dict[str, Any]) -> None:
+         raise ValueError("Legacy Boundary fraction key is forbidden")
+     if config["training"]["amp_dtype"] != "bfloat16":
+         raise ValueError("Only registered bfloat16 AMP is supported")
+-    if any(int(config["training"][name]) < 1 for name in RUNTIME_KEYS):
++    if any(int(config["training"].get(name, 1)) < 1 for name in RUNTIME_KEYS):
+         raise ValueError("Runtime workers/prefetch/cache must be positive")
+     if v411:
+         quotas = config["training"].get("group_quotas")
+@@ -243,6 +304,16 @@ def validate_config(config: dict[str, Any]) -> None:
+                  or config["boundary"]["modes"] != ["off", "start_only", "both"]
+                  or not 1 <= config["resources"]["search_processes"] <= 4):
+         raise ValueError("v411 localization, budget, Boundary or search profile mismatch")
++    if v412:
++        training = config["training"]
++        if (training["lr_horizon_epochs"] != 64 or training["max_epochs"] != 64
++                or training["lr_warmup_epochs"] != 2 or training["lr_minimum_fraction"] != 0.10
++                or training["mining_families"] != 32 or training["mining_near_miss_families"] != 8
++                or not isinstance(training["derived_cache_mib"], int) or not 1 <= training["derived_cache_mib"] <= 256
++                or training["low_bandwidth_rates"] != [25.0, 26.316, 50.0]
++                or any(training[name] != 0.20 for name in ("gyro_modality_dropout", "ppg_modality_dropout",
++                    "rotation_augmentation_probability", "low_bandwidth_probability"))):
++            raise ValueError("v412 augmentation, mining or scheduler profile mismatch")
+ 
+ 
+ def assert_excluded(training: set[str], prediction: set[str], outer: set[str]) -> None:
+@@ -270,16 +341,19 @@ def initialize_run(config: dict[str, Any], root: Path, output: Path, run_name: s
+                 "historical_reference": historical_reference}
+     git = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True, check=False)
+     identity["git_head"] = git.stdout.strip() if git.returncode == 0 else None
+-    snapshot = root / "manifests" / "v411_source_snapshot.json"
+-    if protocol_for(config) == V411_PROTOCOL and snapshot.is_file():
++    snapshot = root / "v412_source_snapshot.json" if protocol_for(config) == V412_PROTOCOL else root / "manifests" / "v411_source_snapshot.json"
++    if grouped_protocol(config) and snapshot.is_file():
+         identity["parent_snapshot_sha256"] = sha256_file(snapshot)
++    provenance = root / "manifests/v412_source_provenance.json"
++    if protocol_for(config) == V412_PROTOCOL and provenance.is_file():
++        identity["parent_provenance_sha256"] = sha256_file(provenance)
+     if fresh:
+         if run.exists():
+             raise FileExistsError("Fresh cannot overwrite an existing run; use --resume")
+         run.mkdir(parents=True)
+         write_json_atomic(run / "identity.json", identity)
+         write_json_atomic(run / "execution_status.json", {"status": "CREATED", "stages": {}})
+-        if protocol_for(config) == V411_PROTOCOL:
++        if grouped_protocol(config):
+             import shutil
+             for relative, checksum in identity["source"].items():
+                 destination = run / "source_snapshot" / relative
+@@ -290,20 +364,24 @@ def initialize_run(config: dict[str, Any], root: Path, output: Path, run_name: s
+             write_json_atomic(run / "source_snapshot" / "SHA256SUMS.json", identity["source"])
+             if snapshot.is_file():
+                 shutil.copyfile(snapshot, run / "parent_source_snapshot.json")
++            if protocol_for(config) == V412_PROTOCOL and provenance.is_file():
++                shutil.copyfile(provenance, run / "parent_source_provenance.json")
+     else:
+         if not (run / "identity.json").is_file():
+             raise FileNotFoundError("Resume requires an existing joint run")
++        if (run / "single_partition_migration.json").exists():
++            model_run_identity(run)
+         from bme_eating.joint_resume_migration import (
+             active_resume_identity,
+             migrate_clipping_run,
+             migrate_resume_identity,
+         )
+-        if protocol_for(config) != V411_PROTOCOL:
++        if not grouped_protocol(config):
+             migrate_resume_identity(run, identity, root)
+         from bme_eating.joint_performance_migration import migrate_performance_run
+-        if protocol_for(config) != V411_PROTOCOL:
++        if not grouped_protocol(config):
+             migrate_performance_run(run, identity, root)
+-        if migrate_clipping_gate and protocol_for(config) == V411_PROTOCOL:
++        if migrate_clipping_gate and grouped_protocol(config):
+             raise ValueError("v411 does not allow source/protocol migration on resume")
+         if migrate_clipping_gate:
+             migrate_clipping_run(run, identity, root)
+@@ -313,7 +391,7 @@ def initialize_run(config: dict[str, Any], root: Path, output: Path, run_name: s
+             raise RuntimeError("Resume identity changed: " + ", ".join(differences)
+                                + "; create a new run")
+         record_resume_git(run, stored, identity)
+-        if protocol_for(config) == V411_PROTOCOL:
++        if grouped_protocol(config):
+             verify_artifact_hashes(run / "source_snapshot", identity["source"])
+     if fresh:
+         write_json_atomic(run / "resolved_config.json", config)
+@@ -332,15 +410,18 @@ def checkpoint_qualified(payload: dict[str, Any], expected_identity: str,
+                 and bool(payload.get("model")))
+ 
+ 
+-def verify_oof_lineage(lineages, subjects, outer, *, identities=None):
++def verify_oof_lineage(lineages, subjects, outer, *, identities=None, expected_partitions=(0, 1, 2)):
+     predictions, models, partitions = [], set(), set()
+-    if len(lineages) != 3:
+-        raise RuntimeError("Joint OOF requires three complete partitions")
++    if expected_partitions not in ((0,), (0, 1, 2)):
++        raise ValueError("Unregistered internal prediction partitions")
++    if len(lineages) != len(expected_partitions):
++        raise RuntimeError("Joint OOF requires three complete partitions" if len(expected_partitions) == 3
++                           else "Single calibration requires exactly partition 0")
+     for lineage in lineages:
+         fit, prediction = set(lineage["training_subjects"]), set(lineage["prediction_subjects"])
+         model = lineage.get("model_identity")
+         partition = lineage.get("partition")
+-        if not model or model in models or partition in partitions or partition not in range(3):
++        if not model or model in models or partition in partitions or partition not in expected_partitions:
+             raise RuntimeError("Joint OOF model/partition identity is missing or duplicated")
+         models.add(model)
+         partitions.add(partition)
+@@ -357,10 +438,20 @@ def verify_oof_lineage(lineages, subjects, outer, *, identities=None):
+         if identities and any(lineage.get(name) != value for name, value in identities.items()):
+             raise RuntimeError("Joint OOF config/source/data identity mismatch")
+         predictions.extend(prediction)
+-    if len(predictions) != len(set(predictions)) or set(predictions) != subjects:
++    expected_subjects = subjects
++    if expected_partitions == (0,):
++        from bme_eating.training.hierarchical_v4_trainer import stacking_partitions
++        assignment = stacking_partitions(subjects, 3, 2026)
++        expected_subjects = {subject for subject, partition in assignment.items() if partition == 0}
++    if len(predictions) != len(set(predictions)) or set(predictions) != expected_subjects:
+         raise RuntimeError("Joint OOF does not have exactly one prediction model per subject")
+ 
+ 
++def verify_calibration_lineage(lineages, subjects, outer, config, *, identities=None):
++    verify_oof_lineage(lineages, subjects, outer, identities=identities,
++                       expected_partitions=tuple(internal_partitions(config)))
++
++
+ def protocol_identities(config, data_identity):
+     return {"config_sha256": config_identity(config),
+             "source_sha256": digest(source_identity(Path(config["_config_path"]).resolve().parents[1])),
+@@ -377,6 +468,9 @@ def verify_internal_manifest(directory, config, data_identity, subjects, outer,
+                 **protocol_identities(config, data_identity)}
+     if any(manifest.get(name) != value for name, value in expected.items()):
+         raise RuntimeError("Joint internal OOF completion identity mismatch")
++    if internal_partitions(config) == [0] and any(
++            manifest.get(name) != value for name, value in calibration_scope(config).items()):
++        raise RuntimeError("Single-partition calibration scope is missing or mismatched")
+     required = {"operating_point.json", "internal_oof.pt", "internal_oof_windows.parquet",
+                 "search.json", "boundary_crossfit.json"}
+     if not required.issubset(manifest.get("evidence_sha256", {})):
+@@ -384,7 +478,10 @@ def verify_internal_manifest(directory, config, data_identity, subjects, outer,
+     verify_artifact_hashes(directory, manifest["evidence_sha256"])
+     point = json.loads((directory / "operating_point.json").read_text(encoding="utf-8"))
+     identities = protocol_identities(config, data_identity)
+-    verify_oof_lineage(point["lineage"], subjects, outer, identities=identities)
++    verify_calibration_lineage(point["lineage"], subjects, outer, config, identities=identities)
++    if internal_partitions(config) == [0] and any(
++            point.get(name) != value for name, value in calibration_scope(config).items()):
++        raise RuntimeError("Single-partition operating point cannot claim complete internal OOF")
+     for lineage in point["lineage"]:
+         train, prediction = set(lineage["training_subjects"]), set(lineage["prediction_subjects"])
+         expected_model = digest({"run": run_identity, "training": sorted(train), "prediction": sorted(prediction),
+@@ -475,7 +572,7 @@ def write_failure(run: Path, stage: str, error: BaseException) -> None:
+               "protocol": json.loads((run / "identity.json").read_text(encoding="utf-8")).get("protocol", PROTOCOL), "deployable": False,
+               "identity_sha256": sha256_file(run / "identity.json")}
+     if stage in {"gates", "final", "export", "replay"}:
+-        for name in ("bundle", "bundle.partial"):
++        for name in ("bundle", "bundle.partial", "fold0_bundle", "fold0_bundle.partial"):
+             source = run / name
+             if source.exists():
+                 destination = run / "failures" / ("nondeployable_" + name + "_" + uuid.uuid4().hex)
+diff --git a/src/bme_eating/joint_stream.py b/src/bme_eating/joint_stream.py
+index 9a55522..0a635cf 100644
+--- a/src/bme_eating/joint_stream.py
++++ b/src/bme_eating/joint_stream.py
+@@ -1,7 +1,9 @@
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import math
++import os
+ from copy import deepcopy
+ from dataclasses import asdict, dataclass
+ from pathlib import Path
+@@ -133,21 +135,22 @@ class FrozenSourceCDF:
+             raise RuntimeError("No training candidates for source score normalization")
+         if any(candidate.subject_key not in subjects for candidate in candidates):
+             raise RuntimeError("Source normalization subject leakage")
+-        representatives: dict[tuple[str, str, int], JointCandidate] = {}
++        representatives: dict[tuple[Any, ...], JointCandidate] = {}
+         for candidate in candidates:
+-            parent = candidate.generation_parameters if candidate.generation_parameters.get("v411") else {}
+-            key = (candidate.ancestor_id if parent else candidate.proposal_family_id,
++            parent = candidate.generation_parameters
++            key = (candidate.model_identity, candidate.subject_key, candidate.session_id,
++                   candidate.ancestor_id,
+                    parent.get("parent_source", candidate.source), candidate.scale_seconds)
+             if key not in representatives or representatives[key].raw_score < candidate.raw_score:
+                 representatives[key] = candidate
+         for candidate in representatives.values():
+-            parent = candidate.generation_parameters if candidate.generation_parameters.get("v411") else {}
++            parent = candidate.generation_parameters
+             source = f"{parent.get('parent_source', candidate.source)}:{candidate.scale_seconds}"
+             distributions.setdefault(source, []).append(candidate.raw_score)
+         return cls(distributions, sorted(subjects))
+ 
+     def transform(self, candidate: JointCandidate) -> float:
+-        parent = candidate.generation_parameters if candidate.generation_parameters.get("v411") else {}
++        parent = candidate.generation_parameters
+         source = parent.get("parent_source", candidate.source)
+         values = self.distributions.get(f"{source}:{candidate.scale_seconds}",
+                                          self.distributions.get(candidate.source, []))
+@@ -343,6 +346,8 @@ class StreamingProposals:
+             variants.extend((start - int(self.config[name + "_seconds"] * 1000), end, name,
+                              {"seconds": self.config[name + "_seconds"]})
+                             for name in ("backtrack", "start_expansion"))
++            if self.config.get("parent_proposals_only"):
++                variants = variants[:1]
+             seen = set()
+             for left, right, kind, parameters in variants:
+                 left = max(int(self.origin), left)
+@@ -379,7 +384,7 @@ class ImmutableCommitter:
+     def submit(self, candidates: list[JointCandidate]) -> list[JointCandidate]:
+         from dataclasses import replace
+         emitted = []
+-        if candidates and candidates[0].score_formula == "calibrated_event_probability_v411":
++        if candidates and candidates[0].score_formula in {"calibrated_event_probability_v411", "calibrated_event_probability_v412"}:
+             parents = {}
+             for candidate in candidates:
+                 candidate.validate()
+@@ -413,8 +418,8 @@ class ImmutableCommitter:
+                 candidate = replace(candidate, start_ms=candidate.unrefined_start_ms,
+                     end_ms=candidate.unrefined_end_ms, event_logit=candidate.coarse_event_logit,
+                     predicted_quality=candidate.coarse_quality, event_probability=candidate.coarse_probability,
+-                    rank_score=(candidate.coarse_probability if candidate.score_formula ==
+-                                "calibrated_event_probability_v411" else
++                    rank_score=(candidate.coarse_probability if candidate.score_formula
++                                in {"calibrated_event_probability_v411", "calibrated_event_probability_v412"} else
+                                 candidate.coarse_probability * candidate.coarse_quality), refined=False,
+                     boundary_conflict=True, boundary_fallback_reason="neighbor_conflict")
+                 candidate.acceptance_score = candidate.rank_score
+@@ -437,9 +442,10 @@ class ImmutableCommitter:
+ 
+ class TimelineCache:
+     def __init__(self, path: Path, binding: dict[str, Any], width: int = 138,
+-                 committed_rows: int = 0) -> None:
+-        import json
++                  committed_rows: int = 0, committed_sha256: str | None = None) -> None:
+         self.path, self.binding, self.width = path, binding, width
++        if width <= 0 or committed_rows < 0:
++            raise ValueError("Invalid cache width or committed row count")
+         path.mkdir(parents=True, exist_ok=True)
+         identity = path / "binding.json"
+         if identity.exists() and json.loads(identity.read_text(encoding="utf-8")) != binding:
+@@ -452,21 +458,77 @@ class TimelineCache:
+                 target.touch()
+             if target.stat().st_size < committed_rows * size:
+                 raise RuntimeError("Committed cache is truncated")
++        self.checksum_path = path / "checksums.jsonl"
++        self.checksum = hashlib.sha256(json.dumps({"binding": binding, "width": width},
++            sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
++        self._restore_integrity(committed_sha256)
++        for name, size in (("times.bin", 8), ("features.bin", width * 4)):
++            target = path / name
+             if target.stat().st_size != committed_rows * size:
+                 with target.open("r+b") as handle:
+                     handle.truncate(committed_rows * size)
++                    handle.flush()
++                    os.fsync(handle.fileno())
++
++    def _chunk_checksum(self, times: bytes, values: bytes, rows: int) -> str:
++        checksum = hashlib.sha256(self.checksum.encode("ascii"))
++        checksum.update(rows.to_bytes(8, "little"))
++        checksum.update(times)
++        checksum.update(values)
++        return checksum.hexdigest()
++
++    def _restore_integrity(self, committed_sha256: str | None) -> None:
++        if self.rows and not self.checksum_path.exists():
++            raise RuntimeError("Committed cache checksum evidence is missing")
++        self.checksum_path.touch(exist_ok=True)
++        verified_rows = 0
++        with (self.path / "times.bin").open("rb") as times, \
++                (self.path / "features.bin").open("rb") as values, \
++                self.checksum_path.open("r+b") as journal:
++            while verified_rows < self.rows:
++                line = journal.readline()
++                try:
++                    record = json.loads(line)
++                    stop = record["rows"]
++                    if not line.endswith(b"\n") or not isinstance(stop, int) or not verified_rows < stop <= self.rows:
++                        raise ValueError("Invalid committed checksum cursor")
++                    count = stop - verified_rows
++                    time_bytes = times.read(count * 8)
++                    value_bytes = values.read(count * self.width * 4)
++                    checksum = self._chunk_checksum(time_bytes, value_bytes, stop)
++                    if (len(time_bytes) != count * 8 or len(value_bytes) != count * self.width * 4
++                            or checksum != record["sha256"]):
++                        raise ValueError("Cache content differs from committed checksum")
++                except (ValueError, KeyError, TypeError) as error:
++                    raise RuntimeError("Committed cache checksum verification failed") from error
++                self.checksum = checksum
++                verified_rows = stop
++            if committed_sha256 is not None and committed_sha256 != self.checksum:
++                raise RuntimeError("Cache checksum differs from checkpoint")
++            journal.truncate(journal.tell())
++            journal.flush()
++            os.fsync(journal.fileno())
+ 
+     def append(self, times: np.ndarray, values: np.ndarray) -> None:
+-        import os
+-        if values.shape != (len(times), self.width) or not np.isfinite(values).all():
++        times = np.asarray(times, dtype=np.int64)
++        values = np.asarray(values, dtype=np.float32)
++        if times.ndim != 1 or values.shape != (len(times), self.width) or not np.isfinite(values).all():
+             raise RuntimeError("Cache feature shape or finite gate failed")
+-        for name, payload in (("times.bin", np.asarray(times, dtype=np.int64)),
+-                              ("features.bin", np.asarray(values, dtype=np.float32))):
++        if not len(times):
++            return
++        time_bytes, value_bytes = times.tobytes(), values.tobytes()
++        rows = self.rows + len(times)
++        checksum = self._chunk_checksum(time_bytes, value_bytes, rows)
++        for name, payload in (("times.bin", time_bytes), ("features.bin", value_bytes)):
+             with (self.path / name).open("ab") as handle:
+-                handle.write(payload.tobytes())
++                handle.write(payload)
+                 handle.flush()
+                 os.fsync(handle.fileno())
+-        self.rows += len(times)
++        with self.checksum_path.open("ab") as journal:
++            journal.write((json.dumps({"rows": rows, "sha256": checksum}) + "\n").encode("utf-8"))
++            journal.flush()
++            os.fsync(journal.fileno())
++        self.rows, self.checksum = rows, checksum
+ 
+     def tensors(self) -> tuple[torch.Tensor, torch.Tensor]:
+         if not self.rows:
+diff --git a/src/bme_eating/joint_v411_boundary.py b/src/bme_eating/joint_v411_boundary.py
+index 083133b..79ae9e1 100644
+--- a/src/bme_eating/joint_v411_boundary.py
++++ b/src/bme_eating/joint_v411_boundary.py
+@@ -21,15 +21,31 @@ def refined_key(point):
+ 
+ 
+ def lock_boundary_modes(coarse_point, natural, coarse_predictions, outputs, truth, ignore, windows, config):
++    from bme_eating.joint_protocol import event_score_formula
++    from bme_eating.joint_v411_resources import SearchResourceMonitor
+     from bme_eating.training.statsfusion_joint_trainer import boundary_pair_gate
++    monitor = SearchResourceMonitor(config)
++    monitor.check(force=True)
+     locked = copy.deepcopy(coarse_point)
+     point = {**copy.deepcopy(locked), "boundary_mode": "off", "boundary_enabled": False,
+              "boundary_entropy": None}
+     reports, search, best = [], [], None
++    if config["model"]["architecture"] == "statsfusion_joint_event_v412":
++        events = {(item.subject_key, item.session_id, candidate_targets(item, truth)[2])
++                  for item in natural if candidate_targets(item, truth)[0]}
++        minimum = config["boundary"]["minimum_positive_events"]
++        if len(events) < minimum or locked["candidate_recall"] < config["boundary"]["minimum_candidate_recall"]:
++            point.update({"coarse_operating_point": locked, "score_formula": event_score_formula(config)})
++            reports.append({"passed": False, "search_skipped": True,
++                "reason": "insufficient_independent_event_or_coverage_evidence",
++                "maximum_available_events": len(events), "truth_events": len(truth), "required_events": minimum,
++                "head_learning_enabled": True, "boundary_mode": "off"})
++            return point, reports, search
+     thresholds = np.arange(config["search"]["acceptance_min"], config["search"]["acceptance_max"] + 1e-8,
+                            config["search"]["acceptance_step"])
+     for mode in ("start_only", "both"):
+         for entropy in config["boundary"]["entropy_thresholds"]:
++            monitor.check(force=True)
+             versions = {item.proposal_id: item for output in outputs for item in
+                         output["refined"][f"{mode}:{entropy}"][locked["setting"]]}
+             refined = [versions[item.proposal_id] for item in natural]
+@@ -41,6 +57,7 @@ def lock_boundary_modes(coarse_point, natural, coarse_predictions, outputs, trut
+             ece = calibration_ece(calibrator.transform(logits[keep]), labels[keep], config["calibration"]["bins"])
+             mode_best, mode_report = None, None
+             for acceptance in thresholds:
++                monitor.check()
+                 prediction, diagnostics = commit_candidates(copy.deepcopy(refined), calibrator,
+                     float(acceptance), locked["nms"], return_diagnostics=True)
+                 report = boundary_pair_gate(coarse_predictions, prediction, truth, ignore, windows,
+@@ -66,5 +83,6 @@ def lock_boundary_modes(coarse_point, natural, coarse_predictions, outputs, trut
+                         "promotion_eligible": True}
+             reports.append(mode_report)
+     point["coarse_operating_point"] = locked
+-    point["score_formula"] = "calibrated_event_probability_v411"
++    point["score_formula"] = event_score_formula(config)
++    point["boundary_search_resources"] = monitor.check(force=True)
+     return point, reports, search
+diff --git a/src/bme_eating/joint_v411_prediction.py b/src/bme_eating/joint_v411_prediction.py
+index 9cf9d0f..1067b0a 100644
+--- a/src/bme_eating/joint_v411_prediction.py
++++ b/src/bme_eating/joint_v411_prediction.py
+@@ -13,6 +13,7 @@ from bme_eating.data.joint_sessions import (
+     session_loader,
+ )
+ from bme_eating.hierarchical_artifacts import write_json_atomic
++from bme_eating.joint_progress import progress
+ from bme_eating.joint_stream import FrozenSourceCDF, OnlineBudget, TimelineCache, stable_id
+ from bme_eating.joint_v411_features import ExactROICache
+ from bme_eating.joint_v411_scoring import refine, score_candidates
+@@ -21,7 +22,7 @@ from bme_eating.joint_v411_stream import make_stream
+ 
+ @torch.no_grad()
+ def predict(model, inputs, subjects, config, preprocessing, directory, identity, boundary,
+-            *, source_only=False, mapping=None):
++            *, source_only=False, mapping=None, operating_point=None):
+     from bme_eating.training.statsfusion_joint_trainer import (
+         decoder_settings,
+         enforce_resources,
+@@ -33,46 +34,96 @@ def predict(model, inputs, subjects, config, preprocessing, directory, identity,
+     dataset, _ = make_joint_dataset(inputs, subjects, config, preprocessing, training=source_only)
+     dataset.training = False
+     sampler = SessionChunkSampler(dataset, 0, training=False)
+-    loader = session_loader(dataset, sampler, config)
+     model.eval()
+     reference_execution = config.get("_reference_execution", False)
+     head_batch = 1 if reference_execution else config["training"]["validation_head_batch_size"]
+     settings = decoder_settings(config)
++    v412 = getattr(model, "is_v412", False)
++    if v412:
++        from bme_eating.joint_protocol import digest
++        from bme_eating.joint_v412_cache import PredictionFeatureCache, feature_binding
++        feature_identity = feature_binding(model, inputs, config, preprocessing, identity)
++        feature_root = directory.parent / "feature_cache" / digest(feature_identity)
++        feature_caches = {key: PredictionFeatureCache(feature_root / stable_id(*key),
++            {**feature_identity, "subject": key[0], "session": key[1]}) for key in dataset.session_groups}
++        reader_sampler = copy.copy(sampler)
++        reader_sampler.chunks = [chunk for chunk in sampler.chunks if not feature_caches[chunk[3]].reused]
++    else:
++        reader_sampler = sampler
++    loader = session_loader(dataset, reader_sampler, config) if reader_sampler.chunks else None
++    batches = iter(loader) if loader is not None else iter(())
++    if operating_point is not None:
++        settings = {operating_point["setting"]: settings[operating_point["setting"]]}
++    if source_only and v412:
++        settings = {name: {**decoder, "parent_proposals_only": True} for name, decoder in settings.items()}
++    modes = [(mode, entropy) for mode in ("start_only", "both")
++             for entropy in config["boundary"]["entropy_thresholds"]]
++    if v412 and (source_only or not boundary.get("search_eligible", True)):
++        modes = []
++    if operating_point is not None:
++        modes = ([(operating_point["boundary_mode"], operating_point["boundary_entropy"])]
++                 if operating_point["boundary_enabled"] else [])
+     coarse = {name: [] for name in settings}
+-    refined = {f"{mode}:{entropy}": {name: [] for name in settings}
+-               for mode in ("start_only", "both") for entropy in config["boundary"]["entropy_thresholds"]}
++    refined = {f"{mode}:{entropy}": {name: [] for name in settings} for mode, entropy in modes}
+     windows, current_key, streams, trackers = [], None, {}, {}
++    previous_roi_hits, previous_roi_misses = 0, 0
+     counters = {"head_calls": 0, "boundary_rescore_calls": 0, "parent_proposals": 0,
+                 "generated_geometries": 0, "admitted_geometries": 0,
+                 "roi_hits": 0, "roi_misses": 0, "cache_write_bytes": 0,
+                 "encoder_seconds": 0.0, "proposal_seconds": 0.0, "head_seconds": 0.0}
+     try:
+-        for chunk_index, batch in enumerate(loader):
+-            _, _, _, key, last, count = sampler.chunks[chunk_index]
++        prediction_progress = progress(range(len(sampler.chunks)), total=len(sampler.chunks),
++            description=f"{'Source CDF' if source_only else 'Validation inference'} {directory.parent.name}/{directory.name}")
++        for chunk_index in prediction_progress:
++            row, _, _, key, last, count = sampler.chunks[chunk_index]
+             if hasattr(inputs, "assert_session_unchanged"):
+                 inputs.assert_session_unchanged(key)
+             if key != current_key:
+                 current_key = key
+                 streams = {name: make_stream(*key, identity, decoder) for name, decoder in settings.items()}
+-                trackers = {name: {budget: OnlineBudget(budget, {}) for budget in config["search"]["budgets"]}
++                budgets = [operating_point["budget"]] if operating_point is not None else config["search"]["budgets"]
++                trackers = {name: {budget: OnlineBudget(budget, {}) for budget in budgets}
+                             for name in settings}
+-                cache = TimelineCache(directory / "cache" / stable_id(*key),
+-                    {"identity": identity, "epoch": "prediction", "subject": key[0], "session": key[1]}, 137)
++                if v412:
++                    cache = feature_caches[key]
++                else:
++                    cache = TimelineCache(directory / "cache" / stable_id(*key),
++                        {"identity": identity, "epoch": "prediction", "subject": key[0], "session": key[1]}, 137)
+                 roi_cache = ExactROICache((identity, key))
++                previous_roi_hits, previous_roi_misses = 0, 0
++            if v412 and cache.reused:
++                group = dataset.session_groups[key]
++                stop = int((group["_row_id"].to_numpy() == row).nonzero()[0][0]) + 1
++                batch = {"timestamp_ms": torch.from_numpy(group.timestamp_ms.to_numpy()[stop - count:stop])[None]}
++            else:
++                batch = next(batches)
+             batch = {name: value.to(device) if isinstance(value, torch.Tensor) else value for name, value in batch.items()}
+             stage = time.monotonic()
+-            outputs = model(batch)
+             mask = torch.zeros(batch["timestamp_ms"].shape[1], dtype=torch.bool, device=device)
+             mask[-count:] = True
+-            times, features = batch["timestamp_ms"][0, mask].cpu(), pack_features(outputs, mask).cpu()
++            if v412 and cache.reused:
++                times, features = cache.read(batch["timestamp_ms"][0, mask].cpu().numpy())
++                counters["feature_cache_hit_chunks"] = counters.get("feature_cache_hit_chunks", 0) + 1
++            else:
++                outputs = model(batch)
++                times, features = batch["timestamp_ms"][0, mask].cpu(), pack_features(outputs, mask).cpu()
+             counters["encoder_seconds"] += time.monotonic() - stage
+-            if not source_only:
++            if v412:
++                if not cache.reused:
++                    cache.append(times, features)
++                    counters["cache_write_bytes"] += len(times) * (8 + 137 * 4)
++                all_times, all_features = cache.prefix()
++                if last:
++                    cache.finish()
++            elif not source_only:
+                 cache.append(times.numpy(), features.numpy())
+                 all_times, all_features = cache.tensors()
+                 counters["cache_write_bytes"] += len(times) * (8 + 137 * 4)
+             for timestamp, values in zip(times.tolist(), features.numpy()):
+                 windows.append({"subject_key": key[0], "session_id": key[1], "timestamp_ms": timestamp,
+-                                "valid": float(values[128]), "gyro_valid": float(values[135]), "model_identity": identity})
++                                "valid": float(values[128]), "gyro_valid": float(values[135]), "model_identity": identity,
++                                **({"onset_probability": float(values[133]), "offset_probability": float(values[134])}
++                                   if v412 else {})})
+             stage = time.monotonic()
+             generated = {name: [] for name in settings}
+             for name, stream in streams.items():
+@@ -109,26 +160,41 @@ def predict(model, inputs, subjects, config, preprocessing, directory, identity,
+                     counters["head_calls"] += (len(pool) + head_batch - 1) // head_batch
+                     counters["admitted_geometries"] += len(pool)
+                     coarse[name].extend(pool)
+-                    for mode in ("start_only", "both"):
+-                        for entropy in config["boundary"]["entropy_thresholds"]:
+-                            versions = [refine(model, item, all_times, all_features, device,
++                    for mode, entropy in modes:
++                        versions = [refine(model, item, all_times, all_features, device,
+                                 {**boundary, "mode": mode}, entropy, embedding=score["candidate_embedding"][0],
+                                 rescore=False) for item, score in zip(pool, scores)]
+-                            changed = [item for item in versions if item.refined]
+-                            score_candidates(model, changed, all_times, all_features, device,
++                        changed = [item for item in versions if item.refined]
++                        score_candidates(model, changed, all_times, all_features, device,
+                                 batch_size=head_batch, cache=None if reference_execution else roi_cache)
+-                            counters["boundary_rescore_calls"] += (len(changed) + head_batch - 1) // head_batch
+-                            refined[f"{mode}:{entropy}"][name].extend(versions)
++                        counters["boundary_rescore_calls"] += (len(changed) + head_batch - 1) // head_batch
++                        refined[f"{mode}:{entropy}"][name].extend(versions)
+                 counters["head_seconds"] += time.monotonic() - stage
+-                counters["roi_hits"], counters["roi_misses"] = roi_cache.hits, roi_cache.misses
++                counters["roi_hits"] += roi_cache.hits - previous_roi_hits
++                counters["roi_misses"] += roi_cache.misses - previous_roi_misses
++                previous_roi_hits, previous_roi_misses = roi_cache.hits, roi_cache.misses
+             usage = enforce_resources(config, device)
++            prediction_progress.set_postfix(head_calls=counters["head_calls"],
++                candidates=counters["admitted_geometries"], refresh=False)
+             if hasattr(inputs, "assert_session_unchanged"):
+                 inputs.assert_session_unchanged(key)
++        prediction_progress.close()
+         counters.update({"elapsed_seconds": time.monotonic() - started, "source_only": source_only,
++                         "boundary_search_skipped": not bool(modes), "decoder_settings": list(settings),
++                         "locked_operating_point": operating_point is not None,
+                          "candidate_throughput_per_second": counters["admitted_geometries"] /
+                          max(time.monotonic() - started, 1e-9), **usage})
+         write_json_atomic(directory / "performance.json", counters)
+-        return {"coarse": coarse, "refined": refined, "windows": pd.DataFrame(windows), "performance": counters}
++        frame = pd.DataFrame(windows)
++        if v412 and not source_only:
++            from bme_eating.joint_v412_diagnostics import endpoint_diagnostics
++            from bme_eating.metrics import partition_evaluation_events
++            _, _, events, _ = inputs.frames(subjects, labels=True)
++            truth, ignore = partition_evaluation_events(events, subjects)
++            diagnostics = endpoint_diagnostics(frame, truth, ignore,
++                [item for pool in coarse.values() for item in pool])
++            write_json_atomic(directory / "endpoint_diagnostics.json", diagnostics)
++        return {"coarse": coarse, "refined": refined, "windows": frame, "performance": counters}
+     finally:
+         release_session_loader(loader)
+ 
+diff --git a/src/bme_eating/joint_v411_reference.py b/src/bme_eating/joint_v411_reference.py
+index ff0c4aa..bc4fa93 100644
+--- a/src/bme_eating/joint_v411_reference.py
++++ b/src/bme_eating/joint_v411_reference.py
+@@ -9,33 +9,50 @@ from bme_eating.hierarchical_artifacts import sha256_file
+ from bme_eating.joint_protocol import (
+     checkpoint_qualified,
+     digest,
++    model_run_identity,
+     verify_artifact_hashes,
+     verify_oof_lineage,
+ )
+ 
+ 
+-def audit_completed_joint(reference_root, inputs):
++def audit_completed_joint(reference_root, inputs, *, folds=None):
+     def read(path):
+         return json.loads(path.read_text(encoding="utf-8"))
+     identity = read(reference_root / "identity.json")
+     from bme_eating.joint_resume_migration import active_resume_identity, migration_evidence
+     identity = active_resume_identity(reference_root)
+-    if (identity["protocol"] != "statsfusion-joint-event-v1" or identity["data"] != inputs.identity
++    if (identity["protocol"] not in {"statsfusion-joint-event-v1", "statsfusion-joint-event-v2", "statsfusion-joint-event-v3"}
++            or identity["data"] != inputs.identity
+             or identity.get("seed") != 2026):
+         raise RuntimeError("v410 reference protocol or data identity differs")
+     evidence = {"identity.json": sha256_file(reference_root / "identity.json")}
+     evidence.update(migration_evidence(reference_root))
++    config_path = reference_root / "resolved_config.json"
++    reference_config = read(config_path) if config_path.is_file() else {}
++    from bme_eating.joint_protocol import config_identity
++    if not reference_config or config_identity(reference_config) != identity["config_sha256"]:
++        raise RuntimeError("Reference resolved configuration identity differs")
++    single = reference_config.get("execution", {}).get("internal_mode") == "single"
++    expected_partitions = (0,) if single else (0, 1, 2)
++    selected_folds = list(range(5)) if folds is None else list(folds)
++    if folds is None and reference_config.get("execution", {}).get("mode") == "fold0":
++        raise RuntimeError("Single-fold reference cannot qualify a five-fold comparison")
++    if config_path.is_file():
++        evidence["resolved_config.json"] = sha256_file(config_path)
++    migration = reference_root / "single_partition_migration.json"
++    if migration.is_file():
++        evidence[migration.name] = sha256_file(migration)
+     for artifact in (reference_root / "resume_migrations").rglob("*"):
+         if artifact.is_file():
+             evidence[artifact.relative_to(reference_root).as_posix()] = sha256_file(artifact)
+     predictions, windows, truths, ignores, candidates, lineages, calibrations, budgets = [], [], [], [], [], [], [], []
+     covered = 0
+     subjects = set(inputs.subject_folds)
+-    for fold in range(5):
++    for fold in selected_folds:
+         directory = reference_root / f"fold_{fold}"
+         completion = read(directory / "completion.json")
+         verify_artifact_hashes(directory, completion["evidence_sha256"])
+-        if completion["protocol"] != identity["protocol"] or completion["run_identity"] != evidence["identity.json"]:
++        if completion["protocol"] != identity["protocol"] or completion["run_identity"] != model_run_identity(reference_root):
+             raise RuntimeError("Reference fold completion identity mismatch")
+         report = read(directory / "evaluation.json")
+         holdout = {subject for subject, number in inputs.subject_folds.items() if number == fold}
+@@ -59,7 +76,7 @@ def audit_completed_joint(reference_root, inputs):
+             raise RuntimeError("Reference operating point differs from internal OOF lock")
+         verify_oof_lineage(point["lineage"], train, holdout, identities={
+             "data_sha256": payload["data_sha256"], "config_sha256": payload["config_sha256"],
+-            "source_sha256": payload["source_sha256"]})
++            "source_sha256": payload["source_sha256"]}, expected_partitions=expected_partitions)
+         for lineage in point["lineage"]:
+             checkpoint = torch.load(directory / "internal" / f"partition_{lineage['partition']}" /
+                                     "retrain" / "latest.pt", map_location="cpu", weights_only=True)
+@@ -107,11 +124,13 @@ def audit_completed_joint(reference_root, inputs):
+                                                        for frames in (predictions, windows, truths, ignores, candidates)]
+     if windows.duplicated(["subject_key", "session_id", "timestamp_ms"]).any():
+         raise RuntimeError("Reference has duplicated outer exposure")
+-    if set(windows.subject_key.astype(str)) != subjects:
++    expected_subjects = {subject for subject, fold in inputs.subject_folds.items() if fold in selected_folds}
++    if set(windows.subject_key.astype(str)) != expected_subjects:
+         raise RuntimeError("Reference is missing outer subject exposure")
+     return {"qualified": True, "comparison_performed": False, "reasons": [],
+         "root": str(reference_root.resolve()), "evidence_sha256": evidence,
+-        "derived_from_five_fold_completions": True,
++        "derived_from_five_fold_completions": len(selected_folds) == 5,
++        "folds": selected_folds,
+         "payload": {"truth_sha256": digest(truths.to_dict("records")),
+                     "ignore_sha256": digest(ignores.to_dict("records")),
+                     "candidate_budget": budgets[0] if len(set(budgets)) == 1 else None,
+diff --git a/src/bme_eating/joint_v411_resources.py b/src/bme_eating/joint_v411_resources.py
+index 53df62a..f73bbd7 100644
+--- a/src/bme_eating/joint_v411_resources.py
++++ b/src/bme_eating/joint_v411_resources.py
+@@ -7,13 +7,19 @@ from ctypes import wintypes
+ _peak_private = 0.0
+ 
+ 
+-def private_process_tree():
++def private_process_tree(root_pid=None):
+     global _peak_private
++    root_pid = os.getpid() if root_pid is None else root_pid
+     if os.name != "nt":
+         import psutil
+-        process = psutil.Process()
++        process = psutil.Process(root_pid)
+         members = [process, *process.children(recursive=True)]
+-        private = sum(member.memory_full_info().uss for member in members)
++        private = 0
++        for member in members:
++            try:
++                private += member.memory_full_info().uss
++            except psutil.NoSuchProcess:
++                continue
+         count = len(members)
+     else:
+         class ProcessEntry(ctypes.Structure):
+@@ -48,7 +54,7 @@ def private_process_tree():
+                 available = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+         finally:
+             kernel.CloseHandle(snapshot)
+-        members = {os.getpid()}
++        members = {root_pid}
+         while True:
+             extended = members | {pid for pid, parent in parents.items() if parent in members}
+             if members == extended:
+@@ -71,3 +77,23 @@ def private_process_tree():
+     _peak_private = max(_peak_private, current)
+     return {"process_tree_private_ram_gb": current, "peak_process_tree_private_ram_gb": _peak_private,
+             "worker_process_count": count - 1}
++
++
++class SearchResourceMonitor:
++    def __init__(self, config, root_pid=None):
++        self.limit = config["resources"].get("maximum_private_ram_gb")
++        self.root_pid = root_pid
++        self.last_check = float("-inf")
++        self.usage = {}
++
++    def check(self, *, force=False, allocation_bytes=0):
++        import time
++        now = time.monotonic()
++        if self.limit is None or (not force and not allocation_bytes and now - self.last_check < .25):
++            return self.usage
++        self.usage = private_process_tree(self.root_pid)
++        self.last_check = now
++        projected = self.usage["process_tree_private_ram_gb"] + allocation_bytes / 1024 ** 3
++        if projected >= self.limit:
++            raise RuntimeError(f"Search process tree private RAM exceeds registered {self.limit:g} GB limit")
++        return self.usage
+diff --git a/src/bme_eating/joint_v411_scoring.py b/src/bme_eating/joint_v411_scoring.py
+index f740222..ce9bcd0 100644
+--- a/src/bme_eating/joint_v411_scoring.py
++++ b/src/bme_eating/joint_v411_scoring.py
+@@ -35,7 +35,8 @@ def score_candidates(model, candidates, times, features, device, *, batch_size=1
+         detached = torch.stack((scores["event_logit"], scores["quality_logit"].sigmoid()), -1).detach().cpu()
+         for index, candidate in enumerate(pool):
+             candidate.event_logit, candidate.predicted_quality = detached[index].tolist()
+-            candidate.score_formula = "calibrated_event_probability_v411"
++            candidate.score_formula = ("calibrated_event_probability_v412" if getattr(model, "is_v412", False)
++                                       else "calibrated_event_probability_v411")
+             outputs.append({name: value[index:index + 1] for name, value in scores.items()})
+     return outputs
+ 
+diff --git a/src/bme_eating/joint_v411_search.py b/src/bme_eating/joint_v411_search.py
+index a73d322..95d9fff 100644
+--- a/src/bme_eating/joint_v411_search.py
++++ b/src/bme_eating/joint_v411_search.py
+@@ -1,8 +1,9 @@
+ from __future__ import annotations
+ 
+ import copy
++import os
+ import time
+-from concurrent.futures import ProcessPoolExecutor
++from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+ from itertools import product
+ 
+ import numpy as np
+@@ -16,13 +17,16 @@ from bme_eating.joint_evaluation import (
+     candidate_coverage,
+     event_frame,
+ )
++from bme_eating.joint_progress import progress
+ from bme_eating.joint_stream import candidate_targets
++from bme_eating.joint_v411_resources import SearchResourceMonitor
+ from bme_eating.metrics import interval_iou_matrix, prediction_ignore_mask
+ 
+ 
+ class CachedSearch:
+-    def __init__(self, candidates, truth, ignore, windows, calibrator):
++    def __init__(self, candidates, truth, ignore, windows, calibrator, resource_monitor=None):
+         self.candidates, self.truth = candidates, truth
++        self.resource_monitor = resource_monitor
+         self.hours = float((windows.valid > 0).sum() * 3 / 3600)
+         probabilities = calibrator.transform(np.asarray([item.event_logit for item in candidates]))
+         self.groups = []
+@@ -35,6 +39,8 @@ class CachedSearch:
+             target = truth[truth.subject_key.astype(str).eq(subject) & truth.session_id.astype(str).eq(session)]
+             target_coordinates = target[["start_ms", "end_ms"]].to_numpy()
+             coordinates = np.asarray([[item.start_ms, item.end_ms] for item in pool]).reshape(-1, 2)
++            if resource_monitor is not None:
++                resource_monitor.check(allocation_bytes=8 * 6 * (len(pool) ** 2 + len(target) * len(pool)))
+             iou = interval_iou_matrix(target_coordinates, coordinates)
+             overlap = interval_iou_matrix(coordinates, coordinates)
+             ignored = prediction_ignore_mask(event_frame(pool), ignore)
+@@ -43,11 +49,15 @@ class CachedSearch:
+                 decisions.setdefault(item.decision_time_ms, {}).setdefault(item.ancestor_id, []).append(index)
+             self.groups.append((pool, target, target_coordinates, coordinates, iou, overlap, ignored,
+                                 probabilities[indices], [decisions[key] for key in sorted(decisions)]))
++            if resource_monitor is not None:
++                resource_monitor.check(force=True)
+ 
+     def evaluate(self, acceptance, nms):
+         tp, fp, ignored_count = 0, 0, 0
+         start_errors, end_errors, hands = [], [], {name: 0 for name in ("same", "different", "unknown")}
+         for pool, target, target_coordinates, coordinates, iou, overlap, ignored, probabilities, decisions in self.groups:
++            if self.resource_monitor is not None:
++                self.resource_monitor.check()
+             committed = []
+             for parents in decisions:
+                 winners = []
+@@ -101,29 +111,37 @@ class CachedSearch:
+         return metrics
+ 
+ 
+-def search_group(payload):
+-    import os
++def search_group(payload, root_pid=None):
+     os.environ.setdefault("OMP_NUM_THREADS", "1")
+     natural, truth, ignore, windows, registered, config, calibrator, coverage, ece = payload
+-    cache = CachedSearch(natural, truth, ignore, windows, calibrator)
++    monitor = SearchResourceMonitor(config, root_pid)
++    monitor.check(force=True)
++    cache = CachedSearch(natural, truth, ignore, windows, calibrator, monitor)
+     thresholds = np.arange(config["search"]["acceptance_min"], config["search"]["acceptance_max"] + 1e-8,
+                            config["search"]["acceptance_step"])
+     qualified = calibrator.qualified and ece <= config["calibration"]["maximum_ece"] and coverage["recall"] >= .70
+     records = []
+     for nms, acceptance in product(config["search"]["nms_ious"], thresholds):
++        monitor.check()
+         metrics = cache.evaluate(float(acceptance), nms)
+         records.append({**registered, "nms": nms, "acceptance": float(acceptance),
+             "calibration": calibrator.to_json(), "calibration_ece": ece,
+             "candidate_recall": coverage["recall"], "promotion_eligible": qualified and
+             metrics["fp_per_hour"] <= config["gates"]["maximum_fp_per_hour"], **metrics})
++    monitor.check(force=True)
+     return records
+ 
+ 
+ def choose_point(candidate_sets, windows, truth, ignore, mappings, config):
+     started = time.monotonic()
++    monitor = SearchResourceMonitor(config)
++    monitor.check(force=True)
+     payloads, audits = [], {}
+-    for setting, candidates in candidate_sets.items():
++    preparation = progress(candidate_sets.items(), total=len(candidate_sets),
++                           description="Selector calibration/budget", unit="decoder")
++    for setting, candidates in preparation:
+         for budget in config["search"]["budgets"]:
++            monitor.check(force=True)
+             natural, audit = apply_online_budget(candidates, windows, mappings, budget, {})
+             if any(item.source == "truth_jitter" or item.generation_parameters.get("training_only") for item in natural):
+                 raise RuntimeError("Natural calibration contains training-only candidates")
+@@ -137,13 +155,33 @@ def choose_point(candidate_sets, windows, truth, ignore, mappings, config):
+             payloads.append((copy.deepcopy(natural), truth, ignore, windows[["valid"]],
+                              {"setting": setting, "budget": budget}, config, calibrator, coverage, ece))
+             audits[(setting, budget)] = audit
++            monitor.check(force=True)
+     workers = min(config["resources"]["search_processes"], len(payloads))
+     if workers == 1:
+         groups = map(search_group, payloads)
+-        records = [record for group in groups for record in group]
++        records = [record for group in progress(groups, total=len(payloads),
++            description="Selector operating-point search", unit="group") for record in group]
+     else:
+         with ProcessPoolExecutor(max_workers=workers) as executor:
+-            records = [record for group in executor.map(search_group, payloads) for record in group]
++            futures = {executor.submit(search_group, payload, os.getpid()): index
++                       for index, payload in enumerate(payloads)}
++            completed = {}
++            pending = set(futures)
++            search_progress = progress(None, total=len(payloads),
++                                      description="Selector operating-point search", unit="group")
++            try:
++                while pending:
++                    monitor.check(force=True)
++                    done, pending = wait(pending, timeout=.25, return_when=FIRST_COMPLETED)
++                    for future in done:
++                        completed[futures[future]] = future.result()
++                        search_progress.update(1)
++                records = [record for index in range(len(payloads)) for record in completed[index]]
++            finally:
++                for future in pending:
++                    future.cancel()
++                search_progress.close()
++    monitor.check(force=True)
+     best, best_key = None, None
+     for record in records:
+         bias = record["start_signed_error_seconds"]
+@@ -155,4 +193,5 @@ def choose_point(candidate_sets, windows, truth, ignore, mappings, config):
+         raise RuntimeError("No registered operating points")
+     return {**best, "budget_audit": audits[(best["setting"], best["budget"])],
+             "search_seconds": time.monotonic() - started,
++            "search_resources": {**monitor.usage, "search_processes": workers},
+             "registered_operating_points": len(records)}, records
+diff --git a/src/bme_eating/joint_v411_stream.py b/src/bme_eating/joint_v411_stream.py
+index 7afd7ad..15cf114 100644
+--- a/src/bme_eating/joint_v411_stream.py
++++ b/src/bme_eating/joint_v411_stream.py
+@@ -33,6 +33,10 @@ class LearnedStreamingProposals(StreamingProposals):
+ 
+     def _ready(self, decision, eof=False):
+         legacy = super()._ready(decision, eof)
++        if self.config.get("parent_proposals_only"):
++            for candidate in legacy:
++                candidate.score_formula = self.config.get("score_formula", "calibrated_event_probability_v411")
++            return legacy
+         parents = {}
+         for candidate in legacy:
+             parents.setdefault(candidate.ancestor_id, []).append(candidate)
+@@ -83,7 +87,7 @@ class LearnedStreamingProposals(StreamingProposals):
+                     "source_flags": sorted(set(flags)), "parent_raw_score": coarse.raw_score,
+                     "learned_peak_count": len(selected), "compatibility_fallback": not bool(selected),
+                     "coarse_parent_id": coarse.ancestor_id})
+-                candidate.score_formula = "calibrated_event_probability_v411"
++                candidate.score_formula = self.config.get("score_formula", "calibrated_event_probability_v411")
+                 candidate.validate()
+                 unique[geometry] = candidate
+             for item in pool:
+diff --git a/src/bme_eating/joint_v411_training.py b/src/bme_eating/joint_v411_training.py
+index 880bc77..8689a79 100644
+--- a/src/bme_eating/joint_v411_training.py
++++ b/src/bme_eating/joint_v411_training.py
+@@ -100,6 +100,7 @@ def group_losses(model, groups, truth, times, features, device, boundary, config
+             score = score_by_id[candidate.proposal_id]
+             target = candidate_targets(candidate, truth)
+             positive, quality = target[:2]
++            ranking_quality, ranking_logit = quality, score["quality_logit"].float().squeeze()
+             event_loss = F.binary_cross_entropy_with_logits(score["event_logit"].float(),
+                                                             torch.tensor([positive], device=device))
+             quality_loss = quality_focal_loss(score["quality_logit"].float(),
+@@ -123,10 +124,12 @@ def group_losses(model, groups, truth, times, features, device, boundary, config
+                         times, features, device, boundary, new_score["candidate_embedding"][0])) / 2
+                     label_changes.append({"proposal_id": candidate.proposal_id,
+                         "before_target": list(target), "after_target": list(new_target)})
++                    if getattr(model, "is_v412", False):
++                        ranking_quality, ranking_logit = new_target[1], new_score["quality_logit"].float().squeeze()
+             losses["event"].append(event_loss)
+             losses["quality"].append(quality_loss)
+             losses["boundary"].append(candidate_boundary)
+-            quality_pairs.append((quality, score["quality_logit"].float().squeeze()))
++            quality_pairs.append((ranking_quality, ranking_logit))
+         ranking = []
+         if config.get("ablation", {}).get("name") != "single_candidate":
+             for first, (left_quality, left_score) in enumerate(quality_pairs):
+diff --git a/src/bme_eating/joint_validation.py b/src/bme_eating/joint_validation.py
+index 5f3fcbf..ef43f43 100644
+--- a/src/bme_eating/joint_validation.py
++++ b/src/bme_eating/joint_validation.py
+@@ -248,7 +248,10 @@ def raw_session_replay(model, config):
+ 
+ 
+ def replay_joint_bundle(bundle: Path, config):
+-    detector = StatsFusionJointDetector(bundle)
++    from bme_eating.joint_single_fold import StatsFusionJointFoldDetector
++    single_fold = config.get("execution", {}).get("mode") == "fold0"
++    detector_type = StatsFusionJointFoldDetector if single_fold else StatsFusionJointDetector
++    detector = detector_type(bundle)
+     report = long_event_feature_replay(detector.model, config)
+     locked = replay_locked_bundle(detector)
+     code = """import builtins
+@@ -264,6 +267,9 @@ from bme_eating.joint_validation import replay_locked_bundle
+ replay_locked_bundle(StatsFusionJointDetector(sys.argv[1]))
+ print('PASS')
+ """
++    if single_fold:
++        code = code.replace("from bme_eating.joint_pipeline import StatsFusionJointDetector",
++                            "from bme_eating.joint_single_fold import StatsFusionJointFoldDetector as StatsFusionJointDetector")
+     command = [sys.executable, "-c", code, str(bundle)]
+     import os
+     environment = dict(os.environ)
+diff --git a/src/bme_eating/joint_workflow.py b/src/bme_eating/joint_workflow.py
+index 658f76f..3265d18 100644
+--- a/src/bme_eating/joint_workflow.py
++++ b/src/bme_eating/joint_workflow.py
+@@ -19,14 +19,19 @@ from bme_eating.joint_evaluation import (
+     metrics_with_exposure,
+     paired_subject_bootstrap,
+ )
++from bme_eating.joint_progress import print_metrics
+ from bme_eating.joint_protocol import (
+     checkpoint_qualified,
+     digest,
++    event_score_formula,
++    grouped_protocol,
++    model_run_identity,
+     protocol_for,
+     protocol_identities,
+     require_gate,
+     save_torch_atomic,
+     verify_artifact_hashes,
++    verify_calibration_lineage,
+     verify_internal_manifest,
+     verify_oof_lineage,
+     write_failure,
+@@ -51,7 +56,7 @@ def verify_outer_completion(inputs, config, run, fold):
+     if not path.is_file():
+         raise RuntimeError(f"Outer fold {fold} completion evidence is missing")
+     manifest = read_json(path)
+-    expected_identity = {"protocol": protocol_for(config), "run_identity": sha256_file(run / "identity.json"),
++    expected_identity = {"protocol": protocol_for(config), "run_identity": model_run_identity(run),
+                          "fold": fold, **protocol_identities(config, inputs.identity)}
+     if any(manifest.get(name) != value for name, value in expected_identity.items()):
+         raise RuntimeError("Outer completion config/source/data/run identity mismatch")
+@@ -90,10 +95,11 @@ def execute_outer(inputs, config, run, fold, resume):
+         return verify_outer_completion(inputs, config, run, fold)
+     outer = {subject for subject, index in inputs.subject_folds.items() if index == fold}
+     subjects = set(inputs.subject_folds) - outer
+-    run_identity = sha256_file(run / "identity.json")
++    run_identity = model_run_identity(run)
+     epoch, point = train_partition_protocol(inputs, subjects, outer, config,
+                                            directory / "internal", run_identity, resume)
+-    verify_oof_lineage(point["lineage"], subjects, outer, identities=protocol_identities(config, inputs.identity))
++    verify_calibration_lineage(point["lineage"], subjects, outer, config,
++                               identities=protocol_identities(config, inputs.identity))
+     identity = digest({"run": run_identity, "fold": fold, "training": sorted(subjects), "epoch": epoch})
+     train_joint_model(inputs, subjects, config, directory / "model", identity, epochs=epoch,
+                       resume=resume, outer_excluded=outer)
+@@ -101,7 +107,8 @@ def execute_outer(inputs, config, run, fold, resume):
+     mapping = fit_source_mapping(model, inputs, subjects, config, payload["preprocessing"],
+                                   directory / "source_fit", identity)
+     output = predict_joint_model(model, inputs, outer, config, payload["preprocessing"],
+-                                directory / "prediction", identity, payload["boundary"], mapping=mapping)
++                                directory / "prediction", identity, payload["boundary"], mapping=mapping,
++                                operating_point=point if config["model"]["architecture"] == "statsfusion_joint_event_v412" else None)
+     candidates, budget_audit = apply_online_budget(output["coarse"][point["setting"]], output["windows"],
+         {identity: mapping}, point["budget"], config["decoder"]["quotas"])
+     from bme_eating.joint_v411_boundary import refined_key
+@@ -115,10 +122,11 @@ def execute_outer(inputs, config, run, fold, resume):
+     truth, ignore = partition_evaluation_events(events, outer)
+     metrics, matches = metrics_with_exposure(truth, prediction, ignore, output["windows"])
+     coverage = candidate_coverage(candidates, truth, output["windows"])
++    print_metrics(f"outer fold {fold} TEST (locked internal OOF)",
++                  {**point, **metrics, "candidate_recall": coverage["recall"]})
+     coarse_by_id = {candidate.proposal_id: candidate for candidate in output["coarse"][point["setting"]]}
+     coarse_candidates = [coarse_by_id[candidate.proposal_id] for candidate in candidates]
+-    comparison_point = (point["coarse_operating_point"] if protocol_for(config) ==
+-                        "statsfusion-joint-event-v2" else point)
++    comparison_point = point["coarse_operating_point"] if grouped_protocol(config) else point
+     coarse_prediction = commit_candidates(coarse_candidates, NonnegativePlatt(**comparison_point["calibration"]),
+                                            comparison_point["acceptance"], comparison_point["nms"])
+     from bme_eating.training.statsfusion_joint_trainer import boundary_pair_gate
+@@ -129,7 +137,7 @@ def execute_outer(inputs, config, run, fold, resume):
+     locked_prediction = commit_candidates(coarse_candidates, NonnegativePlatt(**locked_coarse["calibration"]),
+                                           locked_coarse["acceptance"], locked_coarse["nms"])
+     locked_metrics, _ = metrics_with_exposure(truth, locked_prediction, ignore, output["windows"])
+-    if protocol_for(config) == "statsfusion-joint-event-v2":
++    if grouped_protocol(config):
+         boundary = boundary_pair_gate(locked_prediction, prediction, truth, ignore, output["windows"],
+             config, require_sixty=False, refined_candidates=boundary_diagnostics,
+             mode=point.get("boundary_mode", "both"))
+@@ -162,19 +170,23 @@ def execute_outer(inputs, config, run, fold, resume):
+     return report
+ 
+ 
+-def audit_reference(reference_root: Path, inputs):
++def audit_reference(reference_root: Path, inputs, *, folds=None):
+     try:
+-        return _audit_reference(reference_root, inputs)
++        return _audit_reference(reference_root, inputs, folds=folds)
+     except (OSError, ValueError, TypeError, KeyError, AttributeError, RuntimeError, EOFError,
+             pickle.UnpicklingError) as error:
+         return {"qualified": False, "comparison_performed": False, "evidence_sha256": {},
+                 "reasons": [f"Reference audit failed: {type(error).__name__}: {error}"]}
+ 
+ 
+-def _audit_reference(reference_root: Path, inputs):
+-    if (reference_root / "identity.json").is_file() and read_json(reference_root / "identity.json").get("protocol") == "statsfusion-joint-event-v1":
++def _audit_reference(reference_root: Path, inputs, *, folds=None):
++    if (reference_root / "identity.json").is_file() and read_json(reference_root / "identity.json").get("protocol") in {
++            "statsfusion-joint-event-v1", "statsfusion-joint-event-v2", "statsfusion-joint-event-v3"}:
+         from bme_eating.joint_v411_reference import audit_completed_joint
+-        return audit_completed_joint(reference_root, inputs)
++        return audit_completed_joint(reference_root, inputs, folds=folds)
++    if folds is not None:
++        return {"qualified": False, "comparison_performed": False,
++                "reasons": ["Single-fold comparison requires a completed joint outer checkpoint"]}
+     reasons, files = [], {}
+     path = reference_root / "joint_reference_evidence.json"
+     legacy = list(reference_root.glob("**/final_manifest.json")) if reference_root.is_dir() else []
+@@ -268,7 +280,7 @@ def execute_gates(inputs, config, run, reference_root):
+         payload = torch.load(directory / "outer_evidence.pt", map_location="cpu", weights_only=False)
+         reports.append(report)
+         mode = report["operating_point"].get("boundary_mode", "off")
+-        if protocol_for(config) == "statsfusion-joint-event-v2" and mode != "off":
++        if grouped_protocol(config) and mode != "off":
+             bucket = boundary_pools.setdefault(mode, {"coarse": [], "refined": [], "diagnostics": [], "folds": []})
+             bucket["coarse"].extend(payload["coarse_prediction"])
+             bucket["refined"].extend(payload["prediction"])
+@@ -310,7 +322,7 @@ def execute_gates(inputs, config, run, reference_root):
+         "qualified": False, "comparison_performed": False, "reasons": ["Reference not provided"]}
+     checks["reference"] = reference["qualified"]
+     boundary_summary = {}
+-    if protocol_for(config) == "statsfusion-joint-event-v2":
++    if grouped_protocol(config):
+         from bme_eating.training.statsfusion_joint_trainer import boundary_pair_gate
+         for mode, bucket in boundary_pools.items():
+             selected_subjects = {subject for subject, fold in inputs.subject_folds.items() if fold in bucket["folds"]}
+@@ -407,9 +419,7 @@ def execute_final(inputs, config, run, resume):
+                 "boundary_mode": point.get("boundary_mode", "both" if point["boundary_enabled"] else "off"),
+                 "score_formula": point.get(
+                     "score_formula",
+-                    "calibrated_event_probability_v411"
+-                    if protocol_for(config) == "statsfusion-joint-event-v2"
+-                    else "event_probability_times_quality_v410")}
++                    event_score_formula(config))}
+     manifest["resume_migration_evidence"] = migration_evidence(run)
+     write_json_atomic(directory / "final_manifest.json", manifest)
+     return manifest
+@@ -453,8 +463,8 @@ def export_joint_bundle(config, run, source_root, *, resume=False):
+         raise RuntimeError("Final operating point differs from dedicated internal OOF")
+     if not point["promotion_eligible"] or point["boundary_enabled"] != manifest["boundary_enabled"]:
+         raise RuntimeError("Deployment operating point is unqualified or differs from manifest")
+-    if protocol_for(config) == "statsfusion-joint-event-v2" and (
+-            point.get("score_formula") != "calibrated_event_probability_v411"
++    if grouped_protocol(config) and (
++            point.get("score_formula") != event_score_formula(config)
+             or point.get("boundary_mode") != manifest.get("boundary_mode")
+             or point["boundary_enabled"] != (point["boundary_mode"] != "off")):
+         raise RuntimeError("Deployment v411 scoring or Boundary mode lock differs")
+diff --git a/src/bme_eating/models/statsfusion_joint_event_v411.py b/src/bme_eating/models/statsfusion_joint_event_v411.py
+index f7b581f..ee9fffc 100644
+--- a/src/bme_eating/models/statsfusion_joint_event_v411.py
++++ b/src/bme_eating/models/statsfusion_joint_event_v411.py
+@@ -85,6 +85,9 @@ class StatsFusionJointEventV411(StatsFusionJointEvent):
+ 
+ def build_joint_model(config):
+     architecture = config["model"]["architecture"]
++    if architecture == "statsfusion_joint_event_v412":
++        from bme_eating.models.statsfusion_joint_event_v412 import StatsFusionJointEventV412
++        return StatsFusionJointEventV412(config)
+     if architecture == "statsfusion_joint_event_v411":
+         return StatsFusionJointEventV411(config)
+     if architecture == "statsfusion_joint_event":
+diff --git a/src/bme_eating/training/statsfusion_joint_trainer.py b/src/bme_eating/training/statsfusion_joint_trainer.py
+index 432acca..97c20e2 100644
+--- a/src/bme_eating/training/statsfusion_joint_trainer.py
++++ b/src/bme_eating/training/statsfusion_joint_trainer.py
+@@ -33,18 +33,21 @@ from bme_eating.joint_evaluation import (
+     commit_candidates,
+     metrics_with_exposure,
+ )
++from bme_eating.joint_progress import print_metrics, progress
+ from bme_eating.joint_protocol import (
+     assert_excluded,
++    calibration_scope,
+     checkpoint_qualified,
+     config_identity,
+     configure_numerics,
+     digest,
++    internal_partitions,
+     protocol_for,
+     protocol_identities,
+     save_torch_atomic,
+     source_identity,
++    verify_calibration_lineage,
+     verify_internal_manifest,
+-    verify_oof_lineage,
+ )
+ from bme_eating.joint_stream import (
+     FrozenSourceCDF,
+@@ -214,7 +217,7 @@ def resource_usage(device):
+ 
+ def enforce_resources(config, device):
+     usage = resource_usage(device)
+-    if config["model"]["architecture"] == "statsfusion_joint_event_v411":
++    if config["model"]["architecture"] in {"statsfusion_joint_event_v411", "statsfusion_joint_event_v412"}:
+         from bme_eating.joint_v411_resources import private_process_tree
+         usage.update(private_process_tree())
+         if usage["process_tree_private_ram_gb"] >= config["resources"]["maximum_private_ram_gb"]:
+@@ -427,10 +430,19 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+         torch.cuda.reset_peak_memory_stats(device)
+     model = seed_model(config).to(device)
+     v411 = getattr(model, "is_v411", False)
++    v412 = getattr(model, "is_v412", False)
+     from bme_eating.joint_v411_features import FeatureBlocks
+     from bme_eating.joint_v411_journal import CheckedJournal
+     from bme_eating.joint_v411_stream import make_stream
+     from bme_eating.joint_v411_training import PositiveGradientBuffer
++    if v412:
++        from bme_eating.joint_v412_training import (
++            ReplaceablePositiveGradientBuffer,
++            apply_learning_rate,
++            heatmap_focal_loss,
++            subject_weights,
++        )
++        PositiveGradientBuffer = ReplaceablePositiveGradientBuffer
+     source_root = Path(config["_config_path"]).resolve().parents[1]
+     bound_source = source_identity(source_root)
+     bound_config = config_identity(config)
+@@ -451,7 +463,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+     state = {"epoch": 1, "next_chunk": 0, "session_count": 0, "update_count": 0,
+              "clipped_steps": 0, "optimizer_steps": 0, "epoch_complete": False,
+              "boundary": {"qualified": False, "start_range_seconds": 900},
+-             "cache_rows": 0, "session_key": None, "stream": None,
++             "cache_rows": 0, "cache_sha256": None, "session_key": None, "stream": None,
+              "history": [], "best_epoch": None, "best_f1": -1.0, "stale_checks": 0,
+              "diagnostic_epoch": None, "diagnostic_f1": -1.0,
+              "event_contributions": set(), "family_contributions": set(),
+@@ -483,6 +495,8 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+             gradient = payload["gradients"].get(name)
+             parameter.grad = gradient.to(device) if gradient is not None else None
+         state = payload["state"]
++        if v412:
++            PositiveGradientBuffer(state["positive_gradients"])
+         if migration:
+             state["resume_migration"] = migration
+         random.setstate(payload["python_rng"])
+@@ -496,6 +510,12 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+             return (state["best_epoch"] or state["diagnostic_epoch"]) if selector else epochs
+     truth, _ = partition_evaluation_events(dataset.events, subjects)
+     session_lengths = {key: len(group) for key, group in dataset.session_groups.items()}
++    contribution_weights = subject_weights(session_lengths) if v412 else {subject: 1.0 for subject in subjects}
++    if v412:
++        write_json_atomic(directory / "subject_weights.json", {
++            "weights": contribution_weights,
++            "session_counts": {subject: sum(key[0] == subject for key in session_lengths) for subject in sorted(subjects)},
++            "natural_calibration_weights": True})
+     session_events = {key: max(1, int(((truth.subject_key.astype(str) == key[0])
+                         & (truth.session_id.astype(str) == key[1])).sum())) for key in session_lengths}
+     started = time.monotonic()
+@@ -514,8 +534,10 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                                             if parameter.grad is not None):
+             raise RuntimeError("Finite gate failed before chunk checkpoint")
+         if v411:
+-            if not tensors_finite(value for event in state["positive_gradients"].values()
+-                                  for value in event["gradients"].values()):
++            positive_values = (PositiveGradientBuffer(state["positive_gradients"]).tensors() if v412 else
++                               (value for event in state["positive_gradients"].values()
++                                for value in event["gradients"].values()))
++            if not tensors_finite(positive_values):
+                 raise RuntimeError("Positive event gradient buffer finite gate failed")
+             if not tensors_finite(value for moment in optimizer.state.values()
+                                   for value in moment.values() if isinstance(value, torch.Tensor)):
+@@ -541,6 +563,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+ 
+     loader = None
+     while state["epoch"] <= epochs:
++        active_cache = None
+         epoch = state["epoch"]
+         sampler = SessionChunkSampler(dataset, epoch, state["next_chunk"])
+         if state.get("sampler_identity") and state["sampler_identity"] != sampler.identity:
+@@ -554,7 +577,10 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+         loader = (reuse_session_loader(loader, dataset, sampler, config)
+                   if isinstance(loader, torch.utils.data.DataLoader)
+                   else session_loader(dataset, sampler, config))
+-        for chunk_index, batch in enumerate(loader, start=sampler.start_chunk):
++        chunk_progress = progress(enumerate(loader, start=sampler.start_chunk),
++            total=len(sampler.chunks), initial=sampler.start_chunk,
++            description=f"{directory.parent.name}/{directory.name} epoch {epoch}/{epochs}")
++        for chunk_index, batch in chunk_progress:
+             chunk_started = time.monotonic()
+             _, _, _, key, last, new_steps = sampler.chunks[chunk_index]
+             if hasattr(inputs, "assert_session_unchanged"):
+@@ -564,10 +590,22 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                     raise RuntimeError("Session changed before completion")
+                 state["session_key"] = key
+                 state["cache_rows"] = 0
++                state["cache_sha256"] = None
+                 state["stream"] = make_stream(*key, identity, config["decoder"])
+-            cache = TimelineCache(directory / "cache" / f"epoch_{epoch}" / stable_id(*key),
+-                {"identity": identity, "epoch": epoch, "update": state["update_count"],
+-                 "subject": key[0], "session": key[1]}, FEATURE_WIDTH, state["cache_rows"])
++                if v412:
++                    state["augmentation_identity"] = batch["augmentation_identity"]
++                    state["augmentation_description"] = batch["augmentation_description"]
++            if v412 and state.get("augmentation_identity") != batch["augmentation_identity"]:
++                raise RuntimeError("Session augmentation changed across chunks or resume")
++            cache_path = directory / "cache" / f"epoch_{epoch}" / stable_id(*key)
++            cache_binding = {"identity": identity, "epoch": epoch, "update": state["update_count"],
++                             "subject": key[0], "session": key[1]}
++            if active_cache is None or active_cache.path != cache_path:
++                active_cache = TimelineCache(cache_path, cache_binding, FEATURE_WIDTH,
++                    state["cache_rows"], committed_sha256=state.get("cache_sha256"))
++            if active_cache.binding != cache_binding or active_cache.rows != state["cache_rows"]:
++                raise RuntimeError("Active training cache identity or cursor changed")
++            cache = active_cache
+             history_times, history_features = cache.tensors()
+             cpu_batch = batch
+             batch = {name: value.to(device, non_blocking=device.type == "cuda")
+@@ -618,9 +656,15 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                     candidates = [candidate for candidate, drop in zip(candidates, ignored)
+                                   if not drop or candidate_targets(candidate, truth)[0] > 0]
+                 if v411:
+-                    from bme_eating.joint_v411_training import sample_groups
+-                    candidate_groups, sample_report = sample_groups(candidates, truth, config, rng,
+-                        state["positive_group_counts"], schedule["truth_jitter"])
++                    if v412:
++                        from bme_eating.joint_v412_training import sample_groups
++                        candidate_groups, sample_report = sample_groups(model, candidates, truth, config, rng,
++                            state["positive_gradients"], state["family_contributions"], times,
++                            full_features, device, schedule["truth_jitter"])
++                    else:
++                        from bme_eating.joint_v411_training import sample_groups
++                        candidate_groups, sample_report = sample_groups(candidates, truth, config, rng,
++                            state["positive_group_counts"], schedule["truth_jitter"])
+                     candidates = [candidate for group in candidate_groups for candidate in group["versions"]]
+                 else:
+                     candidates, sample_report = sample_candidates(candidates, truth,
+@@ -628,6 +672,8 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                         truth_jitter_fraction=schedule["truth_jitter"])
+                 state["sample_audit"].append({"epoch": epoch, "chunk": chunk_index,
+                     "subject": key[0], "session": key[1], **sample_report})
++                if v412:
++                    state["sample_audit"][-1]["augmentation"] = batch["augmentation_description"]
+                 target = batch["state_target"].float()
+                 valid = mask.float() * batch["state_loss_mask"] * (outputs["sensor_valid"] > 0)
+                 def masked_bce(logit, label, weight):
+@@ -643,6 +689,12 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                 tasks["transitions"] = sum(masked_bce(outputs[name + "_logit"],
+                     batch[name + "_target"], mask.float() * batch[name + "_loss_mask"])
+                     for name in ("onset", "offset"))
++                if v412:
++                    tasks["transitions"] = sum(heatmap_focal_loss(outputs[name + "_logit"],
++                        batch[name + "_target"], mask.float() * batch[name + "_loss_mask"]
++                        * batch["supervision_mask"] * (outputs["sensor_valid"] > 0),
++                        batch[name + "_positive_count"], batch[name + "_background_count"])
++                        for name in ("onset", "offset"))
+                 smooth_mask = valid[:, 1:] * valid[:, :-1] * batch["smooth_mask"][:, 1:] * batch["smooth_loss_mask"][:, 1:]
+                 tasks["smooth"] = ((outputs["state_logit"][:, 1:].sigmoid()
+                     - outputs["state_logit"][:, :-1].sigmoid()).square() * smooth_mask).sum() / smooth_mask.sum().clamp_min(1)
+@@ -697,9 +749,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                     used_groups = []
+                     for group, group_tasks in grouped:
+                         if group["category"] == "positive":
+-                            positive_group_losses.append((group["event_key"], sum(
++                            positive_group_losses.append((group if v412 else group["event_key"], sum(
+                                 value * config["loss"][name] * schedule.get(name, schedule["event"])
+-                                for name, value in group_tasks.items())))
++                                for name, value in group_tasks.items()) * contribution_weights[key[0]]))
+                         elif (key, group["family"]) not in state["family_contributions"]:
+                             state["family_contributions"].add((key, group["family"]))
+                             for name, value in group_tasks.items():
+@@ -709,7 +761,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                         used_groups.append(group)
+                         category = group["category"]
+                         stratum_loss = sum(value * config["loss"][name] * schedule.get(name, schedule["event"])
+-                                           for name, value in group_tasks.items()) / training["accumulate_sessions"]
++                                           for name, value in group_tasks.items()) * contribution_weights[key[0]] / training["accumulate_sessions"]
+                         gradient_strata[category] = gradient_strata.get(category, zero) + stratum_loss
+                     for name, values in negative_tasks.items():
+                         tasks[name] = torch.stack(values).mean() * new_steps / session_lengths[key] if values else zero
+@@ -721,6 +773,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                         "positive_group_version_mean": True,
+                         "positive_session_event_mean_at_commit": True})
+                 state["sample_audit"][-1]["training_weights"] = {
++                    "subject": contribution_weights[key[0]],
+                     "valid_timeline": new_steps / session_lengths[key], "positive_event": 1 / session_events[key],
+                     "negative_family": new_steps / session_lengths[key] / max(len(negative_event_losses), 1),
+                     "natural_calibration": 1.0}
+@@ -730,6 +783,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                         "positive_group": "1 / actual_supervised_groups_for_event",
+                         "version": "1 / actual_unique_versions_for_group",
+                         "accumulate_sessions": training["accumulate_sessions"], "schedule": schedule})
++                if v412:
++                    state["sample_audit"][-1]["training_weights"]["negative_family"] = (
++                        new_steps / session_lengths[key] / max(len(negative_tasks["event"]), 1))
+                 event_ids = torch.full((new_steps,), -2, dtype=torch.long, device=device)
+                 phases = torch.zeros_like(event_ids)
+                 invalid = batch["state_loss_mask"][0, mask[0]] <= 0
+@@ -757,7 +813,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                 state["sample_audit"][-1]["contrastive_pairs"] = contrastive_pairs
+                 state["sample_audit"][-1]["contrastive_no_negative_or_positive_pairs"] = contrastive_pairs == 0
+                 weighted = {name: loss * config["loss"][name] * schedule.get(name, 1)
+-                            * (new_steps / session_lengths[key] if name not in {"event", "quality", "boundary", "quality_ranking"} else 1)
++                            * (new_steps / session_lengths[key] if name not in {"event", "quality", "boundary", "quality_ranking"}
++                               and not (v412 and name == "transitions") else 1)
++                            * contribution_weights[key[0]]
+                             / training["accumulate_sessions"] for name, loss in tasks.items()}
+                 loss = sum(weighted.values())
+             if not torch.isfinite(loss):
+@@ -774,18 +832,27 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+             if v411:
+                 buffer = PositiveGradientBuffer(state["positive_gradients"])
+                 for event_key, positive_loss in positive_group_losses:
+-                    buffer.add(event_key, positive_loss, model)
++                    change = buffer.add(event_key, positive_loss, model)
++                    if v412:
++                        state["sample_audit"][-1].setdefault("positive_retention", []).append(change)
+             loss.backward()
+             cache.append(current_times.detach().cpu().numpy(), features.detach().cpu().numpy())
+             state["cache_rows"] = cache.rows
++            state["cache_sha256"] = cache.checksum
+             state["next_chunk"] = chunk_index + 1
+             if last:
+                 if v411:
+                     state["sample_audit"][-1]["positive_committed_events"] = len(state["positive_gradients"])
++                    if v412:
++                        state["sample_audit"][-1]["positive_committed_groups"] = {
++                            str(event): [item["descriptor"] for item in groups.values()]
++                            for event, groups in state["positive_gradients"].items()}
+                     PositiveGradientBuffer(state["positive_gradients"]).finish(model, training["accumulate_sessions"])
+                 state["session_count"] += 1
+                 state["session_key"], state["stream"] = None, None
+                 state["cache_rows"] = 0
++                state["cache_sha256"] = None
++                active_cache = None
+                 if state["session_count"] == training["accumulate_sessions"] or chunk_index == len(sampler.chunks) - 1:
+                     if state["session_count"] < training["accumulate_sessions"]:
+                         factor = training["accumulate_sessions"] / state["session_count"]
+@@ -816,6 +883,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                             "minimum full-epoch fraction "
+                             f"{clipping_report['minimum_epoch_clipping_fraction']:.4f} "
+                             f"> {training['clipping_abort_fraction']:.4f}")
++                    if v412:
++                        apply_learning_rate(optimizer, state, training,
++                            epoch - 1 + (state["optimizer_steps"] - 1) / expected_optimizer_steps)
+                     optimizer.step()
+                     optimizer.zero_grad(set_to_none=True)
+                     state["update_count"] += 1
+@@ -830,8 +900,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+             if hasattr(inputs, "assert_session_unchanged"):
+                 inputs.assert_session_unchanged(key)
+             checkpoint()
+-            print(f"[joint epoch={epoch}/{epochs} chunk={chunk_index + 1}/{len(sampler.chunks)}] "
+-                  f"subject={key[0]} loss={float(loss.detach()):.5f}", flush=True)
++            chunk_progress.set_postfix(loss=f"{float(loss.detach()):.5f}", subject=key[0],
++                                       refresh=False)
++        chunk_progress.close()
+         if state["optimizer_steps"] != expected_optimizer_steps:
+             raise RuntimeError("Completed joint epoch optimizer count differs from session traversal")
+         clipping_report = epoch_clipping_report(
+@@ -876,6 +947,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+             "preprocessing": preprocessing, "boundary": state["boundary"],
+             "config_sha256": bound_config, "source_sha256": digest(bound_source),
+             "data_sha256": digest(inputs.identity)}
++        if v412:
++            epoch_payload.update({"lr_position": state.get("lr_position", 0),
++                                  "learning_rates": state.get("learning_rates", [])})
+         if state.get("resume_migration"):
+             epoch_payload["resume_migration"] = state["resume_migration"]
+         checkpoint()
+@@ -888,6 +962,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                   "clipping_gate": clipping_report,
+                   "maximum_gradient_norm": state.get("maximum_gradient_norm", 0),
+                   "elapsed_seconds": time.monotonic() - started, **enforce_resources(config, device)}
++        if v412:
++            record.update({"lr_position": state.get("lr_position", 0),
++                           "learning_rates": state.get("learning_rates", [])})
+         stop = False
+         if selector and epoch >= training["checkpoint_min_epoch"] and epoch % training["validation_every_epochs"] == 0:
+             if v411:
+@@ -899,12 +976,14 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+                                                 directory / "source_fit" / str(epoch), identity)
+             predictions = predict_joint_model(model, inputs, selector, config, preprocessing,
+                                                directory / "selector" / str(epoch), identity,
+-                                               state["boundary"], mapping=fitted_mapping)
++                                               {**state["boundary"], **({"search_eligible": False} if v412 else {})},
++                                               mapping=fitted_mapping)
+             _, _, selector_events, _ = inputs.frames(selector, labels=True)
+             selector_truth, selector_ignore = partition_evaluation_events(selector_events, selector)
+             point, search_records = choose_operating_point(predictions["coarse"], predictions["windows"],
+                 selector_truth, selector_ignore, {identity: fitted_mapping}, config)
+             record["selector"] = point
++            print_metrics(f"selector epoch {epoch}/{epochs}", point)
+             write_json_atomic(directory / "selector" / str(epoch) / "search.json", search_records)
+             f1 = point["f1"]
+             eligible = qualification and point["promotion_eligible"]
+@@ -918,6 +997,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
+             else:
+                 state["stale_checks"] += 1
+             stop = state["stale_checks"] >= training["patience_checks"]
++            print(f"[selection] best_epoch={state['best_epoch']} best_F1={state['best_f1']:.4f} "
++                  f"stale_checks={state['stale_checks']}/{training['patience_checks']} "
++                  f"clipping={fraction:.4f} early_stop={stop}", flush=True)
+         if v411:
+             journals["training_history"].append([record])
+             state["journal_offsets"]["training_history"] = journals["training_history"].offset
+@@ -967,11 +1049,11 @@ def decoder_settings(config):
+ 
+ @torch.no_grad()
+ def predict_joint_model(model, inputs, subjects, config, preprocessing, directory, identity,
+-                        boundary, *, training_source: bool = False, mapping=None):
++                        boundary, *, training_source: bool = False, mapping=None, operating_point=None):
+     if getattr(model, "is_v411", False):
+         from bme_eating.joint_v411_prediction import predict
+         return predict(model, inputs, subjects, config, preprocessing, directory, identity, boundary,
+-                       source_only=training_source, mapping=mapping)
++                       source_only=training_source, mapping=mapping, operating_point=operating_point)
+     device = next(model.parameters()).device
+     dataset, _ = make_joint_dataset(inputs, subjects, config, preprocessing, training=training_source)
+     dataset.training = False
+@@ -1058,7 +1140,7 @@ def boundary_pair_gate(coarse, refined, truth, ignore, windows, config, *, requi
+     proposal_keys = ["subject_key", "session_id", "prediction_event_id"]
+     before = set(map(tuple, coarse_match[proposal_keys].values)) if len(coarse_match) else set()
+     after = set(map(tuple, refined_match[proposal_keys].values)) if len(refined_match) else set()
+-    v411 = config["model"]["architecture"] == "statsfusion_joint_event_v411"
++    v411 = config["model"]["architecture"] in {"statsfusion_joint_event_v411", "statsfusion_joint_event_v412"}
+     paired = coarse_match.merge(refined_match, on=event_keys if v411 else keys,
+                                 suffixes=("_coarse", "_refined")) if before and after else pd.DataFrame()
+     improvements = {}
+@@ -1066,10 +1148,16 @@ def boundary_pair_gate(coarse, refined, truth, ignore, windows, config, *, requi
+         old = float(paired[endpoint + "_absolute_error_ms_coarse"].mean()) if len(paired) else float("nan")
+         new = float(paired[endpoint + "_absolute_error_ms_refined"].mean()) if len(paired) else float("nan")
+         improvements[endpoint] = (old - new) / old if old > 0 else 0
+-    if v411:
+-        before = set(map(tuple, coarse_match[event_keys].values)) if len(coarse_match) else set()
+-        after = set(map(tuple, refined_match[event_keys].values)) if len(refined_match) else set()
+-    tp_to_fp = len(before - after) / max(len(before), 1)
++    truth_before = set(map(tuple, coarse_match[event_keys].values)) if len(coarse_match) else set()
++    truth_after = set(map(tuple, refined_match[event_keys].values)) if len(refined_match) else set()
++    from bme_eating.joint_evaluation import event_frame
++    refined_frame = event_frame(refined)
++    refined_keys = ["subject_key", "session_id", "proposal_id"]
++    emitted = set(map(tuple, refined_frame[refined_keys].values))
++    ignored = prediction_ignore_mask(refined_frame, ignore)
++    false_positive_ids = set(map(tuple, refined_frame.loc[~ignored, refined_keys].values)) - after
++    conversions = before & false_positive_ids if v411 else before - after
++    tp_to_fp = len(conversions) / max(len(before), 1)
+     population = {candidate.proposal_id: candidate for candidate in
+                   (refined_candidates if refined_candidates is not None else refined)}
+     population.update({candidate.proposal_id: candidate for candidate in refined})
+@@ -1088,7 +1176,7 @@ def boundary_pair_gate(coarse, refined, truth, ignore, windows, config, *, requi
+         passed &= all(candidate.end_ms == candidate.unrefined_end_ms for candidate in population
+                       if candidate.unrefined_end_ms is not None)
+     from scipy.stats import beta
+-    failures = len(before - after)
++    failures = len(conversions)
+     denominator = len(before)
+     interval = [float(beta.ppf(.025, failures, denominator - failures + 1)) if failures else 0,
+                 float(beta.ppf(.975, failures + 1, denominator - failures)) if failures < denominator else 1]
+@@ -1096,6 +1184,13 @@ def boundary_pair_gate(coarse, refined, truth, ignore, windows, config, *, requi
+             "paired_positive_events": positive_events, "improvements": improvements,
+             "tp_to_fp_count": failures, "tp_to_fp_denominator": denominator,
+             "tp_to_fp_exact_95_interval": interval,
++            "tp_to_fp_basis": ("coarse_matched_prediction_id_to_refined_false_positive" if v411
++                               else "coarse_matched_prediction_id_not_refined_matched"),
++            "tp_prediction_loss_count": len(before - after),
++            "dropped_tp_prediction_count": len(before - emitted),
++            "ignored_tp_prediction_count": len((before & emitted) - after - false_positive_ids),
++            "lost_truth_count": len(truth_before - truth_after),
++            "truth_retention_rate": len(truth_before & truth_after) / max(len(truth_before), 1),
+             "coarse": coarse_metrics, "refined": refined_metrics, "tp_to_fp_rate": tp_to_fp,
+             "clipping_rate": clipping, "conflicts": conflicts,
+             "diagnostic_candidate_count": len(population),
+@@ -1115,7 +1210,16 @@ def train_partition_protocol(inputs, subjects, outer, config, directory, run_ide
+         return int(np.median([lineage["epoch"] for lineage in point["lineage"]])), point
+     partitions = stacking_partitions(subjects, 3, 2026)
+     epochs, outputs, mappings, lineages = [], [], {}, []
+-    for partition in range(3):
++    executed = internal_partitions(config)
++    boundary_search_eligible = True
++    if config["model"]["architecture"] == "statsfusion_joint_event_v412":
++        calibration_subjects = {subject for subject, partition in partitions.items() if partition in executed}
++        _, _, calibration_events, _ = inputs.frames(calibration_subjects, labels=True)
++        calibration_truth, _ = partition_evaluation_events(calibration_events, calibration_subjects)
++        boundary_search_eligible = len(calibration_truth) >= config["boundary"]["minimum_positive_events"]
++    for partition in executed:
++        print(f"[internal] {directory.parent.name} partition {partition + 1}/{len(executed)} "
++              f"({calibration_scope(config)['calibration_kind']})", flush=True)
+         prediction = {subject for subject, group in partitions.items() if group == partition}
+         train = subjects - prediction
+         assert_excluded(train, prediction, outer)
+@@ -1137,7 +1241,8 @@ def train_partition_protocol(inputs, subjects, outer, config, directory, run_ide
+                                       partition_root / "source_fit", identity)
+         mappings[identity] = mapping
+         output = predict_joint_model(model, inputs, prediction, config, payload["preprocessing"],
+-            partition_root / "prediction", identity, payload["boundary"], mapping=mapping)
++            partition_root / "prediction", identity,
++            {**payload["boundary"], "search_eligible": boundary_search_eligible}, mapping=mapping)
+         outputs.append(output)
+         history = json.loads((partition_root / "selection" / "training_history.json").read_text(encoding="utf-8"))
+         selected_record = next(record for record in history if record["epoch"] == selected_epoch)
+@@ -1156,8 +1261,9 @@ def train_partition_protocol(inputs, subjects, outer, config, directory, run_ide
+     windows = pd.concat([output["windows"] for output in outputs], ignore_index=True)
+     coarse = {name: [candidate for output in outputs for candidate in output["coarse"][name]]
+               for name in outputs[0]["coarse"]}
+-    _, _, events, _ = inputs.frames(subjects, labels=True)
+-    truth, ignore = partition_evaluation_events(events, subjects)
++    calibration_subjects = {subject for lineage in lineages for subject in lineage["prediction_subjects"]}
++    _, _, events, _ = inputs.frames(calibration_subjects, labels=True)
++    truth, ignore = partition_evaluation_events(events, calibration_subjects)
+     point, search = choose_operating_point(coarse, windows, truth, ignore, mappings, config)
+     coarse_point = copy.deepcopy(point)
+     natural, _ = apply_online_budget(coarse[point["setting"]], windows, mappings, point["budget"],
+@@ -1165,7 +1271,7 @@ def train_partition_protocol(inputs, subjects, outer, config, directory, run_ide
+     calibrator = NonnegativePlatt(**point["calibration"])
+     coarse_predictions = commit_candidates(natural, calibrator, point["acceptance"], point["nms"])
+     boundary_reports, enabled, best_boundary_f1, best_entropy, winning_point = [], False, -1.0, None, None
+-    v411 = config["model"]["architecture"] == "statsfusion_joint_event_v411"
++    v411 = config["model"]["architecture"] in {"statsfusion_joint_event_v411", "statsfusion_joint_event_v412"}
+     if v411:
+         from bme_eating.joint_v411_boundary import lock_boundary_modes
+         point, boundary_reports, search_boundary = lock_boundary_modes(
+@@ -1218,7 +1324,9 @@ def train_partition_protocol(inputs, subjects, outer, config, directory, run_ide
+     point["boundary_enabled"], point["boundary_entropy"] = enabled, best_entropy
+     point["promotion_eligible"] &= all(lineage["selector_promotion_eligible"] for lineage in lineages)
+     point["lineage"] = lineages
+-    verify_oof_lineage(lineages, subjects, outer, identities=protocol_identities(config, inputs.identity))
++    point.update({**calibration_scope(config), "calibration_subjects": sorted(calibration_subjects)})
++    verify_calibration_lineage(lineages, subjects, outer, config,
++                               identities=protocol_identities(config, inputs.identity))
+     write_json_atomic(directory / "operating_point.json", point)
+     write_json_atomic(directory / "search.json", search)
+     write_json_atomic(directory / "boundary_crossfit.json", boundary_reports)
+@@ -1236,5 +1344,6 @@ def train_partition_protocol(inputs, subjects, outer, config, directory, run_ide
+     write_json_atomic(directory / "internal_manifest.json", {"protocol": protocol_for(config),
+         "run_identity": run_identity, "training_subjects": sorted(subjects),
+         "outer_excluded_subjects": sorted(outer), **protocol_identities(config, inputs.identity),
++        **calibration_scope(config), "calibration_subjects": sorted(calibration_subjects),
+         "evidence_sha256": evidence})
+     return int(np.median(epochs)), point
+diff --git a/tests/test_statsfusion_joint_bundle.py b/tests/test_statsfusion_joint_bundle.py
+index 32e4d9f..1e969b2 100644
+--- a/tests/test_statsfusion_joint_bundle.py
++++ b/tests/test_statsfusion_joint_bundle.py
+@@ -27,11 +27,58 @@ from bme_eating.models.statsfusion_joint_event_v411 import build_joint_model
+ from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
+ 
+ 
+-@pytest.fixture(params=["v410", "v411"])
++def convert_to_single_fold_bundle(bundle, config):
++    from bme_eating.joint_protocol import config_identity
++
++    config["execution"] = {"mode": "fold0", **({"internal_mode": "single"}
++        if config["experiment"]["code_version"] == "v4.12" else {})}
++    identity = json.loads((bundle / "identity.json").read_text(encoding="utf-8"))
++    identity["config_sha256"] = config_identity(config)
++    write_json_atomic(bundle / "identity.json", identity)
++    write_json_atomic(bundle / "resolved_config.json", config)
++    manifest = json.loads((bundle / "final_manifest.json").read_text(encoding="utf-8"))
++    test_subjects = ["outer_test"]
++    for lineage in manifest["lineage"]:
++        lineage["outer_excluded_subjects"] = test_subjects
++        lineage["config_sha256"] = config_identity(config)
++    point = json.loads((bundle / "operating_point.json").read_text(encoding="utf-8"))
++    point["lineage"] = manifest["lineage"]
++    write_json_atomic(bundle / "operating_point.json", point)
++    payload = torch.load(bundle / "checkpoint.pt", weights_only=True)
++    payload["excluded_subjects"] = test_subjects
++    payload["config_sha256"] = config_identity(config)
++    save_torch_atomic(bundle / "checkpoint.pt", payload)
++    gate = {"protocol": protocol_for(config), "promotable": False, "five_folds_complete": False,
++        "artifact_kind": "single_fold_diagnostic", "evaluation_mode": "fold0",
++        "diagnostic_complete": True,
++        "export_eligible": True, "checks": {name: True for name in
++            ("training_qualified", "operating_point_qualified", "boundary")}, "fold": 0,
++        "identity_sha256": sha256_file(bundle / "identity.json"),
++        "training_subjects": manifest["training_subjects"], "test_subjects": test_subjects}
++    write_json_atomic(bundle / "fold0_gate_manifest.json", gate)
++    manifest.update({"promotable": False, "export_eligible": True, "fold": 0,
++        "artifact_kind": "single_fold_diagnostic", "evaluation_mode": "fold0", "test_subjects": test_subjects,
++        "uses_test_labels_for_selection": False,
++        "identity_sha256": gate["identity_sha256"],
++        "gate_sha256": sha256_file(bundle / "fold0_gate_manifest.json"),
++        "evidence_sha256": {name: sha256_file(bundle / name) for name in
++                           ("checkpoint.pt", "operating_point.json", "source_mapping.json")}})
++    write_json_atomic(bundle / "final_manifest.json", manifest)
++    update_hashes(bundle)
++    hashes = json.loads((bundle / "SHA256SUMS.json").read_text(encoding="utf-8"))
++    hashes["fold0_gate_manifest.json"] = sha256_file(bundle / "fold0_gate_manifest.json")
++    write_json_atomic(bundle / "SHA256SUMS.json", hashes)
++    return config
++
++
++@pytest.fixture(params=["v410", "v411", "v412"])
+ def synthetic_bundle(tmp_path, request):
+     source = Path(__file__).resolve().parents[1]
+-    config = load_config(source / "configs" / ("statsfusion_v411_learned_boundary.yaml"
+-                         if request.param == "v411" else "statsfusion_v410_joint_event.yaml"))
++    filenames = {"v410": "statsfusion_v410_joint_event.yaml", "v411": "statsfusion_v411_learned_boundary.yaml",
++                 "v412": "statsfusion_v412_integrated_repair.yaml"}
++    config = load_config(source / "configs" / filenames[request.param])
++    if request.param == "v412":
++        config["execution"] = {"mode": "fivefold", "internal_mode": "oof"}
+     bundle = tmp_path / "synthetic_bundle"
+     bundle.mkdir()
+     torch.set_num_threads(2)
+@@ -62,8 +109,8 @@ def synthetic_bundle(tmp_path, request):
+     write_json_atomic(bundle / "resolved_config.json", config)
+     write_json_atomic(bundle / "operating_point.json", {"setting": "high_0.1_gap_15", "budget": 30,
+         "acceptance": .1, "nms": .5, "promotion_eligible": True, "boundary_enabled": False,
+-        "boundary_mode": "off", "score_formula": ("calibrated_event_probability_v411"
+-            if request.param == "v411" else "event_probability_times_quality_v410"),
++        "boundary_mode": "off", "score_formula": (f"calibrated_event_probability_{request.param}"
++            if request.param != "v410" else "event_probability_times_quality_v410"),
+         "calibration": {"slope": 1, "intercept": 0, "qualified": True}})
+     write_json_atomic(bundle / "source_mapping.json", {"distributions": {"proposal": [0, 1]},
+                                                        "training_subjects": subjects})
+@@ -80,8 +127,8 @@ def synthetic_bundle(tmp_path, request):
+         "model_identity": "synthetic_fixture", "identity_sha256": identity_hash,
+         "training_subjects": subjects,
+         "gate_sha256": sha256_file(bundle / "joint_gate_manifest.json"), "boundary_enabled": False,
+-        "boundary_mode": "off", "score_formula": ("calibrated_event_probability_v411"
+-            if request.param == "v411" else "event_probability_times_quality_v410"),
++        "boundary_mode": "off", "score_formula": (f"calibrated_event_probability_{request.param}"
++            if request.param != "v410" else "event_probability_times_quality_v410"),
+         "internal_oof_sha256": "synthetic_fixture", "lineage": lineages,
+         "checkpoint_sha256": sha256_file(bundle / "checkpoint.pt"),
+         "operating_point_sha256": sha256_file(bundle / "operating_point.json"),
+@@ -109,6 +156,150 @@ def test_bundle_replay_without_xgboost(synthetic_bundle):
+     assert report["event_count"] > 0
+ 
+ 
++def test_single_fold_bundle_replay_is_separate_from_formal_promotion(synthetic_bundle):
++    from bme_eating.joint_single_fold import StatsFusionJointFoldDetector
++
++    bundle, config = synthetic_bundle
++    if config["experiment"]["code_version"] != "v4.11":
++        pytest.skip("Single-fold continuation targets v411")
++    config = convert_to_single_fold_bundle(bundle, config)
++    detector = StatsFusionJointFoldDetector(bundle)
++    assert detector.identity == "synthetic_fixture"
++    with pytest.raises(RuntimeError, match="qualified"):
++        StatsFusionJointDetector(bundle)
++    report = replay_joint_bundle(bundle, config)
++    assert report["no_xgboost_replay"]
++
++
++def test_single_partition_bundle_keeps_holdout_lineage_and_cannot_claim_full_oof(synthetic_bundle):
++    from bme_eating.joint_protocol import calibration_scope
++    from bme_eating.joint_single_fold import StatsFusionJointFoldDetector
++    from bme_eating.training.hierarchical_v4_trainer import stacking_partitions
++
++    bundle, config = synthetic_bundle
++    if config["experiment"]["code_version"] not in {"v4.11", "v4.12"}:
++        pytest.skip("Single partition requires grouped candidates")
++    config = convert_to_single_fold_bundle(bundle, config)
++    config["execution"]["internal_mode"] = "single"
++    manifest = json.loads((bundle / "final_manifest.json").read_text(encoding="utf-8"))
++    subjects = set(manifest["training_subjects"])
++    assignment = stacking_partitions(subjects, 3, 2026)
++    prediction = {subject for subject, partition in assignment.items() if partition == 0}
++    train = subjects - prediction
++    selector = {max(train)}
++    lineage = {**manifest["lineage"][0], "training_subjects": sorted(train),
++        "prediction_subjects": sorted(prediction), "source_training_subjects": sorted(train),
++        "normalization_subjects": sorted(train), "selector_subjects": sorted(selector),
++        "selector_fit_subjects": sorted(train - selector), "config_sha256": config_identity(config)}
++    scope = calibration_scope(config)
++    identity = json.loads((bundle / "identity.json").read_text(encoding="utf-8"))
++    identity["config_sha256"] = config_identity(config)
++    write_json_atomic(bundle / "identity.json", identity)
++    write_json_atomic(bundle / "resolved_config.json", config)
++    payload = torch.load(bundle / "checkpoint.pt", weights_only=True)
++    payload["config_sha256"] = config_identity(config)
++    save_torch_atomic(bundle / "checkpoint.pt", payload)
++    point = json.loads((bundle / "operating_point.json").read_text(encoding="utf-8"))
++    point.update({"lineage": [lineage], **scope})
++    write_json_atomic(bundle / "operating_point.json", point)
++    gate = json.loads((bundle / "fold0_gate_manifest.json").read_text(encoding="utf-8"))
++    gate.update({"identity_sha256": sha256_file(bundle / "identity.json"), **scope})
++    write_json_atomic(bundle / "fold0_gate_manifest.json", gate)
++    manifest.update({"lineage": [lineage], **scope, "identity_sha256": gate["identity_sha256"],
++        "gate_sha256": sha256_file(bundle / "fold0_gate_manifest.json"),
++        "evidence_sha256": {name: sha256_file(bundle / name) for name in
++                            ("checkpoint.pt", "operating_point.json", "source_mapping.json")}})
++    write_json_atomic(bundle / "final_manifest.json", manifest)
++    update_hashes(bundle)
++    assert StatsFusionJointFoldDetector(bundle).identity == "synthetic_fixture"
++    assert replay_joint_bundle(bundle, config)["no_xgboost_replay"]
++    manifest["full_internal_oof"] = True
++    write_json_atomic(bundle / "final_manifest.json", manifest)
++    update_hashes(bundle)
++    with pytest.raises(RuntimeError, match="calibration scope"):
++        StatsFusionJointFoldDetector(bundle)
++
++
++def test_single_fold_bundle_rejects_test_subject_training_leakage(synthetic_bundle):
++    from bme_eating.joint_single_fold import StatsFusionJointFoldDetector
++
++    bundle, config = synthetic_bundle
++    if config["experiment"]["code_version"] != "v4.11":
++        pytest.skip("Single-fold continuation targets v411")
++    convert_to_single_fold_bundle(bundle, config)
++    manifest = json.loads((bundle / "final_manifest.json").read_text(encoding="utf-8"))
++    manifest["test_subjects"] = [manifest["training_subjects"][0]]
++    write_json_atomic(bundle / "final_manifest.json", manifest)
++    update_hashes(bundle)
++    with pytest.raises(RuntimeError, match="lineage"):
++        StatsFusionJointFoldDetector(bundle)
++
++
++def test_single_fold_export_flag_cannot_replace_required_qualifications(synthetic_bundle):
++    from bme_eating.joint_single_fold import StatsFusionJointFoldDetector
++
++    bundle, config = synthetic_bundle
++    if config["experiment"]["code_version"] != "v4.11":
++        pytest.skip("Single-fold continuation targets v411")
++    convert_to_single_fold_bundle(bundle, config)
++    gate = json.loads((bundle / "fold0_gate_manifest.json").read_text(encoding="utf-8"))
++    gate["checks"].pop("boundary")
++    write_json_atomic(bundle / "fold0_gate_manifest.json", gate)
++    manifest = json.loads((bundle / "final_manifest.json").read_text(encoding="utf-8"))
++    manifest["gate_sha256"] = sha256_file(bundle / "fold0_gate_manifest.json")
++    write_json_atomic(bundle / "final_manifest.json", manifest)
++    update_hashes(bundle)
++    with pytest.raises(RuntimeError, match="manifest lock"):
++        StatsFusionJointFoldDetector(bundle)
++
++
++def test_single_fold_save_export_resume_and_partial_recovery(synthetic_bundle, tmp_path, monkeypatch):
++    from bme_eating.joint_single_fold import StatsFusionJointFoldDetector, export_fold_bundle
++
++    fixture, config = synthetic_bundle
++    if config["experiment"]["code_version"] != "v4.11":
++        pytest.skip("Single-fold continuation targets v411")
++    convert_to_single_fold_bundle(fixture, config)
++    run, source = tmp_path / "single_run", Path(__file__).resolve().parents[1]
++    run.mkdir()
++    for name in ("identity.json", "resolved_config.json"):
++        shutil.copyfile(fixture / name, run / name)
++    manifest = json.loads((fixture / "final_manifest.json").read_text(encoding="utf-8"))
++    point = json.loads((fixture / "operating_point.json").read_text(encoding="utf-8"))
++    checkpoint = run / "fold_0/model/latest.pt"
++    checkpoint.parent.mkdir(parents=True)
++    shutil.copyfile(fixture / "checkpoint.pt", checkpoint)
++    mapping = run / "fold_0/source_fit/source_mapping.json"
++    mapping.parent.mkdir(parents=True)
++    shutil.copyfile(fixture / "source_mapping.json", mapping)
++    report = {"identity": manifest["model_identity"], "epoch": 8, "operating_point": point,
++        "checkpoint_qualified": True, "checkpoint_sha256": sha256_file(checkpoint),
++        "training_subjects": manifest["training_subjects"], "prediction_subjects": manifest["test_subjects"],
++        "boundary": {"passed": True}, "stress_f1_drop": 0,
++        "metrics": {"f1": .6, "fp_per_hour": .05}, "coverage": {"recall": .8}}
++    write_json_atomic(run / "fold_0/evaluation.json", report)
++    write_json_atomic(run / "fold_0/completion.json", {"evidence_sha256": {
++        "evaluation.json": sha256_file(run / "fold_0/evaluation.json"),
++        "model/latest.pt": sha256_file(checkpoint)}})
++    monkeypatch.setattr("bme_eating.joint_workflow.verify_outer_completion", lambda *args: report)
++    write_json_atomic(run / "fold0_bundle.partial/incomplete.json", {"partial": True})
++    exported = export_fold_bundle(None, config, run, source, resume=True)
++    assert not (run / "fold0_bundle.partial").exists()
++    assert list((run / "failures").glob("incomplete_fold0_bundle_*"))
++    detector = StatsFusionJointFoldDetector(exported["bundle"])
++    assert detector.identity == report["identity"]
++    assert sha256_file(run / "fold0_final/checkpoint.pt") == report["checkpoint_sha256"]
++    assert export_fold_bundle(None, config, run, source, resume=True)["resumed"]
++    final_checkpoint = run / "fold0_final/checkpoint.pt"
++    with final_checkpoint.open("ab") as handle:
++        handle.write(b"changed")
++    final_manifest = json.loads((run / "fold0_final/final_manifest.json").read_text(encoding="utf-8"))
++    final_manifest["evidence_sha256"]["checkpoint.pt"] = sha256_file(final_checkpoint)
++    write_json_atomic(run / "fold0_final/final_manifest.json", final_manifest)
++    with pytest.raises(RuntimeError, match="weights"):
++        export_fold_bundle(None, config, run, source, resume=True)
++
++
+ def test_bundle_false_gate_cannot_load(synthetic_bundle):
+     bundle, _ = synthetic_bundle
+     gate_path = bundle / "joint_gate_manifest.json"
+diff --git a/tests/test_statsfusion_joint_io_runtime.py b/tests/test_statsfusion_joint_io_runtime.py
+index 9e9a2f9..eb33b96 100644
+--- a/tests/test_statsfusion_joint_io_runtime.py
++++ b/tests/test_statsfusion_joint_io_runtime.py
+@@ -5,6 +5,7 @@ from pathlib import Path
+ 
+ import numpy as np
+ import pandas as pd
++import pytest
+ import torch
+ 
+ from bme_eating.config import load_config
+@@ -85,19 +86,27 @@ def test_larger_reader_cache_preserves_samples_and_avoids_repeated_decompression
+             np.testing.assert_array_equal(baseline[name], optimized[name])
+ 
+ 
+-def test_augmented_chunks_identical_after_prefetch_cache_change_and_resume(tmp_path):
++@pytest.mark.parametrize("version", ["v410", "v412"])
++def test_augmented_chunks_identical_after_prefetch_cache_change_and_resume(tmp_path, version):
+     anchors, segments, events = native_session_frames(tmp_path)
+     geometry = SequenceGeometry(supervised_steps=4, short_receptive_field_steps=7,
+         fused_short_receptive_field_steps=7, long_receptive_field_tokens=3)
+-    config = load_config(Path(__file__).resolve().parents[1] / "configs/statsfusion_v410_joint_event.yaml")
++    filename = "statsfusion_v412_integrated_repair.yaml" if version == "v412" else "statsfusion_v410_joint_event.yaml"
++    config = load_config(Path(__file__).resolve().parents[1] / "configs" / filename)
+     config["training"]["num_workers"] = 2
+ 
+     def collect(cache, prefetch, start_chunk):
+-        dataset = JointSessionDataset(anchors, segments, events,
++        from bme_eating.data.joint_v412_augmentation import JointSessionDatasetV412
++        from bme_eating.stats_features import FoldRobustScaler
++        dataset_class = JointSessionDatasetV412 if version == "v412" else JointSessionDataset
++        dataset = dataset_class(anchors, segments, events,
+             Normalization(np.zeros(6), np.ones(6), 0., 1.),
+             statistics_columns=STATISTICS_COLUMNS, geometry=geometry,
+             training=True, seed=2026, reader_cache_size=cache,
+             ppg_modality_dropout=.2, gyro_modality_dropout=.1, rotation_augmentation_probability=.2)
++        if version == "v412":
++            dataset.configure(config, FoldRobustScaler(STATS_FEATURE_COLUMNS, np.zeros(12), np.ones(12),
++                                                      ("first", "second")), {"fixture": "natural"})
+         sampler = SessionChunkSampler(dataset, 8, start_chunk=start_chunk)
+         settings = copy.deepcopy(config)
+         settings["training"]["loader_prefetch_factor"] = prefetch
+diff --git a/tests/test_statsfusion_joint_resources.py b/tests/test_statsfusion_joint_resources.py
+index 125f770..1a83b2b 100644
+--- a/tests/test_statsfusion_joint_resources.py
++++ b/tests/test_statsfusion_joint_resources.py
+@@ -37,7 +37,8 @@ class ResourceProbeDataset(torch.utils.data.Dataset):
+ 
+ 
+ @pytest.mark.skipif(not RESOURCE_ENABLED, reason="Resource probe waits for current training to finish")
+-@pytest.mark.parametrize("config_name", ["statsfusion_v410_joint_event.yaml", "statsfusion_v411_learned_boundary.yaml"])
++@pytest.mark.parametrize("config_name", ["statsfusion_v410_joint_event.yaml", "statsfusion_v411_learned_boundary.yaml",
++                                        "statsfusion_v412_integrated_repair.yaml"])
+ def test_real_ten_worker_chunk_cursor_recovery(config_name):
+     config = load_config(Path(__file__).resolve().parents[1] / "configs" / config_name)
+     dataset = ResourceProbeDataset()
+diff --git a/tests/test_statsfusion_joint_resume.py b/tests/test_statsfusion_joint_resume.py
+index ad51568..46cd310 100644
+--- a/tests/test_statsfusion_joint_resume.py
++++ b/tests/test_statsfusion_joint_resume.py
+@@ -98,11 +98,13 @@ def test_resume_reports_source_data_and_config_differences():
+ 
+ @pytest.mark.parametrize("failure", [KeyboardInterrupt, torch.OutOfMemoryError])
+ @pytest.mark.parametrize("device", ["cpu", "cuda"])
+-def test_chunk_resume_restores_partial_gradients_and_session_cache(tmp_path, monkeypatch, failure, device):
++@pytest.mark.parametrize("version", ["v410", "v412"])
++def test_chunk_resume_restores_partial_gradients_and_session_cache(tmp_path, monkeypatch, failure, device, version):
+     if device == "cuda" and not torch.cuda.is_available():
+         pytest.skip("CUDA unavailable")
+     from pathlib import Path
+-    config = load_config(Path(__file__).resolve().parents[1] / "configs/statsfusion_v410_joint_event.yaml")
++    name = "statsfusion_v412_integrated_repair.yaml" if version == "v412" else "statsfusion_v410_joint_event.yaml"
++    config = load_config(Path(__file__).resolve().parents[1] / "configs" / name)
+     config["training"]["device"] = device
+     config["training"]["loader_prefetch_factor"] = 1
+     config["training"]["session_reader_cache_size"] = 1
+@@ -116,6 +118,12 @@ def test_chunk_resume_restores_partial_gradients_and_session_cache(tmp_path, mon
+         session_groups=groups, geometry=SimpleNamespace(supervised_steps=4))
+     preprocessing = {"training_subjects": ["fit"]}
+     monkeypatch.setattr(trainer, "make_joint_dataset", lambda *args, **kwargs: (dataset, preprocessing))
++    cache_class = trainer.TimelineCache
++    constructed_caches = []
++    def tracked_cache(*args, **kwargs):
++        constructed_caches.append(args[0])
++        return cache_class(*args, **kwargs)
++    monkeypatch.setattr(trainer, "TimelineCache", tracked_cache)
+     normal_loader = trainer.session_loader
+     should_fail = {"enabled": False}
+     def fake_loader(dataset, sampler, config):
+@@ -134,11 +142,18 @@ def test_chunk_resume_restores_partial_gradients_and_session_cache(tmp_path, mon
+             for name in ("state_loss_mask", "onset_loss_mask", "offset_loss_mask", "smooth_mask", "smooth_loss_mask"):
+                 batch[name] = torch.ones(1, 20)
+             batch["subject_key"], batch["session_id"] = key
++            if version == "v412":
++                batch["augmentation_identity"] = "fixed_" + key[1]
++                batch["augmentation_description"] = {"identity": key[1], "gyro_dropout": False}
++                for name in ("onset", "offset"):
++                    batch[name + "_positive_count"] = torch.tensor(1.0)
++                    batch[name + "_background_count"] = torch.tensor(8.0)
+             yield batch
+     monkeypatch.setattr(trainer, "session_loader", fake_loader)
+     inputs = SimpleNamespace(identity={"test": "data"})
+     trainer.train_joint_model(inputs, {"fit"}, config, tmp_path / "continuous", "identity",
+                               epochs=1, resume=False)
++    assert len(constructed_caches) == len(groups)
+     should_fail["enabled"] = True
+     with pytest.raises(failure):
+         trainer.train_joint_model(inputs, {"fit"}, config, tmp_path / "interrupted", "identity",
+@@ -146,6 +161,8 @@ def test_chunk_resume_restores_partial_gradients_and_session_cache(tmp_path, mon
+     saved = torch.load(tmp_path / "interrupted" / "resume.pt", weights_only=False)
+     assert saved["state"]["next_chunk"] == 1
+     assert saved["state"]["cache_rows"] == 4
++    assert saved["state"]["cache_sha256"] == json.loads(
++        (constructed_caches[-1] / "checksums.jsonl").read_text().splitlines()[0])["sha256"]
+     assert any(value is not None for value in saved["gradients"].values())
+     config["training"]["loader_prefetch_factor"] = 2
+     config["training"]["session_reader_cache_size"] = 2
+diff --git a/tests/test_statsfusion_v411_reference.py b/tests/test_statsfusion_v411_reference.py
+index cf56326..dcef617 100644
+--- a/tests/test_statsfusion_v411_reference.py
++++ b/tests/test_statsfusion_v411_reference.py
+@@ -7,7 +7,7 @@ import pytest
+ import torch
+ 
+ from bme_eating.hierarchical_artifacts import sha256_file, write_json_atomic
+-from bme_eating.joint_protocol import digest, save_torch_atomic
++from bme_eating.joint_protocol import config_identity, digest, save_torch_atomic
+ from bme_eating.joint_workflow import audit_reference
+ 
+ 
+@@ -16,8 +16,11 @@ def completed_reference(tmp_path):
+     subjects = {f"subject_{index}": index // 2 for index in range(10)}
+     inputs = SimpleNamespace(subject_folds=subjects, identity={"subject_folds": "split"})
+     source = {"model.py": "a" * 64}
++    reference_config = {"experiment": {"protocol_version": "statsfusion-joint-event-v1"},
++                        "execution": {"mode": "fivefold", "internal_mode": "oof"}}
++    write_json_atomic(tmp_path / "resolved_config.json", reference_config)
+     identity = {"protocol": "statsfusion-joint-event-v1", "seed": 2026,
+-                "data": inputs.identity, "source": source, "config_sha256": "b" * 64}
++                "data": inputs.identity, "source": source, "config_sha256": config_identity(reference_config)}
+     write_json_atomic(tmp_path / "identity.json", identity)
+     write_json_atomic(tmp_path / "joint_gate_manifest.json", {"promotable": False})
+     identity_hash = sha256_file(tmp_path / "identity.json")
+@@ -86,6 +89,17 @@ def test_completed_v410_reference_qualifies_without_old_promotion(tmp_path, comp
+     assert not audit_reference(tmp_path, inputs)["qualified"]
+ 
+ 
++def test_reference_rejects_changed_resolved_configuration(tmp_path, completed_reference):
++    import json
++
++    path = tmp_path / "resolved_config.json"
++    config = json.loads(path.read_text(encoding="utf-8"))
++    config["execution"]["internal_mode"] = "single"
++    write_json_atomic(path, config)
++    result = audit_reference(tmp_path, completed_reference)
++    assert not result["qualified"] and not result["comparison_performed"]
++
++
+ @pytest.mark.parametrize("relative", ["retrain/latest.pt", "selection/diagnostic_selected.pt"])
+ @pytest.mark.parametrize("field,value", [("source_sha256", "c" * 64), ("config_sha256", "c" * 64),
+     ("data_sha256", "c" * 64), ("epoch", 10)])
+diff --git a/tests/test_statsfusion_v4_config.py b/tests/test_statsfusion_v4_config.py
+index e05f472..a3c187c 100644
+--- a/tests/test_statsfusion_v4_config.py
++++ b/tests/test_statsfusion_v4_config.py
+@@ -377,5 +377,8 @@ def test_repository_keeps_only_current_config_chain() -> None:
+         "hierarchical_v4_v49_integrated_optimized.yaml",
+         "statsfusion_v410_joint_event.yaml",
+         "statsfusion_v411_learned_boundary.yaml",
++        "statsfusion_v411_fold0_continue64.yaml",
++        "statsfusion_v411_fold0_single_partition.yaml",
++        "statsfusion_v412_integrated_repair.yaml",
+     }
+     assert {path.name for path in root.glob("*.yaml")} == expected

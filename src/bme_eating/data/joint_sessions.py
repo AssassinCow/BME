@@ -21,6 +21,7 @@ from bme_eating.data.stats_fusion_sequence import (
     sequence_geometry_from_config,
 )
 from bme_eating.hierarchical_artifacts import sha256_file
+from bme_eating.joint_capabilities import supported
 from bme_eating.joint_protocol import digest
 from bme_eating.models.statsfusion_joint_event import CompletedScale
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
@@ -126,7 +127,12 @@ class JointSessionDataset(StatsFusionSequenceDataset):
 
 
 def make_joint_dataset(inputs: JointInputs, subjects: set[str], config: dict[str, Any],
-                       preprocessing: dict[str, Any] | None = None, *, training: bool):
+                       preprocessing: dict[str, Any] | None = None, *, training: bool,
+                       development_calibration: dict[str, Any] | None = None):
+    if development_calibration is not None:
+        from bme_eating.joint_v414_split import validate_development_calibration
+        validate_development_calibration(inputs, subjects, config, preprocessing, development_calibration,
+                                         training=training)
     anchors, statistics, events, segments = inputs.frames(subjects, labels=training)
     if preprocessing is None:
         if not training:
@@ -138,7 +144,7 @@ def make_joint_dataset(inputs: JointInputs, subjects: set[str], config: dict[str
     else:
         scaler = FoldRobustScaler.from_json(preprocessing["scaler"])
         normal = Normalization.from_json(preprocessing["normalization"])
-        if not training:
+        if not training and development_calibration is None:
             scaler.assert_unseen(subjects)
     transformed = scaler.transform_frame(statistics)
     keys = ["subject_key", "session_id", "timestamp_ms"]
@@ -147,7 +153,11 @@ def make_joint_dataset(inputs: JointInputs, subjects: set[str], config: dict[str
     anchors = anchors.merge(transformed[[*keys, *columns]], on=keys, how="left", validate="one_to_one")
     if anchors[columns].isna().any().any():
         raise RuntimeError("Canonical statistics have missing anchor alignment rows")
-    dataset = JointSessionDataset(
+    dataset_type = JointSessionDataset
+    if supported(config, "consistent_inputs"):
+        from bme_eating.data.joint_v412_augmentation import JointSessionDatasetV412
+        dataset_type = JointSessionDatasetV412
+    dataset = dataset_type(
         anchors, segments, events, normal, statistics_columns=columns,
         geometry=joint_geometry(config), training=training, seed=2026,
         reader_cache_size=int(config["training"]["session_reader_cache_size"]),
@@ -155,6 +165,8 @@ def make_joint_dataset(inputs: JointInputs, subjects: set[str], config: dict[str
         gyro_modality_dropout=float(config["training"]["gyro_modality_dropout"]) if training else 0,
         rotation_augmentation_probability=float(config["training"]["rotation_augmentation_probability"])
         if training else 0)
+    if dataset_type is not JointSessionDataset:
+        dataset.configure(config, scaler, inputs.identity)
     return dataset, preprocessing
 
 
@@ -205,7 +217,49 @@ def single_item_collate(items):
 def session_loader(dataset: JointSessionDataset, sampler: SessionChunkSampler,
                    config: dict[str, Any]):
     workers = int(config["training"]["num_workers"])
-    return DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=workers,
-                      prefetch_factor=int(config["training"]["loader_prefetch_factor"]),
-                      persistent_workers=False, collate_fn=single_item_collate,
+    loader = DataLoader(dataset, batch_size=1, sampler=sampler, num_workers=workers,
+                      prefetch_factor=int(config["training"]["loader_prefetch_factor"]) if workers else None,
+                      persistent_workers=bool(workers), pin_memory=config["training"]["device"] == "cuda",
+                      collate_fn=single_item_collate,
                       generator=torch.Generator().manual_seed(2026 + sampler.epoch))
+    if _active_loader_scopes:
+        import weakref
+        _active_loader_scopes[-1].append(weakref.ref(loader))
+    return loader
+
+
+def reuse_session_loader(loader, dataset, sampler, config):
+    if not isinstance(loader, DataLoader):
+        return session_loader(dataset, sampler, config)
+    previous = loader.sampler
+    if not isinstance(previous, SessionChunkSampler) or previous.dataset is not dataset:
+        raise RuntimeError("Persistent loader cannot cross dataset or subject partitions")
+    previous.chunks = sampler.chunks
+    previous.epoch, previous.start_chunk, previous.identity = sampler.epoch, sampler.start_chunk, sampler.identity
+    loader.generator.manual_seed(2026 + sampler.epoch)
+    return loader
+
+
+def release_session_loader(loader):
+    iterator = getattr(loader, "_iterator", None)
+    if iterator is not None:
+        iterator._shutdown_workers()
+        loader._iterator = None
+
+
+_active_loader_scopes = []
+
+
+def release_loaders_after(function):
+    from functools import wraps
+    @wraps(function)
+    def guarded(*arguments, **keywords):
+        _active_loader_scopes.append([])
+        try:
+            return function(*arguments, **keywords)
+        finally:
+            for reference in _active_loader_scopes.pop():
+                loader = reference()
+                if loader is not None:
+                    release_session_loader(loader)
+    return guarded

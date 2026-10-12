@@ -1,0 +1,15 @@
+{
+  "audit_passed": true,
+  "subject_count": 39,
+  "data_identity": {
+    "anchors": "b0cf18d29ae037aeb9d744ea826a05193ef69dea584ee8ae9e6ec4963bd5a414",
+    "statistics": "903775f62a55bf2fc606fb32ee15e0f4fdfb3cc35d8c704d3a81f8ebb01c7373",
+    "events": "a95910bcb250246d012f42329c68dc383ae5cb57134a27e3a32de12c7dac4031",
+    "manifest": "4fc9adaffe46c821b1b88af0bd941468c7898f7484be537f47d07834df819b2f",
+    "preparation_identity": "dd522e3c014749ba2b613f5baa225e0e50da2c70897e00241c58cb05d4cc14a0",
+    "subject_folds": "fbebc3b58de9b864ec53a6dd6228c3a053bb9a19006f326aa7e1e31ab8e1a135",
+    "segments": "8da8dd326b0678a29d8a751304cfef202592086e98d7490cf07a2e56743dd0b7"
+  },
+  "segment_files": 2125,
+  "session_count": 1153
+}

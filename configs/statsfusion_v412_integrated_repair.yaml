@@ -1,0 +1,24 @@
+extends: statsfusion_v411_fold0_continue64.yaml
+project:
+  artifact_schema_version: v412
+experiment:
+  name: statsfusion_v412_integrated_repair
+  code_version: v4.12
+  protocol_version: statsfusion-joint-event-v3
+model:
+  architecture: statsfusion_joint_event_v412
+decoder:
+  score_formula: calibrated_event_probability_v412
+training:
+  gyro_modality_dropout: 0.20
+  low_bandwidth_probability: 0.20
+  low_bandwidth_rates: [25.0, 26.316, 50.0]
+  derived_cache_mib: 256
+  mining_families: 32
+  mining_near_miss_families: 8
+  lr_horizon_epochs: 64
+  lr_warmup_epochs: 2
+  lr_minimum_fraction: 0.10
+execution:
+  mode: fold0
+  internal_mode: single

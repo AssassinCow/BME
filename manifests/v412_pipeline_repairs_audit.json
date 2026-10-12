@@ -1,0 +1,173 @@
+{
+  "created_at": "2026-10-10T15:48:56.963605+00:00",
+  "version": "v4.12",
+  "protocol": "statsfusion-joint-event-v3",
+  "source_sha256": "a19c324b0e3801ea90422d0203cc84853ae00443e40d3c705f5c3a9479bad957",
+  "config_sha256": "a62709ebcfb8b7b4006f29acf8cda3bd0b381d240efdd3156db8dbc0b8ead33b",
+  "recommended_run": "statsfusion_v412_integrated_repair_20261010b",
+  "fresh_run_required": true,
+  "implementation_complete": true,
+  "formal_training_performed": false,
+  "promotable": false,
+  "five_fold_diagnostic_complete": false,
+  "formal_promotion_passed": false,
+  "repairs": [
+    "parent_proposal_source_cdf_namespace",
+    "candidate_id_based_boundary_tp_to_fp",
+    "process_tree_private_ram_gates_for_all_search_paths",
+    "checkpoint_bound_cache_checksum_chain",
+    "complete_feature_dependency_source_binding"
+  ],
+  "validation": {
+    "reports": {
+      "v412_pipeline_repairs_cpu.xml": {
+        "tests": 115,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "seconds": 101.859
+      },
+      "v412_pipeline_repairs_regression.xml": {
+        "tests": 221,
+        "failures": 1,
+        "errors": 0,
+        "skipped": 15,
+        "seconds": 593.031
+      },
+      "v412_pipeline_repairs_legacy_audit.xml": {
+        "tests": 21,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "seconds": 9.322
+      },
+      "v412_pipeline_repairs_final_targeted.xml": {
+        "tests": 41,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "seconds": 18.728
+      },
+      "v412_pipeline_repairs_ten_workers.xml": {
+        "tests": 1,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "seconds": 29.85
+      },
+      "v412_pipeline_repairs_cuda.xml": {
+        "tests": 7,
+        "failures": 0,
+        "errors": 0,
+        "skipped": 0,
+        "seconds": 106.774
+      }
+    },
+    "reconciled": {
+      "unique_cases": 344,
+      "passed": 329,
+      "skipped": 15,
+      "unresolved_failures": 0,
+      "method": "Later reports supersede earlier results for duplicate classname and testcase name; the legacy audit failure in the broad report is resolved by final targeted reruns."
+    },
+    "initial_regression_failure": "v410 legacy audit expected prediction disappearance to remain counted by its historical tp_to_fp definition; v410 compatibility restored and 21 audit cases retested successfully.",
+    "ruff": "passed",
+    "compileall": "passed",
+    "git_diff_check": "passed",
+    "gpu_smoke": {
+      "shared_event_quality_gradients": true,
+      "repeat_max_error": 0,
+      "long_event": {
+        "event_duration_seconds": 13023,
+        "chunks": [
+          17,
+          256,
+          4362
+        ],
+        "event_count": 1,
+        "identities": [
+          "369bec168025e040fc2c784e"
+        ],
+        "max_latency_seconds": 0
+      },
+      "device": "cuda",
+      "raw_session": {
+        "native_motion_samples": 6001,
+        "native_ppg_samples": 3001,
+        "new_chunk_steps": [
+          10,
+          20
+        ],
+        "feature_max_error": 2.384185791015625e-7,
+        "event_score_max_error": 0,
+        "event_identity_alignment": true,
+        "timestamp_alignment": true,
+        "incremental_native_chunks": true,
+        "public_event_schema": true
+      },
+      "gpu_validation_performed": true,
+      "candidate_batch128_max_error": 1.4901161193847656e-8,
+      "coordinate_selection_discrete": true,
+      "history_gradient_detached": true,
+      "bfloat16_shared_gradient_norms": {
+        "event": 0.04098183661699295,
+        "quality": 0.013547126203775406
+      },
+      "bfloat16_backward_passed": true,
+      "peak_process_ram_gb": 1.9381523132324219,
+      "peak_gpu_gb": 1.1994543075561523,
+      "peak_gpu_reserved_gb": 1.390625,
+      "process_tree_private_ram_gb": 3.9786033630371094,
+      "peak_process_tree_private_ram_gb": 3.9786033630371094,
+      "worker_process_count": 0,
+      "elapsed_seconds": 7.016000000061467,
+      "protocol": "statsfusion-joint-event-v3",
+      "config_sha256": "a62709ebcfb8b7b4006f29acf8cda3bd0b381d240efdd3156db8dbc0b8ead33b",
+      "source_sha256": "a19c324b0e3801ea90422d0203cc84853ae00443e40d3c705f5c3a9479bad957",
+      "runtime": {
+        "python": "3.11.16 | packaged by conda-forge | (main, Sep  2 2026, 23:31:17) [MSC v.1944 64 bit (AMD64)]",
+        "executable": "C:\\Users\\LZX\\anaconda3\\envs\\bme-model\\python.exe",
+        "torch": "2.5.1",
+        "cuda": "12.4",
+        "platform": "Windows-10-10.0.26200-SP0",
+        "conda_environment": null,
+        "gpu": "NVIDIA GeForce RTX 4080 Laptop GPU"
+      },
+      "synthetic_validation": true,
+      "formal_five_fold_training": false
+    },
+    "ten_worker_cursor_recovery": "passed",
+    "bundle_replay_without_xgboost": "passed_in_regression",
+    "limitations": [
+      "Synthetic GPU smoke and bounded recovery tests do not establish worst-case full training resource usage or F1/MAE improvement.",
+      "Full training, five-fold diagnosis and promotion gates were not executed.",
+      "Fifteen skipped regression cases remain explicitly recorded in their JUnit report."
+    ]
+  },
+  "artifact_sha256": {
+    "manifests/v412_pipeline_repairs_cpu.xml": "9e0f94225a6ce0c0a8a7b43705e86d91aa34815eca18a06eae306c0bd388bf04",
+    "manifests/v412_pipeline_repairs_regression.xml": "6f70c8e4c4b5dbb19bb792e92b8772a119e2bdfd13a04ef3a4d239dfa31798c7",
+    "manifests/v412_pipeline_repairs_legacy_audit.xml": "41f436943d7f764cd8c59c665403cea761b4c7e7ddce9fb82c468a0063030629",
+    "manifests/v412_pipeline_repairs_final_targeted.xml": "205b0d542473beaa5b56eaacc284f952d20933c77355b08c7a511ed92891c782",
+    "manifests/v412_pipeline_repairs_ten_workers.xml": "8f278d378112ee042d7f0aa44657015a0689eb1aa0254f29c4d45d306dfdb2df",
+    "manifests/v412_pipeline_repairs_cuda.xml": "69fafd811fd14e45deba55cbf5a7af90763b87a79ff7b957c4f326d96904a259",
+    "manifests/v412_pipeline_repairs_gpu_validation.json": "6cdaa4d646f3732c0aca6c3d67abfe01d043037c0016f74e2fcb8a5caa750569",
+    "src/bme_eating/joint_stream.py": "12b2387c024588918a7cd7815bfddc5128f16e9e8eae954217f097d555ec3d50",
+    "src/bme_eating/joint_v412_cache.py": "ac66824ceabad75bb0f59f23f3f152c2698bec99742a688b15c9b5e19dee0dca",
+    "src/bme_eating/joint_v411_resources.py": "7f4a3b75f03281d108a2e29efd44b1b5e09e44c19fbedd60e7db7325229e6c99",
+    "src/bme_eating/joint_v411_search.py": "be5e90d15184297cdd6bc1ce4351fcd4adbe17d10482066193f09a77c323d5f4",
+    "src/bme_eating/joint_v411_boundary.py": "84760b6be3df0096c34cbf6dfb5d05482f4ccb78687559bec75d372fa4d5c21f",
+    "src/bme_eating/joint_evaluation.py": "777dd8dc66e865d282d4f1f4b10c2aa1289c723951300f09a7c027b1b9ef0c8e",
+    "src/bme_eating/training/statsfusion_joint_trainer.py": "bbb965c1a0dc4498927feff8918cb49c626b23d538b6c23f4cd51dc163ab8236",
+    "tests/test_statsfusion_joint_pipeline_repairs.py": "b5b3d2d2d5b1fa26f44befaf49477216f1b7e4c286dfec52e9d9b28295a663ce",
+    "tests/test_statsfusion_joint_resume.py": "ac259f8b43be20602b39c95bceff1c54e7664ad87eadc002c33fdc9909fd03a2",
+    "tests/test_statsfusion_joint_resources.py": "9e5dcf67b2d96ee246d730f1fabaa33c274bc1e74a0ea597099e8b8adbbc9ab0",
+    "docs/statsfusion_v412_integrated_repair.md": "be70e7fb92ffa7f81fe4cc25c267005ec656015fbfd7df7181f373037464177a"
+  },
+  "original_project_verification": {
+    "verified_files": 481,
+    "differences": [],
+    "source_root": "C:\\Users\\LZX\\Desktop\\University\\Competition\\生医工\\project\\modeling_joint_v411",
+    "original_project_unchanged": true
+  }
+}

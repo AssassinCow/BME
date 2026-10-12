@@ -770,7 +770,7 @@ def _proposal_sampling_metadata(proposals: pd.DataFrame, windows: pd.DataFrame |
         return np.full(len(proposals), default, dtype=str)
 
     iou = proposals.get("max_iou", pd.Series(0.0, index=proposals.index)).fillna(0.0).to_numpy(dtype=float)
-    gyro = proposals.get("gyro_valid_fraction", pd.Series(np.nan, index=proposals.index)).to_numpy(dtype=float)
+    gyro = proposals.get("gyro_valid_fraction", pd.Series(np.nan, index=proposals.index)).to_numpy(dtype=float).copy()
     hand = values("hand_relation").astype(object)
     if windows is not None:
         groups = {

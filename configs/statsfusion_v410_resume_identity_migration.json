@@ -1,0 +1,17 @@
+{
+  "migration": "resume_identity_comparison_v1",
+  "run_name": "statsfusion_v410_joint_event_20261007a",
+  "previous_migration_receipt_sha256": "930b42f64b590ac550730aadeacb2f85c100a7e414158368a7a9d59c7dc5e881",
+  "previous_source_sha256": "096131f0923fd6d3c70e13104f552e24087e280de8cb436dfbe636abb48cc0d1",
+  "current_source_sha256": "bf7f6e0ece1b8c883f43d9d1d9883d0c51229f14c9850f80540334fb0e577bcd",
+  "source_changes": {
+    "src/bme_eating/joint_protocol.py": {
+      "before": "dbf77ea7aa70f0df78f1693a0044c0d09e10b871ce7b1092d3fd2af3f05a4b51",
+      "after": "1c335ce1fe33dfe17ffdef1104760436b669f881edc33105c5353dbca44ee3fe"
+    },
+    "src/bme_eating/joint_resume_migration.py": {
+      "before": "304e8bd1bb5adddce2608817a904d7e9053cfa6c84bcda73ccb873532f821623",
+      "after": "18dce5e3de1e79d1d1625842891723684002c6aef257f9314b29d5dea1d90f06"
+    }
+  }
+}

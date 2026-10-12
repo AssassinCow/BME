@@ -89,6 +89,9 @@ clipping 按完整 epoch 的 optimizer 更新数统计，包含末尾不足四�
 
 用户随后明确授权旧 run 恢复，因此增加一次性 `--resume --migrate-clipping-gate` 迁移。登记文件 `configs/statsfusion_v410_clipping_resume_migration.json` 锁定旧身份、修复源码集合及该断点 SHA-256；仅支持此 run 的第八轮、已提交 29 个 chunk 的断点。其它源码、模型、配置、数据、划分或环境改变仍拒绝恢复。
 迁移保留原 `identity.json` 和断点，备份放入 `resume_migrations/clipping_epoch_gate_v1/`，另外生成 `active_identity.json` 与 `resume_migration.json`。模型、optimizer、累计梯度、RNG、session/cache 游标原样加载；未提交的第 30 个 chunk 重新执行。原验证记录备份后重验，五折/最终 manifest 与 bundle 保留迁移证据。迁移准备完成后普通 `--resume` 即可继续，无需重跑前七轮；一般源码修改仍要求新 run。
+
+Git HEAD 作为版本观察信息保存；源码文件集合及逐文件 SHA-256 一致时，提交相同代码不会阻止恢复。每次恢复写入 `resume_git_history.json`，保留原始身份。真实源码、配置、数据、运行环境或协议差异仍拒绝恢复，报错列出具体字段。
+上述旧 run 的身份比较补丁通过 `configs/statsfusion_v410_resume_identity_migration.json` 精确登记，仅允许身份比较和迁移模块的已登记字节变更。普通 `--resume` 自动提交该受控补丁迁移，保存 `resume_identity_migration.json` 及 `resume_migrations/resume_identity_comparison_v1/` 的前序证据备份；原始身份、裁剪迁移 receipt 和旧 checkpoint 保持不变。后续同源码提交继续允许恢复；未登记源码变化仍要求新 run。
 无可行操作点时保留诊断最优的训练合格 epoch，标记不可晋级，不把诊断选择变成正式资格。
 
 Boundary 须覆盖>=0.70 且至少 60 独立正事件才训练。内部 cross-fit 决定是否启用；启用时使用实际 refined 标签重新校准。
@@ -118,6 +121,8 @@ S0 显式跳过，不宣称优于 sensor-only。
 恢复、gate、final/export 重查完整证据哈希及实际内部/outer checkpoint 的 finite、clipping、训练/排除 subject 和配置/data/source 身份。
 运行期间检查 canonical 文件及当前 session 原始 archive 的变更；源码身份检查包含新增、删除文件。
 worker、prefetch、reader-cache 可修改后 resume；模型、loss、数据、源码、协议、seed 或其他配置改变需要新 run。
+当前默认 I/O 配置为 workers=10、prefetch=4、reader-cache=4，启用训练分区内的 persistent workers、CUDA pinned memory 和非阻塞输入传输。persistent worker 只缓存原始 archive，不复用编码器历史特征；更换训练分区必须新建 dataset/loader。参见 `docs/statsfusion_v410_io_acceleration.md` 的不变性验收和回退说明。
+用户随后授权暂停并启用更大加速。源码优化使用 `numerically_equivalent_performance_v1` 的登记迁移，锁定第八轮、已提交 1481 个 chunk 的断点；保留旧身份、前序 receipt、完整源码备份和断点。监督目标的二值窗口批量生成，soft target/mask 窗口保留原规约顺序；checkpoint 的 CPU 状态使用紧凑封装，但普通 `torch.load(..., weights_only=False)` 仍得到原状态字典。正式权重和 deployment bundle 不使用此状态封装，继续支持 `weights_only=True`。
 入口检测已有 Python GPU 进程，资源被占用时记录 PAUSED，不启动联合训练。
 门禁失败保存独立 failure report 和诊断；final/export 逐项验证锁及 OOF，失败不产生正式 bundle。
 正式阶段失败时，已有 bundle 和未完成 staging 原子移入 `failures/nondeployable_*`，保存诊断而不保留部署入口。

@@ -9,6 +9,7 @@ import pandas as pd
 from scipy.optimize import minimize
 from scipy.special import expit
 
+from bme_eating.joint_capabilities import EVENT_PROBABILITY_FORMULAS, supported
 from bme_eating.joint_stream import (
     FrozenSourceCDF,
     ImmutableCommitter,
@@ -24,6 +25,9 @@ class NonnegativePlatt:
     slope: float
     intercept: float
     qualified: bool
+    optimization_succeeded: bool | None = None
+    probability_range: float | None = None
+    discriminative: bool | None = None
 
     def __post_init__(self):
         if not np.isfinite([self.slope, self.intercept]).all() or self.slope < 0:
@@ -44,7 +48,10 @@ class NonnegativePlatt:
             gradient = np.asarray([np.mean(residual * logits), np.mean(residual)])
             return value, gradient
         result = minimize(objective, [1.0, 0.0], jac=True, bounds=[(0, None), (None, None)])
-        return cls(float(result.x[0]), float(result.x[1]), bool(result.success))
+        slope, intercept = float(result.x[0]), float(result.x[1])
+        spread = float(np.ptp(expit(slope * logits + intercept)))
+        return cls(slope, intercept, bool(result.success), bool(result.success), spread,
+                   bool(slope > 1e-6 and spread > 1e-6))
 
     def transform(self, value):
         return expit(self.slope * np.asarray(value) + self.intercept)
@@ -160,7 +167,10 @@ def commit_candidates(candidates: list[JointCandidate], calibrator: NonnegativeP
     decisions: dict[tuple[str, str, int], list[JointCandidate]] = {}
     for candidate in candidates:
         candidate.event_probability = float(calibrator.transform(candidate.event_logit))
-        candidate.rank_score = candidate.event_probability * candidate.predicted_quality
+        candidate.rank_score = (candidate.event_probability if candidate.score_formula
+            in EVENT_PROBABILITY_FORMULAS
+            else candidate.event_probability * candidate.predicted_quality)
+        candidate.acceptance_score, candidate.quality_score = candidate.rank_score, candidate.predicted_quality
         if candidate.coarse_event_logit is not None:
             candidate.coarse_probability = float(calibrator.transform(candidate.coarse_event_logit))
         decisions.setdefault((candidate.subject_key, candidate.session_id,
@@ -197,13 +207,20 @@ def calibration_ece(probabilities: np.ndarray, targets: np.ndarray, bins: int) -
 
 def choose_operating_point(candidate_sets: dict[str, list[JointCandidate]], windows,
                            truth, ignore, mappings, config):
+    if supported(config, "grouped") and not config.get("_reference_execution"):
+        from bme_eating.joint_v411_search import choose_point
+        return choose_point(candidate_sets, windows, truth, ignore, mappings, config)
     search = config["search"]
+    from bme_eating.joint_v411_resources import SearchResourceMonitor
+    monitor = SearchResourceMonitor(config)
+    monitor.check(force=True)
     records, best, best_key = [], None, None
     observed_hours = float((windows.valid > 0).sum() * 3 / 3600)
     thresholds = np.arange(search["acceptance_min"], search["acceptance_max"] + 1e-8,
                            search["acceptance_step"])
     for setting, candidates in candidate_sets.items():
         for budget in search["budgets"]:
+            monitor.check(force=True)
             natural, budget_audit = apply_online_budget(candidates, windows, mappings, budget,
                                                          config["decoder"]["quotas"])
             ignored = prediction_ignore_mask(event_frame(natural), ignore)
@@ -214,9 +231,12 @@ def choose_operating_point(candidate_sets: dict[str, list[JointCandidate]], wind
             ece = calibration_ece(calibrator.transform(logits[keep]), labels[keep],
                                   config["calibration"]["bins"])
             coverage = candidate_coverage(natural, truth, windows)
-            qualified = (calibrator.qualified and ece <= config["calibration"]["maximum_ece"]
+            qualified = (calibrator.qualified and (not supported(config, "stabilized") or
+                         bool(calibrator.discriminative))
+                         and ece <= config["calibration"]["maximum_ece"]
                          and coverage["recall"] >= 0.70)
             for nms, acceptance in product(search["nms_ious"], thresholds):
+                monitor.check()
                 predictions = commit_candidates(natural, calibrator, float(acceptance), nms)
                 metrics, _ = metrics_with_exposure(truth, predictions, ignore, windows,
                                                    observed_hours=observed_hours)
@@ -233,6 +253,7 @@ def choose_operating_point(candidate_sets: dict[str, list[JointCandidate]], wind
                     best_key, best = key, {**record, "budget_audit": budget_audit}
     if best is None:
         raise RuntimeError("No diagnostic operating point could be evaluated")
+    best["search_resources"] = monitor.check(force=True)
     return best, records
 
 

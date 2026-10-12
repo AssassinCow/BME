@@ -15,13 +15,20 @@ from bme_eating.data.stats_fusion_preprocess import (
     StatsFusionRawSessionPreprocessor,
 )
 from bme_eating.hierarchical_artifacts import sha256_file
+from bme_eating.joint_capabilities import calibration_discriminates, capabilities, supported
 from bme_eating.joint_evaluation import NonnegativePlatt
 from bme_eating.joint_protocol import (
     PROTOCOL,
+    V411_PROTOCOL,
+    V412_PROTOCOL,
+    V413_PROTOCOL,
     checkpoint_qualified,
     config_identity,
     configure_numerics,
     digest,
+    event_score_formula,
+    grouped_protocol,
+    protocol_for,
     validate_config,
     validate_gate_structure,
     verify_artifact_hashes,
@@ -30,9 +37,7 @@ from bme_eating.joint_stream import (
     FrozenSourceCDF,
     ImmutableCommitter,
     OnlineBudget,
-    StreamingProposals,
 )
-from bme_eating.models.statsfusion_joint_event import StatsFusionJointEvent
 from bme_eating.stats_features import FoldRobustScaler
 from bme_eating.training.statsfusion_joint_trainer import (
     decoder_settings,
@@ -49,50 +54,76 @@ class JointChunkDetector:
         self.model, self.config, self.point = model.eval(), config, point
         self.mapping, self.identity, self.boundary = mapping, identity, boundary
         self.device = next(model.parameters()).device
-        self.stream = StreamingProposals(subject, session, identity, decoder_settings(config)[point["setting"]])
+        from bme_eating.joint_v411_stream import make_stream
+        self.stream = make_stream(subject, session, identity, decoder_settings(config)[point["setting"]])
         self.budget = OnlineBudget(point["budget"], config["decoder"]["quotas"])
         self.committer = ImmutableCommitter(point["acceptance"], point["nms"])
         self.calibrator = NonnegativePlatt(**point["calibration"])
         self.times = torch.empty(0, dtype=torch.int64)
-        self.features = torch.empty(0, 137)
+        self.features = torch.empty(0, capabilities(self.model).feature_width)
         self.finished = False
+        self.pending_decision = []
+        if supported(model, "grouped"):
+            from bme_eating.joint_v411_features import BlockedHistory
+            self.history = BlockedHistory()
 
     @torch.no_grad()
     def push_features(self, times: torch.Tensor, features: torch.Tensor, *, final: bool = False):
         if self.finished:
             raise RuntimeError("Finished session cannot accept future chunks")
-        if (times.ndim != 1 or times.dtype != torch.int64 or features.shape != (len(times), 137)
+        if (times.ndim != 1 or times.dtype != torch.int64 or features.shape != (len(times), capabilities(self.model).feature_width)
                 or not torch.isfinite(features).all() or (torch.diff(times) != 3000).any()
-                or ((features[:, 128:] < 0) | (features[:, 128:] > 1)).any()):
+                or ((features[:, 128:137] < 0) | (features[:, 128:137] > 1)).any()):
             raise ValueError("Invalid streaming timeline, feature shape, finite values or masks")
         if len(self.times) and len(times) and int(times[0]) != int(self.times[-1]) + 3000:
             raise ValueError("Feature chunks overlap, move backwards or skip missing bins")
-        self.times = torch.cat((self.times, times.cpu()))
-        self.features = torch.cat((self.features, features.cpu()))
+        if supported(self.model, "grouped"):
+            self.history.append(times, features)
+            self.times, self.features = self.history.times, self.history.features
+        else:
+            self.times = torch.cat((self.times, times.cpu()))
+            self.features = torch.cat((self.features, features.cpu()))
         emitted = []
-        for timestamp, values in zip(times.tolist(), features.cpu().numpy()):
+        for index, (timestamp, values) in enumerate(zip(times.tolist(), features.cpu().numpy())):
+            if self.pending_decision:
+                emitted.extend(self._decide(self.pending_decision))
+                self.pending_decision = []
             self.budget.observe(3, float(values[128]))
             probabilities = {"state": float(values[129]),
                              **{f"proposal_{scale}": float(values[130 + index])
                                 for index, scale in enumerate((3, 15, 60))}}
-            candidates = self.stream.observe(int(timestamp), probabilities, float(values[128]),
-                                              float(values[134]))
-            emitted.extend(self._decide(candidates))
+            arguments = (int(timestamp), probabilities, float(values[128]), float(values[134]))
+            candidates = (self.stream.observe(*arguments, onset_probability=float(values[133]))
+                          if supported(self.model, "grouped") else self.stream.observe(*arguments))
+            if final and index == len(times) - 1:
+                candidates.extend(self.stream.finish())
+            if not final and index == len(times) - 1:
+                self.pending_decision = candidates
+            else:
+                emitted.extend(self._decide(candidates))
         if final:
-            emitted.extend(self._decide(self.stream.finish()))
+            if not len(times):
+                emitted.extend(self._decide(self.pending_decision + self.stream.finish()))
+                self.pending_decision = []
             self.finished = True
         return [candidate.to_dict() for candidate in emitted]
 
     def _decide(self, candidates):
         chosen = self.budget.select(candidates, self.mapping) if candidates else []
+        v411 = supported(self.model, "grouped")
+        if v411:
+            from bme_eating.joint_v411_scoring import score_candidates
+            score_candidates(self.model, chosen, self.times, self.features, self.device, batch_size=128)
         for index, candidate in enumerate(chosen):
-            score_candidate(self.model, candidate, self.times, self.features, self.device)
+            if not v411:
+                score_candidate(self.model, candidate, self.times, self.features, self.device)
             if self.point["boundary_enabled"]:
                 candidate = refine_candidate(self.model, candidate, self.times, self.features, self.device,
-                                               self.boundary, self.point["boundary_entropy"])
+                                               {**self.boundary, "mode": self.point.get("boundary_mode", "both")}, self.point["boundary_entropy"])
                 chosen[index] = candidate
             candidate.event_probability = float(self.calibrator.transform(candidate.event_logit))
-            candidate.rank_score = candidate.event_probability * candidate.predicted_quality
+            candidate.rank_score = candidate.event_probability if v411 else candidate.event_probability * candidate.predicted_quality
+            candidate.acceptance_score, candidate.quality_score = candidate.rank_score, candidate.predicted_quality
             if candidate.coarse_event_logit is not None:
                 candidate.coarse_probability = float(self.calibrator.transform(candidate.coarse_event_logit))
         return self.committer.submit(chosen)
@@ -185,7 +216,7 @@ class JointRawStream:
             self.last_input_ms = int(batch["timestamp_ms"][0, -1])
         if final and not self.detector.finished:
             emitted.extend(self.detector.push_features(torch.empty(0, dtype=torch.int64),
-                                                       torch.empty(0, 137), final=True))
+                                                       torch.empty(0, capabilities(self.detector.model).feature_width), final=True))
         self.diagnostics.extend(emitted)
         return public_events(emitted)
 
@@ -194,7 +225,7 @@ class StatsFusionJointDetector:
     def __init__(self, bundle: str | Path, *, device: str = "cpu") -> None:
         root = Path(bundle)
         manifest = json.loads((root / "final_manifest.json").read_text(encoding="utf-8"))
-        if manifest.get("protocol") != PROTOCOL or not manifest.get("promotable"):
+        if manifest.get("protocol") not in {PROTOCOL, V411_PROTOCOL, V412_PROTOCOL, V413_PROTOCOL} or not manifest.get("promotable"):
             raise RuntimeError("Bundle has no qualified joint manifest")
         checksums = json.loads((root / "SHA256SUMS.json").read_text(encoding="utf-8"))
         verify_artifact_hashes(root, checksums)
@@ -210,7 +241,7 @@ class StatsFusionJointDetector:
             raise RuntimeError("Joint bundle lacks audited deployment artifacts")
         gate = json.loads((root / "joint_gate_manifest.json").read_text(encoding="utf-8"))
         identity_hash = sha256_file(root / "identity.json")
-        if (not gate.get("promotable") or gate.get("protocol") != PROTOCOL
+        if (not gate.get("promotable") or gate.get("protocol") != manifest.get("protocol")
                 or manifest.get("identity_sha256") != identity_hash
                 or gate.get("identity_sha256") != identity_hash
                 or manifest.get("gate_sha256") != sha256_file(root / "joint_gate_manifest.json")):
@@ -220,6 +251,12 @@ class StatsFusionJointDetector:
         validate_config(self.config)
         configure_numerics(self.config)
         self.point = json.loads((root / "operating_point.json").read_text(encoding="utf-8"))
+        if grouped_protocol(self.config) and (
+                self.point.get("score_formula") != event_score_formula(self.config)
+                or self.point.get("boundary_mode") not in {"off", "start_only", "both"}
+                or self.point.get("boundary_mode") != manifest.get("boundary_mode")
+                or self.point["boundary_enabled"] != (self.point["boundary_mode"] != "off")):
+            raise RuntimeError("Bundle v411 scoring or Boundary mode lock differs")
         payload = torch.load(root / "checkpoint.pt", map_location=device, weights_only=True)
         identity = json.loads((root / "identity.json").read_text(encoding="utf-8"))
         subjects = {subject for fold in gate["folds"] for subject in fold["prediction_subjects"]}
@@ -246,12 +283,16 @@ class StatsFusionJointDetector:
                                ("source_mapping", "source_mapping.json")):
             if manifest.get(name + "_sha256") != sha256_file(root / relative):
                 raise RuntimeError("Bundle final manifest artifact binding failed")
-        if not self.point.get("promotion_eligible") or not self.point["calibration"].get("qualified"):
+        if (not self.point.get("promotion_eligible") or not self.point["calibration"].get("qualified")
+                or not calibration_discriminates(self.config, self.point["calibration"])):
             raise RuntimeError("Bundle has an unqualified operating point")
         if self.point["boundary_enabled"] != manifest.get("boundary_enabled") or (
                 self.point["boundary_enabled"] and not payload["boundary"].get("qualified")):
             raise RuntimeError("Bundle Boundary gate failed")
-        self.model = StatsFusionJointEvent(self.config).to(device).eval()
+        from bme_eating.models.statsfusion_joint_event_v411 import build_joint_model
+        if manifest["protocol"] != protocol_for(self.config):
+            raise RuntimeError("Bundle model protocol mismatch")
+        self.model = build_joint_model(self.config).to(device).eval()
         self.model.load_state_dict(payload["model"])
         self.preprocessing, self.boundary = payload["preprocessing"], payload["boundary"]
         self.identity = payload["identity"]

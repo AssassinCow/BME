@@ -52,7 +52,8 @@ class CompletedScale(nn.Module):
             )
             weights = mask[members]
             pooled = (sequence[members] * weights[..., None]).sum(1)
-            pooled = pooled / weights.sum(1).clamp_min(1)[:, None]
+            pooled = pooled / weights.sum(1).clamp_min(
+                torch.finfo(sequence.dtype).tiny if getattr(self, "fractional_mean", False) else 1)[:, None]
             low = self.head(self.temporal(pooled[None])).squeeze(0).squeeze(-1)
             mapping = torch.searchsorted(ends, torch.arange(len(sequence), device=ends.device),
                                          right=True) - 1

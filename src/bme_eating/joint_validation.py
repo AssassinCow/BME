@@ -12,19 +12,19 @@ import torch
 
 from bme_eating.data.deep_dataset import Normalization
 from bme_eating.data.stats_fusion_preprocess import RawSessionInput, causal_completed_block_layout
+from bme_eating.joint_capabilities import capabilities, supported
 from bme_eating.joint_evaluation import NonnegativePlatt
 from bme_eating.joint_pipeline import JointChunkDetector, StatsFusionJointDetector
 from bme_eating.joint_protocol import (
-    PROTOCOL,
     config_identity,
     configure_numerics,
     digest,
+    protocol_for,
     runtime_identity,
     source_identity,
 )
 from bme_eating.joint_stream import FrozenSourceCDF, TimelineCache
 from bme_eating.models.statsfusion_joint_event import (
-    StatsFusionJointEvent,
     candidate_roi,
     quality_focal_loss,
 )
@@ -55,13 +55,13 @@ def synthetic_batch(config, steps=20, device="cpu"):
 
 
 def long_event_feature_replay(model, config, steps=4341):
-    point = {"setting": "high_0.1_gap_15", "budget": 30, "acceptance": 0.0, "nms": .5,
+    point = {"setting": ("high_0.1_low_0.9_gap_15" if supported(config, "stabilized") else "high_0.1_gap_15"), "budget": 30, "acceptance": 0.0, "nms": .5,
              "calibration": NonnegativePlatt(0, 20, True).to_json(),
              "boundary_enabled": False, "boundary_entropy": None}
     mapping = FrozenSourceCDF({source: [0, 1] for source in
         ("state", "proposal", "jitter", "backtrack", "start_expansion")}, ["training"])
     times = torch.arange(1, steps + 22) * 3000
-    features = torch.zeros(len(times), 137)
+    features = torch.zeros(len(times), capabilities(config).feature_width)
     features[:, 128] = 1
     features[:, 135] = 1
     features[:steps, 129:133] = .95
@@ -90,7 +90,11 @@ def validate_joint_implementation(config, *, device="cpu"):
     started = time.monotonic()
     configure_numerics(config)
     torch.manual_seed(2026)
-    model = StatsFusionJointEvent(config).to(device).eval()
+    from bme_eating.models.statsfusion_joint_event_v411 import build_joint_model, indexed_roi
+    model = build_joint_model(config).to(device).eval()
+    roi_function = indexed_roi if supported(model, "grouped") else candidate_roi
+    if supported(model, "stabilized"):
+        from bme_eating.models.statsfusion_joint_event_v413 import indexed_roi as roi_function
     from bme_eating.data.joint_sessions import joint_geometry
     batch = synthetic_batch(config, steps=joint_geometry(config).total_steps if device.startswith("cuda") else 20,
                             device=device)
@@ -98,7 +102,7 @@ def validate_joint_implementation(config, *, device="cpu"):
     if not all(torch.isfinite(outputs[name]).all() for name in ("semantic_features", "local_features")):
         raise RuntimeError("Shared encoder finite gate failed")
     times = batch["timestamp_ms"][0]
-    roi = candidate_roi(outputs["semantic_features"][0], outputs["local_features"][0], times,
+    roi = roi_function(outputs["semantic_features"][0], outputs.get("localization_features", outputs["local_features"])[0], times,
                          torch.ones_like(times).float(), 9000, 45_000, 60_000)
     scores = model.candidate_head(roi[None], torch.zeros(1, 12, device=device))
     for name, loss in (("event", torch.nn.functional.binary_cross_entropy_with_logits(
@@ -116,8 +120,8 @@ def validate_joint_implementation(config, *, device="cpu"):
         raise RuntimeError("Checkpoint repeat inference differs")
     with tempfile.TemporaryDirectory(prefix="bme_joint_cache_") as temporary:
         binding = {"epoch": 1, "subject": "synthetic", "session": "long", "model": "fixed"}
-        cache = TimelineCache(Path(temporary), binding, 137)
-        values = np.zeros((4341, 137), dtype=np.float32)
+        cache = TimelineCache(Path(temporary), binding, capabilities(config).feature_width)
+        values = np.zeros((4341, capabilities(config).feature_width), dtype=np.float32)
         for first in range(0, 4341, 256):
             stop = min(4341, first + 256)
             cache.append(np.arange(first, stop, dtype=np.int64) * 3000, values[first:stop])
@@ -129,11 +133,27 @@ def validate_joint_implementation(config, *, device="cpu"):
               "long_event": long_event_feature_replay(model, config), "device": device,
               "raw_session": raw_session_replay(model, config),
               "gpu_validation_performed": device.startswith("cuda")}
+    if supported(model, "stabilized"):
+        report["localization_receptive_field_seconds"] = model.localization_receptive_field_seconds
+        report["localization_dependency_seconds"] = model.localization_dependency_seconds
+    if supported(model, "grouped"):
+        with torch.no_grad():
+            batched_roi = roi.detach()[None].expand(128, -1, -1).contiguous()
+            metadata = torch.zeros(128, 12, device=device)
+            single = model.candidate_head(batched_roi[:1], metadata[:1])
+            parallel = model.candidate_head(batched_roi, metadata)
+            head_error = max(float((single[name] - parallel[name][:1]).abs().max())
+                             for name in ("event_logit", "quality_logit", "candidate_embedding"))
+        if head_error > 1e-6:
+            raise RuntimeError("v411 batch128 equivalence gate failed; optimization cannot be enabled")
+        report["candidate_batch128_max_error"] = head_error
+        report["coordinate_selection_discrete"] = True
+        report["history_gradient_detached"] = True
     if device.startswith("cuda"):
         model.train()
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             mixed = model(batch)
-            mixed_roi = candidate_roi(mixed["semantic_features"][0], mixed["local_features"][0], times,
+            mixed_roi = roi_function(mixed["semantic_features"][0], mixed.get("localization_features", mixed["local_features"])[0], times,
                                       torch.ones_like(times).float(), 9000, 45_000, 60_000)
             mixed_scores = model.candidate_head(mixed_roi[None], torch.zeros(1, 12, device=device))
             mixed_losses = {
@@ -158,7 +178,7 @@ def validate_joint_implementation(config, *, device="cpu"):
         from bme_eating.training.statsfusion_joint_trainer import enforce_resources
         report.update(enforce_resources(config, torch.device(device)))
     report["elapsed_seconds"] = time.monotonic() - started
-    report.update({"protocol": PROTOCOL, "config_sha256": config_identity(config),
+    report.update({"protocol": protocol_for(config), "config_sha256": config_identity(config),
         "source_sha256": digest(source_identity(Path(config["_config_path"]).resolve().parents[1])),
         "runtime": runtime_identity(), "synthetic_validation": True, "formal_five_fold_training": False})
     return report
@@ -182,7 +202,7 @@ def raw_session_replay(model, config):
     model.eval()
     for chunk in (10, 20):
         times, hidden = [], []
-        point = {"setting": "high_0.1_gap_15", "budget": 30, "acceptance": 0, "nms": .5,
+        point = {"setting": ("high_0.1_low_0.9_gap_15" if supported(config, "stabilized") else "high_0.1_gap_15"), "budget": 30, "acceptance": 0, "nms": .5,
                  "calibration": NonnegativePlatt(0, 20, True).to_json(), "boundary_enabled": False}
         mapping = FrozenSourceCDF({name: [0, 1] for name in
             ("state", "proposal", "jitter", "backtrack", "start_expansion")}, ["fit"])
@@ -233,8 +253,13 @@ def raw_session_replay(model, config):
             "public_event_schema": True}
 
 
-def replay_joint_bundle(bundle: Path, config):
-    detector = StatsFusionJointDetector(bundle)
+def replay_joint_bundle(bundle: Path, config, *, device="cpu"):
+    from bme_eating.joint_single_fold import StatsFusionJointFoldDetector
+    from bme_eating.joint_v414_bundle import StatsFusionJointFinalDataDetector
+    single_fold = config.get("execution", {}).get("mode") == "fold0"
+    full_data = supported(config, "full_data_workflow")
+    detector_type = StatsFusionJointFinalDataDetector if full_data else StatsFusionJointFoldDetector if single_fold else StatsFusionJointDetector
+    detector = detector_type(bundle, device=device)
     report = long_event_feature_replay(detector.model, config)
     locked = replay_locked_bundle(detector)
     code = """import builtins
@@ -250,6 +275,12 @@ from bme_eating.joint_validation import replay_locked_bundle
 replay_locked_bundle(StatsFusionJointDetector(sys.argv[1]))
 print('PASS')
 """
+    if single_fold:
+        code = code.replace("from bme_eating.joint_pipeline import StatsFusionJointDetector",
+                            "from bme_eating.joint_single_fold import StatsFusionJointFoldDetector as StatsFusionJointDetector")
+    if full_data:
+        code = code.replace("from bme_eating.joint_pipeline import StatsFusionJointDetector",
+                            "from bme_eating.joint_v414_bundle import StatsFusionJointFinalDataDetector as StatsFusionJointDetector")
     command = [sys.executable, "-c", code, str(bundle)]
     import os
     environment = dict(os.environ)
@@ -259,7 +290,8 @@ print('PASS')
                             cwd=bundle)
     if result.returncode:
         raise RuntimeError("No-XGBoost bundle load failed: " + result.stderr)
-    return {**report, "locked_native_replay": locked, "no_xgboost_load": True,
+    return {**report, "device": device, "gpu_validation_performed": device == "cuda",
+            "locked_native_replay": locked, "no_xgboost_load": True,
             "no_xgboost_replay": True, "bundle_sha256": json.loads(
         (bundle / "SHA256SUMS.json").read_text(encoding="utf-8"))}
 

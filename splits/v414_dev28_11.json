@@ -1,0 +1,808 @@
+{
+  "schema": "v414",
+  "algorithm": "subject_constrained_multistart_swap_v1",
+  "seed": 2026,
+  "data_identity": {
+    "anchors": "b0cf18d29ae037aeb9d744ea826a05193ef69dea584ee8ae9e6ec4963bd5a414",
+    "statistics": "903775f62a55bf2fc606fb32ee15e0f4fdfb3cc35d8c704d3a81f8ebb01c7373",
+    "events": "a95910bcb250246d012f42329c68dc383ae5cb57134a27e3a32de12c7dac4031",
+    "manifest": "4fc9adaffe46c821b1b88af0bd941468c7898f7484be537f47d07834df819b2f",
+    "preparation_identity": "dd522e3c014749ba2b613f5baa225e0e50da2c70897e00241c58cb05d4cc14a0",
+    "subject_folds": "fbebc3b58de9b864ec53a6dd6228c3a053bb9a19006f326aa7e1e31ab8e1a135",
+    "segments": "8da8dd326b0678a29d8a751304cfef202592086e98d7490cf07a2e56743dd0b7"
+  },
+  "data_sha256": "9d1656d4ca7e41c57585e6fbfa6f323833554fcb51c71ee9f7e13afe335f5fcb",
+  "training_subjects": [
+    "045fa7f8810b13fa88e4",
+    "0c4f3b4dd4e2396ea8a3",
+    "0d24bd704049f627dbd0",
+    "1ff38584c81d9c19806c",
+    "2f8c1acc1c1cce6aa8c2",
+    "3bf8358d6c8ba2813dd9",
+    "3f01da18b2360ed95945",
+    "40a4b3ade50366e145a2",
+    "4aa8c37cc003d188b78e",
+    "4af9280fcb3819687734",
+    "55d2bf29f776989df358",
+    "64124e0fe3248a92d711",
+    "6c814bd092b6d2720c8d",
+    "6d716eaeeba7f2e54a49",
+    "818bb9dda9e135ef52c7",
+    "84d1ab10b4c247fed87a",
+    "8fd455276aefe9a998cf",
+    "b64fefbf3f8eb74856ae",
+    "b86fe529e3520474404a",
+    "bdf7b9fa66fb056982d1",
+    "bed5899df7e00fe5dbd9",
+    "c650bc84bb62392070e1",
+    "c66f7301e8a683be5bdc",
+    "cb1db26faff2b6ed3776",
+    "d6fb2ed55829461db333",
+    "df5709465843654a5dfa",
+    "e5076d6e8cbdd20b45eb",
+    "ee72811a6684192995a7"
+  ],
+  "development_subjects": [
+    "206fb1ef35bf276e6142",
+    "594ad753200e258889d6",
+    "69c41b6d658a17cd2fcb",
+    "9390489a29727c2fbb8e",
+    "9e24ef644643f9be260f",
+    "b3ecfc6a7a60aa397f84",
+    "b9e8117a3c8055965854",
+    "cc0d2348769628ec84c1",
+    "ccf5bed2242144f281ff",
+    "d2fb8a2f68a7e08b6b92",
+    "ed1b48ec5b09b0eeb303"
+  ],
+  "all_subjects": [
+    "045fa7f8810b13fa88e4",
+    "0c4f3b4dd4e2396ea8a3",
+    "0d24bd704049f627dbd0",
+    "1ff38584c81d9c19806c",
+    "206fb1ef35bf276e6142",
+    "2f8c1acc1c1cce6aa8c2",
+    "3bf8358d6c8ba2813dd9",
+    "3f01da18b2360ed95945",
+    "40a4b3ade50366e145a2",
+    "4aa8c37cc003d188b78e",
+    "4af9280fcb3819687734",
+    "55d2bf29f776989df358",
+    "594ad753200e258889d6",
+    "64124e0fe3248a92d711",
+    "69c41b6d658a17cd2fcb",
+    "6c814bd092b6d2720c8d",
+    "6d716eaeeba7f2e54a49",
+    "818bb9dda9e135ef52c7",
+    "84d1ab10b4c247fed87a",
+    "8fd455276aefe9a998cf",
+    "9390489a29727c2fbb8e",
+    "9e24ef644643f9be260f",
+    "b3ecfc6a7a60aa397f84",
+    "b64fefbf3f8eb74856ae",
+    "b86fe529e3520474404a",
+    "b9e8117a3c8055965854",
+    "bdf7b9fa66fb056982d1",
+    "bed5899df7e00fe5dbd9",
+    "c650bc84bb62392070e1",
+    "c66f7301e8a683be5bdc",
+    "cb1db26faff2b6ed3776",
+    "cc0d2348769628ec84c1",
+    "ccf5bed2242144f281ff",
+    "d2fb8a2f68a7e08b6b92",
+    "d6fb2ed55829461db333",
+    "df5709465843654a5dfa",
+    "e5076d6e8cbdd20b45eb",
+    "ed1b48ec5b09b0eeb303",
+    "ee72811a6684192995a7"
+  ],
+  "original_fold0_in_training": [
+    "045fa7f8810b13fa88e4",
+    "1ff38584c81d9c19806c",
+    "4aa8c37cc003d188b78e",
+    "4af9280fcb3819687734",
+    "6d716eaeeba7f2e54a49",
+    "8fd455276aefe9a998cf",
+    "c650bc84bb62392070e1",
+    "ee72811a6684192995a7"
+  ],
+  "subject_statistics": {
+    "045fa7f8810b13fa88e4": {
+      "sessions": 28,
+      "events": 3,
+      "same": 1,
+      "different": 2,
+      "unknown": 0,
+      "duration_bins": [
+        2,
+        0,
+        1,
+        0,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "0c4f3b4dd4e2396ea8a3": {
+      "sessions": 25,
+      "events": 5,
+      "same": 1,
+      "different": 4,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        2,
+        3,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "0d24bd704049f627dbd0": {
+      "sessions": 29,
+      "events": 6,
+      "same": 3,
+      "different": 3,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        1,
+        1,
+        3,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "1ff38584c81d9c19806c": {
+      "sessions": 23,
+      "events": 4,
+      "same": 2,
+      "different": 2,
+      "unknown": 0,
+      "duration_bins": [
+        1,
+        0,
+        1,
+        2,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "206fb1ef35bf276e6142": {
+      "sessions": 27,
+      "events": 2,
+      "same": 1,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        1,
+        1,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "2f8c1acc1c1cce6aa8c2": {
+      "sessions": 26,
+      "events": 6,
+      "same": 5,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        1,
+        2,
+        1,
+        2
+      ],
+      "gyro_all_missing": true
+    },
+    "3bf8358d6c8ba2813dd9": {
+      "sessions": 35,
+      "events": 4,
+      "same": 1,
+      "different": 3,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        1,
+        0,
+        3
+      ],
+      "gyro_all_missing": false
+    },
+    "3f01da18b2360ed95945": {
+      "sessions": 19,
+      "events": 6,
+      "same": 2,
+      "different": 4,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        3,
+        3,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "40a4b3ade50366e145a2": {
+      "sessions": 30,
+      "events": 6,
+      "same": 3,
+      "different": 3,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        5,
+        1,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "4aa8c37cc003d188b78e": {
+      "sessions": 29,
+      "events": 1,
+      "same": 0,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        1,
+        0,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "4af9280fcb3819687734": {
+      "sessions": 15,
+      "events": 5,
+      "same": 2,
+      "different": 3,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        4,
+        1,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "55d2bf29f776989df358": {
+      "sessions": 21,
+      "events": 3,
+      "same": 1,
+      "different": 2,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        0,
+        3,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "594ad753200e258889d6": {
+      "sessions": 85,
+      "events": 7,
+      "same": 3,
+      "different": 4,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        1,
+        5,
+        1,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "64124e0fe3248a92d711": {
+      "sessions": 21,
+      "events": 7,
+      "same": 2,
+      "different": 5,
+      "unknown": 0,
+      "duration_bins": [
+        4,
+        0,
+        0,
+        2,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "69c41b6d658a17cd2fcb": {
+      "sessions": 15,
+      "events": 6,
+      "same": 2,
+      "different": 4,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        2,
+        3,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "6c814bd092b6d2720c8d": {
+      "sessions": 32,
+      "events": 4,
+      "same": 3,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        0,
+        2,
+        2
+      ],
+      "gyro_all_missing": false
+    },
+    "6d716eaeeba7f2e54a49": {
+      "sessions": 28,
+      "events": 6,
+      "same": 3,
+      "different": 3,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        2,
+        4,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "818bb9dda9e135ef52c7": {
+      "sessions": 24,
+      "events": 7,
+      "same": 2,
+      "different": 5,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        1,
+        5,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "84d1ab10b4c247fed87a": {
+      "sessions": 49,
+      "events": 1,
+      "same": 0,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        0,
+        1,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "8fd455276aefe9a998cf": {
+      "sessions": 18,
+      "events": 5,
+      "same": 2,
+      "different": 3,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        1,
+        2,
+        1,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "9390489a29727c2fbb8e": {
+      "sessions": 34,
+      "events": 4,
+      "same": 1,
+      "different": 3,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        1,
+        3,
+        0
+      ],
+      "gyro_all_missing": true
+    },
+    "9e24ef644643f9be260f": {
+      "sessions": 35,
+      "events": 4,
+      "same": 2,
+      "different": 2,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        0,
+        2,
+        2
+      ],
+      "gyro_all_missing": false
+    },
+    "b3ecfc6a7a60aa397f84": {
+      "sessions": 25,
+      "events": 5,
+      "same": 2,
+      "different": 3,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        2,
+        3,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "b64fefbf3f8eb74856ae": {
+      "sessions": 22,
+      "events": 7,
+      "same": 3,
+      "different": 4,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        1,
+        5,
+        1,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "b86fe529e3520474404a": {
+      "sessions": 19,
+      "events": 3,
+      "same": 2,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        3,
+        0,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "b9e8117a3c8055965854": {
+      "sessions": 21,
+      "events": 1,
+      "same": 0,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        1,
+        0,
+        0,
+        0,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "bdf7b9fa66fb056982d1": {
+      "sessions": 11,
+      "events": 1,
+      "same": 0,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        1,
+        0,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "bed5899df7e00fe5dbd9": {
+      "sessions": 47,
+      "events": 2,
+      "same": 1,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        1,
+        0,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "c650bc84bb62392070e1": {
+      "sessions": 20,
+      "events": 8,
+      "same": 3,
+      "different": 5,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        3,
+        4,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "c66f7301e8a683be5bdc": {
+      "sessions": 43,
+      "events": 0,
+      "same": 0,
+      "different": 0,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "cb1db26faff2b6ed3776": {
+      "sessions": 36,
+      "events": 3,
+      "same": 2,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        0,
+        2,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "cc0d2348769628ec84c1": {
+      "sessions": 17,
+      "events": 6,
+      "same": 3,
+      "different": 3,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        2,
+        2,
+        2
+      ],
+      "gyro_all_missing": false
+    },
+    "ccf5bed2242144f281ff": {
+      "sessions": 32,
+      "events": 0,
+      "same": 0,
+      "different": 0,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "d2fb8a2f68a7e08b6b92": {
+      "sessions": 26,
+      "events": 6,
+      "same": 2,
+      "different": 4,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        4,
+        1,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "d6fb2ed55829461db333": {
+      "sessions": 31,
+      "events": 5,
+      "same": 3,
+      "different": 2,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        3,
+        1,
+        1
+      ],
+      "gyro_all_missing": false
+    },
+    "df5709465843654a5dfa": {
+      "sessions": 37,
+      "events": 4,
+      "same": 2,
+      "different": 2,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        0,
+        4,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "e5076d6e8cbdd20b45eb": {
+      "sessions": 43,
+      "events": 4,
+      "same": 3,
+      "different": 1,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        3,
+        1,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "ed1b48ec5b09b0eeb303": {
+      "sessions": 37,
+      "events": 4,
+      "same": 2,
+      "different": 2,
+      "unknown": 0,
+      "duration_bins": [
+        1,
+        1,
+        1,
+        1,
+        0
+      ],
+      "gyro_all_missing": false
+    },
+    "ee72811a6684192995a7": {
+      "sessions": 38,
+      "events": 0,
+      "same": 0,
+      "different": 0,
+      "unknown": 0,
+      "duration_bins": [
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "gyro_all_missing": false
+    }
+  },
+  "training_statistics": {
+    "subjects": 28,
+    "sessions": 799,
+    "events": 116,
+    "same": 52,
+    "different": 64,
+    "unknown": 0,
+    "duration_bins": [
+      7,
+      4,
+      45,
+      45,
+      15
+    ],
+    "gyro_missing_subjects": [
+      "2f8c1acc1c1cce6aa8c2"
+    ],
+    "gyro_missing_events": 6
+  },
+  "development_statistics": {
+    "subjects": 11,
+    "sessions": 354,
+    "events": 45,
+    "same": 18,
+    "different": 27,
+    "unknown": 0,
+    "duration_bins": [
+      2,
+      2,
+      18,
+      17,
+      6
+    ],
+    "gyro_missing_subjects": [
+      "9390489a29727c2fbb8e"
+    ],
+    "gyro_missing_events": 4
+  },
+  "duration_edges_seconds": [
+    60,
+    300,
+    900,
+    1800
+  ],
+  "search": {
+    "starts": 4096,
+    "refined_starts": 16,
+    "maximum_swaps": 100,
+    "feature_names": [
+      "sessions",
+      "events",
+      "same",
+      "different",
+      "unknown",
+      "duration_bin_0",
+      "duration_bin_1",
+      "duration_bin_2",
+      "duration_bin_3",
+      "duration_bin_4"
+    ],
+    "target": [
+      352.0,
+      45.0,
+      18.0,
+      27.0,
+      0.0,
+      2.515527950310559,
+      1.6770186335403727,
+      17.608695652173914,
+      17.32919254658385,
+      5.869565217391305
+    ],
+    "weights": [
+      8.0,
+      16.0,
+      4.0,
+      4.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ],
+    "scales": [
+      352.0,
+      45.0,
+      18.0,
+      27.0,
+      1.0,
+      2.515527950310559,
+      1.6770186335403727,
+      17.608695652173914,
+      17.32919254658385,
+      5.869565217391305
+    ],
+    "objective": 0.08069838448588323,
+    "deviations": [
+      2.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      -0.5155279503105592,
+      0.3229813664596273,
+      0.39130434782608603,
+      -0.329192546583851,
+      0.13043478260869534
+    ],
+    "tie_break": "sorted_stable_subject_ids",
+    "uses_model_results": false
+  }
+}

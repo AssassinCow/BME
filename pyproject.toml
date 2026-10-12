@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "bme-eating-detection"
 version = "0.1.0"
-description = "StatsFusion v4.7.1 eating-event detection for the 2026 BME competition"
+description = "StatsFusion v4.14 eating-event detection for the 2026 BME competition"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
@@ -17,6 +17,7 @@ dependencies = [
   "PyYAML>=6,<7",
   "tqdm>=4.66,<5",
   "torch>=2.5,<3",
+  "psutil>=6,<8",
 ]
 
 [project.optional-dependencies]
@@ -33,6 +34,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["src"]
 addopts = "-q"
 
 [tool.ruff]

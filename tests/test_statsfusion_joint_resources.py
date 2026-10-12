@@ -37,8 +37,10 @@ class ResourceProbeDataset(torch.utils.data.Dataset):
 
 
 @pytest.mark.skipif(not RESOURCE_ENABLED, reason="Resource probe waits for current training to finish")
-def test_real_ten_worker_chunk_cursor_recovery():
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/statsfusion_v410_joint_event.yaml")
+@pytest.mark.parametrize("config_name", ["statsfusion_v410_joint_event.yaml", "statsfusion_v411_learned_boundary.yaml",
+                                        "statsfusion_v412_integrated_repair.yaml"])
+def test_real_ten_worker_chunk_cursor_recovery(config_name):
+    config = load_config(Path(__file__).resolve().parents[1] / "configs" / config_name)
     dataset = ResourceProbeDataset()
     sampler = SessionChunkSampler(dataset, 1)
     iterator = iter(session_loader(dataset, sampler, config))
@@ -51,9 +53,10 @@ def test_real_ten_worker_chunk_cursor_recovery():
 
 
 @pytest.mark.skipif(not RESOURCE_ENABLED or not torch.cuda.is_available(), reason="GPU resource probe deferred")
-def test_gpu_full_receptive_field_memory_and_backward():
+@pytest.mark.parametrize("config_name", ["statsfusion_v410_joint_event.yaml", "statsfusion_v411_learned_boundary.yaml"])
+def test_gpu_full_receptive_field_memory_and_backward(config_name):
     require_idle_gpu("cuda")
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/statsfusion_v410_joint_event.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs" / config_name)
     torch.cuda.reset_peak_memory_stats()
     report = validate_joint_implementation(config, device="cuda")
     assert report["peak_gpu_gb"] < 10.5
@@ -61,9 +64,10 @@ def test_gpu_full_receptive_field_memory_and_backward():
 
 
 @pytest.mark.skipif(not RESOURCE_ENABLED or not torch.cuda.is_available(), reason="GPU data pipeline probe deferred")
-def test_native_archive_joint_training_bfloat16_and_safe_checkpoint(tmp_path):
+@pytest.mark.parametrize("config_name", ["statsfusion_v410_joint_event.yaml", "statsfusion_v411_learned_boundary.yaml"])
+def test_native_archive_joint_training_bfloat16_and_safe_checkpoint(tmp_path, config_name):
     require_idle_gpu("cuda")
-    config = load_config(Path(__file__).resolve().parents[1] / "configs/statsfusion_v410_joint_event.yaml")
+    config = load_config(Path(__file__).resolve().parents[1] / "configs" / config_name)
     config["training"]["num_workers"] = 1
     config["training"]["gradient_diagnostics_every_chunks"] = 1
     config["training"]["gradient_clip_norm"] = 1000
@@ -110,10 +114,18 @@ def test_native_archive_joint_training_bfloat16_and_safe_checkpoint(tmp_path):
     payload = torch.load(directory / "latest.pt", map_location="cpu", weights_only=True)
     assert not torch.equal(initial, payload["model"]["encoder.short_fusion.0.weight"])
     assert all(torch.isfinite(value).all() for value in payload["model"].values())
-    gradients = json.loads((directory / "gradients.json").read_text(encoding="utf-8"))
-    assert any(row["event_weighted_norm"] > 0 and row["quality_weighted_norm"] > 0
-               for row in gradients if row["epoch"] == 3)
-    sampling = json.loads((directory / "sampling.json").read_text(encoding="utf-8"))
-    assert any(row["truth_jitter_candidates"] > 0 for row in sampling if row["epoch"] == 3)
+    if config["model"]["architecture"] == "statsfusion_joint_event_v411":
+        gradients = [json.loads(line)["payload"] for line in
+                     (directory / "gradients.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert any(row.get("positive_event_weighted_norm", 0) > 0 for row in gradients if row["epoch"] == 3)
+        sampling = [json.loads(line)["payload"] for line in
+                    (directory / "sampling.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert any(row["positive_loss_groups"] > 0 for row in sampling if row["epoch"] == 3)
+    else:
+        gradients = json.loads((directory / "gradients.json").read_text(encoding="utf-8"))
+        assert any(row["event_weighted_norm"] > 0 and row["quality_weighted_norm"] > 0
+                   for row in gradients if row["epoch"] == 3)
+        sampling = json.loads((directory / "sampling.json").read_text(encoding="utf-8"))
+        assert any(row["truth_jitter_candidates"] > 0 for row in sampling if row["epoch"] == 3)
     assert train_joint_model(inputs, {"fit"}, config, directory, "native_pipeline_probe", epochs=3, resume=True) == 3
     assert torch.cuda.max_memory_reserved() / 1024 ** 3 < 10.5

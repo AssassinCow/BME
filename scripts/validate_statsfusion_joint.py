@@ -14,7 +14,7 @@ from bme_eating.joint_validation import replay_joint_bundle, validate_joint_impl
 
 def main():
     parser = argparse.ArgumentParser(description="Joint model CPU/GPU smoke and native raw replay")
-    parser.add_argument("--config", default="configs/statsfusion_v410_joint_event.yaml")
+    parser.add_argument("--config", default="configs/statsfusion_v411_learned_boundary.yaml")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--bundle")
     parser.add_argument("--output")
@@ -23,7 +23,7 @@ def main():
     require_idle_gpu(arguments.device)
     if arguments.bundle:
         from pathlib import Path
-        report = replay_joint_bundle(Path(arguments.bundle), config)
+        report = replay_joint_bundle(Path(arguments.bundle), config, device=arguments.device)
     else:
         report = validate_joint_implementation(config, device=arguments.device)
     if arguments.output:

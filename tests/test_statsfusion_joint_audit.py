@@ -91,6 +91,8 @@ def test_boundary_neighbor_conflict_restores_coarse_probability_and_coordinates(
     assert chosen[1].start_ms == current.start_ms
     assert chosen[1].boundary_conflict
     assert chosen[1].rank_score < .001
+    assert chosen[1].acceptance_score == chosen[1].rank_score
+    assert chosen[1].quality_score == chosen[1].predicted_quality
     assert not chosen[1].refined
 
 

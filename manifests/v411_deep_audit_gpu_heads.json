@@ -1,0 +1,8 @@
+{
+  "boundary_updates_shared_encoder": true,
+  "boundary_shared_gradient_norm": 0.43707382678985596,
+  "heterogeneous_candidates": 128,
+  "batch1_vs128_max_error": 1.210719347000122e-08,
+  "source_sha256": "fe488975944a18d40b41f04a555253d1fc43d63a2b2f9b1419f01f1bebcdbbf4",
+  "synthetic_validation": true
+}

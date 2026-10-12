@@ -1,0 +1,49 @@
+{
+  "scope": "four extra final39 epochs and neighbor saving",
+  "source_sha256": "eeb557fb18ebb62a422c046790d0917ec2d22bfcaac590d1cd9b43d6a667a7cd",
+  "cases": {
+    "None": {
+      "latest_epoch": 10,
+      "retained_epochs": [],
+      "executed_epochs": 10
+    },
+    "8": {
+      "latest_epoch": 8,
+      "retained_epochs": [
+        4,
+        6,
+        8,
+        10,
+        12
+      ],
+      "executed_epochs": 12
+    },
+    "20": {
+      "latest_epoch": 20,
+      "retained_epochs": [
+        16,
+        18,
+        20,
+        22,
+        24
+      ],
+      "executed_epochs": 24
+    },
+    "64": {
+      "latest_epoch": 64,
+      "retained_epochs": [
+        60,
+        62,
+        64,
+        66,
+        68
+      ],
+      "executed_epochs": 68
+    }
+  },
+  "rng_unchanged": true,
+  "atomic_writes_complete": true,
+  "original_lr_schedule_unchanged": true,
+  "automatic_selection_added": false,
+  "default_deployment_epoch_unchanged": true
+}
