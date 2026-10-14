@@ -347,7 +347,7 @@ def test_replay_hash_rejects_changed_cache(config, tmp_path):
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, torch.OutOfMemoryError])
 def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, failure, *,
                                             epochs=1, deployment_epoch=None, interruption_epoch=1,
-                                            empty_source_validation=False):
+                                            empty_source_validation=False, periodic_baseline=False):
     from types import SimpleNamespace
 
     import pandas as pd
@@ -413,6 +413,16 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
     monkeypatch.setattr(trainer, "generate_chunk", generated)
     monkeypatch.setattr(trainer, "loss_schedule", lambda epoch: {"event": 1, "quality": 1,
         "boundary": 0, "contrastive": 0, "truth_jitter": 0})
+    neighbor_epochs = {deployment_epoch + offset for offset in (-4, -2, 0, 2, 4)
+                       if 0 < deployment_epoch + offset <= epochs} if deployment_epoch is not None else set()
+    if periodic_baseline:
+        original_save = trainer.save_torch_atomic
+        def save_checkpoint(path, payload):
+            if ("continuous" in path.parts and path.parent.name == "nearby"
+                    and payload["epoch"] not in neighbor_epochs):
+                return
+            return original_save(path, payload)
+        monkeypatch.setattr(trainer, "save_torch_atomic", save_checkpoint)
     inputs = SimpleNamespace(identity={"data": "fixture"})
     subjects = {"fit"} | ({f"audit_subject_{index}" for index in range(38)} if deployment_epoch is not None else set())
     if empty_source_validation:
@@ -472,7 +482,26 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
                 torch.testing.assert_close(value, resumed_resume["optimizer"]["state"][parameter][name], rtol=0, atol=0)
         for directory in ("continuous", "interrupted"):
             checkpoints = sorted((tmp_path / directory / "nearby").glob("*.pt"))
-            assert [int(path.stem.split("_")[-1]) for path in checkpoints] == [4, 6, 8, 10, 12]
+            periodic_epochs = set() if periodic_baseline and directory == "continuous" else set(range(4, epochs + 1, 4))
+            expected_epochs = sorted(periodic_epochs | neighbor_epochs)
+            assert [int(path.stem.split("_")[-1]) for path in checkpoints] == expected_epochs
+        for retained_epoch in sorted(neighbor_epochs if periodic_baseline else set(expected_epochs)):
+            filename = f"nearby/epoch_{retained_epoch:03d}.pt"
+            original_checkpoint = torch.load(tmp_path / "continuous" / filename, weights_only=True)
+            resumed_checkpoint = torch.load(tmp_path / "interrupted" / filename, weights_only=True)
+            assert original_checkpoint["epoch"] == resumed_checkpoint["epoch"] == retained_epoch
+            for name in original_checkpoint["model"]:
+                torch.testing.assert_close(original_checkpoint["model"][name],
+                                           resumed_checkpoint["model"][name], rtol=0, atol=0)
+    else:
+        assert not (tmp_path / "continuous/nearby").exists()
+        assert not (tmp_path / "interrupted/nearby").exists()
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt, torch.OutOfMemoryError])
+def test_final39_periodic_checkpoints_preserve_resume_and_deployment(config, tmp_path, monkeypatch, failure):
+    test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, failure,
+        epochs=16, deployment_epoch=12, interruption_epoch=4, periodic_baseline=True)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")

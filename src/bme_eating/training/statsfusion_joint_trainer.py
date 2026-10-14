@@ -969,9 +969,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             raise RuntimeError("Epoch checkpoint finite gate failed")
         if deployment_epoch is None or epoch <= deployment_epoch:
             save_torch_atomic(directory / "latest.pt", epoch_payload)
-        if deployment_epoch is not None and epoch in {
+        if deployment_epoch is not None and (epoch % 4 == 0 or epoch in {
                 deployment_epoch - 4, deployment_epoch - 2, deployment_epoch,
-                deployment_epoch + 2, deployment_epoch + 4}:
+                deployment_epoch + 2, deployment_epoch + 4}):
             save_torch_atomic(directory / "nearby" / f"epoch_{epoch:03d}.pt", epoch_payload)
         record = {"epoch": epoch, "clipping_fraction": fraction, "promotion_eligible": qualification,
                   "chunks": len(sampler.chunks), "sessions": len(session_lengths),

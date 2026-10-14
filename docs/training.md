@@ -11,7 +11,7 @@ v4.14的训练、源码快照、缓存及诊断写入`$BME_OUTPUT_ROOT/v414/runs
 ## 两次训练
 
 1. `dev`：28人从头训练，11人开发验证选择E。normalization仅在28人自然数据上拟合。最大64轮，epoch8起每2轮验证，保留操作点资格、clipping与两类早停规则。
-2. `final39`：39人从头训练，采用相同64轮LR时间轴，不重新选epoch。运行至E+4并保存五档邻近checkpoint，默认最终模型为E。
+2. `final39`：39人从头训练，采用相同64轮LR时间轴，不重新选epoch。运行至E+4，保存每4轮（4、8、12…）权重及E−4/E−2/E/E+2/E+4五档邻近checkpoint；重复轮次只保存一次，默认最终模型为E。
 3. 最终模型在11名开发受试者上重新拟合Platt校准器和搜索操作点，明确记录这些标签已参与最终训练。16038个操作点全部保留；部署Boundary固定off。
 4. `export/replay`：资格及证据hash通过后原子导出bundle，验证锁定因果推理与无XGBoost重放。
 
@@ -49,7 +49,7 @@ Ctrl+C为PAUSED；OOM及其他异常为FAILED。未完成epoch不标记完成；
 | `identity.json`, `resolved_config.json`, `source_snapshot/` | 数据、源码、运行与配置身份 |
 | `split_manifest.json`, `dev_selection.json` | 冻结成员与开发选模证据 |
 | `dev/model/`, `final39/model/` | 模型、resume状态和训练日志 |
-| `final39/model/nearby/` | E−4/E−2/E/E+2/E+4权重 |
+| `final39/model/nearby/` | 每4轮权重及E−4/E−2/E/E+2/E+4邻近权重；不自动选优 |
 | `final39_training_manifest.json` | 固定epoch、从头训练及资格 |
 | `calibration_manifest.json`, `operating_point.json` | 最终开发校准与锁定操作点 |
 | `final_manifest.json`, `SHA256SUMS.json` | 导出资格与证据完整性 |
