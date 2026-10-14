@@ -3,12 +3,13 @@ from __future__ import annotations
 import random
 import time
 from contextlib import contextmanager
+from copy import deepcopy
 
 import numpy as np
 import torch
 
 from bme_eating.artifacts import sha256_file
-from bme_eating.candidates import stable_id
+from bme_eating.candidates import candidate_order_key, decision_key, geometry_key, stable_id
 from bme_eating.prediction_cache import feature_binding
 from bme_eating.progress import progress
 from bme_eating.proposal_stream import make_stream
@@ -33,6 +34,26 @@ def preserve_training_state(model):
             torch.cuda.set_rng_state_all(cuda_rng)
 
 
+def merge_replay_candidates(candidates):
+    representatives, duplicates = {}, []
+    for candidate in candidates:
+        candidate.validate()
+    for candidate in sorted(candidates, key=candidate_order_key):
+        geometry = geometry_key(candidate)
+        if geometry not in representatives:
+            representatives[geometry] = deepcopy(candidate)
+            continue
+        first = representatives[geometry]
+        flags = candidate.generation_parameters.get("source_flags", [candidate.source])
+        if decision_key(first) == decision_key(candidate):
+            first.generation_parameters["source_flags"] = sorted(set(
+                first.generation_parameters.get("source_flags", [first.source]) + flags))
+        duplicates.append({"geometry": geometry, "proposal_id": candidate.proposal_id,
+            "representative_id": first.proposal_id, "decision_time_ms": candidate.decision_time_ms,
+            "decision_phase": candidate.decision_phase, "source_flags": sorted(set(flags))})
+    return sorted(representatives.values(), key=candidate_order_key), duplicates
+
+
 def replay_session(model, inputs, config, preprocessing, dataset, sampler, key, directory,
                    identity, epoch, update, stored=None):
     from bme_eating.training.statsfusion_joint_trainer import (
@@ -54,7 +75,7 @@ def replay_session(model, inputs, config, preprocessing, dataset, sampler, key, 
         return payload, stored
     started = time.monotonic()
     streams = {name: make_stream(*key, identity, decoder) for name, decoder in decoder_settings(config).items()}
-    candidates, timeline, features = {}, [], []
+    candidates, timeline, features = [], [], []
     device = next(model.parameters()).device
     chunks = [item for item in sampler.chunks if item[3] == key]
     previous_training = dataset.training
@@ -80,20 +101,19 @@ def replay_session(model, inputs, config, preprocessing, dataset, sampler, key, 
                     pool = generate_chunk(stream, times, packed)
                     if last:
                         pool.extend(stream.finish())
-                    for item in pool:
-                        geometry = (item.decision_time_ms, item.start_ms, item.end_ms)
-                        if geometry not in candidates or item.proposal_id < candidates[geometry].proposal_id:
-                            candidates[geometry] = item
+                    candidates.extend(pool)
                 enforce_resources(config, device)
     finally:
         dataset.training = previous_training
+    candidates, duplicates = merge_replay_candidates(candidates)
     payload = {"binding": binding, "times": torch.cat(timeline), "features": torch.cat(features),
-               "candidates": sorted(candidates.values(), key=lambda item: (item.decision_time_ms, item.proposal_id)),
+               "candidates": candidates, "duplicates": duplicates,
                "seconds": time.monotonic() - started}
     path.parent.mkdir(parents=True, exist_ok=True)
     save_torch_atomic(path, payload)
     manifest = {"binding": binding, "path": str(path), "sha256": sha256_file(path),
-                "cursor": 0, "released": 0, "seconds": payload["seconds"]}
+                "cursor": 0, "released": 0, "duplicate_cursor": 0, "duplicates_released": 0,
+                "seconds": payload["seconds"]}
     return payload, manifest
 
 
@@ -103,6 +123,14 @@ def release_candidates(payload, state, observed_ms):
     while stop < len(pool) and pool[stop].decision_time_ms <= observed_ms:
         stop += 1
     state["cursor"], state["released"] = stop, state["released"] + stop - cursor
+    duplicates = payload.get("duplicates", [])
+    duplicate_cursor = state.get("duplicate_cursor", 0)
+    duplicate_stop = duplicate_cursor
+    while duplicate_stop < len(duplicates) and duplicates[duplicate_stop]["decision_time_ms"] <= observed_ms:
+        duplicate_stop += 1
+    state["duplicate_cursor"] = duplicate_stop
+    state["duplicates_released"] = state.get("duplicates_released", 0) + duplicate_stop - duplicate_cursor
+    state["last_duplicates"] = duplicates[duplicate_cursor:duplicate_stop]
     return pool[cursor:stop]
 
 
@@ -112,7 +140,7 @@ def naturalize_jitter(candidates, times, features, natural_candidates):
             continue
         observed = [item for item in natural_candidates if item.decision_time_ms <= candidate.decision_time_ms]
         parent = min(observed, key=lambda item: (abs(item.start_ms - candidate.start_ms)
-                     + abs(item.end_ms - candidate.end_ms), item.proposal_id)) if observed else None
+                     + abs(item.end_ms - candidate.end_ms), candidate_order_key(item))) if observed else None
         if parent:
             candidate.raw_score = parent.raw_score
             candidate.scale_seconds = parent.scale_seconds

@@ -9,6 +9,8 @@ import torch
 
 from bme_eating.config import load_config
 from bme_eating.protocol import (
+    CHECKPOINT_STATE_VERSION,
+    PROTOCOL,
     checkpoint_qualified,
     execution_failure_status,
     initialize_run,
@@ -24,6 +26,7 @@ def test_failure_status_ctrl_c_oom():
 
 def test_checkpoint_filters_clipping_finite_identity_lineage():
     payload = {"epoch_complete": True, "promotion_eligible": True, "epoch": 8,
+               "protocol": PROTOCOL, "state_version": CHECKPOINT_STATE_VERSION,
                "clipping_fraction": .1, "identity": "identity", "training_subjects": ["fit"],
                "model": {"parameter": torch.ones(2)}}
     assert checkpoint_qualified(payload, "identity", {"fit"}, 8)

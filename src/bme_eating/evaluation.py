@@ -15,6 +15,7 @@ from bme_eating.candidates import (
     JointCandidate,
     OnlineBudget,
     candidate_targets,
+    decision_key,
 )
 from bme_eating.metrics import evaluate_events, interval_iou_matrix, prediction_ignore_mask
 from bme_eating.protocol import EVENT_PROBABILITY_FORMULAS, supported
@@ -138,15 +139,15 @@ def apply_online_budget(candidates: list[JointCandidate], windows: pd.DataFrame,
                 if candidate.subject_key == str(subject) and candidate.session_id == str(session)]
         decisions: dict[int, list[JointCandidate]] = {}
         for candidate in pool:
-            decisions.setdefault(candidate.decision_time_ms, []).append(candidate)
+            decisions.setdefault(decision_key(candidate), []).append(candidate)
         tracker = OnlineBudget(budget, quotas)
         group = group.sort_values("timestamp_ms")
         timeline = group.timestamp_ms.to_numpy()
         exposure = np.cumsum(group.valid.to_numpy() > 0) * 3
         observed = 0
         for decision in sorted(decisions):
-            position = int(np.searchsorted(timeline, decision))
-            if position >= len(timeline) or timeline[position] != decision:
+            position = int(np.searchsorted(timeline, decision[0]))
+            if position >= len(timeline) or timeline[position] != decision[0]:
                 raise RuntimeError("Candidate decision has no corresponding observed input time")
             tracker.observe(float(exposure[position] - observed), 1)
             observed = exposure[position]
@@ -174,7 +175,7 @@ def commit_candidates(candidates: list[JointCandidate], calibrator: NonnegativeP
         if candidate.coarse_event_logit is not None:
             candidate.coarse_probability = float(calibrator.transform(candidate.coarse_event_logit))
         decisions.setdefault((candidate.subject_key, candidate.session_id,
-                               candidate.decision_time_ms), []).append(candidate)
+                               *decision_key(candidate)), []).append(candidate)
     for key in sorted(decisions):
         committer.submit(decisions[key])
     return (committer.committed, committer.diagnostics) if return_diagnostics else committer.committed

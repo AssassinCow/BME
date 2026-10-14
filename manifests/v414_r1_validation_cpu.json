@@ -1,0 +1,62 @@
+{
+  "shared_event_quality_gradients": true,
+  "repeat_max_error": 0.0,
+  "long_event": {
+    "event_duration_seconds": 13023,
+    "chunks": [
+      1,
+      17,
+      256,
+      4362
+    ],
+    "three_second_increment_actual_return_latency_seconds": 0.0,
+    "batch_input_available_time_recorded": true,
+    "event_count": 1,
+    "identities": [
+      "f5886ef415ceb09d6d71ec4a"
+    ],
+    "max_latency_seconds": 0.0
+  },
+  "device": "cpu",
+  "raw_session": {
+    "native_motion_samples": 6001,
+    "native_ppg_samples": 3001,
+    "new_chunk_steps": [
+      10,
+      20
+    ],
+    "feature_max_error": 2.6226043701171875e-06,
+    "event_score_max_error": 0.0,
+    "event_identity_alignment": true,
+    "timestamp_alignment": true,
+    "incremental_native_chunks": true,
+    "public_event_schema": true
+  },
+  "gpu_validation_performed": false,
+  "localization_receptive_field_seconds": 45,
+  "localization_dependency_seconds": {
+    "motion_blocks": 3,
+    "statistics_window": 15,
+    "ppg_block": 15,
+    "ppg_maximum_hold": 12,
+    "temporal_history": 18
+  },
+  "candidate_batch128_max_error": 4.0978193283081055e-08,
+  "coordinate_selection_discrete": true,
+  "history_gradient_detached": true,
+  "elapsed_seconds": 59.28100000000268,
+  "protocol": "statsfusion-joint-event-v6",
+  "config_sha256": "4156d559a78e886b481a7ead858e28d14814afe4c497cf0e7e3d7732fd40bb39",
+  "source_sha256": "225c349e4d54796af5056a68652bb8296783bc082b060946fbfb694c88781b6e",
+  "runtime": {
+    "python": "3.11.16 | packaged by conda-forge | (main, Sep  2 2026, 23:31:17) [MSC v.1944 64 bit (AMD64)]",
+    "executable": "C:\\Users\\LZX\\anaconda3\\envs\\bme-model\\python.exe",
+    "torch": "2.5.1",
+    "cuda": "12.4",
+    "platform": "Windows-10-10.0.26200-SP0",
+    "conda_environment": "base",
+    "gpu": "NVIDIA GeForce RTX 4080 Laptop GPU"
+  },
+  "synthetic_validation": true,
+  "formal_five_fold_training": false
+}

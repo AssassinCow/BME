@@ -111,11 +111,11 @@ def refine(model, candidate, times, features, device, boundary, entropy, *, embe
     return result
 
 
-def boundary_loss(model, candidate, target, times, features, device, boundary, embedding):
+def boundary_loss(model, candidate, target, times, features, device, boundary, embedding, *, return_eligibility=False):
     positive, _, _, true_start, true_end = target
     zero = embedding.sum() * 0
     if not positive:
-        return zero
+        return (zero, False) if return_eligibility else zero
     losses = []
     for endpoint, truth_endpoint in enumerate((true_start, true_end)):
         if truth_endpoint > candidate.decision_time_ms:
@@ -129,4 +129,5 @@ def boundary_loss(model, candidate, target, times, features, device, boundary, e
         if logits is not None and int(support[0]) <= truth_endpoint <= int(support[-1]):
             distribution = gaussian_distribution(support, truth_endpoint, boundary.get("sigma_seconds", 9))
             losses.append(-(distribution * logits.float().log_softmax(0)).sum())
-    return torch.stack(losses).mean() if losses else zero
+    result = torch.stack(losses).mean() if losses else zero
+    return (result, bool(losses)) if return_eligibility else result

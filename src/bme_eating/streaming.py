@@ -44,7 +44,6 @@ class JointChunkDetector:
         self.times = torch.empty(0, dtype=torch.int64)
         self.features = torch.empty(0, capabilities(self.model).feature_width)
         self.finished = False
-        self.pending_decision = []
         from bme_eating.feature_cache import BlockedHistory
         self.history = BlockedHistory()
 
@@ -61,27 +60,24 @@ class JointChunkDetector:
         self.history.append(times, features)
         self.times, self.features = self.history.times, self.history.features
         emitted = []
+        available_time = int(times[-1]) if len(times) else int(self.times[-1]) if len(self.times) else None
         for index, (timestamp, values) in enumerate(zip(times.tolist(), features.cpu().numpy())):
-            if self.pending_decision:
-                emitted.extend(self._decide(self.pending_decision))
-                self.pending_decision = []
             self.budget.observe(3, float(values[128]))
             probabilities = {"state": float(values[129]),
                              **{f"proposal_{scale}": float(values[130 + index])
                                 for index, scale in enumerate((3, 15, 60))}}
             arguments = (int(timestamp), probabilities, float(values[128]), float(values[134]))
             candidates = (self.stream.observe(*arguments, onset_probability=float(values[133])))
+            emitted.extend(self._decide(candidates))
             if final and index == len(times) - 1:
-                candidates.extend(self.stream.finish())
-            if not final and index == len(times) - 1:
-                self.pending_decision = candidates
-            else:
-                emitted.extend(self._decide(candidates))
+                emitted.extend(self._decide(self.stream.finish()))
         if final:
             if not len(times):
-                emitted.extend(self._decide(self.pending_decision + self.stream.finish()))
-                self.pending_decision = []
+                emitted.extend(self._decide(self.stream.finish()))
             self.finished = True
+        for candidate in emitted:
+            candidate.input_available_time_ms = available_time
+            candidate.emitted_at_ms = available_time
         return [candidate.to_dict() for candidate in emitted]
 
     def _decide(self, candidates):
@@ -189,6 +185,11 @@ class JointRawStream:
         if final and not self.detector.finished:
             emitted.extend(self.detector.push_features(torch.empty(0, dtype=torch.int64),
                                                        torch.empty(0, capabilities(self.detector.model).feature_width), final=True))
+        available_time = max((int(values[-1]) for values in
+            (self.raw.motion_timestamp_ms, self.raw.ppg_timestamp_ms) if len(values)), default=None)
+        for candidate in emitted:
+            candidate["input_available_time_ms"] = available_time
+            candidate["emitted_at_ms"] = available_time
         self.diagnostics.extend(emitted)
         return public_events(emitted)
 
@@ -210,5 +211,10 @@ class JointDetector:
         detector, events = self.new_session(subject, session), []
         for batch, final in causal_raw_batches(raw, self.preprocessing, self.config, new_steps):
             events.extend(detector.push_batch(batch, final=final))
+        available_time = max((int(values[-1]) for values in
+            (raw.motion_timestamp_ms, raw.ppg_timestamp_ms) if len(values)), default=None)
+        for candidate in events:
+            candidate["input_available_time_ms"] = available_time
+            candidate["emitted_at_ms"] = available_time
         self.last_event_diagnostics = events
         return public_events(events)

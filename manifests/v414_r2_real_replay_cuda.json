@@ -1,0 +1,90 @@
+{
+  "passed": true,
+  "disposable_audit_weights": true,
+  "formal_run_started": false,
+  "synthetic_cdf_and_calibration_for_consistency_only": true,
+  "label_use": "audit_selection_and_search_only",
+  "checkpoint_sha256": "ae2b19bca21ccb06615cbc2063f5c48f13525e00be452e5d928e8f9c37b05c84",
+  "source_sha256": "7318e4c20b4f3f744d92e6c455874c3deaa8be498c608085e47aac8471746b90",
+  "data_sha256": "9d1656d4ca7e41c57585e6fbfa6f323833554fcb51c71ee9f7e13afe335f5fcb",
+  "config_sha256": "181a5bb0fb2baae63deb5fdcc8398477729a9d36777da86aa94de731258f61e2",
+  "sessions": [
+    {
+      "subject": "64124e0fe3248a92d711",
+      "session": "cc14017e0f79af253445",
+      "selection_duration_seconds": 29.0,
+      "motion_samples": 9408,
+      "ppg_samples": 4704,
+      "chunks": [
+        128,
+        256
+      ],
+      "elapsed_seconds": [
+        0.5310000000026776,
+        0.21899999999732245
+      ],
+      "event_count": 1,
+      "score_max_error": 0.0,
+      "identity_alignment": true
+    },
+    {
+      "subject": "64124e0fe3248a92d711",
+      "session": "f5ea5ae8a1746ea19bba",
+      "selection_duration_seconds": 13022.0,
+      "motion_samples": 3557275,
+      "ppg_samples": 1778641,
+      "chunks": [
+        128,
+        256
+      ],
+      "elapsed_seconds": [
+        455.4530000000086,
+        237.17199999999139
+      ],
+      "event_count": 1,
+      "score_max_error": 3.7227406712858624e-09,
+      "identity_alignment": true
+    }
+  ],
+  "elapsed_seconds": 694.4220000000059,
+  "search_benchmark": {
+    "passed": true,
+    "registered_points": 16038,
+    "metric_mismatches": 0,
+    "reference_seconds": 82.23300000010931,
+    "cached_seconds": 3.6729999998933636,
+    "search_speedup": 22.388510754831675,
+    "target_twofold_met": true,
+    "candidate_count": 909,
+    "sessions": [
+      [
+        "1ff38584c81d9c19806c",
+        "2fb023922d4ea6f97829"
+      ],
+      [
+        "3bf8358d6c8ba2813dd9",
+        "1018772631cfa1156485"
+      ],
+      [
+        "64124e0fe3248a92d711",
+        "cc14017e0f79af253445"
+      ],
+      [
+        "2f8c1acc1c1cce6aa8c2",
+        "801b72eb31f2c9031ac6"
+      ]
+    ],
+    "scope": "search_only_on_real_audit_subset",
+    "calibration": "fixed_for_equivalence_only",
+    "same_weights_and_candidates": true,
+    "directory": "C:\\Users\\LZX\\AppData\\Local\\Temp\\bme_v414_r2_search_3ki5sy2l"
+  },
+  "resources": {
+    "peak_process_ram_gb": 2.9159774780273438,
+    "peak_gpu_gb": 0.18901920318603516,
+    "peak_gpu_reserved_gb": 0.328125,
+    "process_tree_private_ram_gb": 3.800281524658203,
+    "peak_process_tree_private_ram_gb": 3.800281524658203,
+    "worker_process_count": 0
+  }
+}

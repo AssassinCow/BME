@@ -3,16 +3,23 @@ from __future__ import annotations
 import math
 import time
 from collections import Counter
+from copy import deepcopy
 
 import numpy as np
 import torch
 from torch.nn import functional as F
 
 from bme_eating.amp import training_inference
-from bme_eating.candidate_scoring import boundary_loss, refine, score_candidates
-from bme_eating.candidates import candidate_targets, stable_id
+from bme_eating.candidate_scoring import boundary_loss, score_candidates
+from bme_eating.candidates import candidate_order_key, candidate_targets, geometry_key, stable_id
 from bme_eating.models.statsfusion_joint_event import quality_focal_loss
 from bme_eating.protocol import supported
+from bme_eating.training.contributions import (
+    ContributionBank as ContributionBank,
+)
+from bme_eating.training.contributions import (
+    PositiveGradientBuffer as PositiveGradientBuffer,
+)
 
 
 def group_losses(model, groups, truth, times, features, device, boundary, config, schedule,
@@ -25,7 +32,7 @@ def group_losses(model, groups, truth, times, features, device, boundary, config
     results, label_changes = [], []
     for group in groups:
         losses = {name: [] for name in ("event", "quality", "boundary")}
-        quality_pairs = []
+        quality_pairs, version_tasks, pair_tasks = [], [], []
         for candidate in group["versions"]:
             score = score_by_id[candidate.proposal_id]
             target = candidate_targets(candidate, truth)
@@ -35,47 +42,38 @@ def group_losses(model, groups, truth, times, features, device, boundary, config
                                                             torch.tensor([positive], device=device))
             quality_loss = quality_focal_loss(score["quality_logit"].float(),
                 torch.tensor([quality], device=device), config["loss"]["quality_beta"]).mean()
-            candidate_boundary = boundary_loss(model, candidate, target, times, features, device,
-                boundary, score["candidate_embedding"][0]) if schedule["boundary"] and (
-                    config.get("ablation", {}).get("name") != "no_boundary") else score["event_logit"].sum() * 0
-            if schedule["boundary"] and config.get("ablation", {}).get("name") != "no_boundary":
-                with training_inference(device, cache_safe=supported(model, "stabilized")):
-                    refined = refine(model, candidate, times, features, device,
-                        {**boundary, "qualified": True, "mode": "both"}, .65,
-                        embedding=score["candidate_embedding"][0].detach(), rescore=False)
-                if refined.refined:
-                    new_target = candidate_targets(refined, truth)
-                    new_score = score_candidates(model, [refined], times, features, device, **scoring_options)[0]
-                    event_loss = (event_loss + F.binary_cross_entropy_with_logits(
-                        new_score["event_logit"].float(), torch.tensor([new_target[0]], device=device))) / 2
-                    quality_loss = (quality_loss + quality_focal_loss(new_score["quality_logit"].float(),
-                        torch.tensor([new_target[1]], device=device), config["loss"]["quality_beta"]).mean()) / 2
-                    candidate_boundary = (candidate_boundary + boundary_loss(model, refined, new_target,
-                        times, features, device, boundary, new_score["candidate_embedding"][0])) / 2
-                    label_changes.append({"proposal_id": candidate.proposal_id,
-                        "before_target": list(target), "after_target": list(new_target)})
-                    ranking_quality, ranking_logit = new_target[1], new_score["quality_logit"].float().squeeze()
+            candidate_boundary, boundary_legal = boundary_loss(model, candidate, target, times, features, device,
+                boundary, score["candidate_embedding"][0], return_eligibility=True) if schedule["boundary"] and (
+                    config.get("ablation", {}).get("name") != "no_boundary") else (score["event_logit"].sum() * 0, False)
             losses["event"].append(event_loss)
             losses["quality"].append(quality_loss)
-            losses["boundary"].append(candidate_boundary)
+            if boundary_legal:
+                losses["boundary"].append(candidate_boundary)
             quality_pairs.append((ranking_quality, ranking_logit))
+            version_tasks.append({"geometry": (candidate.start_ms, candidate.end_ms),
+                "event": event_loss, "quality": quality_loss, "boundary": candidate_boundary,
+                "boundary_legal": boundary_legal})
         ranking = []
         if config.get("ablation", {}).get("name") != "single_candidate":
             for first, (left_quality, left_score) in enumerate(quality_pairs):
-                for right_quality, right_score in quality_pairs[first + 1:]:
+                for second, (right_quality, right_score) in enumerate(quality_pairs[first + 1:], first + 1):
                     difference = left_quality - right_quality
                     if abs(difference) >= config["loss"]["ranking_minimum_iou_difference"]:
-                        ranking.append(F.softplus(-(left_score - right_score) * (1 if difference > 0 else -1)))
-        losses["boundary"] = [value for value in losses["boundary"] if float(value.detach()) > 0]
+                        value = F.softplus(-(left_score - right_score) * (1 if difference > 0 else -1))
+                        ranking.append(value)
+                        pair_tasks.append({"geometries": (version_tasks[first]["geometry"],
+                            version_tasks[second]["geometry"]), "quality_ranking": value})
         tasks = {name: torch.stack(values).mean() if values else scores[0]["event_logit"].sum() * 0
                  for name, values in losses.items()}
         tasks["quality_ranking"] = torch.stack(ranking).mean() if ranking else tasks["quality"] * 0
+        tasks["_legal_auxiliary"] = {"boundary": bool(losses["boundary"]), "quality_ranking": bool(ranking)}
+        tasks["_versions"], tasks["_pairs"] = version_tasks, pair_tasks
         results.append((group, tasks))
     return results, label_changes
 
 
 def historical_contrastive(model, current, current_ids, current_phases, times, history, truth,
-                           subject, session, config, *, ignore=None):
+                           subject, session, config, *, ignore=None, diagnostics=None):
     from bme_eating.models.statsfusion_joint_event import event_contrastive_loss
     limit = config["loss"]["contrastive_max_pairs"]
     selected = truth[(truth.subject_key.astype(str) == subject) & (truth.session_id.astype(str) == session)]
@@ -94,11 +92,30 @@ def historical_contrastive(model, current, current_ids, current_phases, times, h
             identities.extend([index] * len(indices))
             phases.extend((((times[indices] - event.start_ms) * 3) //
                            (event.end_ms - event.start_ms)).clamp(0, 2).tolist())
+    background = valid_history.clone()
+    for event in selected.itertuples(index=False):
+        background &= (times <= event.start_ms - 30_000) | (times >= event.end_ms + 30_000)
+    indices = background.nonzero().flatten()
+    if len(indices):
+        indices = indices[torch.linspace(0, len(indices) - 1, min(len(indices), 12)).long()]
+        masks.extend(indices.tolist())
+        identities.extend([-2] * len(indices))
+        phases.extend([0] * len(indices))
     projected = model.contrastive_projection(current)
-    if not masks:
-        return event_contrastive_loss(projected, current_ids, current_phases,
+    chosen = bounded_history(masks, identities, phases, config["loss"]["contrastive_max_history_bins"])
+    if diagnostics is not None:
+        diagnostics.update({"positive_anchors": int(((current_ids >= 0) & (current_phases >= 0)).sum()),
+            "history_positive_bins": sum(identity >= 0 for _, identity, _ in chosen),
+            "history_background_bins": sum(identity == -2 for _, identity, _ in chosen),
+            "history_discovered_bins": len(masks), "history_retained_bins": len(chosen),
+            "history_truncated_bins": len(masks) - len(chosen)})
+    if not chosen:
+        result = event_contrastive_loss(projected, current_ids, current_phases,
             temperature=config["loss"]["contrastive_temperature"], maximum_pairs=limit)
-    chosen = sorted(zip(masks, identities, phases))[:limit]
+        if diagnostics is not None:
+            diagnostics.update({"valid_pairs": result[1], "zero_reason":
+                "no_legal_current_positive_negative_pairs" if result[1] == 0 else None})
+        return result
     mask = torch.zeros(len(times), dtype=torch.bool)
     mask[[item[0] for item in chosen]] = True
     with torch.no_grad():
@@ -116,7 +133,40 @@ def historical_contrastive(model, current, current_ids, current_phases, times, h
         if positive.any() and negative.any():
             similarities = all_values[anchor] @ all_values.T / config["loss"]["contrastive_temperature"]
             losses.append(-(similarities[positive] - torch.logsumexp(similarities[positive | negative], 0)).mean())
+    if diagnostics is not None:
+        diagnostics.update({"valid_pairs": len(losses), "zero_reason":
+            "no_legal_positive_negative_pairs" if not losses else None})
     return (torch.stack(losses).mean(), len(losses)) if losses else (projected.sum() * 0, 0)
+
+
+def bounded_history(indices, identities, phases, maximum):
+    unique = {}
+    for index, identity, phase in zip(indices, identities, phases, strict=True):
+        if index in unique and unique[index] != (identity, phase):
+            raise RuntimeError("Conflicting historical contrastive labels")
+        unique[index] = identity, phase
+    records = sorted((index, *label) for index, label in unique.items())
+    if len(records) <= maximum:
+        return records
+    selected = [record for record in records if record[1] == -2]
+    if len(selected) > maximum:
+        raise RuntimeError("Historical background reservation exceeds reference limit")
+    buckets = {}
+    for record in records:
+        if record[1] >= 0:
+            buckets.setdefault(record[1:], []).append(record)
+    counts = dict.fromkeys(buckets, 0)
+    available = maximum - len(selected)
+    while available and any(counts[key] < len(bucket) for key, bucket in buckets.items()):
+        for key in sorted(buckets):
+            if available and counts[key] < len(buckets[key]):
+                counts[key] += 1
+                available -= 1
+    for key, count in counts.items():
+        if count:
+            positions = np.linspace(0, len(buckets[key]) - 1, count).astype(int)
+            selected.extend(buckets[key][position] for position in positions)
+    return sorted(selected)
 
 
 def subject_weights(session_keys):
@@ -157,16 +207,16 @@ def apply_learning_rate(optimizer, state, training, epoch_position):
 def describe_group(group, truth):
     versions = group["versions"]
     qualities = [candidate_targets(candidate, truth)[1] for candidate in versions]
-    return {"id": stable_id(group["family"], group["event_key"],
-                            sorted((item.start_ms, item.end_ms) for item in versions)),
+    return {"id": stable_id(group["event_key"], sorted(candidate_order_key(item) for item in versions)),
             "maximum_iou": max(qualities), "bins": sorted({min(2, math.ceil(quality * 4) - 2)
                 for quality in qualities if quality > .25}),
             "decision": max(item.decision_time_ms for item in versions),
-            "geometries": sorted((item.start_ms, item.end_ms) for item in versions)}
+            "geometries": [(item.start_ms, item.end_ms) for item in versions],
+            "qualities": qualities}
 
 
-def retained_groups(descriptors, maximum=3):
-    remaining = {item["id"]: item for item in descriptors}
+def retained_groups(descriptors, maximum=3, *, diagnostics=None):
+    remaining = {item["id"]: deepcopy(item) for item in descriptors if item["maximum_iou"] > .25}
     selected = []
     while remaining and len(selected) < maximum:
         covered = {band for item in selected for band in item["bins"]}
@@ -182,13 +232,25 @@ def retained_groups(descriptors, maximum=3):
         selected.append(item)
         remaining.pop(item["id"])
         used = set(map(tuple, item["geometries"]))
+        for candidate in remaining.values():
+            qualities = candidate.get("qualities", [candidate["maximum_iou"]] * len(candidate["geometries"]))
+            unique = [(geometry, quality) for geometry, quality in zip(candidate["geometries"], qualities)
+                      if tuple(geometry) not in used]
+            candidate["geometries"] = [geometry for geometry, _ in unique]
+            candidate["qualities"] = [quality for _, quality in unique]
+            candidate["maximum_iou"] = max(candidate["qualities"], default=0)
+            candidate["bins"] = sorted({min(2, math.ceil(quality * 4) - 2)
+                for quality in candidate["qualities"] if quality > .25})
+            if candidate["maximum_iou"] <= .25 and diagnostics is not None:
+                diagnostics.append({"group": candidate["id"], "reason": "no_positive_after_dedup",
+                                    "remaining_versions": len(candidate["geometries"])})
         remaining = {identity: candidate for identity, candidate in remaining.items()
-                     if not used.intersection(map(tuple, candidate["geometries"]))}
+                     if candidate["geometries"] and candidate["maximum_iou"] > .25}
     return selected
 
 
 def _versions(candidates, truth):
-    ordered = sorted(candidates, key=lambda item: (-candidate_targets(item, truth)[1], item.proposal_id))
+    ordered = sorted(candidates, key=lambda item: (-candidate_targets(item, truth)[1], candidate_order_key(item)))
     selected, bins = [], set()
     for item in ordered:
         band = min(3, max(0, math.ceil(candidate_targets(item, truth)[1] * 4) - 1))
@@ -213,7 +275,7 @@ def _stratum(group):
 
 def _rotate_strata(groups, rng):
     strata = {}
-    for group in sorted(groups, key=lambda item: item["family"]):
+    for group in sorted(groups, key=lambda item: candidate_order_key(item["versions"][0])):
         strata.setdefault(_stratum(group), []).append(group)
     keys = sorted(strata, key=str)
     rng.shuffle(keys)
@@ -228,10 +290,26 @@ def _rotate_strata(groups, rng):
 
 
 def sample_groups(model, candidates, truth, config, rng, positive_state, used_families,
-                  times, features, device, teacher_fraction=0, *, performance=None):
+                  times, features, device, teacher_fraction=0, *, performance=None, locked_geometries=None):
     started = time.monotonic()
     families = {}
-    for candidate in candidates:
+    unique = {}
+    owned = {(*event[:2], *geometry) for event, groups in positive_state.items()
+             for group in groups.values() for geometry in group["descriptor"]["geometries"]
+             if isinstance(event, tuple)}
+    locked_geometries = locked_geometries or set()
+    for candidate in sorted(candidates, key=candidate_order_key):
+        key = geometry_key(candidate)
+        if key in locked_geometries:
+            continue
+        if key in unique:
+            previous = unique[key]
+            previous.generation_parameters["source_flags"] = sorted(set(
+                previous.generation_parameters.get("source_flags", [previous.source])
+                + candidate.generation_parameters.get("source_flags", [candidate.source])))
+        else:
+            unique[key] = candidate
+    for candidate in unique.values():
         families.setdefault(candidate.proposal_family_id, {})[(candidate.start_ms, candidate.end_ms)] = candidate
     positives, negatives = [], {"near_miss": [], "background": []}
     for family, geometries in families.items():
@@ -252,11 +330,15 @@ def sample_groups(model, candidates, truth, config, rng, positive_state, used_fa
                 group["descriptor"] = describe_group(group, truth)
                 positives.append(group)
             elif ((representative.subject_key, representative.session_id), family) not in used_families:
-                category = "near_miss" if max(candidate_targets(item, truth)[1] for item in versions) > 0 else "background"
+                group["versions"] = [item for item in versions if geometry_key(item) not in owned]
+                if not group["versions"]:
+                    continue
+                category = "near_miss" if max(candidate_targets(item, truth)[1]
+                    for item in group["versions"]) > 0 else "background"
                 group["category"] = category
                 negatives[category].append(group)
     discovered_events = len({group["event_key"] for group in positives})
-    selected, reservations = [], {}
+    selected, reservations, retention_drops = [], {}, []
     teacher_limit = int(2 * teacher_fraction + .5)
     teacher_count = 0
     while positives and len(selected) < 2:
@@ -268,11 +350,12 @@ def sample_groups(model, candidates, truth, config, rng, positive_state, used_fa
         if teacher and teacher_count >= teacher_limit:
             continue
         key = group["event_key"]
-        existing = reservations.get(key, [item["descriptor"] for item in positive_state.get(key, {}).values()])
-        retained = retained_groups([*existing, group["descriptor"]])
+        existing = reservations.get(key, [item.get("original_descriptor", item["descriptor"])
+                                          for item in positive_state.get(key, {}).values()])
+        retained = retained_groups([*existing, group["descriptor"]], diagnostics=retention_drops)
         retained_ids = {item["id"] for item in retained}
         if group["descriptor"]["id"] in retained_ids and group["descriptor"]["id"] not in {item["id"] for item in existing}:
-            reservations[key] = retained
+            reservations[key] = [item for item in [*existing, group["descriptor"]] if item["id"] in retained_ids]
             group["retained_ids"] = retained_ids
             selected.append(group)
             teacher_count += int(teacher)
@@ -301,7 +384,7 @@ def sample_groups(model, candidates, truth, config, rng, positive_state, used_fa
         model.train(training_state)
     for group in pool:
         group["difficulty"] = float(np.mean([difficulty[item.proposal_id] for item in group["versions"]]))
-    ranked = sorted(pool, key=lambda group: (-group["difficulty"], group["family"]))
+    ranked = sorted(pool, key=lambda group: (-group["difficulty"], candidate_order_key(group["versions"][0])))
     chosen_families = set()
     if anchor:
         chosen_families.add(anchor["family"])
@@ -330,6 +413,7 @@ def sample_groups(model, candidates, truth, config, rng, positive_state, used_fa
         "independent_negative_families": len(chosen_families), "mining_families": len(pool),
         "mining_head_candidates": len(flat), "mining_seconds": time.monotonic() - started,
         "random_anchor_reserved": anchor is not None, "discovered_positive_events": discovered_events,
+        "positive_retention_drops": retention_drops,
         "mining_ranking": [{"family": group["family"], "bce": group["difficulty"],
                              "category": group["category"]} for group in ranked],
         "categories": {category: {"requested_groups": quota, "actual_groups": counts[category],
@@ -338,127 +422,20 @@ def sample_groups(model, candidates, truth, config, rng, positive_state, used_fa
                        for category, quota in config["training"]["group_quotas"].items()}}
 
 
-def heatmap_focal_loss(logits, targets, valid, positive_count, background_count):
+def heatmap_focal_loss(logits, targets, valid, positive_count, background_count,
+                      *, peak_scale=1.0, background_scale=1.0):
+    return sum(heatmap_focal_components(logits, targets, valid, positive_count, background_count,
+        peak_scale=peak_scale, background_scale=background_scale).values())
+
+
+def heatmap_focal_components(logits, targets, valid, positive_count, background_count,
+                             *, peak_scale=1.0, background_scale=1.0):
     logits, targets, valid = logits.float(), targets.float(), valid.float()
     probability = logits.sigmoid()
     peaks = F.softplus(-logits) * (1 - probability).square() * (targets == 1) * valid
     background = F.softplus(logits) * probability.square() * (1 - targets).pow(4) * (targets < 1) * valid
-    return (peaks.sum() / positive_count.sum().clamp_min(1)
-            + 20 * background.sum() / background_count.sum().clamp_min(1)) / 21
-
-
-def cpu_gradients(loss, model):
-    parameters = list(model.named_parameters())
-    gradients = torch.autograd.grad(loss, [parameter for _, parameter in parameters],
-                                    retain_graph=True, allow_unused=True)
-    return {name: gradient.detach().float().cpu().clone()
-            for (name, _), gradient in zip(parameters, gradients) if gradient is not None}
-
-
-def add_gradients(destination, gradients, divisor=1):
-    for name, value in gradients.items():
-        if name in destination:
-            destination[name].add_(value, alpha=1 / divisor)
-        else:
-            destination[name] = value.clone() / divisor
-
-
-class ContributionBank:
-    def __init__(self, state):
-        self.state = state
-        state.setdefault("negative_task_gradients", {})
-        state.setdefault("negative_family_count", 0)
-        state.setdefault("pending_task_gradients", {})
-        state.setdefault("pending_task_sessions", {})
-
-    def negative(self, loss, model):
-        add_gradients(self.state["negative_task_gradients"], cpu_gradients(loss, model))
-        self.state["negative_family_count"] += 1
-
-    def pending(self, name, gradients):
-        if gradients:
-            destination = self.state["pending_task_gradients"].setdefault(name, {})
-            add_gradients(destination, gradients)
-            counts = self.state["pending_task_sessions"]
-            counts[name] = counts.get(name, 0) + 1
-
-    def finish_session(self, positive):
-        for task in ("classification", "boundary", "quality_ranking"):
-            event_gradients = []
-            for groups in positive.values():
-                legal = [group["task_gradients"][task] for group in groups.values()
-                         if task in group["task_gradients"]]
-                if legal:
-                    gradients = {}
-                    for contribution in legal:
-                        add_gradients(gradients, contribution, len(legal))
-                    event_gradients.append(gradients)
-            session = {}
-            for event in event_gradients:
-                add_gradients(session, event, len(event_gradients))
-            self.pending("positive" if task == "classification" else task, session)
-        if self.state["negative_family_count"]:
-            self.pending("negative", {name: value / self.state["negative_family_count"]
-                for name, value in self.state["negative_task_gradients"].items()})
-        self.state["last_session_contributions"] = {
-            "positive_events": len(positive), "negative_families": self.state["negative_family_count"],
-            "groups": sum(map(len, positive.values()))}
-        positive.clear()
-        self.state["negative_task_gradients"] = {}
-        self.state["negative_family_count"] = 0
-
-    def commit(self, model):
-        pending, counts = self.state["pending_task_gradients"], self.state["pending_task_sessions"]
-        classes = sum(counts.get(name, 0) > 0 for name in ("positive", "negative"))
-        parameters = dict(model.named_parameters())
-        if classes:
-            classification = [pending.get(task, {}) for task in ("positive", "negative")]
-            for name in ("candidate_head.event.weight", "candidate_head.event.bias",
-                         "candidate_head.quality.weight", "candidate_head.quality.bias"):
-                if name in parameters and not any(name in gradients for gradients in classification):
-                    raise RuntimeError(f"Candidate classification gradient disconnected: {name}")
-        if counts.get("boundary", 0):
-            for name in parameters:
-                if name.startswith("boundary_head.") and name not in pending.get("boundary", {}):
-                    raise RuntimeError(f"Candidate boundary gradient disconnected: {name}")
-        for task, gradients in pending.items():
-            divisor = counts[task] * (classes if task in {"positive", "negative"} else 1)
-            for name, value in gradients.items():
-                gradient = value.to(parameters[name].device) / divisor
-                if parameters[name].grad is None:
-                    parameters[name].grad = gradient
-                else:
-                    parameters[name].grad.add_(gradient)
-        self.state["last_update_contributions"] = dict(counts)
-        pending.clear()
-        counts.clear()
-
-    def tensors(self):
-        return (value for bank in (self.state["negative_task_gradients"],
-            *self.state["pending_task_gradients"].values()) for value in bank.values())
-
-
-class PositiveGradientBuffer:
-    def __init__(self, state):
-        self.state = state
-
-    def add(self, group, tasks, model):
-        groups = self.state.setdefault(group["event_key"], {})
-        descriptor = group["descriptor"]
-        retained = {item["id"] for item in retained_groups(
-            [*[item["descriptor"] for item in groups.values()], descriptor])}
-        if descriptor["id"] not in retained:
-            return {"added": None, "removed": []}
-        removed = sorted(set(groups) - retained)
-        for identity in removed:
-            groups.pop(identity)
-        groups[descriptor["id"]] = {"descriptor": descriptor,
-            "task_gradients": {name: cpu_gradients(loss, model) for name, loss in tasks.items()}}
-        return {"added": descriptor["id"], "removed": removed, "retained": sorted(retained)}
-
-    def tensors(self):
-        return (value for groups in self.state.values() for group in groups.values()
-                for gradients in group["task_gradients"].values() for value in gradients.values())
+    return {"peak": peak_scale * peaks.sum() / positive_count.sum().clamp_min(1) / 21,
+            "background": 20 * background_scale * background.sum() / background_count.sum().clamp_min(1) / 21}
 
 
 def selection_update(state, epoch, eligible, f1, training):

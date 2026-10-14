@@ -63,7 +63,7 @@ def long_event_feature_replay(model, config, steps=4341):
     features[:, 135] = 1
     features[:steps, 129:133] = .95
     outputs = []
-    for chunk in (17, 256, len(times)):
+    for chunk in (1, 17, 256, len(times)):
         detector = JointChunkDetector(model, config, point, mapping, "synthetic", {"qualified": False},
                                       "subject", "session")
         emitted = []
@@ -72,13 +72,19 @@ def long_event_feature_replay(model, config, steps=4341):
             emitted.extend(detector.push_features(times[first:stop], features[first:stop], final=stop == len(times)))
         outputs.append(emitted)
     identities = [[event["proposal_id"] for event in output] for output in outputs]
-    if identities[0] != identities[1] or identities[1] != identities[2] or not identities[0]:
+    if not identities[0] or any(item != identities[0] for item in identities[1:]):
         raise RuntimeError("Long event replay chunk invariance failed")
-    for left, right in zip(outputs[0], outputs[1]):
-        for name in ("event_probability", "predicted_quality", "rank_score"):
-            if abs(left[name] - right[name]) > 1e-6:
-                raise RuntimeError("Long replay determinism failed")
-    return {"event_duration_seconds": steps * 3, "chunks": [17, 256, len(times)],
+    for other in outputs[1:]:
+        for left, right in zip(outputs[0], other):
+            for name in ("event_probability", "predicted_quality", "rank_score"):
+                if abs(left[name] - right[name]) > 1e-6:
+                    raise RuntimeError("Long replay determinism failed")
+    actual_latency = max((event["emitted_at_ms"] - event["end_ms"]) / 1000 for event in outputs[0])
+    if actual_latency > 60:
+        raise RuntimeError("Three-second incremental input return latency exceeds 60 seconds")
+    return {"event_duration_seconds": steps * 3, "chunks": [1, 17, 256, len(times)],
+            "three_second_increment_actual_return_latency_seconds": actual_latency,
+            "batch_input_available_time_recorded": True,
             "event_count": len(outputs[0]), "identities": identities[0],
             "max_latency_seconds": max((event["decision_time_ms"] - event["end_ms"]) / 1000 for event in outputs[0])}
 
@@ -138,7 +144,7 @@ def validate_joint_implementation(config, *, device="cpu"):
         head_error = max(float((single[name] - parallel[name][:1]).abs().max())
                          for name in ("event_logit", "quality_logit", "candidate_embedding"))
     if head_error > 1e-6:
-        raise RuntimeError("v411 batch128 equivalence gate failed; optimization cannot be enabled")
+        raise RuntimeError("v414 batch128 equivalence gate failed; optimization cannot be enabled")
     report["candidate_batch128_max_error"] = head_error
     report["coordinate_selection_discrete"] = True
     report["history_gradient_detached"] = True

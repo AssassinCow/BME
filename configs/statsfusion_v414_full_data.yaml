@@ -8,7 +8,8 @@ project:
 experiment:
   name: statsfusion_v414_28_11_then_39
   code_version: v4.14
-  protocol_version: statsfusion-joint-event-v5
+  protocol_version: statsfusion-joint-event-v7
+  repair_revision: v414-r2
 model:
   architecture: statsfusion_joint_event_v414
   hidden_dim: 64
@@ -118,6 +119,7 @@ loss:
   ranking_minimum_iou_difference: 0.10
   contrastive_temperature: 0.1
   contrastive_max_pairs: 128
+  contrastive_max_history_bins: 128
 decoder:
   high_threshold: 0.10
   low_ratio: 0.90

@@ -14,11 +14,30 @@ import torch
 
 from bme_eating.artifacts import write_json_atomic
 from bme_eating.metrics import interval_iou_matrix
-from bme_eating.protocol import EVENT_PROBABILITY_FORMULAS
+from bme_eating.protocol import EVENT_PROBABILITY_FORMULAS, PROFILE
 
 
 def stable_id(*values: Any) -> str:
     return hashlib.sha256("|".join(map(str, values)).encode("utf-8")).hexdigest()[:24]
+
+
+def geometry_key(candidate):
+    return candidate.subject_key, candidate.session_id, candidate.start_ms, candidate.end_ms
+
+
+def decision_key(candidate):
+    return candidate.decision_time_ms, int(candidate.decision_phase == "eof")
+
+
+def candidate_order_key(candidate):
+    return (*decision_key(candidate), *geometry_key(candidate),
+            candidate.coarse_start_ms, candidate.coarse_end_ms,
+            candidate.generation_parameters.get("parent_source", candidate.source),
+            candidate.scale_seconds, candidate.source)
+
+
+class NoSourceCandidatesError(RuntimeError):
+    pass
 
 
 @dataclass
@@ -66,9 +85,14 @@ class JointCandidate:
     quality_score: float = 0.0
     selection_reason: str = ""
     boundary_mode: str = "off"
-    score_formula: str = "event_probability_times_quality_v410"
+    score_formula: str = PROFILE.score_formula
+    decision_phase: str = "regular"
+    input_available_time_ms: int | None = None
+    emitted_at_ms: int | None = None
 
     def validate(self) -> None:
+        if self.decision_phase not in {"regular", "eof"}:
+            raise RuntimeError("Unknown candidate decision phase")
         if (any(not isinstance(value, (int, np.integer)) for value in
                 (self.start_ms, self.end_ms, self.decision_time_ms, self.max_input_time_ms,
                  self.coarse_start_ms, self.coarse_end_ms))
@@ -141,7 +165,7 @@ class FrozenSourceCDF:
     def fit(cls, candidates: list[JointCandidate], subjects: set[str]) -> FrozenSourceCDF:
         distributions: dict[str, list[float]] = {}
         if not candidates:
-            raise RuntimeError("No training candidates for source score normalization")
+            raise NoSourceCandidatesError("No training candidates for source score normalization")
         if any(candidate.subject_key not in subjects for candidate in candidates):
             raise RuntimeError("Source normalization subject leakage")
         representatives: dict[tuple[Any, ...], JointCandidate] = {}
@@ -217,15 +241,17 @@ class OnlineBudget:
         return result
 
     def select(self, candidates: list[JointCandidate], mapping: FrozenSourceCDF) -> list[JointCandidate]:
-        if mapping.fallback:
+        for candidate in candidates:
+            candidate.validate()
+        if candidates:
             fresh = []
             representatives = {}
-            for candidate in sorted(candidates, key=lambda item: (item.decision_time_ms, item.proposal_id)):
+            for candidate in sorted(candidates, key=candidate_order_key):
                 geometry = (candidate.model_identity, candidate.subject_key, candidate.session_id,
                             candidate.start_ms, candidate.end_ms)
                 if geometry in self.seen_geometries:
                     kept = representatives.get(geometry)
-                    if kept is not None and kept.decision_time_ms == candidate.decision_time_ms:
+                    if kept is not None and decision_key(kept) == decision_key(candidate):
                         flags = kept.generation_parameters.get("source_flags", [kept.source])
                         kept.generation_parameters["source_flags"] = sorted(set(flags +
                             candidate.generation_parameters.get("source_flags", [candidate.source])))
@@ -239,7 +265,7 @@ class OnlineBudget:
             candidates = fresh
         if not self.quotas:
             unique = {}
-            for candidate in sorted(candidates, key=lambda item: item.proposal_id):
+            for candidate in sorted(candidates, key=candidate_order_key):
                 geometry = (candidate.subject_key, candidate.session_id, candidate.decision_time_ms,
                             candidate.start_ms, candidate.end_ms)
                 if geometry in unique:
@@ -272,7 +298,7 @@ class OnlineBudget:
                 debt = max((deficits[name] for name in self.categories(candidate) if name in deficits), default=0)
                 coarse = int(candidate.start_ms == candidate.coarse_start_ms
                              and candidate.end_ms == candidate.coarse_end_ms)
-                return debt if self.quotas else coarse, candidate.normalized_source_score, candidate.proposal_id
+                return debt if self.quotas else coarse, candidate.normalized_source_score, candidate_order_key(candidate)
             choice = max(pool, key=priority)
             remaining.remove(choice)
             selected.append(choice)
@@ -398,6 +424,8 @@ class StreamingProposals:
                                            kind, scale, item["score"], start, end, family,
                                            identifier, parent_proposal_id, parent_hash,
                                            self.identity, {"parent_source": parent_kind,
+                                                           "schema": PROFILE.schema, "protocol": PROFILE.protocol,
+                                                           "repair_revision": PROFILE.repair_revision,
                                                            "parent_scale": scale, **parameters}, decision)
                 candidate.validate()
                 candidates.append(candidate)
@@ -408,7 +436,10 @@ class StreamingProposals:
             return []
         self.pending.extend(self.active.values())
         self.active = {}
-        return self._ready(self.last_time, eof=True)
+        candidates = self._ready(self.last_time, eof=True)
+        for candidate in candidates:
+            candidate.decision_phase = "eof"
+        return candidates
 
 
 class ImmutableCommitter:
@@ -434,14 +465,14 @@ class ImmutableCommitter:
                     entropy = [value for value in (item.boundary_start_entropy,
                                item.boundary_end_entropy) if value is not None]
                     return (-item.predicted_quality, max(entropy, default=1),
-                            -item.event_probability, item.proposal_id)
+                            -item.event_probability, candidate_order_key(item))
                 winner = min(versions, key=version_priority)
                 winner.selection_reason = "accepted_version_quality_then_confidence_probability_id"
                 selected.append(winner)
             ordered = sorted(selected, key=lambda item: (-item.event_probability,
-                             -item.predicted_quality, item.proposal_id))
+                             -item.predicted_quality, candidate_order_key(item)))
         else:
-            ordered = sorted(candidates, key=lambda item: (-item.rank_score, item.proposal_id))
+            ordered = sorted(candidates, key=lambda item: (-item.rank_score, candidate_order_key(item)))
         for candidate in ordered:
             candidate.validate()
             previous = [item for item in self.committed

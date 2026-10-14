@@ -12,6 +12,7 @@ def endpoint_diagnostics(windows, truth, ignore, candidates):
     for name, field, threshold, support in (("onset", "start_ms", .30, 30_000),
                                             ("offset", "end_ms", .50, 60_000)):
         hits, eligible, background, peaks, maximum = 0, 0, 0, 0, 0.0
+        usable_hits, usable_peaks, usable_background = 0, 0, 0
         for key, timeline in windows.groupby(["subject_key", "session_id"], sort=False):
             timeline = timeline.sort_values("timestamp_ms")
             times = timeline.timestamp_ms.to_numpy(np.int64)
@@ -25,10 +26,35 @@ def endpoint_diagnostics(windows, truth, ignore, candidates):
                 valid &= (times < interval.start_ms) | (times > interval.end_ms)
             endpoints = targets[field].to_numpy(np.int64)
             eligible_endpoints = endpoints[(endpoints > times[0] - 3000) & (endpoints <= times[-1])]
+            from bme_eating.endpoint_peaks import CausalOnsetPeaks
+            detector = CausalOnsetPeaks(threshold)
+            available = []
+            if name == "onset":
+                for timestamp, score, observed in zip(times, scores, timeline.valid):
+                    peak = detector.observe(int(timestamp), float(score), float(observed))
+                    if peak is not None and valid[np.searchsorted(times, peak[0])]:
+                        available.append(peak[0])
+            elif "state_probability" in timeline:
+                from bme_eating.candidates import StreamingProposals
+                stream = StreamingProposals(str(key[0]), str(key[1]), "diagnostic",
+                    {"high_threshold": .10, "low_ratio": .90, "ema_half_life_seconds": 6,
+                     "gap_merge_seconds": 15, "jitter_seconds": [],
+                     "backtrack_seconds": 600, "start_expansion_seconds": 600})
+                for row in timeline.itertuples(index=False):
+                    previous = {source: entry["end"] for source, entry in stream.active.items()}
+                    stream.observe(int(row.timestamp_ms), {"state": float(row.state_probability)},
+                                   float(row.valid), float(row.offset_probability))
+                    if row.offset_probability >= .50:
+                        available.extend(end for source, end in previous.items() if source not in stream.active)
+            available = np.asarray(sorted(set(available)), dtype=np.int64)
+            usable_peaks += len(available)
+            usable_background += sum(not ((timestamp >= endpoints) & (timestamp <= endpoints + support)).any()
+                                     for timestamp in available)
             for endpoint in eligible_endpoints:
                 selected = valid & (times >= endpoint) & (times <= endpoint + support)
                 eligible += int(selected.any())
                 hits += int((scores[selected] >= threshold).any())
+                usable_hits += int(selected.any() and ((available >= endpoint) & (available <= endpoint + support)).any())
             maximum = max(maximum, float(scores[valid].max()) if valid.any() else 0.0)
             previous = -10**18
             for index in np.flatnonzero(valid & (scores >= threshold)):
@@ -43,6 +69,10 @@ def endpoint_diagnostics(windows, truth, ignore, candidates):
                         "eligible_endpoints": eligible, "endpoint_hits": hits,
                         "endpoint_hit_rate": hits / max(eligible, 1), "peaks": peaks,
                         "background_peaks": background, "background_peaks_per_hour": background / max(hours, 1e-9)}
+        report[name].update({"usable_endpoint_hits": usable_hits,
+            "usable_endpoint_hit_rate": usable_hits / max(eligible, 1), "usable_peaks": usable_peaks,
+            "usable_background_peaks_per_hour": usable_background / max(hours, 1e-9),
+            "usable_trigger_scope": "causal_onset_peaks" if name == "onset" else "fixed_state_decoder_offset_closure"})
     errors = {"start": [], "end": []}
     from bme_eating.candidates import candidate_targets
     parents = {}

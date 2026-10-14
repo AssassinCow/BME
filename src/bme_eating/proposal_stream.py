@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import copy
-from collections import deque
 
-from bme_eating.candidates import StreamingProposals, stable_id
+from bme_eating.candidates import StreamingProposals, candidate_order_key, stable_id
+from bme_eating.endpoint_peaks import CausalOnsetPeaks
+from bme_eating.protocol import PROFILE
 
 
 class LearnedStreamingProposals(StreamingProposals):
     def __init__(self, *arguments):
         super().__init__(*arguments)
-        self.onset_samples = deque()
+        self.peak_detector = CausalOnsetPeaks(self.config["onset_peak_threshold"])
         self.onset_peaks = []
 
     def observe(self, timestamp, probabilities, valid, offset_probability=0.0,
@@ -17,25 +18,16 @@ class LearnedStreamingProposals(StreamingProposals):
         import math
         if not math.isfinite(onset_probability) or not 0 <= onset_probability <= 1:
             raise ValueError("Invalid onset probability")
-        self.onset_samples.append((timestamp, onset_probability, valid))
-        if len(self.onset_samples) >= 7:
-            samples = list(self.onset_samples)[-7:]
-            center = samples[3]
-            if (center[2] > 0 and center[1] >= self.config["onset_peak_threshold"]
-                    and samples[-1][0] - center[0] == 9000
-                    and center[0] - samples[0][0] == 9000
-                    and all(center[1] > value[1] for value in samples[:3])
-                    and all(center[1] >= value[1] for value in samples[4:])):
-                self.onset_peaks.append((center[0], center[1]))
-        while len(self.onset_samples) > 7:
-            self.onset_samples.popleft()
+        peak = self.peak_detector.observe(timestamp, onset_probability, valid)
+        if peak is not None:
+            self.onset_peaks.append(peak[:2])
         return super().observe(timestamp, probabilities, valid, offset_probability)
 
     def _ready(self, decision, eof=False):
         legacy = super()._ready(decision, eof)
         if self.config.get("parent_proposals_only"):
             for candidate in legacy:
-                candidate.score_formula = self.config.get("score_formula", "calibrated_event_probability_v411")
+                candidate.score_formula = self.config.get("score_formula", PROFILE.score_formula)
             return legacy
         parents = {}
         for candidate in legacy:
@@ -67,7 +59,12 @@ class LearnedStreamingProposals(StreamingProposals):
             else:
                 variants = [coarse]
                 geometries = {(coarse.start_ms, coarse.end_ms)}
-                for item in sorted(pool, key=lambda item: item.proposal_id):
+                def fallback_priority(item):
+                    parent = item.generation_parameters
+                    return stable_id(2026, item.subject_key, item.session_id,
+                        parent.get("parent_source", item.source), item.scale_seconds,
+                        item.coarse_start_ms, item.coarse_end_ms, item.start_ms, item.end_ms), candidate_order_key(item)
+                for item in sorted(pool, key=fallback_priority):
                     geometry = item.start_ms, item.end_ms
                     if geometry not in geometries:
                         variants.append(item)
@@ -83,11 +80,12 @@ class LearnedStreamingProposals(StreamingProposals):
                     previous.generation_parameters["source_flags"] = sorted(set(
                         previous.generation_parameters["source_flags"] + flags))
                     continue
-                candidate.generation_parameters.update({"v411": True,
+                candidate.generation_parameters.update({PROFILE.schema: True,
+                    "schema": PROFILE.schema, "protocol": PROFILE.protocol, "repair_revision": PROFILE.repair_revision,
                     "source_flags": sorted(set(flags)), "parent_raw_score": coarse.raw_score,
                     "learned_peak_count": len(selected), "compatibility_fallback": not bool(selected),
                     "coarse_parent_id": coarse.ancestor_id})
-                candidate.score_formula = self.config.get("score_formula", "calibrated_event_probability_v411")
+                candidate.score_formula = self.config.get("score_formula", PROFILE.score_formula)
                 candidate.validate()
                 unique[geometry] = candidate
             for item in pool:

@@ -29,6 +29,7 @@ from bme_eating.diagnostics import locked_subject_bootstrap, stratified_diagnost
 from bme_eating.evaluation import NonnegativePlatt, commit_candidates
 from bme_eating.models.statsfusion_joint_event import build_joint_model
 from bme_eating.protocol import (
+    CHECKPOINT_STATE_VERSION,
     capabilities,
     config_identity,
     digest,
@@ -69,6 +70,7 @@ def payload_for(config, split, subjects, excluded, identity, epoch):
     model = build_joint_model(config)
     scaler = FoldRobustScaler(STATS_FEATURE_COLUMNS, np.zeros(12), np.ones(12), tuple(sorted(subjects)))
     return {"identity": identity, "epoch": epoch, "model": model.state_dict(), "epoch_complete": True,
+        "protocol": protocol_for(config), "state_version": CHECKPOINT_STATE_VERSION,
         "promotion_eligible": True, "clipping_fraction": 0, "training_subjects": sorted(subjects),
         "excluded_subjects": sorted(excluded), "config_sha256": config_identity(config),
         "source_sha256": digest(source_identity(ROOT)), "data_sha256": split["data_sha256"],

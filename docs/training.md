@@ -22,7 +22,7 @@ AdamW、BF16、256个新步及实际感受野warmup、每session权重固定、�
 ```powershell
 python scripts/run_statsfusion_joint.py `
   --config configs/statsfusion_v414_full_data.yaml `
-  --run-name statsfusion_v414_28_11_then_39_20261012a `
+  --run-name statsfusion_v414_28_11_then_39_repair_r2_20261013a `
   --evaluation-mode dev28_11 --stage all --fresh
 ```
 
@@ -32,7 +32,13 @@ python scripts/run_statsfusion_joint.py `
 
 ## 恢复提交
 
-每chunk先持久化缓存和校验追加日志，再原子提交checkpoint。保存RNG、模型/optimizer、LR位置、累计梯度、可替换正组、纯负贡献、自然回放hash和游标、增强描述及早停计数。恢复截断未提交日志尾部、核验缓存，只接受完整chunk。
+每chunk先持久化缓存和校验追加日志，再原子提交checkpoint。v7恢复状态版本为3，保存RNG、模型/optimizer、LR位置、累计梯度、端点计数表及hash、逐版本和逐排序对梯度、几何所有权、纯负贡献、自然回放hash、候选及重复诊断释放游标、增强描述及早停计数。恢复截断未提交日志尾部、核验缓存，只接受完整chunk。旧协议checkpoint、梯度缓冲、候选缓存与校准器不得加载或resume。
+
+自然回放按subject/session/start/end合并几何，首次可用decision和phase的稳定代表提供完整metadata。同decision/phase合并来源审计；晚到重复按自身时间释放诊断，不改写早期输入。预算几何去重不依赖CDF fallback，即使首次预算不足，后续重复也不能重试。
+
+每epoch使用独立计数视图计算训练session的合法峰值和背景资格，不消耗训练RNG。令W为所有session权重和，W_peak/W_bg为具有对应监督的session权重和；端点贡献为`w_s * ((W/W_peak)*P_s + 20*(W/W_bg)*B_s)/21`，onset/offset平均后乘0.1。分母为零时对应项关闭。28人和39人各自统计，计数只读取本阶段训练标签。
+
+合法训练父候选为空时记录专用无资格原因，CDF、校准和操作点不可用；该验证计入已有无资格规则。数据损坏、身份错误、非finite或OOM继续失败。验证结果与早停计数原子提交，中断恢复不会重训完成epoch或重复计数。
 
 Ctrl+C为PAUSED；OOM及其他异常为FAILED。未完成epoch不标记完成；失败报告和诊断权重保留，资格失败不生成部署bundle。资源上限为GPU峰值10.5 GiB、进程树private RAM 26 GiB，超限失败而不静默减小训练协议。
 
@@ -50,4 +56,4 @@ Ctrl+C为PAUSED；OOM及其他异常为FAILED。未完成epoch不标记完成；
 | `resource_log.json`, `failure_report.json` | 资源诊断与失败原因 |
 | `bundle/`, `bundle_replay.json` | 推理包与重放结果 |
 
-训练、自然回放、CDF、验证和select均显示单行进度。验证输出F1、TP/FP/FN、FP/h、候选覆盖、边界误差、操作点、clipping、最佳epoch和早停计数。
+训练、自然回放、CDF、验证和select均显示单行进度。训练分别显示chunk计算目标及最近提交update在实际保留集合上的归一化目标；两者含义不同。日志保存峰值/背景有效数量、分项梯度、实际任务贡献和VJP耗时，零梯度夹角记录为不可定义。验证输出F1、TP/FP/FN、FP/h、候选覆盖、边界误差、操作点、clipping、最佳epoch和早停计数。

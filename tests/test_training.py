@@ -346,7 +346,8 @@ def test_replay_hash_rejects_changed_cache(config, tmp_path):
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, torch.OutOfMemoryError])
 def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, failure, *,
-                                            epochs=1, deployment_epoch=None, interruption_epoch=1):
+                                            epochs=1, deployment_epoch=None, interruption_epoch=1,
+                                            empty_source_validation=False):
     from types import SimpleNamespace
 
     import pandas as pd
@@ -356,6 +357,8 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
 
     config["training"].update({"gradient_clip_norm": 1000, "gradient_diagnostics_every_chunks": 1000,
                                "natural_replay_from_epoch": 1})
+    if empty_source_validation:
+        config["training"].update({"checkpoint_min_epoch": 1, "validation_every_epochs": 1})
     truth = pd.concat([truth_fixture().assign(subject_key="fit", session_id=name,
         start_ms=0, end_ms=6000, evaluable=True, valid_duration=True) for name in ("first", "second")])
     class Dataset:
@@ -365,6 +368,9 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
         training = True
         geometry = SimpleNamespace(supervised_steps=4)
         events, ignore_events = truth, truth.iloc[:0]
+
+        def endpoint_counts(self, key, name):
+            return 1, 8
 
         def __getitem__(self, item):
             row, _, _ = item
@@ -388,7 +394,7 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
     interrupted = {"enabled": False}
     def loader(dataset, sampler, configuration):
         for position in range(sampler.start_chunk, len(sampler.chunks)):
-            if interrupted["enabled"] and sampler.epoch == interruption_epoch and position == 1:
+            if interrupted["enabled"] and not empty_source_validation and sampler.epoch == interruption_epoch and position == 1:
                 interrupted["enabled"] = False
                 raise failure("injected interruption")
             row, epoch, mask, *_ = sampler.chunks[position]
@@ -409,22 +415,50 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
         "boundary": 0, "contrastive": 0, "truth_jitter": 0})
     inputs = SimpleNamespace(identity={"data": "fixture"})
     subjects = {"fit"} | ({f"audit_subject_{index}" for index in range(38)} if deployment_epoch is not None else set())
-    trainer.train_joint_model(inputs, subjects, config, tmp_path / "continuous", "identity",
-                              epochs=epochs, resume=False, deployment_epoch=deployment_epoch)
+    if empty_source_validation:
+        from bme_eating.candidates import NoSourceCandidatesError
+        def no_sources(*args, **kwargs):
+            raise NoSourceCandidatesError("No legal training parent candidates")
+        monkeypatch.setattr(trainer, "fit_source_mapping", no_sources)
+        original_write = trainer.write_json_atomic
+        def write_status(path, payload):
+            if interrupted["enabled"] and "interrupted" in path.parts and path.name == "validation_status.json":
+                interrupted["enabled"] = False
+                raise failure("injected validation interruption")
+            return original_write(path, payload)
+        monkeypatch.setattr(trainer, "write_json_atomic", write_status)
+    selector = {"selector"} if empty_source_validation else None
+    def train(directory, resume):
+        if empty_source_validation:
+            with pytest.raises(RuntimeError, match="selection failed"):
+                trainer.train_joint_model(inputs, subjects, config, directory, "identity", epochs=epochs,
+                    resume=resume, selector=selector, deployment_epoch=deployment_epoch)
+        else:
+            trainer.train_joint_model(inputs, subjects, config, directory, "identity", epochs=epochs,
+                resume=resume, deployment_epoch=deployment_epoch)
+    train(tmp_path / "continuous", False)
     interrupted["enabled"] = True
     with pytest.raises(failure):
         trainer.train_joint_model(inputs, subjects, config, tmp_path / "interrupted", "identity",
-                                  epochs=epochs, resume=False, deployment_epoch=deployment_epoch)
+                                  epochs=epochs, resume=False, selector=selector, deployment_epoch=deployment_epoch)
     saved = torch.load(tmp_path / "interrupted/resume.pt", weights_only=False)
-    assert saved["state"]["natural_replay"]["cursor"] > 0
-    assert saved["state"]["positive_gradients"]
+    if empty_source_validation:
+        assert saved["state"]["epoch_complete"]
+        assert saved["state"]["next_chunk"] == 4
+    else:
+        assert saved["state"]["natural_replay"]["cursor"] > 0
+        assert saved["state"]["positive_gradients"]
     assert saved["state"]["epoch"] == interruption_epoch
-    trainer.train_joint_model(inputs, subjects, config, tmp_path / "interrupted", "identity",
-                              epochs=epochs, resume=True, deployment_epoch=deployment_epoch)
+    train(tmp_path / "interrupted", True)
     continuous = torch.load(tmp_path / "continuous/latest.pt", weights_only=True)
     resumed = torch.load(tmp_path / "interrupted/latest.pt", weights_only=True)
     for name in continuous["model"]:
         torch.testing.assert_close(continuous["model"][name], resumed["model"][name], rtol=0, atol=0)
+    if empty_source_validation:
+        resumed_state = torch.load(tmp_path / "interrupted/resume.pt", weights_only=False)["state"]
+        assert resumed_state["unqualified_checks"] == 1
+        assert len(resumed_state["history"]) == 1
+        assert resumed_state["history"][0]["selector"]["f1"] is None
     if deployment_epoch is not None:
         continuous_resume = torch.load(tmp_path / "continuous/resume.pt", weights_only=False)
         resumed_resume = torch.load(tmp_path / "interrupted/resume.pt", weights_only=False)

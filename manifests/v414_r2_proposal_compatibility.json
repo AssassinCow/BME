@@ -1,0 +1,34 @@
+{
+  "passed": true,
+  "records": [
+    {
+      "factor": 1,
+      "all_valid_max_error": 0.0,
+      "state_dict_keys_and_shapes_unchanged": true,
+      "r1_cpu_seconds": 0.0007699869999487418,
+      "r2_cpu_seconds": 0.0009980470000300556,
+      "cpu_delta_seconds": 0.00022806000008131373
+    },
+    {
+      "factor": 5,
+      "all_valid_max_error": 0.0,
+      "state_dict_keys_and_shapes_unchanged": true,
+      "r1_cpu_seconds": 0.0005173560000548605,
+      "r2_cpu_seconds": 0.0006999119999818504,
+      "cpu_delta_seconds": 0.00018255599992698989
+    },
+    {
+      "factor": 20,
+      "all_valid_max_error": 0.0,
+      "state_dict_keys_and_shapes_unchanged": true,
+      "r1_cpu_seconds": 0.00045257500009029174,
+      "r2_cpu_seconds": 0.0005590279999887571,
+      "cpu_delta_seconds": 0.00010645299989846534
+    }
+  ],
+  "scope": "proposal_only_cpu_microbenchmark",
+  "same_weights_inputs": true,
+  "formal_run_started": false,
+  "full_model_seed_initialization_identical": true,
+  "full_model_parameter_count": 767197
+}

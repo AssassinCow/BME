@@ -18,10 +18,20 @@ class CausalSeparableBlock(nn.Module):
         self.pointwise = nn.Conv1d(channels, channels, 1)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, features: torch.Tensor) -> torch.Tensor:
+    def forward(self, features: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
+        if valid is not None:
+            features = features.masked_fill(~valid[..., None], 0)
         values = self.depthwise(F.pad(features.transpose(1, 2), (2, 0)))
         values = F.silu(self.pointwise(values)).transpose(1, 2)
-        return features + self.dropout(values)
+        result = features + self.dropout(values)
+        return result.masked_fill(~valid[..., None], 0) if valid is not None else result
+
+
+class ProposalTemporal(nn.Sequential):
+    def forward(self, features, valid=None):
+        for block in self:
+            features = block(features, valid)
+        return features
 
 
 class CompletedScale(nn.Module):
@@ -30,8 +40,8 @@ class CompletedScale(nn.Module):
     def __init__(self, factor: int, channels: int, dropout: float) -> None:
         super().__init__()
         self.factor = factor
-        self.temporal = nn.Sequential(CausalSeparableBlock(channels, dropout),
-                                      CausalSeparableBlock(channels, dropout))
+        self.temporal = ProposalTemporal(CausalSeparableBlock(channels, dropout),
+                                        CausalSeparableBlock(channels, dropout))
         self.head = nn.Linear(channels, 1)
 
     def forward(
@@ -52,7 +62,10 @@ class CompletedScale(nn.Module):
             pooled = (sequence[members] * weights[..., None]).sum(1)
             pooled = pooled / weights.sum(1).clamp_min(
                 torch.finfo(sequence.dtype).tiny if getattr(self, "fractional_mean", False) else 1)[:, None]
-            low = self.head(self.temporal(pooled[None])).squeeze(0).squeeze(-1)
+            block_valid = weights.sum(1) > 0
+            values = pooled[None].masked_fill(~block_valid[None, :, None], 0)
+            values = self.temporal(values, block_valid[None])
+            low = self.head(values).squeeze(0).squeeze(-1).masked_fill(~block_valid, 0)
             mapping = torch.searchsorted(ends, torch.arange(len(sequence), device=ends.device),
                                          right=True) - 1
             eligible = mapping >= 0

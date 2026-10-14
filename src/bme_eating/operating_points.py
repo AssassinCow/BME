@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 
-from bme_eating.candidates import candidate_targets
+from bme_eating.candidates import candidate_order_key, candidate_targets, decision_key
 from bme_eating.evaluation import (
     NonnegativePlatt,
     apply_online_budget,
@@ -46,7 +46,7 @@ class CachedSearch:
             ignored = prediction_ignore_mask(event_frame(pool), ignore)
             decisions = {}
             for index, item in enumerate(pool):
-                decisions.setdefault(item.decision_time_ms, {}).setdefault(item.ancestor_id, []).append(index)
+                decisions.setdefault(decision_key(item), {}).setdefault(item.ancestor_id, []).append(index)
             self.groups.append((pool, target, target_coordinates, coordinates, iou, overlap, ignored,
                                 probabilities[indices], [decisions[key] for key in sorted(decisions)]))
             if resource_monitor is not None:
@@ -69,10 +69,10 @@ class CachedSearch:
                             entropy = [value for value in (item.boundary_start_entropy,
                                        item.boundary_end_entropy) if value is not None]
                             return (-item.predicted_quality, max(entropy, default=1),
-                                    -probabilities[index], item.proposal_id)
+                                    -probabilities[index], candidate_order_key(item))
                         winners.append(min(eligible, key=priority))
                 winners.sort(key=lambda index: (-probabilities[index], -pool[index].predicted_quality,
-                                                pool[index].proposal_id))
+                                                candidate_order_key(pool[index])))
                 for index in winners:
                     if not committed or not (overlap[committed, index] > nms).any():
                         committed.append(index)

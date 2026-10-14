@@ -16,6 +16,7 @@ from bme_eating.protocol import (
     STAGES,
     execution_failure_status,
     initialize_run,
+    protocol_for,
     require_idle_gpu,
     run_lock,
     stages_for,
@@ -139,7 +140,7 @@ def run_v414(arguments, config, parser):
             try:
                 with run_lock(candidate):
                     identity = json.loads((candidate / "identity.json").read_text(encoding="utf-8"))
-                    if identity.get("protocol") == "statsfusion-joint-event-v5":
+                    if identity.get("protocol") == protocol_for(config):
                         status = json.loads((candidate / "execution_status.json").read_text(encoding="utf-8"))
                         record_v414_failure(candidate, config, status, "audit", error)
             except (OSError, ValueError, RuntimeError, KeyError, TypeError, EOFError, UnpicklingError,
@@ -165,7 +166,7 @@ def run_v414(arguments, config, parser):
                         and stage_verified(run, config, stage)):
                     continue
                 status.update({"status": "RUNNING", "current_stage": stage,
-                    "evaluation_mode": "dev28_11", "phase": stage, "command": sys.argv})
+                    "evaluation_mode": arguments.evaluation_mode, "phase": stage, "command": sys.argv})
                 status["stages"][stage] = "RUNNING"
                 status.pop("error", None)
                 write_json_atomic(run / "execution_status.json", status)

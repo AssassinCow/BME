@@ -92,7 +92,7 @@ def predict(model, inputs, subjects, config, preprocessing, directory, identity,
             if cache.reused:
                 group = dataset.session_groups[key]
                 stop = int((group["_row_id"].to_numpy() == row).nonzero()[0][0]) + 1
-                batch = {"timestamp_ms": torch.from_numpy(group.timestamp_ms.to_numpy()[stop - count:stop])[None]}
+                batch = {"timestamp_ms": torch.from_numpy(group.timestamp_ms.to_numpy()[stop - count:stop].copy())[None]}
             else:
                 batch = next(batches)
             batch = {name: value.to(device) if isinstance(value, torch.Tensor) else value for name, value in batch.items()}
@@ -120,6 +120,9 @@ def predict(model, inputs, subjects, config, preprocessing, directory, identity,
                 windows.append({"subject_key": key[0], "session_id": key[1], "timestamp_ms": timestamp,
                                 "valid": float(values[128]), "gyro_valid": float(values[135]), "model_identity": identity,
                                 "onset_probability": float(values[133]), "offset_probability": float(values[134])})
+                windows[-1].update({"state_probability": float(values[129]),
+                    **{f"proposal_{scale}_probability": float(values[130 + index])
+                       for index, scale in enumerate((3, 15, 60))}})
             stage = time.monotonic()
             generated = {name: [] for name in settings}
             for name, stream in streams.items():
@@ -130,20 +133,22 @@ def predict(model, inputs, subjects, config, preprocessing, directory, identity,
                                       for index, scale in enumerate((3, 15, 60))}}
                     pool = stream.observe(timestamp, probabilities, float(values[128]), float(values[134]),
                                           onset_probability=float(values[133]))
+                    phases = [pool]
                     if last and timestamp == int(times[-1]):
-                        pool.extend(stream.finish())
-                    counters["parent_proposals"] += len({item.ancestor_id for item in pool})
-                    counters["generated_geometries"] += len(pool)
-                    if source_only:
-                        generated[name].extend(item for item in pool if item.source in {"state", "proposal"})
-                    else:
-                        if mapping is None:
-                            raise RuntimeError("Joint prediction requires a training-fitted source CDF")
-                        union = {}
-                        for tracker in trackers[name].values():
-                            for item in tracker.select(copy.deepcopy(pool), mapping) if pool else []:
-                                union[item.proposal_id] = item
-                        generated[name].extend(pool if reference_execution else union.values())
+                        phases.append(stream.finish())
+                    for pool in phases:
+                        counters["parent_proposals"] += len({item.ancestor_id for item in pool})
+                        counters["generated_geometries"] += len(pool)
+                        if source_only:
+                            generated[name].extend(item for item in pool if item.source in {"state", "proposal"})
+                        else:
+                            if mapping is None:
+                                raise RuntimeError("Joint prediction requires a training-fitted source CDF")
+                            union = {}
+                            for tracker in trackers[name].values():
+                                for item in tracker.select(copy.deepcopy(pool), mapping) if pool else []:
+                                    union[item.proposal_id] = item
+                            generated[name].extend(pool if reference_execution else union.values())
             counters["proposal_seconds"] += time.monotonic() - stage
             if deferred:
                 for name, pool in generated.items():
