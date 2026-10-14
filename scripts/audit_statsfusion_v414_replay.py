@@ -32,6 +32,7 @@ from bme_eating.progress import progress
 from bme_eating.proposal_stream import make_stream
 from bme_eating.protocol import (
     CHECKPOINT_STATE_VERSION,
+    PROFILE,
     config_identity,
     configure_numerics,
     digest,
@@ -55,7 +56,7 @@ def benchmark_search(model, inputs, config, preprocessing, audit):
     subjects = {key[0] for key in keys}
     dataset, _ = make_joint_dataset(selected, subjects, config, preprocessing, training=True)
     sampler = SessionChunkSampler(dataset, 9, training=False)
-    directory = Path(tempfile.mkdtemp(prefix="bme_v414_r2_search_"))
+    directory = Path(tempfile.mkdtemp(prefix=f"bme_{PROFILE.repair_revision.replace('-', '_')}_search_"))
     settings = decoder_settings(config)
     pools, windows = {name: [] for name in settings}, []
     for key in map(tuple, keys):
@@ -109,7 +110,7 @@ def benchmark_search(model, inputs, config, preprocessing, audit):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Disposable v414-r2 native replay and full search audit")
+    parser = argparse.ArgumentParser(description=f"Disposable {PROFILE.repair_revision} native replay and full search audit")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--benchmark-search", action="store_true")
     arguments = parser.parse_args()
@@ -120,13 +121,14 @@ def main():
     _load_project_dotenv(config)
     output = require_environment_path(config, "output_root_env")
     inputs = JointInputs.audit(output / "v2", output / "v4")
-    audit = json.loads((PROJECT_ROOT / f"manifests/v414_r2_production_loop_{arguments.device}.json").read_text(encoding="utf-8"))
+    repair_tag = PROFILE.repair_revision.replace("-", "_")
+    audit = json.loads((PROJECT_ROOT / f"manifests/{repair_tag}_production_loop_{arguments.device}.json").read_text(encoding="utf-8"))
     checkpoint = Path(audit["directory"]) / "latest.pt"
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True)
     if (not audit["passed"] or payload["protocol"] != protocol_for(config)
             or payload["state_version"] != CHECKPOINT_STATE_VERSION
             or audit["source_sha256"] != digest(source_identity(PROJECT_ROOT))):
-        raise RuntimeError("Native replay requires a qualified disposable r2 audit checkpoint")
+        raise RuntimeError("Native replay requires a qualified disposable audit checkpoint for the current revision")
     detector = JointDetector()
     detector.model = seed_model(config).to(arguments.device).eval()
     detector.model.load_state_dict(payload["model"])
@@ -173,7 +175,7 @@ def main():
         report["search_benchmark"] = benchmark_search(detector.model, inputs, config, payload["preprocessing"], audit)
         report["passed"] &= report["search_benchmark"]["passed"]
     report["resources"] = enforce_resources(config, torch.device(arguments.device))
-    write_json_atomic(PROJECT_ROOT / f"manifests/v414_r2_real_replay_{arguments.device}.json", report)
+    write_json_atomic(PROJECT_ROOT / f"manifests/{repair_tag}_real_replay_{arguments.device}.json", report)
     print(json.dumps(report, ensure_ascii=False), flush=True)
     if not report["passed"]:
         raise RuntimeError("Native replay/search audit failed")

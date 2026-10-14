@@ -25,8 +25,8 @@ from bme_eating.artifacts import sha256_file, write_json_atomic
 class JointCapabilities:
     version: str = "v4.14"
     schema: str = "v414"
-    protocol: str = "statsfusion-joint-event-v7"
-    repair_revision: str = "v414-r2"
+    protocol: str = "statsfusion-joint-event-v8"
+    repair_revision: str = "v414-r3"
     architecture: str = "statsfusion_joint_event_v414"
     grouped: bool = True
     consistent_inputs: bool = True
@@ -60,8 +60,8 @@ def calibration_discriminates(config, payload):
             and (payload.get("probability_range") or 0) > config["calibration"]["minimum_probability_range"])
 
 
-PROTOCOL = "statsfusion-joint-event-v7"
-CHECKPOINT_STATE_VERSION = 3
+PROTOCOL = "statsfusion-joint-event-v8"
+CHECKPOINT_STATE_VERSION = 4
 RUNTIME_KEYS = {"num_workers", "loader_prefetch_factor", "session_reader_cache_size", "derived_cache_mib"}
 STAGES = ("audit", "dev", "final39", "export", "replay")
 
@@ -240,9 +240,9 @@ def validate_config(config: dict[str, Any]) -> None:
     if config["model"]["architecture"] != profile.architecture:
         raise ValueError("Joint architecture mismatch")
     if config["experiment"].get("repair_revision") != profile.repair_revision:
-        raise ValueError("v414 requires the registered v414-r2 repair revision")
+        raise ValueError("v414 requires the registered v414-r3 repair revision")
     if config["loss"].get("contrastive_max_history_bins") != 128:
-        raise ValueError("v414-r2 requires at most 128 historical contrastive references")
+        raise ValueError("v414-r3 requires at most 128 historical contrastive references")
     if config["training"]["seeds"] != [2026] or config["project"]["seed"] != 2026:
         raise ValueError("Joint protocol uses one seed: 2026")
     if config["model"]["hidden_dim"] != 64 or config["sequence"]["step_seconds"] != 3:

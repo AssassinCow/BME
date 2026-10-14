@@ -14,6 +14,7 @@ from bme_eating.data.joint_sessions import JointInputs
 from bme_eating.development_split import load_split
 from bme_eating.metrics import partition_evaluation_events
 from bme_eating.protocol import (
+    PROFILE,
     config_identity,
     configure_numerics,
     digest,
@@ -175,7 +176,8 @@ def main():
         and report["resources"]["peak_gpu_gb"] <= config["resources"]["maximum_gpu_gb"]
         and report["resources"]["peak_process_tree_private_ram_gb"] <= config["resources"]["maximum_private_ram_gb"]
         and max(report["gradient_norms"]) < 10_000)
-    write_json_atomic(PROJECT_ROOT / f"manifests/v414_r2_production_loop_{arguments.device}.json", report)
+    repair_tag = PROFILE.repair_revision.replace("-", "_")
+    write_json_atomic(PROJECT_ROOT / f"manifests/{repair_tag}_production_loop_{arguments.device}.json", report)
     print(json.dumps({name: report[name] for name in ("passed", "directory", "device", "sessions", "epoch_three_positive_groups", "epoch_three_negative_groups", "maximum_mining_calls", "clipping_fractions")}, ensure_ascii=True), flush=True)
     if not report["passed"]:
         raise RuntimeError("Production learning audit failed; inspect head gradients and gradient norms")

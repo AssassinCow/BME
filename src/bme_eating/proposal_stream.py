@@ -47,17 +47,9 @@ class LearnedStreamingProposals(StreamingProposals):
                     break
             if self.config.get("ablation") == "no_onset":
                 variants = pool
-            elif selected:
-                variants = [coarse]
-                for timestamp, probability in selected:
-                    version = copy.deepcopy(coarse)
-                    version.start_ms, version.source = timestamp, "learned_onset"
-                    version.proposal_id = stable_id(coarse.ancestor_id, timestamp, coarse.end_ms,
-                                                    "learned_onset")
-                    version.generation_parameters.update({"onset_peak_probability": probability})
-                    variants.append(version)
+                protected_geometry = None
             else:
-                variants = [coarse]
+                fallback = [coarse]
                 geometries = {(coarse.start_ms, coarse.end_ms)}
                 def fallback_priority(item):
                     parent = item.generation_parameters
@@ -67,10 +59,35 @@ class LearnedStreamingProposals(StreamingProposals):
                 for item in sorted(pool, key=fallback_priority):
                     geometry = item.start_ms, item.end_ms
                     if geometry not in geometries:
-                        variants.append(item)
+                        fallback.append(item)
                         geometries.add(geometry)
-                    if len(variants) == 3:
+                    if len(fallback) == 3:
                         break
+                variants, protected_geometry = fallback, None
+                if selected:
+                    variants = [coarse]
+                    if len(fallback) > 1:
+                        protected = min(fallback[1:], key=lambda item: (
+                            abs(item.end_ms - coarse.end_ms), fallback_priority(item)))
+                        variants.append(protected)
+                        protected_geometry = protected.start_ms, protected.end_ms
+                    geometries = {(item.start_ms, item.end_ms) for item in variants}
+                    for timestamp, probability in selected:
+                        version = copy.deepcopy(coarse)
+                        version.start_ms, version.source = timestamp, "learned_onset"
+                        version.proposal_id = stable_id(coarse.ancestor_id, timestamp, coarse.end_ms,
+                                                        "learned_onset")
+                        version.generation_parameters.update({"onset_peak_probability": probability})
+                        variants.append(version)
+                        geometry = version.start_ms, version.end_ms
+                        if geometry not in geometries:
+                            geometries.add(geometry)
+                            break
+                    for item in fallback:
+                        geometry = item.start_ms, item.end_ms
+                        if len(geometries) < 3 and geometry not in geometries:
+                            variants.append(item)
+                            geometries.add(geometry)
             unique = {}
             for candidate in variants:
                 geometry = candidate.start_ms, candidate.end_ms
@@ -84,6 +101,8 @@ class LearnedStreamingProposals(StreamingProposals):
                     "schema": PROFILE.schema, "protocol": PROFILE.protocol, "repair_revision": PROFILE.repair_revision,
                     "source_flags": sorted(set(flags)), "parent_raw_score": coarse.raw_score,
                     "learned_peak_count": len(selected), "compatibility_fallback": not bool(selected),
+                    "compatibility_guard": geometry == protected_geometry,
+                    "candidate_version_policy": "coarse_compatibility_learned_v1",
                     "coarse_parent_id": coarse.ancestor_id})
                 candidate.score_formula = self.config.get("score_formula", PROFILE.score_formula)
                 candidate.validate()

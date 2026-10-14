@@ -357,6 +357,19 @@ def gradient_diagnostics(tasks, model):
     return report
 
 
+def _training_result(state, selector, epochs, directory):
+    if not selector:
+        return epochs
+    if state["best_epoch"] is None and state["diagnostic_epoch"] is None:
+        raise RuntimeError("No finite/clipping-qualified joint epoch; diagnostic checkpoints preserved")
+    if state["best_epoch"] is None or state.get("selection_failure"):
+        write_json_atomic(directory / "selector_failure_report.json", {
+            "promotion_eligible": False, "diagnostic_epoch": state["diagnostic_epoch"],
+            "reason": state.get("selection_failure") or "No qualified checkpoint at maximum epoch"})
+        raise RuntimeError("Joint selection failed; diagnostic weights cannot enter retraining")
+    return state["best_epoch"]
+
+
 @release_loaders_after
 def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str, Any],
                       directory: Path, identity: str, *, epochs: int, resume: bool,
@@ -408,7 +421,8 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
              "diagnostic_epoch": None, "diagnostic_f1": -1.0,
              "event_contributions": set(), "family_contributions": set(),
              "epoch_candidates": [], "gradient_diagnostics": [], "sample_audit": [],
-             "training_complete": False}
+             "training_complete": False, "stop_requested": False,
+             "stop_reason": None, "completed_epoch": 0}
     state.update({"positive_gradients": {}, "positive_group_counts": {},
                   "journal_offsets": {}, "contrastive_history": None})
     ContributionBank(state)
@@ -442,10 +456,10 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         torch.set_rng_state(payload["torch_rng"].cpu())
         if device.type == "cuda":
             torch.cuda.set_rng_state_all([value.cpu() for value in payload["cuda_rng"]])
+        if state.get("stop_requested") and not state.get("training_complete"):
+            raise RuntimeError("Inconsistent terminal training state; refusing to continue")
         if state.get("training_complete"):
-            if selector and (not state["best_epoch"] or state.get("selection_failure")):
-                raise RuntimeError("No finite/clipping-qualified joint epoch; diagnostic checkpoints preserved")
-            return (state["best_epoch"] or state["diagnostic_epoch"]) if selector else epochs
+            return _training_result(state, selector, epochs, directory)
     natural_dataset = None
     replay_payload = None
     ContributionBank(state)
@@ -1011,6 +1025,9 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
                   f"clipping={fraction:.4f} early_stop={stop} "
                   f"unqualified_checks={state.get('unqualified_checks', 0)} "
                   f"lost_qualification_checks={state.get('lost_qualification_checks', 0)}", flush=True)
+        stop_reason = ((state.get("selection_failure") or "f1_patience") if stop else
+                       "maximum_epochs" if epoch >= epochs else None)
+        record["stop_reason"] = stop_reason
         journals["training_history"].append([record])
         state["journal_offsets"]["training_history"] = journals["training_history"].offset
         if "selector" in record:
@@ -1020,6 +1037,10 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         write_json_atomic(directory / "training_history.json", state["history"])
         write_json_atomic(directory / "sampling.json", state["sample_audit"])
         write_json_atomic(directory / "gradients.json", state["gradient_diagnostics"])
+        state["completed_epoch"] = epoch
+        if stop_reason:
+            state.update({"training_complete": True, "stop_requested": stop,
+                          "stop_reason": stop_reason})
         state["epoch"] += 1
         state["endpoint_balance"] = None
         state["next_chunk"] = 0
@@ -1039,20 +1060,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
     from bme_eating.data.joint_sessions import release_session_loader
     release_session_loader(loader)
     checkpoint()
-    if selector:
-        if state["best_epoch"] is None and state["diagnostic_epoch"] is None:
-            raise RuntimeError("No finite/clipping-qualified joint epoch; diagnostic checkpoints preserved")
-        if (state["best_epoch"] is None or state.get("selection_failure")):
-            write_json_atomic(directory / "selector_failure_report.json", {
-                "promotion_eligible": False, "diagnostic_epoch": state["diagnostic_epoch"],
-                "reason": state.get("selection_failure") or "No qualified checkpoint at maximum epoch"})
-            raise RuntimeError("Joint selection failed; diagnostic weights cannot enter retraining")
-        if state["best_epoch"] is None:
-            write_json_atomic(directory / "selector_failure_report.json", {
-                "promotion_eligible": False, "diagnostic_epoch": state["diagnostic_epoch"],
-                "reason": "No feasible selector operating point"})
-        return state["best_epoch"] or state["diagnostic_epoch"]
-    return epochs
+    return _training_result(state, selector, epochs, directory)
 
 
 def decoder_settings(config):

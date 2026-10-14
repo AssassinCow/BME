@@ -8,8 +8,8 @@ project:
 experiment:
   name: statsfusion_v414_28_11_then_39
   code_version: v4.14
-  protocol_version: statsfusion-joint-event-v7
-  repair_revision: v414-r2
+  protocol_version: statsfusion-joint-event-v8
+  repair_revision: v414-r3
 model:
   architecture: statsfusion_joint_event_v414
   hidden_dim: 64
