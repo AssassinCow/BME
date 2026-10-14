@@ -22,7 +22,7 @@ AdamW、BF16、256个新步及实际感受野warmup、每session权重固定、�
 ```powershell
 python scripts/run_statsfusion_joint.py `
   --config configs/statsfusion_v414_full_data.yaml `
-  --run-name statsfusion_v414_28_11_then_39_repair_r3_20261014a `
+  --run-name statsfusion_v414_28_11_then_39_repair_r4_20261014a `
   --evaluation-mode dev28_11 --stage all --fresh
 ```
 
@@ -32,7 +32,7 @@ python scripts/run_statsfusion_joint.py `
 
 ## 恢复提交
 
-每chunk先持久化缓存和校验追加日志，再原子提交checkpoint。v8恢复状态版本为4，保存RNG、模型/optimizer、LR位置、累计梯度、端点计数表及hash、逐版本和逐排序对梯度、几何所有权、纯负贡献、自然回放hash、候选及重复诊断释放游标、增强描述及早停计数。停止原因、完成epoch和终止标记与下一轮游标在同一个checkpoint提交；恢复终止状态只返回选模结果或重建失败报告，不进入训练循环。恢复截断未提交日志尾部、核验缓存，只接受完整chunk。旧协议checkpoint、梯度缓冲、候选缓存与校准器不得加载或resume。
+每chunk先持久化缓存和校验追加日志，再原子提交checkpoint。v9沿用恢复状态版本4，保存RNG、模型/optimizer、LR位置、累计梯度、端点计数表及hash、逐版本和逐排序对梯度、几何所有权、纯负贡献、自然回放hash、候选及重复诊断释放游标、增强描述及早停计数。停止原因、完成epoch和终止标记与下一轮游标在同一个checkpoint提交；恢复终止状态只返回选模结果或重建失败报告，不进入训练循环。恢复截断未提交日志尾部、核验缓存，只接受完整chunk。候选及训练版本上限改变，旧协议checkpoint、梯度缓冲、候选缓存与校准器不得加载或resume。
 
 自然回放按subject/session/start/end合并几何，首次可用decision和phase的稳定代表提供完整metadata。同decision/phase合并来源审计；晚到重复按自身时间释放诊断，不改写早期输入。预算几何去重不依赖CDF fallback，即使首次预算不足，后续重复也不能重试。
 

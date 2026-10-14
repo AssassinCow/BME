@@ -1,0 +1,4515 @@
+{
+  "passed": true,
+  "disposable_audit_weights": true,
+  "formal_run_started": false,
+  "synthetic_cdf_and_calibration_for_consistency_only": true,
+  "label_use": "audit_selection_and_search_only",
+  "checkpoint_sha256": "9348037812759e47e6d2bf42a21ba33d2e03c193c08214c67715a69bcd70b711",
+  "source_sha256": "d3cb348af108f232b036764c298a5159c29faa4418a06bbb7e4aa01cd51500ab",
+  "data_sha256": "9d1656d4ca7e41c57585e6fbfa6f323833554fcb51c71ee9f7e13afe335f5fcb",
+  "config_sha256": "3baa8ecda45037e67f5e322489d63e3ecdbc579907dd7b480cac45a3f7c61cf1",
+  "sessions": [
+    {
+      "subject": "64124e0fe3248a92d711",
+      "session": "cc14017e0f79af253445",
+      "selection_duration_seconds": 29.0,
+      "motion_samples": 9408,
+      "ppg_samples": 4704,
+      "chunks": [
+        128,
+        256
+      ],
+      "elapsed_seconds": [
+        0.5149999999994179,
+        0.23500000000058208
+      ],
+      "event_count": 1,
+      "score_max_error": 0.0,
+      "identity_alignment": true
+    },
+    {
+      "subject": "64124e0fe3248a92d711",
+      "session": "f5ea5ae8a1746ea19bba",
+      "selection_duration_seconds": 13022.0,
+      "motion_samples": 3557275,
+      "ppg_samples": 1778641,
+      "chunks": [
+        128,
+        256
+      ],
+      "elapsed_seconds": [
+        402.5,
+        225.4210000000021
+      ],
+      "event_count": 1,
+      "score_max_error": 0.0,
+      "identity_alignment": true
+    }
+  ],
+  "elapsed_seconds": 634.031999999992,
+  "disposable_real_bundle_replay": {
+    "passed": true,
+    "bundle": "C:\\Users\\LZX\\AppData\\Local\\Temp\\bme_disposable_bundle_6np5tf4z\\bundle",
+    "checkpoint_sha256": "9348037812759e47e6d2bf42a21ba33d2e03c193c08214c67715a69bcd70b711",
+    "score_max_error": 3.704441087215571e-09,
+    "event_count": 1,
+    "identity_alignment": true,
+    "no_xgboost_load_and_replay": true,
+    "real_input": true,
+    "artifact_kind": "disposable_audit_bundle",
+    "official_test_candidate": false,
+    "promotable": false,
+    "final39_contract_fixture_tested_separately": true
+  },
+  "search_benchmark": {
+    "passed": true,
+    "registered_points": 16038,
+    "metric_mismatches": 0,
+    "reference_seconds": 79.54700000000594,
+    "cached_seconds": 3.449999999967986,
+    "search_speedup": 23.057101449491043,
+    "target_twofold_met": true,
+    "candidate_count": 882,
+    "sessions": [
+      [
+        "1ff38584c81d9c19806c",
+        "2fb023922d4ea6f97829"
+      ],
+      [
+        "3bf8358d6c8ba2813dd9",
+        "1018772631cfa1156485"
+      ],
+      [
+        "64124e0fe3248a92d711",
+        "cc14017e0f79af253445"
+      ],
+      [
+        "2f8c1acc1c1cce6aa8c2",
+        "801b72eb31f2c9031ac6"
+      ]
+    ],
+    "scope": "search_only_on_real_audit_subset",
+    "calibration": "fixed_for_equivalence_only",
+    "same_weights_and_candidates": true,
+    "directory": "C:\\Users\\LZX\\AppData\\Local\\Temp\\bme_v414_r4_search_l8if5di_",
+    "candidate_comparison": {
+      "baseline_candidate_commit": "c7d6be3",
+      "same_model_weights": true,
+      "same_parent_cdf": true,
+      "cdf_from_natural_training_parents": true,
+      "sessions": [
+        [
+          "1ff38584c81d9c19806c",
+          "2fb023922d4ea6f97829"
+        ],
+        [
+          "3bf8358d6c8ba2813dd9",
+          "1018772631cfa1156485"
+        ],
+        [
+          "64124e0fe3248a92d711",
+          "cc14017e0f79af253445"
+        ],
+        [
+          "2f8c1acc1c1cce6aa8c2",
+          "801b72eb31f2c9031ac6"
+        ],
+        [
+          "2f8c1acc1c1cce6aa8c2",
+          "9ec68d9300579a5af73a"
+        ]
+      ],
+      "scope": "five_real_disposable_training_sessions",
+      "scoring": {
+        "r3": {
+          "roi_seconds": 9.142000000036205,
+          "candidate_head_seconds": 1.2980000000243308,
+          "scoring_head_calls": 108,
+          "scoring_candidates": 3606
+        },
+        "r4": {
+          "roi_seconds": 9.23399999999674,
+          "candidate_head_seconds": 1.3570000000036089,
+          "scoring_head_calls": 108,
+          "scoring_candidates": 3606
+        }
+      },
+      "records": [
+        {
+          "decoder": "high_0.06_low_0.5_gap_0",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.5_gap_0",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.5_gap_0",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.5_gap_15",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.5_gap_15",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.5_gap_15",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.5_gap_30",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.5_gap_30",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.5_gap_30",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.9_gap_0",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.9_gap_0",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.9_gap_0",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.9_gap_15",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.9_gap_15",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.9_gap_15",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.9_gap_30",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.9_gap_30",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.06_low_0.9_gap_30",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.5_gap_0",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.5_gap_0",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.5_gap_0",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.5_gap_15",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.5_gap_15",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.5_gap_15",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.5_gap_30",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.5_gap_30",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.5_gap_30",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.9_gap_0",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.9_gap_0",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.9_gap_0",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.9_gap_15",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.9_gap_15",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.9_gap_15",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.9_gap_30",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 18
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.9_gap_30",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.1_low_0.9_gap_30",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 54
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 21
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.5_gap_0",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 17
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 17
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.5_gap_0",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.5_gap_0",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 23
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 23
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.5_gap_15",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 17
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 17
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.5_gap_15",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.5_gap_15",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 23
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 23
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.5_gap_30",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 17
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 17
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.5_gap_30",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 22
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.5_gap_30",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 48
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 23
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 23
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.9_gap_0",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 972
+            },
+            "r4": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 972
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000"
+              ],
+              "candidates": 118
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000"
+              ],
+              "candidates": 118
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.9_gap_0",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 972
+            },
+            "r4": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 972
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 232
+            },
+            "r4": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 232
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.9_gap_0",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 972
+            },
+            "r4": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 972
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 343
+            },
+            "r4": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 343
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.9_gap_15",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 939
+            },
+            "r4": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 939
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 0,
+              "support_events": 4,
+              "covered_event_ids": [],
+              "candidates": 118
+            },
+            "r4": {
+              "covered_events": 0,
+              "support_events": 4,
+              "covered_event_ids": [],
+              "candidates": 118
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.9_gap_15",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 939
+            },
+            "r4": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 939
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 232
+            },
+            "r4": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 232
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.9_gap_15",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 939
+            },
+            "r4": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 939
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 343
+            },
+            "r4": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 343
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.9_gap_30",
+          "budget": 10,
+          "raw": {
+            "r3": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 903
+            },
+            "r4": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 903
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 118
+            },
+            "r4": {
+              "covered_events": 1,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 118
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.9_gap_30",
+          "budget": 20,
+          "raw": {
+            "r3": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 903
+            },
+            "r4": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 903
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 232
+            },
+            "r4": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 232
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        },
+        {
+          "decoder": "high_0.2_low_0.9_gap_30",
+          "budget": 30,
+          "raw": {
+            "r3": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 903
+            },
+            "r4": {
+              "covered_events": 3,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000",
+                "64124e0fe3248a92d711|05d6fc6ae8e1437f968a9570471e7f741784648520000"
+              ],
+              "candidates": 903
+            }
+          },
+          "admitted": {
+            "r3": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 343
+            },
+            "r4": {
+              "covered_events": 2,
+              "support_events": 4,
+              "covered_event_ids": [
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784689080000",
+                "2f8c1acc1c1cce6aa8c2|a65f41c8af79414aba9149fe0b965c631784694900000"
+              ],
+              "candidates": 343
+            }
+          },
+          "lost_after_budget": [],
+          "gained_after_budget": [],
+          "fixed_diagnostic_metrics": {
+            "r3": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            },
+            "r4": {
+              "true_positive": 0.0,
+              "false_positive": 0.0,
+              "false_negative": 4.0,
+              "ignored_predictions": 0.0,
+              "precision": 0.0,
+              "sensitivity": 0.0,
+              "f1": 0.0,
+              "start_mae_seconds": null,
+              "end_mae_seconds": null,
+              "start_signed_error_seconds": null,
+              "end_signed_error_seconds": null,
+              "observed_hours": 11.441666666666666,
+              "fp_per_hour": 0.0,
+              "same_recall": 0.0,
+              "different_recall": 0.0,
+              "unknown_recall": null
+            }
+          }
+        }
+      ],
+      "uses_comparison_to_select_epoch_or_threshold": false,
+      "formal_effect_evidence": false
+    }
+  },
+  "resources": {
+    "peak_process_ram_gb": 3.222980499267578,
+    "peak_gpu_gb": 0.18901920318603516,
+    "peak_gpu_reserved_gb": 0.326171875,
+    "process_tree_private_ram_gb": 4.094318389892578,
+    "peak_process_tree_private_ram_gb": 4.094318389892578,
+    "worker_process_count": 0
+  }
+}

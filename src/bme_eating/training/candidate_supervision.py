@@ -249,7 +249,7 @@ def retained_groups(descriptors, maximum=3, *, diagnostics=None):
     return selected
 
 
-def _versions(candidates, truth):
+def _versions(candidates, truth, maximum):
     ordered = sorted(candidates, key=lambda item: (-candidate_targets(item, truth)[1], candidate_order_key(item)))
     selected, bins = [], set()
     for item in ordered:
@@ -257,10 +257,10 @@ def _versions(candidates, truth):
         if band not in bins:
             selected.append(item)
             bins.add(band)
-        if len(selected) == 3:
+        if len(selected) == maximum:
             break
     for item in ordered:
-        if len(selected) == 3:
+        if len(selected) == maximum:
             break
         if item not in selected:
             selected.append(item)
@@ -321,7 +321,7 @@ def sample_groups(model, candidates, truth, config, rng, positive_state, used_fa
             event = target[2] if target[2] in positive_events else None
             partitioned.setdefault(event, []).append(item)
         for event, items in partitioned.items():
-            versions = _versions(items, truth)
+            versions = _versions(items, truth, config["training"]["versions_per_group"])
             representative = versions[0]
             key = (representative.subject_key, representative.session_id, event)
             group = {"family": family, "versions": versions, "event_key": key}
@@ -370,7 +370,9 @@ def sample_groups(model, candidates, truth, config, rng, positive_state, used_fa
     pool.extend(background[:maximum - len(pool)])
     if len(pool) < maximum:
         pool.extend(near[reserve:reserve + maximum - len(pool)])
-    flat = [item for group in pool for item in group["versions"]]
+    mining_versions = {group["family"]: _versions(group["versions"], truth,
+        config["training"]["mining_versions_per_family"]) for group in pool}
+    flat = [item for group in pool for item in mining_versions[group["family"]]]
     training_state = model.training
     try:
         model.eval()
@@ -383,7 +385,8 @@ def sample_groups(model, candidates, truth, config, rng, positive_state, used_fa
     finally:
         model.train(training_state)
     for group in pool:
-        group["difficulty"] = float(np.mean([difficulty[item.proposal_id] for item in group["versions"]]))
+        group["difficulty"] = float(np.mean([difficulty[item.proposal_id]
+            for item in mining_versions[group["family"]]]))
     ranked = sorted(pool, key=lambda group: (-group["difficulty"], candidate_order_key(group["versions"][0])))
     chosen_families = set()
     if anchor:
@@ -412,6 +415,8 @@ def sample_groups(model, candidates, truth, config, rng, positive_state, used_fa
         "independent_positive_events": len({group["event_key"] for group in selected if group["category"] == "positive"}),
         "independent_negative_families": len(chosen_families), "mining_families": len(pool),
         "mining_head_candidates": len(flat), "mining_seconds": time.monotonic() - started,
+        "mining_versions_per_family": config["training"]["mining_versions_per_family"],
+        "supervised_versions_per_group": config["training"]["versions_per_group"],
         "random_anchor_reserved": anchor is not None, "discovered_positive_events": discovered_events,
         "positive_retention_drops": retention_drops,
         "mining_ranking": [{"family": group["family"], "bce": group["difficulty"],

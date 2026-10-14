@@ -48,7 +48,7 @@ def test_learned_onset_preserves_compatibility_coverage(config, peaks):
 
     assert max(map(overlap, baseline)) > .25
     assert max(map(overlap, actual)) > .25
-    assert len(actual) == 3
+    assert len(actual) == 4
     assert sum(candidate.source == "learned_onset" for candidate in actual) == 1
     assert any(candidate.generation_parameters["compatibility_guard"] for candidate in actual)
     extended = stream_candidates(config, peaks, steps=200)
@@ -178,8 +178,8 @@ def test_early_stop_commit_resume_is_terminal(config, tmp_path, monkeypatch, mod
 
 
 def test_new_candidate_and_terminal_protocol_rejects_r2(config):
-    assert PROFILE.protocol == "statsfusion-joint-event-v8"
-    assert PROFILE.repair_revision == "v414-r3"
+    assert PROFILE.protocol == config["experiment"]["protocol_version"]
+    assert PROFILE.repair_revision == config["experiment"]["repair_revision"]
     assert CHECKPOINT_STATE_VERSION == 4
     old = copy.deepcopy(config)
     old["experiment"].update({"protocol_version": "statsfusion-joint-event-v7", "repair_revision": "v414-r2"})

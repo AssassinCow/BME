@@ -36,7 +36,7 @@ def test_learned_onset_and_fallback_prefix(config, onset):
         return output
     short, long = replay(70), replay(100)
     assert short and [item.to_dict() for item in short] == [item.to_dict() for item in long[:len(short)]]
-    assert len(short) <= 3
+    assert len(short) <= config["decoder"]["maximum_versions_per_parent"]
     assert len({(item.start_ms, item.end_ms) for item in short}) == len(short)
     assert any(item.source == "learned_onset" for item in short) == (onset >= .30)
     if onset >= .30:

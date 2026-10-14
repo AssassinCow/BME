@@ -1,0 +1,73 @@
+{
+  "shared_event_quality_gradients": true,
+  "repeat_max_error": 0.0,
+  "long_event": {
+    "event_duration_seconds": 13023,
+    "chunks": [
+      1,
+      17,
+      256,
+      4362
+    ],
+    "three_second_increment_actual_return_latency_seconds": 0.0,
+    "batch_input_available_time_recorded": true,
+    "event_count": 1,
+    "identities": [
+      "f5886ef415ceb09d6d71ec4a"
+    ],
+    "max_latency_seconds": 0.0
+  },
+  "device": "cuda",
+  "raw_session": {
+    "native_motion_samples": 6001,
+    "native_ppg_samples": 3001,
+    "new_chunk_steps": [
+      10,
+      20
+    ],
+    "feature_max_error": 2.384185791015625e-07,
+    "event_score_max_error": 0.0,
+    "event_identity_alignment": true,
+    "timestamp_alignment": true,
+    "incremental_native_chunks": true,
+    "public_event_schema": true
+  },
+  "gpu_validation_performed": true,
+  "localization_receptive_field_seconds": 45,
+  "localization_dependency_seconds": {
+    "motion_blocks": 3,
+    "statistics_window": 15,
+    "ppg_block": 15,
+    "ppg_maximum_hold": 12,
+    "temporal_history": 18
+  },
+  "candidate_batch128_max_error": 2.60770320892334e-08,
+  "coordinate_selection_discrete": true,
+  "history_gradient_detached": true,
+  "bfloat16_shared_gradient_norms": {
+    "event": 0.051625799387693405,
+    "quality": 0.010629602707922459
+  },
+  "bfloat16_backward_passed": true,
+  "peak_process_ram_gb": 1.917266845703125,
+  "peak_gpu_gb": 1.2022714614868164,
+  "peak_gpu_reserved_gb": 1.392578125,
+  "process_tree_private_ram_gb": 3.9586334228515625,
+  "peak_process_tree_private_ram_gb": 3.9586334228515625,
+  "worker_process_count": 0,
+  "elapsed_seconds": 14.531000000002678,
+  "protocol": "statsfusion-joint-event-v9",
+  "config_sha256": "3baa8ecda45037e67f5e322489d63e3ecdbc579907dd7b480cac45a3f7c61cf1",
+  "source_sha256": "d3cb348af108f232b036764c298a5159c29faa4418a06bbb7e4aa01cd51500ab",
+  "runtime": {
+    "python": "3.11.16 | packaged by conda-forge | (main, Sep  2 2026, 23:31:17) [MSC v.1944 64 bit (AMD64)]",
+    "executable": "C:\\Users\\LZX\\anaconda3\\envs\\bme-model\\python.exe",
+    "torch": "2.5.1",
+    "cuda": "12.4",
+    "platform": "Windows-10-10.0.26200-SP0",
+    "conda_environment": "base",
+    "gpu": "NVIDIA GeForce RTX 4080 Laptop GPU"
+  },
+  "synthetic_validation": true,
+  "formal_five_fold_training": false
+}

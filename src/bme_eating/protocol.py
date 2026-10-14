@@ -25,8 +25,8 @@ from bme_eating.artifacts import sha256_file, write_json_atomic
 class JointCapabilities:
     version: str = "v4.14"
     schema: str = "v414"
-    protocol: str = "statsfusion-joint-event-v8"
-    repair_revision: str = "v414-r3"
+    protocol: str = "statsfusion-joint-event-v9"
+    repair_revision: str = "v414-r4"
     architecture: str = "statsfusion_joint_event_v414"
     grouped: bool = True
     consistent_inputs: bool = True
@@ -60,7 +60,7 @@ def calibration_discriminates(config, payload):
             and (payload.get("probability_range") or 0) > config["calibration"]["minimum_probability_range"])
 
 
-PROTOCOL = "statsfusion-joint-event-v8"
+PROTOCOL = "statsfusion-joint-event-v9"
 CHECKPOINT_STATE_VERSION = 4
 RUNTIME_KEYS = {"num_workers", "loader_prefetch_factor", "session_reader_cache_size", "derived_cache_mib"}
 STAGES = ("audit", "dev", "final39", "export", "replay")
@@ -240,9 +240,9 @@ def validate_config(config: dict[str, Any]) -> None:
     if config["model"]["architecture"] != profile.architecture:
         raise ValueError("Joint architecture mismatch")
     if config["experiment"].get("repair_revision") != profile.repair_revision:
-        raise ValueError("v414 requires the registered v414-r3 repair revision")
+        raise ValueError("v414 requires the registered v414-r4 repair revision")
     if config["loss"].get("contrastive_max_history_bins") != 128:
-        raise ValueError("v414-r3 requires at most 128 historical contrastive references")
+        raise ValueError("v414-r4 requires at most 128 historical contrastive references")
     if config["training"]["seeds"] != [2026] or config["project"]["seed"] != 2026:
         raise ValueError("Joint protocol uses one seed: 2026")
     if config["model"]["hidden_dim"] != 64 or config["sequence"]["step_seconds"] != 3:
@@ -287,10 +287,10 @@ def validate_config(config: dict[str, Any]) -> None:
     quotas = config["training"].get("group_quotas")
     if (quotas != {"positive": 2, "near_miss": 2, "hard_false_positive": 3, "random_background": 1}
             or config["training"]["candidates_per_chunk"] != 8
-            or config["training"]["versions_per_group"] != 3
+            or config["training"]["versions_per_group"] != 4
             or config["training"]["maximum_groups_per_positive_event"] != 3
             or "sample_composition" in config["training"]):
-        raise ValueError("Joint requires explicit 2/2/3/1 group quotas, eight groups and three versions")
+        raise ValueError("Joint requires explicit 2/2/3/1 group quotas, eight groups and four versions")
     if not 0 <= config["training"]["clipping_promotion_fraction"] <= config["training"]["clipping_abort_fraction"] <= 1:
         raise ValueError("Clipping fractions are invalid")
     if (config["training"]["max_epochs"] < config["training"]["checkpoint_min_epoch"]
@@ -305,6 +305,10 @@ def validate_config(config: dict[str, Any]) -> None:
                  or config["boundary"]["modes"] != ["off", "start_only", "both"]
                  or not 1 <= config["resources"]["search_processes"] <= 4):
         raise ValueError("Joint localization, budget, Boundary or search profile mismatch")
+    if (config["decoder"].get("candidate_version_policy") != "fallback_three_plus_one_learned_v1"
+            or config["decoder"].get("maximum_versions_per_parent") != 4
+            or config["training"].get("mining_versions_per_family") != 3):
+        raise ValueError("Joint requires three fallback plus one learned version and 96 mining candidates")
     training = config["training"]
     if (training["lr_horizon_epochs"] != 64 or training["max_epochs"] != 64
             or training["lr_warmup_epochs"] != 2 or training["lr_minimum_fraction"] != 0.10

@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
+import os
+import shutil
+import subprocess
+import sys
 import tempfile
 import time
+import types
+import zipfile
 from pathlib import Path
 
 import numpy as np
@@ -50,34 +57,75 @@ from bme_eating.training.statsfusion_joint_trainer import (
 )
 
 
-def benchmark_search(model, inputs, config, preprocessing, audit):
-    keys = sorted(audit["sessions"], key=lambda key: (audit["session_bins"]["|".join(key)], key))[:4]
-    selected = SelectedSessions(inputs, set(map(tuple, keys)))
-    subjects = {key[0] for key in keys}
+def candidate_reference(archive):
+    with zipfile.ZipFile(archive) as snapshot:
+        source = snapshot.read("src/bme_eating/proposal_stream.py")
+    if hashlib.sha256(source).hexdigest() != "1ea5384e37b244c34b7ca2755bd3c05b8073486a4ff98db1e281afe7e31e8bbc":
+        raise RuntimeError("Candidate comparison requires the immutable c7d6be3 candidate source")
+    module = types.ModuleType("disposable_r3_candidate_reference")
+    exec(compile(source, str(archive) + "!proposal_stream.py", "exec"), module.__dict__)
+    return module.make_stream
+
+
+def coverage(pool, truth):
+    from bme_eating.candidates import candidate_targets
+    covered = {candidate_targets(item, truth)[2] for item in pool if candidate_targets(item, truth)[0]}
+    return {"covered_events": len(covered), "support_events": len(truth),
+            "covered_event_ids": sorted(covered), "candidates": len(pool)}
+
+
+@torch.inference_mode()
+def benchmark_search(model, inputs, config, preprocessing, audit, baseline_archive=None):
+    all_keys = sorted(map(tuple, audit["sessions"]), key=lambda key: (audit["session_bins"]["|".join(key)], key))
+    keys = all_keys[:4]
+    comparison_keys = all_keys if baseline_archive else keys
+    selected = SelectedSessions(inputs, set(map(tuple, comparison_keys)))
+    subjects = {key[0] for key in comparison_keys}
     dataset, _ = make_joint_dataset(selected, subjects, config, preprocessing, training=True)
     sampler = SessionChunkSampler(dataset, 9, training=False)
     directory = Path(tempfile.mkdtemp(prefix=f"bme_{PROFILE.repair_revision.replace('-', '_')}_search_"))
     settings = decoder_settings(config)
     pools, windows = {name: [] for name in settings}, []
-    for key in map(tuple, keys):
+    comparison_pools = {name: {"r3": [], "r4": []} for name in settings}
+    parent_candidates, comparison_windows, scoring = [], [], {"r3": {}, "r4": {}}
+    reference_stream = candidate_reference(baseline_archive) if baseline_archive else None
+    for key in map(tuple, comparison_keys):
         payload, _ = replay_session(model, selected, config, preprocessing, dataset, sampler,
             key, directory, "disposable_search", 9, 0)
         times, features = payload["times"], payload["features"]
-        windows.extend({"subject_key": key[0], "session_id": key[1],
+        session_windows = [{"subject_key": key[0], "session_id": key[1],
             "timestamp_ms": int(timestamp), "valid": float(valid)}
-            for timestamp, valid in zip(times, features[:, 128]))
+            for timestamp, valid in zip(times, features[:, 128])]
+        comparison_windows.extend(session_windows)
+        if key in keys:
+            windows.extend(session_windows)
         for name, decoder in settings.items():
+            parent_stream = make_stream(*key, "disposable_search", {**decoder, "parent_proposals_only": True})
+            parent_candidates.extend(generate_chunk(parent_stream, times, features))
+            parent_candidates.extend(parent_stream.finish())
             stream = make_stream(*key, "disposable_search", decoder)
             pool = generate_chunk(stream, times, features)
             pool.extend(stream.finish())
             score_candidates(model, pool, times, features, next(model.parameters()).device,
-                             batch_size=config["training"]["validation_head_batch_size"])
-            pools[name].extend(pool)
+                batch_size=config["training"]["validation_head_batch_size"], performance=scoring["r4"])
+            comparison_pools[name]["r4"].extend(pool)
+            if key in keys:
+                pools[name].extend(pool)
+            if reference_stream:
+                previous = reference_stream(*key, "disposable_search", decoder)
+                previous_pool = generate_chunk(previous, times, features)
+                previous_pool.extend(previous.finish())
+                score_candidates(model, previous_pool, times, features, next(model.parameters()).device,
+                    batch_size=config["training"]["validation_head_batch_size"], performance=scoring["r3"])
+                comparison_pools[name]["r3"].extend(previous_pool)
     import pandas as pd
     windows = pd.DataFrame(windows)
-    _, _, events, _ = selected.frames(subjects, labels=True)
+    _, _, comparison_events, _ = selected.frames(subjects, labels=True)
+    comparison_truth, comparison_ignore = partition_evaluation_events(comparison_events, subjects)
+    search_inputs = SelectedSessions(inputs, set(map(tuple, keys)))
+    _, _, events, _ = search_inputs.frames(subjects, labels=True)
     truth, ignore = partition_evaluation_events(events, subjects)
-    mapping = FrozenSourceCDF.fit([item for pool in pools.values() for item in pool], subjects)
+    mapping = FrozenSourceCDF.fit(parent_candidates, subjects)
     mapping.fallback = True
     calibrator = NonnegativePlatt(1., 0., True)
     thresholds = np.arange(1, 100) / 100
@@ -100,19 +148,122 @@ def benchmark_search(model, inputs, config, preprocessing, audit):
             for metric in ("true_positive", "false_positive", "false_negative", "f1", "fp_per_hour"):
                 errors += int(not math.isclose(actual[metric], expected[metric], rel_tol=0, abs_tol=1e-12))
         points += len(values)
-    return {"passed": points == 16038 and errors == 0, "registered_points": points,
+    result = {"passed": points == 16038 and errors == 0, "registered_points": points,
         "metric_mismatches": errors, "reference_seconds": reference_seconds,
         "cached_seconds": cached_seconds, "search_speedup": reference_seconds / max(cached_seconds, 1e-9),
         "target_twofold_met": reference_seconds >= cached_seconds * 2,
         "candidate_count": sum(map(len, pools.values())), "sessions": keys,
         "scope": "search_only_on_real_audit_subset", "calibration": "fixed_for_equivalence_only",
         "same_weights_and_candidates": True, "directory": str(directory)}
+    if reference_stream:
+        comparison_windows = pd.DataFrame(comparison_windows)
+        comparison = []
+        for name in settings:
+            raw = {revision: coverage(pool, comparison_truth) for revision, pool in comparison_pools[name].items()}
+            for budget in config["search"]["budgets"]:
+                admitted = {revision: apply_online_budget(copy.deepcopy(pool), comparison_windows,
+                    {"disposable_search": mapping}, budget, {})[0]
+                    for revision, pool in comparison_pools[name].items()}
+                row = {"decoder": name, "budget": budget, "raw": raw,
+                    "admitted": {revision: coverage(pool, comparison_truth) for revision, pool in admitted.items()}}
+                row["lost_after_budget"] = sorted(set(row["admitted"]["r3"]["covered_event_ids"])
+                    - set(row["admitted"]["r4"]["covered_event_ids"]))
+                row["gained_after_budget"] = sorted(set(row["admitted"]["r4"]["covered_event_ids"])
+                    - set(row["admitted"]["r3"]["covered_event_ids"]))
+                row["fixed_diagnostic_metrics"] = {revision: metrics_with_exposure(comparison_truth,
+                    commit_candidates(pool, calibrator, .50, .30), comparison_ignore, comparison_windows)[0]
+                    for revision, pool in admitted.items()}
+                comparison.append(row)
+        result["candidate_comparison"] = {"baseline_candidate_commit": "c7d6be3",
+            "same_model_weights": True, "same_parent_cdf": True,
+            "cdf_from_natural_training_parents": True, "sessions": comparison_keys,
+            "scope": "five_real_disposable_training_sessions", "scoring": scoring,
+            "records": comparison, "uses_comparison_to_select_epoch_or_threshold": False,
+            "formal_effect_evidence": False}
+    return result
+
+
+def audit_bundle_replay(detector, checkpoint, raw, expected):
+    directory = Path(tempfile.mkdtemp(prefix="bme_disposable_bundle_"))
+    bundle = directory / "bundle"
+    bundle.mkdir()
+    shutil.copyfile(checkpoint, bundle / "checkpoint.pt")
+    write_json_atomic(bundle / "resolved_config.json", detector.config)
+    write_json_atomic(bundle / "inference.json", {"point": detector.point,
+        "mapping": detector.mapping.to_json(), "identity": detector.identity,
+        "boundary": detector.boundary, "subject": raw.subject_key, "session": raw.session_id,
+        "artifact_kind": "disposable_audit_bundle", "official_test_candidate": False,
+        "promotable": False, "calibration_is_synthetic_for_consistency": True})
+    for relative in source_identity(PROJECT_ROOT):
+        target = bundle / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(PROJECT_ROOT / relative, target)
+    hashes = {path.relative_to(bundle).as_posix(): sha256_file(path)
+              for path in bundle.rglob("*") if path.is_file()}
+    write_json_atomic(bundle / "SHA256SUMS.json", hashes)
+    raw_path = directory / "private_real_input.npz"
+    np.savez(raw_path, **{name: getattr(raw, name) for name in (
+        "motion_timestamp_ms", "motion_values", "motion_mask",
+        "ppg_timestamp_ms", "ppg_values", "ppg_mask")})
+    code = """import builtins,json,sys
+from pathlib import Path
+original=builtins.__import__
+def guarded(name,*args,**kwargs):
+    if name.split('.')[0]=='xgboost':
+        raise ImportError('xgboost forbidden')
+    return original(name,*args,**kwargs)
+builtins.__import__=guarded
+import numpy as np
+import torch
+from bme_eating.artifacts import sha256_file
+from bme_eating.candidates import FrozenSourceCDF
+from bme_eating.data.stats_fusion_preprocess import RawSessionInput
+from bme_eating.protocol import CHECKPOINT_STATE_VERSION,config_identity,protocol_for,validate_config,verify_artifact_hashes
+from bme_eating.streaming import JointDetector
+from bme_eating.training.statsfusion_joint_trainer import seed_model
+root=Path.cwd()
+hashes=json.loads((root/'SHA256SUMS.json').read_text(encoding='utf-8'))
+verify_artifact_hashes(root,hashes)
+config=json.loads((root/'resolved_config.json').read_text(encoding='utf-8'))
+validate_config(config)
+point=json.loads((root/'inference.json').read_text(encoding='utf-8'))
+payload=torch.load(root/'checkpoint.pt',map_location='cpu',weights_only=True)
+assert payload['protocol']==protocol_for(config) and payload['state_version']==CHECKPOINT_STATE_VERSION
+assert payload['config_sha256']==config_identity(config)
+detector=JointDetector()
+detector.model=seed_model(config).eval()
+detector.model.load_state_dict(payload['model'])
+detector.config,detector.preprocessing=config,payload['preprocessing']
+detector.point,detector.boundary,detector.identity=point['point'],point['boundary'],point['identity']
+detector.mapping=FrozenSourceCDF(**point['mapping'])
+with np.load(sys.argv[1],allow_pickle=False) as archive:
+    raw=RawSessionInput(subject_key=point['subject'],session_id=point['session'],**dict(archive)).validated()
+events=detector.predict_session(raw,new_steps=256)
+print(json.dumps({'events':[{'id':item.event_id,'start_ms':item.start_ms,'end_ms':item.end_ms,'score':item.score} for item in events],'checkpoint_sha256':sha256_file(root/'checkpoint.pt')}))
+"""
+    environment = {**os.environ, "PYTHONPATH": str(bundle / "src"), "PYTHONDONTWRITEBYTECODE": "1"}
+    result = subprocess.run([sys.executable, "-c", code, str(raw_path)], cwd=bundle,
+        env=environment, capture_output=True, text=True, check=False)
+    if result.returncode:
+        raise RuntimeError("Disposable real bundle replay failed: " + result.stderr)
+    output = json.loads(result.stdout.strip().splitlines()[-1])
+    expected_geometry = [(item.event_id, item.start_ms, item.end_ms) for item in expected]
+    actual_geometry = [(item["id"], item["start_ms"], item["end_ms"]) for item in output["events"]]
+    error = max((abs(left.score - right["score"]) for left, right in zip(expected, output["events"])), default=0)
+    if expected_geometry != actual_geometry or error > 1e-6:
+        raise RuntimeError("Disposable bundle differs from live real-session inference")
+    return {"passed": True, "bundle": str(bundle), "checkpoint_sha256": output["checkpoint_sha256"],
+        "score_max_error": error, "event_count": len(expected), "identity_alignment": True,
+        "no_xgboost_load_and_replay": True, "real_input": True,
+        "artifact_kind": "disposable_audit_bundle", "official_test_candidate": False,
+        "promotable": False, "final39_contract_fixture_tested_separately": True}
 
 
 def main():
     parser = argparse.ArgumentParser(description=f"Disposable {PROFILE.repair_revision} native replay and full search audit")
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cuda")
     parser.add_argument("--benchmark-search", action="store_true")
+    parser.add_argument("--candidate-baseline-archive", type=Path)
     arguments = parser.parse_args()
     config = load_config(PROJECT_ROOT / "configs/statsfusion_v414_full_data.yaml")
     config["training"]["device"] = arguments.device
@@ -143,7 +294,7 @@ def main():
         torch.cuda.reset_peak_memory_stats()
     sessions = [("64124e0fe3248a92d711", "cc14017e0f79af253445", 29.),
                 ("64124e0fe3248a92d711", "f5ea5ae8a1746ea19bba", 13022.)]
-    results, started = [], time.monotonic()
+    results, started, bundle_report = [], time.monotonic(), None
     for subject, session, duration in sessions:
         _, _, _, segments = inputs.frames({subject}, labels=False)
         segments = segments[segments.session_id.astype(str).eq(session)]
@@ -166,13 +317,17 @@ def main():
             "motion_samples": len(raw.motion_timestamp_ms), "ppg_samples": len(raw.ppg_timestamp_ms),
             "chunks": [128, 256], "elapsed_seconds": seconds, "event_count": len(outputs[0]),
             "score_max_error": error, "identity_alignment": True})
+        if duration == 29.:
+            bundle_report = audit_bundle_replay(detector, checkpoint, raw, outputs[-1])
     report = {"passed": True, "disposable_audit_weights": True, "formal_run_started": False,
         "synthetic_cdf_and_calibration_for_consistency_only": True, "label_use": "audit_selection_and_search_only",
         "checkpoint_sha256": sha256_file(checkpoint), "source_sha256": digest(source_identity(PROJECT_ROOT)),
         "data_sha256": digest(inputs.identity), "config_sha256": config_identity(config),
-        "sessions": results, "elapsed_seconds": time.monotonic() - started}
+        "sessions": results, "elapsed_seconds": time.monotonic() - started,
+        "disposable_real_bundle_replay": bundle_report}
     if arguments.benchmark_search:
-        report["search_benchmark"] = benchmark_search(detector.model, inputs, config, payload["preprocessing"], audit)
+        report["search_benchmark"] = benchmark_search(detector.model, inputs, config,
+            payload["preprocessing"], audit, arguments.candidate_baseline_archive)
         report["passed"] &= report["search_benchmark"]["passed"]
     report["resources"] = enforce_resources(config, torch.device(arguments.device))
     write_json_atomic(PROJECT_ROOT / f"manifests/{repair_tag}_real_replay_{arguments.device}.json", report)

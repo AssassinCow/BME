@@ -34,6 +34,10 @@ v414-r3新增实际流式候选覆盖反例、双峰配额、重复起点补位�
 
 真实重放审计复用本轮可丢弃权重，比较长短session在128/256新步下的事件及分数。可选完整16038点对照仅衡量真实审计子集上的搜索阶段，不代表完整验证或正式数据上的加速倍数；固定校准器只用于路径等价检查。
 
+v414-r4额外核验18个decoder下原三版本回退集合的包含关系、四版本正式采样及96候选预评分上限。`audit_statsfusion_v414_replay.py --candidate-baseline-archive <r4修复前source.zip> --benchmark-search`加载hash锁定的c7d6be3候选生成器，与当前规则使用同一r4审计权重、时间特征及自然训练父CDF。五个真实session分别报告生成池覆盖、预算后覆盖、评分量/耗时及固定诊断指标；不依据这项对照重新选epoch或调整阈值。
+
+真实短session另导出可丢弃审计bundle，在独立CPU进程禁止XGBoost后核验加载及原始输入重放。该bundle使用审计权重与一致性专用CDF/校准，明确`official_test_candidate=false`、`promotable=false`，不能冒充39人最终bundle；完整final39导出契约由fixture回归另行检查。
+
 长事件验收支持13022秒历史；GPU图不随历史长度增长。batch1/128误差要求≤1e-6，不同chunk/未来前缀不得改变已提交事件。验证性能比较保持同权重、候选和16038操作点，不能缩减搜索宣称加速。
 
 ## 本次仓库整理

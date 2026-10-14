@@ -8,8 +8,8 @@ project:
 experiment:
   name: statsfusion_v414_28_11_then_39
   code_version: v4.14
-  protocol_version: statsfusion-joint-event-v8
-  repair_revision: v414-r3
+  protocol_version: statsfusion-joint-event-v9
+  repair_revision: v414-r4
 model:
   architecture: statsfusion_joint_event_v414
   hidden_dim: 64
@@ -81,7 +81,7 @@ training:
   selector_fraction: 0.35
   partitions: 3
   candidates_per_chunk: 8
-  versions_per_group: 3
+  versions_per_group: 4
   maximum_groups_per_positive_event: 3
   validation_head_batch_size: 128
   group_quotas:
@@ -97,6 +97,7 @@ training:
   augmentation_ramp_end_epoch: 8
   natural_replay_from_epoch: 3
   mining_families: 32
+  mining_versions_per_family: 3
   mining_near_miss_families: 8
   random_background_families: 8
   random_background_seconds: [15, 30, 60, 120, 300, 768, 1800, 3600]
@@ -134,6 +135,8 @@ decoder:
   start_expansion_seconds: 600
   quotas: {}
   learned_localization: true
+  candidate_version_policy: fallback_three_plus_one_learned_v1
+  maximum_versions_per_parent: 4
   onset_peak_threshold: 0.30
   diagnostic_quotas:
     proposal: 0.20
