@@ -30,7 +30,7 @@ from bme_eating.protocol import (
     digest,
     event_score_formula,
     protocol_for,
-    source_identity,
+    training_source_identity,
     verify_artifact_hashes,
 )
 from bme_eating.training.statsfusion_joint_trainer import (
@@ -194,7 +194,7 @@ def audit(inputs, config, run):
 
 def checkpoint_contract(payload, config, inputs, model_identity, subjects, excluded, epoch):
     expected = {"config_sha256": config_identity(config), "data_sha256": digest(inputs.identity),
-                "source_sha256": digest(source_identity(Path(config["_config_path"]).resolve().parents[1]))}
+                "source_sha256": digest(training_source_identity(Path(config["_config_path"]).resolve().parents[1], config))}
     if (not checkpoint_qualified(payload, model_identity, subjects, config["training"]["checkpoint_min_epoch"])
             or payload["epoch"] != epoch or set(payload.get("excluded_subjects", [])) != excluded
             or set(payload["preprocessing"]["training_subjects"]) != subjects

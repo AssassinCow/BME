@@ -22,7 +22,7 @@ from bme_eating.protocol import (
     digest,
     protocol_for,
     runtime_identity,
-    source_identity,
+    training_source_identity,
 )
 from bme_eating.stats_features import STATS_FEATURE_COLUMNS, FoldRobustScaler
 from bme_eating.streaming import JointChunkDetector, JointDetector
@@ -178,7 +178,7 @@ def validate_joint_implementation(config, *, device="cpu"):
         report.update(enforce_resources(config, torch.device(device)))
     report["elapsed_seconds"] = time.monotonic() - started
     report.update({"protocol": protocol_for(config), "config_sha256": config_identity(config),
-        "source_sha256": digest(source_identity(Path(config["_config_path"]).resolve().parents[1])),
+        "source_sha256": digest(training_source_identity(Path(config["_config_path"]).resolve().parents[1], config)),
         "runtime": runtime_identity(), "synthetic_validation": True, "formal_five_fold_training": False})
     return report
 

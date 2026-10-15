@@ -347,7 +347,8 @@ def test_replay_hash_rejects_changed_cache(config, tmp_path):
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, torch.OutOfMemoryError])
 def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, failure, *,
                                             epochs=1, deployment_epoch=None, interruption_epoch=1,
-                                            empty_source_validation=False, periodic_baseline=False):
+                                            empty_source_validation=False, periodic_baseline=False,
+                                            development_mode=False, compatible_resume=False):
     from types import SimpleNamespace
 
     import pandas as pd
@@ -418,12 +419,28 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
     if periodic_baseline:
         original_save = trainer.save_torch_atomic
         def save_checkpoint(path, payload):
-            if ("continuous" in path.parts and path.parent.name == "nearby"
-                    and payload["epoch"] not in neighbor_epochs):
-                return
+            if "continuous" in path.parts:
+                if path.parent.name == "periodic":
+                    return
+                if path.parent.name == "nearby" and payload["epoch"] not in neighbor_epochs:
+                    return
             return original_save(path, payload)
         monkeypatch.setattr(trainer, "save_torch_atomic", save_checkpoint)
     inputs = SimpleNamespace(identity={"data": "fixture"})
+    if development_mode:
+        inputs.frames = lambda *args, **kwargs: (None, None,
+            truth_fixture().assign(subject_key="selector", evaluable=True, valid_duration=True), None)
+        monkeypatch.setattr(trainer, "fit_source_mapping", lambda *args, **kwargs: None)
+        monkeypatch.setattr(trainer, "predict_joint_model", lambda model, inputs, subjects, config,
+            preprocessing, directory, *args, **kwargs: {"coarse": [int(directory.name)], "windows": pd.DataFrame()})
+        monkeypatch.setattr(trainer, "choose_operating_point", lambda coarse, *args, **kwargs:
+            ({"f1": coarse[0] / 100, "promotion_eligible": True}, []))
+    if compatible_resume:
+        from bme_eating.protocol import source_identity
+        current_source = source_identity(Path(config["_config_path"]).resolve().parents[1])
+        training_source = {**current_source, "src/bme_eating/training/natural_replay.py": "0" * 64}
+        config["_output_only_resume"] = {"policy": "test_output_only_resume",
+            "execution_source": current_source, "training_source": training_source}
     subjects = {"fit"} | ({f"audit_subject_{index}" for index in range(38)} if deployment_epoch is not None else set())
     if empty_source_validation:
         from bme_eating.candidates import NoSourceCandidatesError
@@ -437,7 +454,7 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
                 raise failure("injected validation interruption")
             return original_write(path, payload)
         monkeypatch.setattr(trainer, "write_json_atomic", write_status)
-    selector = {"selector"} if empty_source_validation else None
+    selector = {"selector"} if empty_source_validation or development_mode else None
     def train(directory, resume):
         if empty_source_validation:
             with pytest.raises(RuntimeError, match="selection failed"):
@@ -445,7 +462,7 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
                     resume=resume, selector=selector, deployment_epoch=deployment_epoch)
         else:
             trainer.train_joint_model(inputs, subjects, config, directory, "identity", epochs=epochs,
-                resume=resume, deployment_epoch=deployment_epoch)
+                resume=resume, selector=selector, deployment_epoch=deployment_epoch)
     train(tmp_path / "continuous", False)
     interrupted["enabled"] = True
     with pytest.raises(failure):
@@ -464,22 +481,26 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
     resumed = torch.load(tmp_path / "interrupted/latest.pt", weights_only=True)
     for name in continuous["model"]:
         torch.testing.assert_close(continuous["model"][name], resumed["model"][name], rtol=0, atol=0)
+    if deployment_epoch is not None or development_mode:
+        continuous_resume = torch.load(tmp_path / "continuous/resume.pt", weights_only=False)
+        resumed_resume = torch.load(tmp_path / "interrupted/resume.pt", weights_only=False)
+        for parameter, values in continuous_resume["optimizer"]["state"].items():
+            for name, value in values.items():
+                torch.testing.assert_close(value, resumed_resume["optimizer"]["state"][parameter][name], rtol=0, atol=0)
+        assert continuous_resume["python_rng"] == resumed_resume["python_rng"]
+        np.testing.assert_equal(continuous_resume["numpy_rng"], resumed_resume["numpy_rng"])
+        torch.testing.assert_close(continuous_resume["torch_rng"], resumed_resume["torch_rng"], rtol=0, atol=0)
     if empty_source_validation:
         resumed_state = torch.load(tmp_path / "interrupted/resume.pt", weights_only=False)["state"]
         assert resumed_state["unqualified_checks"] == 1
         assert len(resumed_state["history"]) == 1
         assert resumed_state["history"][0]["selector"]["f1"] is None
     if deployment_epoch is not None:
-        continuous_resume = torch.load(tmp_path / "continuous/resume.pt", weights_only=False)
-        resumed_resume = torch.load(tmp_path / "interrupted/resume.pt", weights_only=False)
         assert continuous["epoch"] == resumed["epoch"] == deployment_epoch
         assert resumed_resume["state"]["training_complete"] and resumed_resume["state"]["epoch"] == epochs + 1
         assert [record["epoch"] for record in resumed_resume["state"]["history"]] == list(range(1, epochs + 1))
         for name in continuous_resume["model"]:
             torch.testing.assert_close(continuous_resume["model"][name], resumed_resume["model"][name], rtol=0, atol=0)
-        for parameter, values in continuous_resume["optimizer"]["state"].items():
-            for name, value in values.items():
-                torch.testing.assert_close(value, resumed_resume["optimizer"]["state"][parameter][name], rtol=0, atol=0)
         for directory in ("continuous", "interrupted"):
             checkpoints = sorted((tmp_path / directory / "nearby").glob("*.pt"))
             periodic_epochs = set() if periodic_baseline and directory == "continuous" else set(range(4, epochs + 1, 4))
@@ -496,6 +517,33 @@ def test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, fai
     else:
         assert not (tmp_path / "continuous/nearby").exists()
         assert not (tmp_path / "interrupted/nearby").exists()
+    for directory in ("continuous", "interrupted"):
+        checkpoints = sorted((tmp_path / directory / "periodic").glob("*.pt"))
+        expected_epochs = list(range(10, epochs + 1, 4)) if development_mode else []
+        if periodic_baseline and directory == "continuous":
+            expected_epochs = []
+        assert [int(path.stem.split("_")[-1]) for path in checkpoints] == expected_epochs
+        for path, retained_epoch in zip(checkpoints, expected_epochs):
+            payload = torch.load(path, weights_only=True)
+            assert payload["epoch"] == retained_epoch and payload["epoch_complete"]
+            assert payload["excluded_subjects"] == ["selector"]
+    if development_mode:
+        for directory in ("continuous", "interrupted"):
+            selected = torch.load(tmp_path / directory / "selected.pt", weights_only=True)
+            assert selected["epoch"] == epochs
+            assert [record["epoch"] for record in resumed_resume["state"]["history"]
+                    if "selector" in record] == list(range(8, epochs + 1, 2))
+    if compatible_resume:
+        assert resumed_resume["state"]["resume_migration"]["policy"] == "test_output_only_resume"
+
+
+@pytest.mark.parametrize("failure", [KeyboardInterrupt, torch.OutOfMemoryError])
+def test_development_periodic_checkpoints_quiet_replay_and_compatible_resume(config, tmp_path, monkeypatch, failure, capsys):
+    test_replay_and_contribution_chunk_resume(config, tmp_path, monkeypatch, failure,
+        epochs=14, interruption_epoch=10, development_mode=True, periodic_baseline=True,
+        compatible_resume=True)
+    captured = capsys.readouterr()
+    assert "Natural replay" not in captured.out + captured.err
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, torch.OutOfMemoryError])

@@ -6,6 +6,7 @@ import math
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import uuid
@@ -138,6 +139,55 @@ def source_identity(root: Path) -> dict[str, str]:
     paths = sorted((root / "src" / "bme_eating").rglob("*.py"))
     paths.extend(sorted((root / "scripts").glob("*.py")))
     return {path.relative_to(root).as_posix(): sha256_file(path) for path in paths}
+
+
+def training_source_identity(root: Path, config: dict[str, Any]) -> dict[str, str]:
+    current = source_identity(root)
+    compatibility = config.get("_output_only_resume")
+    if compatibility is None:
+        return current
+    if current != compatibility["execution_source"]:
+        raise RuntimeError("Execution source changed after output-only resume verification")
+    return compatibility["training_source"]
+
+
+def output_only_resume(root: Path, run: Path, stored_source, current_source):
+    registry = root / "manifests/v414_output_only_resume.json"
+    if not registry.is_file():
+        return None
+    policy = json.loads(registry.read_text(encoding="utf-8"))
+    if policy.get("policy") != "v414_dev_checkpoints_10_every_4_quiet_replay_v1":
+        return None
+    verify_artifact_hashes(run / "source_snapshot", stored_source)
+    def normalized_source(directory, sources):
+        return {relative: hashlib.sha256((directory / relative).read_text(
+            encoding="utf-8").encode("utf-8")).hexdigest() for relative in sources}
+    if (normalized_source(run / "source_snapshot", stored_source) != policy["training_source"]
+            or normalized_source(root, current_source) != policy["execution_source"]):
+        return None
+    return {"policy": policy["policy"], "registry_sha256": sha256_file(registry),
+            "training_source": stored_source, "execution_source": current_source}
+
+
+def record_output_only_resume(root: Path, run: Path, compatibility):
+    with run_lock(run):
+        snapshot = run / "runtime_source_snapshots" / digest(compatibility["execution_source"])
+        for relative, checksum in compatibility["execution_source"].items():
+            target = snapshot / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(root / relative, target)
+            if sha256_file(target) != checksum:
+                raise RuntimeError("Execution source changed during output-only resume snapshot")
+        shutil.copyfile(root / "manifests/v414_output_only_resume.json", snapshot / "compatibility.json")
+        if sha256_file(snapshot / "compatibility.json") != compatibility["registry_sha256"]:
+            raise RuntimeError("Output-only resume registry changed during snapshot")
+        write_json_atomic(snapshot / "SHA256SUMS.json", compatibility["execution_source"])
+        path = run / "runtime_source_history.json"
+        history = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {
+            "identity_sha256": sha256_file(run / "identity.json"), "observations": []}
+        if compatibility not in history["observations"]:
+            history["observations"].append(compatibility)
+            write_json_atomic(path, history)
 
 
 def verify_artifact_hashes(root: Path, hashes: dict[str, str]) -> None:
@@ -336,6 +386,7 @@ def assert_excluded(training: set[str], prediction: set[str], outer: set[str]) -
 
 def initialize_run(config, root, output, run_name, data_identity, *, fresh,
                    skip_s0, historical_reference=None):
+    config.pop("_output_only_resume", None)
     validate_config(config)
     if run_name in {".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", run_name):
         raise ValueError("Unsafe run name")
@@ -358,7 +409,6 @@ def initialize_run(config, root, output, run_name, data_identity, *, fresh,
         run.mkdir(parents=True)
         write_json_atomic(run / "identity.json", identity)
         write_json_atomic(run / "execution_status.json", {"status": "CREATED", "stages": {}})
-        import shutil
         for relative, checksum in identity["source"].items():
             destination = run / "source_snapshot" / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
@@ -374,8 +424,17 @@ def initialize_run(config, root, output, run_name, data_identity, *, fresh,
             raise FileNotFoundError("Resume requires an existing joint run")
         stored = json.loads((run / "identity.json").read_text(encoding="utf-8"))
         differences = resume_identity_differences(stored, identity)
+        compatibility = None
+        if differences and all(name.startswith("source.") for name in differences):
+            compatibility = output_only_resume(root, run, stored["source"], identity["source"])
+            if compatibility:
+                identity["source"] = stored["source"]
+                differences = resume_identity_differences(stored, identity)
         if differences:
             raise RuntimeError("Resume identity changed: " + ", ".join(differences) + "; create a new run")
+        if compatibility:
+            record_output_only_resume(root, run, compatibility)
+            config["_output_only_resume"] = compatibility
         record_resume_git(run, stored, identity)
         verify_artifact_hashes(run / "source_snapshot", identity["source"])
     return run
@@ -397,7 +456,7 @@ def checkpoint_qualified(payload: dict[str, Any], expected_identity: str,
 
 def protocol_identities(config, data_identity):
     return {"config_sha256": config_identity(config),
-            "source_sha256": digest(source_identity(Path(config["_config_path"]).resolve().parents[1])),
+            "source_sha256": digest(training_source_identity(Path(config["_config_path"]).resolve().parents[1], config)),
             "data_sha256": digest(data_identity)}
 
 

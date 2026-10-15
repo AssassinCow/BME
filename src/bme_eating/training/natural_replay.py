@@ -11,7 +11,6 @@ import torch
 from bme_eating.artifacts import sha256_file
 from bme_eating.candidates import candidate_order_key, decision_key, geometry_key, stable_id
 from bme_eating.prediction_cache import feature_binding
-from bme_eating.progress import progress
 from bme_eating.proposal_stream import make_stream
 
 
@@ -82,8 +81,7 @@ def replay_session(model, inputs, config, preprocessing, dataset, sampler, key, 
     dataset.training = False
     try:
         with preserve_training_state(model):
-            for row, _, importance, _, last, new_steps in progress(chunks, total=len(chunks),
-                    description=f"Natural replay {key[0]}/{key[1]}"):
+            for row, _, importance, _, last, new_steps in chunks:
                 batch = dataset[(row, epoch, importance)]
                 batch = {name: value[None] if isinstance(value, torch.Tensor) else value
                          for name, value in batch.items()}

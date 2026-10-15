@@ -9,7 +9,7 @@ import torch
 
 from bme_eating.artifacts import sha256_file, write_json_atomic
 from bme_eating.candidates import TimelineCache
-from bme_eating.protocol import capabilities, config_identity, digest
+from bme_eating.protocol import capabilities, config_identity, digest, training_source_identity
 
 
 def feature_binding(model, inputs, config, preprocessing, identity):
@@ -18,13 +18,13 @@ def feature_binding(model, inputs, config, preprocessing, identity):
         weights.update(name.encode())
         weights.update(str((tuple(tensor.shape), tensor.dtype)).encode())
         weights.update(tensor.detach().contiguous().cpu().reshape(-1).view(torch.uint8).numpy().tobytes())
-    source = Path(__file__).parent
-    paths = sorted(source.rglob("*.py"))
+    source = training_source_identity(Path(__file__).resolve().parents[2], config)
     return {"weights_sha256": weights.hexdigest(), "identity": identity,
             "config_sha256": config_identity(config), "data_sha256": digest(inputs.identity),
             "preprocessing_sha256": digest(preprocessing),
-            "feature_source_sha256": digest({path.relative_to(source).as_posix(): sha256_file(path)
-                                              for path in paths}),
+            "feature_source_sha256": digest({relative.removeprefix("src/bme_eating/"): checksum
+                                              for relative, checksum in source.items()
+                                              if relative.startswith("src/bme_eating/")}),
             "view": "natural", "width": capabilities(config).feature_width,
             "layout": capabilities(config).schema}
 

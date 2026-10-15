@@ -10,7 +10,7 @@ v4.14的训练、源码快照、缓存及诊断写入`$BME_OUTPUT_ROOT/v414/runs
 
 ## 两次训练
 
-1. `dev`：28人从头训练，11人开发验证选择E。normalization仅在28人自然数据上拟合。最大64轮，epoch8起每2轮验证，保留操作点资格、clipping与两类早停规则。
+1. `dev`：28人从头训练，11人开发验证选择E。normalization仅在28人自然数据上拟合。最大64轮，epoch8起每2轮验证，保留操作点资格、clipping与两类早停规则。第10轮起每4轮（10、14、18…）额外保存模型权重，不改变每轮`latest.pt`、最佳`selected.pt`及逐chunk恢复存盘。
 2. `final39`：39人从头训练，采用相同64轮LR时间轴，不重新选epoch。运行至E+4，保存每4轮（4、8、12…）权重及E−4/E−2/E/E+2/E+4五档邻近checkpoint；重复轮次只保存一次，默认最终模型为E。
 3. 最终模型在11名开发受试者上重新拟合Platt校准器和搜索操作点，明确记录这些标签已参与最终训练。16038个操作点全部保留；部署Boundary固定off。
 4. `export/replay`：资格及证据hash通过后原子导出bundle，验证锁定因果推理与无XGBoost重放。
@@ -29,6 +29,8 @@ python scripts/run_statsfusion_joint.py `
 `--stage dev`只执行开发选模；完成后使用同一run及`--evaluation-mode final39 --stage all --resume`执行最终训练、导出与重放。`--skip-s0`与`--reference-run`保留作命令兼容与身份记录；本流程不进行正式参考晋级比较。
 
 中断恢复必须完成当前阶段，禁止绕过失败阶段导出。resume只允许worker、prefetch、reader cache、derived cache等已登记运行参数调整；模型、loss、源码、数据、seed和划分变化均要求新run。提交相同源码的Git commit不改变源码身份。
+
+本次保存与终端显示改动允许修改前的`1c51482`源码run使用原命令`--resume`继续。兼容清单`manifests/v414_output_only_resume.json`逐文件严格核验原源码快照及当前执行源码；配置、数据、划分、协议和运行环境仍须一致。原训练身份、checkpoint、累计梯度、自然回放及特征缓存保持原绑定，实际执行源码另存`runtime_source_snapshots/`与`runtime_source_history.json`。未登记的源码修改仍拒绝恢复；不补造过去轮次的周期权重。
 
 ## 恢复提交
 
@@ -49,6 +51,7 @@ Ctrl+C为PAUSED；OOM及其他异常为FAILED。未完成epoch不标记完成；
 | `identity.json`, `resolved_config.json`, `source_snapshot/` | 数据、源码、运行与配置身份 |
 | `split_manifest.json`, `dev_selection.json` | 冻结成员与开发选模证据 |
 | `dev/model/`, `final39/model/` | 模型、resume状态和训练日志 |
+| `dev/model/periodic/` | 第10、14、18…轮权重；不改变选模 |
 | `final39/model/nearby/` | 每4轮权重及E−4/E−2/E/E+2/E+4邻近权重；不自动选优 |
 | `final39_training_manifest.json` | 固定epoch、从头训练及资格 |
 | `calibration_manifest.json`, `operating_point.json` | 最终开发校准与锁定操作点 |
@@ -56,4 +59,4 @@ Ctrl+C为PAUSED；OOM及其他异常为FAILED。未完成epoch不标记完成；
 | `resource_log.json`, `failure_report.json` | 资源诊断与失败原因 |
 | `bundle/`, `bundle_replay.json` | 推理包与重放结果 |
 
-训练、自然回放、CDF、验证和select均显示单行进度。训练分别显示chunk计算目标及最近提交update在实际保留集合上的归一化目标；两者含义不同。日志保存峰值/背景有效数量、分项梯度、实际任务贡献和VJP耗时，零梯度夹角记录为不可定义。验证输出F1、TP/FP/FN、FP/h、候选覆盖、边界误差、操作点、clipping、最佳epoch和早停计数。
+训练、CDF、验证和select显示单行进度；自然回放不打印终端进度，计算、缓存、审计和耗时记录保持。训练分别显示chunk计算目标及最近提交update在实际保留集合上的归一化目标；两者含义不同。日志保存峰值/背景有效数量、分项梯度、实际任务贡献和VJP耗时，零梯度夹角记录为不可定义。验证输出F1、TP/FP/FN、FP/h、候选覆盖、边界误差、操作点、clipping、最佳epoch和早停计数。

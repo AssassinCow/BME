@@ -175,13 +175,17 @@ def run_v414(arguments, config, parser):
                 if stage == "audit":
                     audit(inputs, config, run)
                 elif stage == "dev":
-                    from bme_eating.protocol import config_identity, digest, source_identity
+                    from bme_eating.protocol import (
+                        config_identity,
+                        digest,
+                        training_source_identity,
+                    )
                     from bme_eating.validation import validate_joint_implementation
                     preflight = run / "implementation_validation.json"
                     if preflight.exists():
                         report = json.loads(preflight.read_text(encoding="utf-8"))
                         if (report.get("config_sha256") != config_identity(config)
-                                or report.get("source_sha256") != digest(source_identity(PROJECT_ROOT))
+                                or report.get("source_sha256") != digest(training_source_identity(PROJECT_ROOT, config))
                                 or report.get("device") != config["training"]["device"]):
                             raise RuntimeError("v414 implementation preflight identity differs")
                     else:

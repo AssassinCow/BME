@@ -48,7 +48,7 @@ conda run --no-capture-output -n bme-model python scripts/run_statsfusion_joint.
 | 开发验证 | 11 | 354 | 45 | 4 |
 | 最终重训 | 39 | 1153 | 161 | 10 |
 
-划分冻结于[`splits/v414_dev28_11.json`](splits/v414_dev28_11.json)。开发阶段选择epoch `E`；最终39人模型从头训练至`E+4`，每4轮（4、8、12…）保存权重，并保留`E−4/E−2/E/E+2/E+4`；重复轮次只保存一次，默认校准与导出仍使用`E`。v9保留端点跨session平衡及早停原子终止，完整保留原三个回退候选并附加最多一个学习起点。正式训练每组最多四个版本，负例预评分仍为32个family、每family最多三个、总计96个；模型容量及16038个操作点保持。
+划分冻结于[`splits/v414_dev28_11.json`](splits/v414_dev28_11.json)。开发阶段选择epoch `E`，额外保存第10、14、18…轮权重；验证仍从第8轮起每2轮进行。最终39人模型从头训练至`E+4`，每4轮（4、8、12…）保存权重，并保留`E−4/E−2/E/E+2/E+4`；重复轮次只保存一次，默认校准与导出仍使用`E`。自然回放继续执行及记录审计，但不显示终端进度。此次输出改动支持修改前`1c51482`源码run继续resume，严格兼容范围见[训练与恢复](docs/training.md)。v9保留端点跨session平衡及早停原子终止，完整保留原三个回退候选并附加最多一个学习起点。正式训练每组最多四个版本，负例预评分仍为32个family、每family最多三个、总计96个；模型容量及16038个操作点保持。
 
 最终校准使用已参与39人训练的11名开发受试者，标记为`development_on_final_model`和`independent_calibration=false`。所有产物`promotable=false`；合格最终bundle为`official_test_candidate=true`。开发F1、bootstrap和邻近checkpoint结果均不能作为独立测试证明。Boundary继续学习，部署固定`off`。
 

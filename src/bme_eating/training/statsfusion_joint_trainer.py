@@ -53,8 +53,8 @@ from bme_eating.protocol import (
     digest,
     protocol_for,
     save_torch_atomic,
-    source_identity,
     supported,
+    training_source_identity,
 )
 
 
@@ -397,7 +397,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         subject_weights,
     )
     source_root = Path(config["_config_path"]).resolve().parents[1]
-    bound_source = source_identity(source_root)
+    bound_source = training_source_identity(source_root, config)
     bound_config = config_identity(config)
     def source_signature():
         paths = list((source_root / "src" / "bme_eating").rglob("*.py")) + list((source_root / "scripts").glob("*.py"))
@@ -450,6 +450,11 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             gradient = payload["gradients"].get(name)
             parameter.grad = gradient.to(device) if gradient is not None else None
         state = payload["state"]
+        if config.get("_output_only_resume"):
+            compatibility = config["_output_only_resume"]
+            state["resume_migration"] = {"policy": compatibility["policy"],
+                "training_source_sha256": digest(bound_source),
+                "execution_source_sha256": digest(compatibility["execution_source"])}
         PositiveGradientBuffer(state["positive_gradients"])
         random.setstate(payload["python_rng"])
         np.random.set_state(payload["numpy_rng"])
@@ -486,7 +491,7 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
         checkpoint_started = time.monotonic()
         if config_identity(config) != bound_config:
             raise RuntimeError("Resolved training configuration changed before checkpoint")
-        if source_signature() != bound_signature and source_identity(source_root) != bound_source:
+        if source_signature() != bound_signature and training_source_identity(source_root, config) != bound_source:
             raise RuntimeError("Runtime source changed before checkpoint")
         if input_signature is not None and inputs.file_signature() != input_signature:
             raise RuntimeError("Runtime input data changed before checkpoint")
@@ -969,6 +974,8 @@ def train_joint_model(inputs: JointInputs, subjects: set[str], config: dict[str,
             raise RuntimeError("Epoch checkpoint finite gate failed")
         if deployment_epoch is None or epoch <= deployment_epoch:
             save_torch_atomic(directory / "latest.pt", epoch_payload)
+        if selector and epoch >= 10 and (epoch - 10) % 4 == 0:
+            save_torch_atomic(directory / "periodic" / f"epoch_{epoch:03d}.pt", epoch_payload)
         if deployment_epoch is not None and (epoch % 4 == 0 or epoch in {
                 deployment_epoch - 4, deployment_epoch - 2, deployment_epoch,
                 deployment_epoch + 2, deployment_epoch + 4}):
@@ -1093,7 +1100,7 @@ def load_trained(directory, config, identity, subjects, data_identity, *, checkp
     if not checkpoint_qualified(payload, identity, subjects, config["training"]["checkpoint_min_epoch"]):
         raise RuntimeError("Unqualified joint checkpoint cannot enter OOF/promotion")
     if payload.get("config_sha256") != config_identity(config) or payload.get("source_sha256") != digest(
-            source_identity(Path(config["_config_path"]).resolve().parents[1])):
+            training_source_identity(Path(config["_config_path"]).resolve().parents[1], config)):
         raise RuntimeError("Joint checkpoint config/source identity mismatch")
     if payload.get("data_sha256") != digest(data_identity):
         raise RuntimeError("Joint checkpoint data identity mismatch")
